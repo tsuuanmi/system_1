@@ -131,7 +131,8 @@ web search (T262, `4c924619`, [ADR-0074](../decisions/adr/0074-a-research-roles-
 Accepted by the operator on 2026-11-01 (D113). No new features: each change is switched, at today's
 behaviour or `warn` first, and kept only if quality holds against the week of 2026-10-25
 ([PROP-0022](0022-lean-core.md#validation-plan)). 1b's `on` (D114) and 5b (D115) are the operator's
-decisions.
+decisions. W1 to W3 move work to website Workers (the operator, 2026-11-01; System brainstorm
+`run_28dbe77bb21cce82`): digests and re-reviews first; the first review and verify stay on agent Workers.
 
 | Change | State | Delivers | Task |
 |---|---|---|---|
@@ -144,6 +145,9 @@ decisions.
 | **5a** The operator's load | the operator's policy changes | `dispatch` and `remediation` modes; merges in batches | — |
 | **5b** Light changes land on their own | waits on D115 | — | — |
 | **6** Park what is not used | proposed | rows off and frozen (6a, 6b); 6c after 30 days | T370 |
+| **W1** Digests on website Workers | proposed | a digest requires `reason` only; local-private stays on agents | T371 |
+| **W2** Website re-reviews | proposed | a scoped `review` offer of supplied evidence, `turns.reviewSteps` (off), an input bound | T372 |
+| **W3** One vendor, one family | proposed | diversity by vendor; a heavy change's second review on a website Worker of another vendor | T373 |
 
 ## Done and open milestones
 
