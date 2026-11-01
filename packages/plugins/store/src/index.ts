@@ -153,6 +153,7 @@ export class Store extends StoreSeam {
         const done = db.prepare('SELECT 1 FROM system_migrations WHERE owner = ? AND version = ?').get(owner, migration.version)
         if (done) return
         db.exec(migration.sql)
+        migration.run?.(db)
         db.prepare('INSERT INTO system_migrations (owner, version, applied_at) VALUES (?, ?, ?)').run(owner, migration.version, new Date().toISOString())
         applied++
       })

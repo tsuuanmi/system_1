@@ -11,7 +11,7 @@ import { expect } from 'vitest'
 import { defineSuite, type Scenario } from '../../libs/conformance/runner.ts'
 import {
   type ArtifactRef, type BudgetLine, type DeclaredAccount, type LimitState, type PoolConfig, type PoolState, type PoolTemplate, type QuotaSettings, type Reservation, type ReservationRequest, Resources, ResourcesError,
-  templatePool, type TokenUsage, type Unit, type UsageFilter, type UsageRecord, type UsageTotal,
+  ownSpend, templatePool, type TokenUsage, type Unit, type UsageFilter, type UsageRecord, type UsageTotal,
 } from '../src/index.ts'
 
 export type Boot = () => Promise<{ ctx: Context; dispose: () => Promise<void> }>
@@ -104,6 +104,35 @@ export const resourcesSuite = defineSuite<Boot>({
       // A whole record of the run in its pool reconciles it.
       await ctx.resources.record(usage('u1-whole', { source: 'provider-usage', runId: 'r1', taskId: 't1', cost: { amount: 0.6, currency: 'USD', basis: 'runtime-estimate' } }))
       expect((await ctx.resources.reserve({ runId: 'r6', taskId: 't1', lines: line, caps: cap }, T0)).state).toBe('reserved')
+    }, '1.3'),
+    scenario('resumed-session-own-spend', 'records a run\'s own spend: a result that reports a session\'s running totals (`usage-record@1.2`, `sessionTotals`) counts as its difference from the session\'s latest result, the first one as it is, so the ledger counts the session\'s spend once', async (ctx) => {
+      await ctx.resources.observe(reading('max.programmatic', 'monthly'))
+      const result = (n: number, cost: number, input: number, output: number, turns: number): UsageRecord => usage(`s1:u${n}`, {
+        schema: 'usage-record@1.2', runId: `r${n}`, sessionId: 'sess-1', sessionTotals: 's1', observedAt: at(n).toISOString(), taskId: 't1',
+        usage: { inputTokens: input, outputTokens: output, cacheReadInputTokens: input - 100 }, turns, cost: { amount: cost, currency: 'USD', basis: 'runtime-estimate' },
+      })
+      for (const record of [result(1, 4.49, 1000, 100, 3), result(2, 5.35, 2500, 400, 5), result(3, 6.42, 4000, 700, 9)]) await ctx.resources.record(record)
+      const { records, totals } = await ctx.resources.usage({ taskId: 't1' })
+      expect(records.map((r) => r.cost?.amount)).toEqual([4.49, 0.86, 1.07])
+      expect(records.map((r) => [r.usage?.inputTokens, r.usage?.outputTokens, r.usage?.cacheReadInputTokens, r.turns])).toEqual([[1000, 100, 900, 3], [1500, 300, 1500, 2], [1500, 300, 1500, 4]])
+      for (const r of records) {
+        expect(r.schema).toBe('usage-record@1.2')
+        expect(r.sessionTotals, 'what is read is the run\'s own spend, not the running totals').toBeUndefined()
+        expect(r.includesUnrecorded).toBeUndefined()
+        expect(r.notDifferenced).toBeUndefined()
+      }
+      // The session counted once: its last result's totals, not their sum.
+      expect(totals).toMatchObject([{ pool: 'max.programmatic', records: 3, costUsd: 6.42, usage: { inputTokens: 4000, outputTokens: 700 }, turns: 9 }])
+      // A cap counts the same.
+      const cap = [{ pool: 'max.programmatic', unit: 'usd' as const, amount: 6.5 }]
+      expect((await ctx.resources.reserve({ runId: 'r4', taskId: 't1', lines: [{ pool: 'max.programmatic', unit: 'usd', amount: 0.05 }], caps: cap }, T0)).state).toBe('reserved')
+      expect((await ctx.resources.reserve({ runId: 'r5', taskId: 't1', lines: [{ pool: 'max.programmatic', unit: 'usd', amount: 0.1 }], caps: cap }, T0)).state).toBe('refused')
+      // A session whose first run counted only a lower bound: its first result takes it, and the session totals that result.
+      await ctx.resources.record(usage('q1', { schema: 'usage-record@1.1', runId: 'q1', sessionId: 'sess-2', taskId: 't2', usage: { inputTokens: 10, outputTokens: 1 }, cost: { amount: 0.03, currency: 'USD', basis: 'runtime-estimate' }, partial: 'stopped before its result' }))
+      await ctx.resources.record(usage('s2:u1', { schema: 'usage-record@1.2', runId: 'q2', sessionId: 'sess-2', sessionTotals: 's2', taskId: 't2', usage: { inputTokens: 1000, outputTokens: 100 }, cost: { amount: 4.49, currency: 'USD', basis: 'runtime-estimate' } }))
+      const second = await ctx.resources.usage({ taskId: 't2' })
+      expect(second.records[1]).toMatchObject({ cost: { amount: 4.46 }, usage: { inputTokens: 990, outputTokens: 99 }, includesUnrecorded: true })
+      expect(second.totals).toMatchObject([{ costUsd: 4.49, usage: { inputTokens: 1000, outputTokens: 100 } }])
     }, '1.3'),
     scenario('quota-settings', 'gives the operator\'s quota settings when it has them: each a whole number in its range, the defaults when none is configured (a 20 % reserve of every window, D63), and a copy no caller can change (ADR-0064)', async (ctx) => {
       // Optional: a provider without it leaves a caller unable to keep the operator's reserve.
@@ -295,6 +324,10 @@ export class FakeResources extends Resources {
   static inject = ['artifacts']
   private readonly readings = new Map<string, LimitState>()
   private readonly records: UsageRecord[] = []
+  /** Each runtime session's latest result, as given. */
+  private readonly results = new Map<string, UsageRecord>()
+  /** The lower bounds counted that no result has taken yet. */
+  private lowerBounds: UsageRecord[] = []
   private readonly holds = new Map<string, { request: ReservationRequest; expiresAt: number }>()
   /** The scope each run was reserved for, kept after release, so its usage counts there. */
   private readonly scopes = new Map<string, { projectId?: string; taskId?: string }>()
@@ -419,7 +452,22 @@ export class FakeResources extends Resources {
     const ref = this.ctx.artifacts.put({ kind: 'receipt', bodySchema: usage.schema, body: usage, classification: 'operator-shared', producer: { type: 'system', ref: 'resources' }, ...(usage.runId ? { runId: usage.runId } : {}) }).id as ArtifactRef
     const duplicate = this.records.some((r) => (r.source === usage.source && r.requestId === usage.requestId)
       || (usage.source === 'transcript' && usage.runId !== undefined && r.runId === usage.runId && r.source === 'runtime-result'))
-    if (!duplicate) this.records.push({ ...(usage.runId ? this.scopes.get(usage.runId) : {}), ...structuredClone(usage) })
+    if (!duplicate) {
+      let counted = structuredClone(usage)
+      if (usage.sessionTotals !== undefined) {
+        // A result of a session's running totals counts as the run's own spend (`usage-record@1.2`), its
+        // first result too: less the lower bounds of its agent session, or of its own run, counted since.
+        const mine = (r: UsageRecord): boolean => (usage.sessionId !== undefined && r.sessionId === usage.sessionId) || (usage.runId !== undefined && r.runId === usage.runId)
+        const lowerBounds = this.lowerBounds.filter(mine)
+        counted = ownSpend(usage, this.results.get(usage.sessionTotals), { lowerBounds, unrecorded: false })
+        this.results.set(usage.sessionTotals, structuredClone(usage))
+        this.lowerBounds = this.lowerBounds.filter((r) => !mine(r))
+      } else if (usage.partial !== undefined) {
+        // A lower bound: its spend is in its session's next result too, so it is taken from it.
+        this.lowerBounds.push(structuredClone(usage))
+      }
+      this.records.push({ ...(usage.runId ? this.scopes.get(usage.runId) : {}), ...counted })
+    }
     return { ref, duplicate }
   }
 

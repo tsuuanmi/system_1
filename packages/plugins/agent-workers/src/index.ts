@@ -3070,14 +3070,18 @@ export class AgentWorkers extends Service {
    * but what its runtime reports now is only what it used since the restart: its record is a lower
    * bound of the run (`partial` says so), so it never reconciles the run's unknown usage from before
    * the stop, which is left to transcript reconciliation (INV-2, never invented); and it is its own
-   * unit, never a duplicate of the cut execution's record.
+   * unit, never a duplicate of the cut execution's record. Unless its result reports its session's
+   * running totals (`sessionTotals`, PROP-0022): those hold what it used before the stop too, so its
+   * record is whole, `usage-record@1.2`, and the ledger counts the difference.
    */
   private async account(row: RunRow, worker: AgentWorkerConfig, meter: Meter, metering: RunMetering | undefined, outcome: 'completed' | 'failed' | 'aborted', durationMs: number, report: readonly LimitObservation[], ending: string): Promise<boolean> {
     const ran = metering?.limits?.length ? await this.observe(row.worker, worker, meter, metering.limits) : false
     const reported = report.length ? await this.observe(row.worker, worker, meter, report, true) : false
     const limited = ran || reported
     const usage = usageOf(metering)
-    const again = row.resumes ? againPartial(row.resumes) : undefined
+    // A session's running totals at a result (never a lower bound) hold the whole session so far.
+    const totals = metering?.partial === undefined ? metering?.sessionTotals : undefined
+    const again = row.resumes && totals === undefined ? againPartial(row.resumes) : undefined
     const partial = [metering?.partial, again].filter((p): p is string => p !== undefined).join('; ').slice(0, 300) || undefined
     if ((!usage.usage && metering?.turns === undefined) || (partial && !anyCounted(usage.usage, metering?.turns))) {
       const said = partial ? `its runtime reported no number above 0${metering?.partial ? ' before it ended' : ''}: ${partial}` : 'its runtime reported neither tokens nor turns'
@@ -3091,7 +3095,9 @@ export class AgentWorkers extends Service {
     const record: UsageRecord = {
       // A lower bound says so on its record (`@1.1`, `partial`), in the ledger's one write of it: a
       // crash or a failed append before its fact never leaves it reading as the run's usage (INV-2).
-      schema: partial ? 'usage-record@1.1' : 'usage-record@1.0',
+      schema: partial ? 'usage-record@1.1' : totals ? 'usage-record@1.2' : 'usage-record@1.0',
+      // The session's running totals (`@1.2`): the ledger counts the run's own spend.
+      ...(totals ? { sessionTotals: totals } : {}),
       // The runtime's own identity of its result, so another source of the same unit is a duplicate;
       // without one, a run that ran again after a host stop is a unit of its own each time (T283).
       requestId: `${worker.runtime}:${metering?.resultId ?? (row.resumes ? `${row.run_id}:again-${row.resumes}` : row.run_id)}`,

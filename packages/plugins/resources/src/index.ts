@@ -12,7 +12,7 @@ import { randomUUID } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type {} from '@tsuuanmi/system-ledger-core'
+import type { Migration } from '@tsuuanmi/system-ledger-core'
 import { outline, reply } from '@tsuuanmi/system-gateway-core'
 import { isRecord, MAX_UNKNOWN_ENTRIES, QUOTA_DEFAULTS, QUOTA_RANGES, quotaSettingsProblems, SchemaRegistry, unknownUsageOf, USAGE_UNKNOWN_EVENT } from '@tsuuanmi/system-libs'
 import {
@@ -20,6 +20,53 @@ import {
   templatePool, type TokenUsage, type Unit, type UsageFilter, type UsageRecord, type UsageTotal,
 } from '@tsuuanmi/system-resources-core'
 import { z as zod } from 'zod'
+import { countedOf, ownOf, recomputeOwnSpend, totalsSession, type UnrecordedFacts, whole } from './own-spend.ts'
+
+export { recomputeOwnSpend }
+
+/** The ledger's first store migration: its tables. */
+export const MIGRATION_1: Migration = {
+  version: 1,
+  sql: `CREATE TABLE resource_usage (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, request_id TEXT NOT NULL, observed_ms INTEGER NOT NULL,
+    account TEXT NOT NULL, pool TEXT NOT NULL, run_id TEXT, project_id TEXT, task_id TEXT,
+    input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_creation_tokens INTEGER, reasoning_tokens INTEGER,
+    turns INTEGER, duration_ms INTEGER, cost_usd REAL, record TEXT NOT NULL, artifact TEXT NOT NULL, recorded_at TEXT NOT NULL,
+    UNIQUE (source, request_id)
+  );
+  CREATE INDEX resource_usage_time ON resource_usage (observed_ms, seq);
+  CREATE INDEX resource_usage_run ON resource_usage (run_id, source);
+  CREATE INDEX resource_usage_project ON resource_usage (project_id, pool);
+  CREATE INDEX resource_usage_task ON resource_usage (task_id, pool);
+  CREATE INDEX resource_usage_account ON resource_usage (account, observed_ms);
+  CREATE INDEX resource_usage_pool ON resource_usage (pool, observed_ms);
+  CREATE TABLE resource_readings (
+    pool TEXT NOT NULL, window_id TEXT NOT NULL, account TEXT NOT NULL, observed_ms INTEGER NOT NULL,
+    reading TEXT NOT NULL, artifact TEXT NOT NULL, PRIMARY KEY (pool, window_id)
+  );
+  CREATE TABLE resource_reservations (
+    reservation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, project_id TEXT, task_id TEXT,
+    request TEXT NOT NULL, decision TEXT NOT NULL, reserved_at TEXT NOT NULL, expires_at TEXT NOT NULL, released_at TEXT
+  );
+  CREATE INDEX resource_reservations_run ON resource_reservations (run_id);
+  CREATE TABLE resource_holds (
+    reservation_id TEXT NOT NULL REFERENCES resource_reservations (reservation_id), pool TEXT NOT NULL, unit TEXT NOT NULL,
+    amount REAL NOT NULL, project_id TEXT, task_id TEXT, expires_ms INTEGER NOT NULL
+  );
+  CREATE INDEX resource_holds_reservation ON resource_holds (reservation_id);
+  CREATE INDEX resource_holds_task ON resource_holds (task_id, pool, unit);
+  CREATE INDEX resource_holds_project ON resource_holds (project_id, pool, unit);`,
+}
+/**
+ * The second (a run's own spend, PROP-0022): the columns that find a session's latest result and its
+ * lower bounds, and `own`, the record as it is read; its step recomputes every stored record from the
+ * original in `record`, which stays as it was.
+ */
+const MIGRATION_2_SQL = `ALTER TABLE resource_usage ADD COLUMN session_id TEXT;
+  ALTER TABLE resource_usage ADD COLUMN totals_session TEXT;
+  ALTER TABLE resource_usage ADD COLUMN own TEXT;
+  CREATE INDEX resource_usage_totals_session ON resource_usage (totals_session, seq);
+  CREATE INDEX resource_usage_session ON resource_usage (session_id, seq);`
 
 /** An id as `common@1` defines it: what a pool, account, window, run, project, or task id must be. */
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/
@@ -129,8 +176,6 @@ export function validateQuota(quota: Partial<QuotaSettings> | undefined): Readon
 }
 
 const invalid = (message: string): ResourcesError => new ResourcesError('invalid', message)
-/** SQL: the stored record (of the table `alias`, with its dot) is a whole count, not a lower bound (`usage-record@1.1`'s `partial`, ADR-0065). */
-const whole = (alias = ''): string => `json_extract(${alias}record, '$.partial') IS NULL`
 /** Runs with only a lower bound counted a refused reservation names at most (INV-9); past it, it says so. */
 export const MAX_LOWER_BOUND_RUNS = 100
 /** Milliseconds since the epoch of an RFC 3339 timestamp; refused (`invalid`) when it does not parse. */
@@ -219,6 +264,8 @@ export class StoreResources extends Resources {
   private readonly maxRecords: number
   private readonly holdSeconds: number
   private readonly settings: Readonly<QuotaSettings>
+  /** Whether the missing event log was logged (once). */
+  private saidNoEventLog = false
 
   constructor(ctx: Context, config: Config = {}) {
     super(ctx)
@@ -229,38 +276,7 @@ export class StoreResources extends Resources {
     this.maxRecords = config.maxRecords ?? 10_000
     this.holdSeconds = config.holdSeconds ?? 14_400
     this.settings = validateQuota(config.quota)
-    ctx.store.migrate('resources', [{
-      version: 1,
-      sql: `CREATE TABLE resource_usage (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, request_id TEXT NOT NULL, observed_ms INTEGER NOT NULL,
-        account TEXT NOT NULL, pool TEXT NOT NULL, run_id TEXT, project_id TEXT, task_id TEXT,
-        input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_creation_tokens INTEGER, reasoning_tokens INTEGER,
-        turns INTEGER, duration_ms INTEGER, cost_usd REAL, record TEXT NOT NULL, artifact TEXT NOT NULL, recorded_at TEXT NOT NULL,
-        UNIQUE (source, request_id)
-      );
-      CREATE INDEX resource_usage_time ON resource_usage (observed_ms, seq);
-      CREATE INDEX resource_usage_run ON resource_usage (run_id, source);
-      CREATE INDEX resource_usage_project ON resource_usage (project_id, pool);
-      CREATE INDEX resource_usage_task ON resource_usage (task_id, pool);
-      CREATE INDEX resource_usage_account ON resource_usage (account, observed_ms);
-      CREATE INDEX resource_usage_pool ON resource_usage (pool, observed_ms);
-      CREATE TABLE resource_readings (
-        pool TEXT NOT NULL, window_id TEXT NOT NULL, account TEXT NOT NULL, observed_ms INTEGER NOT NULL,
-        reading TEXT NOT NULL, artifact TEXT NOT NULL, PRIMARY KEY (pool, window_id)
-      );
-      CREATE TABLE resource_reservations (
-        reservation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, project_id TEXT, task_id TEXT,
-        request TEXT NOT NULL, decision TEXT NOT NULL, reserved_at TEXT NOT NULL, expires_at TEXT NOT NULL, released_at TEXT
-      );
-      CREATE INDEX resource_reservations_run ON resource_reservations (run_id);
-      CREATE TABLE resource_holds (
-        reservation_id TEXT NOT NULL REFERENCES resource_reservations (reservation_id), pool TEXT NOT NULL, unit TEXT NOT NULL,
-        amount REAL NOT NULL, project_id TEXT, task_id TEXT, expires_ms INTEGER NOT NULL
-      );
-      CREATE INDEX resource_holds_reservation ON resource_holds (reservation_id);
-      CREATE INDEX resource_holds_task ON resource_holds (task_id, pool, unit);
-      CREATE INDEX resource_holds_project ON resource_holds (project_id, pool, unit);`,
-    }])
+    ctx.store.migrate('resources', [MIGRATION_1, { version: 2, sql: MIGRATION_2_SQL, run: (db) => recomputeOwnSpend(db, this.unrecordedFacts()) }])
     ctx.inject(['mcp'], (c) => {
       const json = (value: object) => reply(value, outline(value))
       const failed = (error: unknown) => {
@@ -499,23 +515,47 @@ export class StoreResources extends Resources {
           : undefined
         const projectId = usage.projectId ?? reserved?.project_id ?? null
         const taskId = usage.taskId ?? reserved?.task_id ?? null
-        const u = usage.usage
+        // A result of a session's running totals counts as the run's own spend (`usage-record@1.2`):
+        // its difference from the session's latest result (the first's from zero), less the lower bounds
+        // counted since. `record` keeps it as given.
+        const session = totalsSession(usage)
+        const own = session === undefined ? undefined : ownOf(db, usage, session, Number.MAX_SAFE_INTEGER, this.unrecordedFacts())
+        const [input, output, cacheRead, cacheCreation, reasoning, turns, cost] = countedOf(own ?? usage)
         db.prepare(`INSERT INTO resource_usage (source, request_id, observed_ms, account, pool, run_id, project_id, task_id, input_tokens, output_tokens,
-          cache_read_tokens, cache_creation_tokens, reasoning_tokens, turns, duration_ms, cost_usd, record, artifact, recorded_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          cache_read_tokens, cache_creation_tokens, reasoning_tokens, turns, duration_ms, cost_usd, record, artifact, recorded_at, session_id, totals_session, own)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
           usage.source, usage.requestId, observed, usage.account, usage.pool, usage.runId ?? null, projectId, taskId,
-          u?.inputTokens ?? null, u?.outputTokens ?? null, u?.cacheReadInputTokens ?? null, u?.cacheCreationInputTokens ?? null, u?.reasoningOutputTokens ?? null,
-          usage.turns ?? null, usage.durationMs ?? null, usage.cost?.amount ?? null, JSON.stringify(usage), ref, new Date().toISOString(),
+          input!, output!, cacheRead!, cacheCreation!, reasoning!, turns!, usage.durationMs ?? null, cost!, JSON.stringify(usage), ref, new Date().toISOString(),
+          usage.sessionId ?? null, session ?? null, own ? JSON.stringify(own) : null,
         )
       }
       return { ref, duplicate }
     })
   }
 
+  /**
+   * Whether a run of an agent session ended with no record between two instants, as its `usage.unknown`
+   * fact says (the event log's first such fact of the session since then). Without an event log loaded,
+   * no fact can be read: the difference is the same, and only its `includesUnrecorded` is not known.
+   */
+  private unrecordedFacts(): UnrecordedFacts {
+    return (sessionId, sinceMs, untilMs) => {
+      const eventLog = this.ctx.get('eventLog')
+      if (!eventLog) {
+        // Said once, not once per record (a migration reads every stored one).
+        if (!this.saidNoEventLog) this.ctx.logger.warn('resources: no event log is loaded, so whether a run of a session ended with no record is not read; a difference is right, but may not say includesUnrecorded')
+        this.saidNoEventLog = true
+        return false
+      }
+      const [first] = eventLog.query({ type: USAGE_UNKNOWN_EVENT, sessionId, since: new Date(sinceMs).toISOString(), limit: 1 })
+      return first !== undefined && Date.parse(first.at) <= untilMs
+    }
+  }
+
   async usage(filter: UsageFilter = {}): Promise<{ records: UsageRecord[]; totals: UsageTotal[] }> {
     const { where, params } = this.where(filter)
     const db = this.ctx.store.db
-    const rows = db.prepare(`SELECT record FROM resource_usage ${where} ORDER BY observed_ms, seq LIMIT ${this.maxRecords + 1}`).all(...params) as Array<{ record: string }>
+    const rows = db.prepare(`SELECT COALESCE(own, record) AS record FROM resource_usage ${where} ORDER BY observed_ms, seq LIMIT ${this.maxRecords + 1}`).all(...params) as Array<{ record: string }>
     if (rows.length > this.maxRecords) throw invalid(`more than ${this.maxRecords} records match: narrow the filter, or page through resources_usage`)
     return { records: rows.map((r) => JSON.parse(r.record) as UsageRecord), totals: this.totals(where, params) }
   }
@@ -537,7 +577,7 @@ export class StoreResources extends Resources {
       clause = `${where ? `${where} AND` : 'WHERE'} (observed_ms > ? OR (observed_ms = ? AND seq > ?))`
       page.push(Number(cursor[1]), Number(cursor[1]), Number(cursor[2]))
     }
-    const rows = this.ctx.store.db.prepare(`SELECT seq, observed_ms, record FROM resource_usage ${clause} ORDER BY observed_ms, seq LIMIT ${limit + 1}`).all(...page) as unknown as CursorRow[]
+    const rows = this.ctx.store.db.prepare(`SELECT seq, observed_ms, COALESCE(own, record) AS record FROM resource_usage ${clause} ORDER BY observed_ms, seq LIMIT ${limit + 1}`).all(...page) as unknown as CursorRow[]
     const shown = rows.slice(0, limit)
     const last = shown.at(-1)
     return {

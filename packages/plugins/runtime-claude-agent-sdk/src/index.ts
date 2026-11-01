@@ -879,6 +879,8 @@ function meteringFrom(result: Record<string, unknown> | undefined, mainModel: st
   const metering: RunMetering = {}
   if (result) {
     if (typeof result.session_id === 'string' && result.session_id && typeof result.uuid === 'string' && result.uuid) metering.resultId = `${result.session_id}:${result.uuid}`
+    // A result reports its session's running totals (a resumed session's whole spend so far): the ledger counts the difference.
+    if (typeof result.session_id === 'string' && result.session_id) metering.sessionTotals = result.session_id
     const turns = count(result.num_turns)
     if (turns !== undefined) metering.turns = turns
     if (typeof result.total_cost_usd === 'number' && Number.isFinite(result.total_cost_usd) && result.total_cost_usd >= 0) metering.costUsd = result.total_cost_usd

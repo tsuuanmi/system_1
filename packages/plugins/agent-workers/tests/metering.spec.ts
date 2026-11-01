@@ -342,6 +342,39 @@ describe('agents source: metering through ctx.resources (docs/design/resources.m
     expect(next.reasons.join(' ')).toContain(started.id)
   })
 
+  it('counts a run the host\'s stop cut as a whole when its result reports its session\'s running totals: the result covers what it used before the stop (PROP-0022)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'system-agents-'))
+    const first = await boot(new ScriptedAgent({ holdMs: 30_000, process: true }), { workers: [metered()] }, dir, LEDGER)
+    const source = first.ctx.workers.source('agents')!
+    const started = source.start({ key: 'k', worker: 'agent:reviewer', prompt: 'look at it', requirement: requirement(), decisions: { tier: 'sha256:0', route: 'sha256:0' } as never })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    await first.stop()
+    const again = new ScriptedAgent({ metering: { ...METERING, sessionTotals: 'h-1' } })
+    const second = await boot(again, { workers: [metered()], deadAfterSeconds: 1 }, dir, LEDGER)
+    expect(await second.ctx.workers.source('agents')!.wait(started.id, 10_000)).toMatchObject({ status: 'completed', submitted: true })
+    expect(again.runs[0]).toMatchObject({ resume: 'h-1' })
+    // The session's running totals hold what it used before the stop too: a whole record, never a lower bound.
+    const { records } = await second.ctx.resources.usage({ runId: started.id })
+    expect(records).toHaveLength(1)
+    expect(records[0]).toMatchObject({ schema: 'usage-record@1.2', requestId: 'scripted:h-1:r-1', usage: METERING.usage, cost: { amount: 0.25 } })
+    expect(records[0]).not.toHaveProperty('partial')
+    expect(records[0]).not.toHaveProperty('sessionTotals')
+    // Counted whole: no lower bound is left unknown, only the cut execution's own fact, which the whole record reconciles.
+    const facts = second.ctx.eventLog.query({ type: 'usage.unknown' }).map((e) => e.data)
+    expect(facts).toMatchObject([{ runId: started.id, kind: 'not-reported', outcome: 'aborted' }])
+    expect(facts[0]).not.toHaveProperty('partial')
+  })
+
+  it('records a result that reports its session\'s running totals as usage-record@1.2 with sessionTotals, so the ledger counts the run\'s own spend (PROP-0022)', async () => {
+    const { ctx } = await boot(new ScriptedAgent({ metering: { ...METERING, sessionTotals: 'h-1' } }), { workers: [metered()] }, undefined, LEDGER)
+    const done = await run(ctx)
+    expect(done).toMatchObject({ status: 'completed' })
+    const [record] = (await ctx.resources.usage({ runId: done.id })).records
+    // The first result of its session counts as it is; what is read carries no running totals.
+    expect(record).toMatchObject({ schema: 'usage-record@1.2', usage: METERING.usage, turns: 3, cost: { amount: 0.25 } })
+    expect(record).not.toHaveProperty('sessionTotals')
+  })
+
   /** What a stopped run's runtime reported before it ended without its final count: a lower bound, marked partial. */
   const STREAMED: RunMetering = {
     model: 'model-main', turns: 2, usage: { inputTokens: 4757, outputTokens: 53, cacheReadInputTokens: 4300 },
