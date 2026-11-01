@@ -197,8 +197,9 @@ accepted/implemented -> superseded
   are unchanged. Six tasks, the switch `enforce.sharedNodeModules` (off, warn, on) and its test on the
   test profile. It changes no code.
 
-- [PROP-0022: Lean core, a small System that runs smoothly](0022-lean-core.md), **draft** (from the
-  operator's request of 2026-11-01, four live System runs). No new features. A command no longer ends
+- [PROP-0022: Lean core, a small System that runs smoothly](0022-lean-core.md), **accepted** (D113,
+  2026-11-01; 1b and 5b stay the operator's decisions D114 and D115; from the operator's request of
+  that day and four live System runs). No new features. A command no longer ends
   its run while it waits for an approval (a quarter of all agent runs); the ledger counts a resumed
   session's spend once (3.9 times too high today); an attempt is develop, then checks and one
   independent review in parallel, at most two fix rounds, then landing; a step's tier is set by the

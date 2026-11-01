@@ -1,7 +1,7 @@
 ---
 id: PROP-0022
 type: proposal
-status: draft
+status: accepted
 owners: [operator]
 created: 2026-11-01
 summary: No new features. System is made small and fast around what it is for: route work to the right Worker, durable runs that survive a restart, independent review, checks before landing, and quota and usage accounting. The command rules the project already wrote are put in force, and the policy allows a sandboxed Bash call it does not forbid or ask for, so a command rarely waits on the operator (a quarter of all agent runs end on such a wait today); a call that still asks waits inside the live query for a bounded time; the ledger counts a resumed session's spend once (3.9 times too high today); an attempt is develop, then the required checks and one independent review in parallel on one exact tree, at most two fix rounds, then landing; a step's tier is set by the step; the operator decides merges in a batch, and, if the operator reverses D56, a light change lands on its own; little-used parts are turned off and frozen. Target: a small task accepted in 20 to 30 minutes from ready (median 1.6 hours to done today), with quality held, each change switched and measured.
@@ -438,9 +438,17 @@ MCP tool, CLI command, or seam contract changes.
 
 ## Decision
 
-Pending the operator. Two decisions are the operator's alone: 1b (a trust-boundary change) and 5b
-(a reversal of D56).
+Accepted by the operator on 2026-11-01 (D113: "implement it as proposed"). Two parts stay the
+operator's own decisions and are not taken by that acceptance:
+
+- **1b** ships with `agent-workers.enforce.sandboxedCommands: warn`; turning it `on` and adding the
+  policy rule is a policy change the operator approves (D114).
+- **5b** needs the operator to reverse D56 (D115); until then a merge always asks, and 5a holds.
+
+Changes 1a and 5a's policy modes are the operator's policy changes through the queue.
 
 ## Implementation
 
-Not started.
+Board tasks of project `system`, each one change with its own ADR or document updates, landed by
+System: T361 (change 2), T362 to T364 (change 1), T365 to T367 (change 3), T368 and T369
+(change 4), T370 (change 6a and 6b). The [roadmap](roadmap.md#lean-core-prop-0022) tracks them.

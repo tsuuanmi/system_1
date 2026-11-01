@@ -126,6 +126,25 @@ Other landed work of the same days that serves the model: a role offering severa
 own model with per-model quota (T261, `a89c5bd4`, [ADR-0073](../decisions/adr/0073-agent-workers-offer-tiers-per-role-with-quota-per-model.md), accepted), and a research Worker with bounded, egress-checked
 web search (T262, `4c924619`, [ADR-0074](../decisions/adr/0074-a-research-roles-web-calls-run-under-a-bounded-egress-checked-grant.md), accepted); a task dossier ([ADR-0070](../decisions/adr/0070-workers-that-share-no-session-work-through-a-tasks-dossier.md), T233, accepted).
 
+## Lean core (PROP-0022)
+
+Accepted by the operator on 2026-11-01 (D113). No new features: each change is switched, at today's
+behaviour or `warn` first, and kept only if quality holds against the week of 2026-10-25
+([PROP-0022](0022-lean-core.md#validation-plan)). 1b's `on` (D114) and 5b (D115) are the operator's
+decisions.
+
+| Change | State | Delivers | Task |
+|---|---|---|---|
+| **1a** Command rules in force | the operator's policy change | the project's `commandRules` in the studio policy, the T326 rules `on` | — |
+| **2** The ledger counts a session once | proposed | a run's own spend from a resumed session's running totals; the migration | T361 |
+| **1b** Sandboxed commands | proposed | the policy's rule for a sandboxed Bash call, `enforce.sandboxedCommands` in `warn` | T363 |
+| **1c** A call waits in the query | proposed, after the SDK check | the bounded wait in `canUseTool`, the compare-and-set binding | T362, T364 |
+| **3** One attempt, one review | proposed | `pipeline: lean`; author `accept` or `dispute`; checks and review in parallel on one tree | T365 to T367 |
+| **4** Tiers by step, fresh attempts | proposed | the template's tiers by step; a new attempt from its brief and dossier | T368, T369 |
+| **5a** The operator's load | the operator's policy changes | `dispatch` and `remediation` modes; merges in batches | — |
+| **5b** Light changes land on their own | waits on D115 | — | — |
+| **6** Park what is not used | proposed | rows off and frozen (6a, 6b); 6c after 30 days | T370 |
+
 ## Done and open milestones
 
 | Milestone | State | What remains | Evidence |
