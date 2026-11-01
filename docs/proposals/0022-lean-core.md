@@ -4,9 +4,9 @@ type: proposal
 status: draft
 owners: [operator]
 created: 2026-11-01
-summary: No new features. System is made small and fast around what it is for: route work to the right Worker, durable runs that survive a restart, independent review, checks before landing, and quota and usage accounting. A Worker's command no longer ends its run while it waits for an approval (a quarter of all agent runs today); the ledger stops counting a resumed session's spend again (3.9 times too high); one attempt is develop, then checks and one independent review in parallel, then at most two fix rounds, then landing; each step's tier is set by what the step is, not by the change's risk; the operator decides merges in a batch and a light change lands on its own; little-used parts are turned off and frozen. Target: a small task landed in 20 to 30 minutes (median 1.6 hours today) at no loss of quality, each change switched and measured.
-evidence: [operator request 2026-11-01, docs/research/lean-core-2026-11-01.md, docs/research/model-routing.md, System runs run_e0e7591e03d02a95, run_fe9811153a832a00, run_1502579e9af30240, run_eec67360b1246709]
-related: [PROP-0016, PROP-0018, PROP-0021, ADR-0038, ADR-0039, ADR-0060, ADR-0067, ADR-0071, ADR-0073, ADR-0075, ADR-0078, INV-2, INV-5, INV-9, INV-12, INV-13, INV-15]
+summary: No new features. System is made small and fast around what it is for: route work to the right Worker, durable runs that survive a restart, independent review, checks before landing, and quota and usage accounting. The command rules the project already wrote are put in force, and the policy allows a sandboxed Bash call it does not forbid or ask for, so a command rarely waits on the operator (a quarter of all agent runs end on such a wait today); a call that still asks waits inside the live query for a bounded time; the ledger counts a resumed session's spend once (3.9 times too high today); an attempt is develop, then the required checks and one independent review in parallel on one exact tree, at most two fix rounds, then landing; a step's tier is set by the step; the operator decides merges in a batch, and, if the operator reverses D56, a light change lands on its own; little-used parts are turned off and frozen. Target: a small task accepted in 20 to 30 minutes from ready (median 1.6 hours to done today), with quality held, each change switched and measured.
+evidence: [operator request 2026-11-01, docs/research/lean-core-2026-11-01.md, docs/research/model-routing.md, System runs run_e0e7591e03d02a95, run_fe9811153a832a00, run_1502579e9af30240, run_eec67360b1246709, review run_523389e965124793]
+related: [PROP-0016, PROP-0018, PROP-0021, ADR-0038, ADR-0039, ADR-0060, ADR-0067, ADR-0070, ADR-0071, ADR-0073, ADR-0075, ADR-0077, ADR-0078, INV-2, INV-4, INV-5, INV-8, INV-9, INV-12, INV-13, INV-15]
 implementation: []
 ---
 
@@ -23,7 +23,8 @@ The measurements ([lean core research](../research/lean-core-2026-11-01.md)) agr
 - a task takes a median of 1.6 hours from creation to done (p90 6.2), and 2.47 attempts per
   accepted result;
 - a quarter of all agent runs end because a command waits for the operator's approval, and the
-  session is resumed by a new run;
+  session is resumed by a new run; the project's command rules for tests and read-only checks are
+  not in force, because the studio policy holds none;
 - review-type steps are 59 % of all steps, fix steps take 70 % as many agent hours as develop, and
   the frontier tier is half the cost, chosen by the change's risk rather than by the step;
 - the operator makes about 116 decisions a day (the L3 line is 10), and 6.5 % of tasks finish
@@ -37,24 +38,35 @@ The measurements ([lean core research](../research/lean-core-2026-11-01.md)) agr
 
 ## Goals
 
-1. A small task (one independently testable behaviour) lands in 20 to 30 minutes from ready, at
-   the median.
-2. No agent run ends because of a wait for an approval.
+1. A small task (one independently testable behaviour) is accepted for landing within 20 to 30
+   minutes of ready, at the median; a light-tier task, if change 5b is decided, lands within that
+   time.
+2. Under 2 % of agent runs end on a wait for an approval (25 % today); a wait within the bound of
+   change 1 ends none.
 3. Usage and cost figures are right.
 4. The operator's decisions fall to at most 10 a day for the `system` project.
 5. Quality does not regress: escaped defects, reverts, and failed required checks after landing
    stay at or below the week of 2026-10-25.
-6. Parts with no measured use are off and frozen, and removed after 30 days unused.
+6. Parts with no measured use are off and frozen, and removed after 30 days unused by a separate,
+   decided change.
+
+### Where the 20 to 30 minutes come from
+
+From the baseline week (per agent run, so a step of several runs takes longer): develop median 3.9
+minutes (p90 16.6), review 0.9 (p90 2.0), fix 5.3 (p90 15.9). A run's wall time today is 37 minutes
+at the median, of which an agent is busy 26; the gap is approval waits and serial steps. Removing
+the approval-ended runs, self-review, per-finding verification, and the serial order of checks and
+review leaves develop, one review beside the checks, and at most one fix round at the median. The
+required checks' own duration is not in the store's records and is measured in the first week. The
+target is an estimate to be measured, not a promise.
 
 ## Non-goals
 
-- New features, seams, protocols, or templates.
-- Changing the security boundary: the read confinement and the SDK sandbox
-  ([ADR-0038](../decisions/adr/0038-confined-commands-for-claude-code-workers.md)), egress
-  (INV-12), credentials (INV-8), exact-subject binding (INV-5), and serialized landing
-  ([ADR-0077](../decisions/adr/0077-landings-queue-per-target-branch-one-at-a-time.md)) stay.
+- New seams, protocols, record kinds, or templates. Changes reuse what exists (command rules, the
+  approval queue's batches, the brief and the task's dossier, `tierByRisk`, enforce switches) and
+  add a switch or configuration key only where a behaviour changes, so it can be reversed.
 - A model classifier in place of the operator for asked calls. Its published miss rate (17 % on
-  real overeager actions) is too high to replace a gate; it can be measured later.
+  real overeager actions) is too high to replace a gate.
 - Line-level clean-up, which [PROP-0018](0018-lean-code.md) covers.
 
 ## Evidence and research
@@ -62,235 +74,316 @@ The measurements ([lean core research](../research/lean-core-2026-11-01.md)) agr
 [Lean core research](../research/lean-core-2026-11-01.md) holds the measurements, the code facts,
 the cited external evidence, and the four live System runs (three brainstorms and one research)
 that chose the options below. The research run's verdict applies to all of them: the mechanisms
-are documented, but no study proves the whole pipeline. Every change is therefore switched,
-measured against the baseline week, and kept only if goal 5 holds.
+are documented, but no study proves the whole pipeline. A team review of the first draft
+(`run_523389e965124793`, ChatGPT and Claude) found seven blocking issues, all addressed in this
+version: the sandbox and the policy's precedence, the wait's fallback, merges that always ask,
+the review cycle count, and two parked parts that kept parts need.
 
 ## Proposed design
 
 Six changes, in the order they land. Each names its switch, what it measures, and the ADR it needs.
 
-### 1. A command does not end its run (approvals)
+### 1. A command rarely waits, and a wait does not end the run (approvals)
 
-**Now.** The gate is a PreToolUse hook; on `ask` it returns `defer`, the SDK ends the turn, the run
-fails as `config_error`, and the engine resumes the session in a new run after the approval
-([a deferred tool call](../design/workflow-engine.md#a-deferred-tool-call)). The studio policy
-holds no `commandRules`, so the project's rules (T326) are not in force.
+**Now.** The gate is a PreToolUse hook on every tool call. On `ask` it returns `defer`, the SDK
+ends the turn, the run fails as `config_error`, and the engine resumes the session in a new run
+after the approval ([a deferred tool call](../design/workflow-engine.md#a-deferred-tool-call)). The
+studio policy holds no `commandRules`, so the project's rules for tests and read-only checks
+([command rules](../design/approvals.md#command-rules), T326) are not in force.
 
-**Change.**
+**1a. Put the command rules in force (configuration, first).** A `policy-change` approval adds the
+project's `commandRules` to the studio policy, and the T326 option rules go from `warn` to `on`. No
+code. This alone removes the asks for the project's tests, type checks, and read-only git.
 
-1. **Put the command rules in force (configuration, first).** A `policy-change` approval adds the
-   project's `commandRules` to the studio policy, and the T326 option rules go from `warn` to `on`.
-   No code.
-2. **Trust the sandbox for what stays inside it.** In a `workspace-write` run whose sandbox the
-   probe proved (writes to the worktree only, no network, no unsandboxed escape), a Bash call is
-   allowed by the gate as `sandboxed`. The gate still asks for everything that leaves the sandbox:
-   an excluded command, a write outside the worktree, any network, `git push`, and every non-Bash
-   tool the policy asks for today. Each allowed call is recorded as an autonomy decision (INV-13),
-   as today.
-3. **An asked call waits in the live query.** The hook answers `ask`, and the runtime's
-   `canUseTool` callback holds the call open while the request is pending, for at most
-   `approvalWaitMinutes` (default 10, the same bound as `deferredCommandMinutes`). An approval runs
-   the call in the same query; a rejection returns the denial to the model, which continues. Only a
-   wait past the bound, or a host stop, falls back to `defer` and today's resume. The `workers`
-   seam's waiting status that ADR-0039 named to revisit is not needed: the run stays `running`, and
-   its liveness shows the pending request.
-4. **Codex** keeps `approvalPolicy: never` in its sandbox: a blocked command fails back to the
-   model, never to a resume.
+**1b. The policy allows a sandboxed Bash call it does not forbid or ask for.** The policy, not the
+sandbox, decides ([ADR-0038](../decisions/adr/0038-confined-commands-for-claude-code-workers.md):
+"the sandbox confines where it can act, the policy decides whether it should"). The autonomy policy
+gains one rule for the `command` class: in a `workspace-write` run whose sandbox the probe proved
+(writes to the worktree only, no network, `allowUnsandboxedCommands: false`), a Bash call that no
+`forbid` or `ask` rule matches is `auto`. The order is the policy's own: `forbid`, then `ask`
+(for example `git push`, `curl`, `ssh`, a package manager's network commands, anything naming a path
+outside the worktree), then this rule, then the class default. A call the sandbox would refuse
+(a write outside the worktree, a connection) is not asked for: it fails inside the sandbox and the
+model sees the failure, as today. A call that asks to run unsandboxed is never allowed. Each
+allowed call is an autonomy decision (INV-13), as today. This changes the policy's defaults, not the
+sandbox, and so it is a change to the trust boundary, decided by the operator through the queue.
 
-**Switch.** `agent-workers.enforce.sandboxedBash` (`off`, `warn`, `on`) for item 2 and
-`approvalWaitMinutes: 0` for item 3 (0 keeps `defer`).
+**1c. An asked call waits inside the live query, bounded.** The hook answers `ask` instead of
+`defer`, and the runtime's `canUseTool` callback holds the call while its request is pending, for at
+most `approvalWaitMinutes`. An approval runs exactly the call the request names (INV-5); a
+rejection returns the denial to the model, which continues. When the bound passes first, the
+callback denies with `interrupt`: the query ends, the run ends as today's deferred run naming the
+request, and an approval later resumes the session through today's path, where the hook finds the
+bound request and lets the exact call run once. A late approval that races the bound is the queue's
+one verdict; whichever path holds the run when it lands uses it, once. A host stop while a call
+waits is today's reconciliation: the liveness verdict (ADR-0056) shows the agent process gone before
+anything resumes (INV-4, INV-15). A run waiting in the query is `running` with its pending request
+shown by its liveness, and its wait counts against the run's existing time bounds (INV-9). The
+`workers` contract does not change: a run still ends with a result or a failure.
 
-**ADR.** A new ADR supersedes ADR-0039's "a run deferred on an approval ends as a failure" with
-"an asked call waits in the run, bounded, then defers", and amends ADR-0038 with the `sandboxed`
-verdict. A supervised check on the pinned SDK first proves that a pending `canUseTool` holds the
-query, survives a 10-minute wait, and is reached after the hook's `ask`.
+The bound matters only for what 1a and 1b leave asking (pushes, network, the unusual), which is rare
+by design; those requests are sent to the operator at once (`notify`), not held for a batch.
 
-**Measure.** Agent runs that end on an approval (target under 2 %), command approvals a week,
-attempt wall time.
+**Codex** keeps `approvalPolicy: never` inside its sandbox: a blocked command fails back to the
+model, never to a resume; the Codex SDK has no channel to answer an approval inside a turn.
+
+**Switches.** 1a is the policy (reverted by another policy change). 1b is the rule in the policy
+plus `agent-workers.enforce.sandboxedCommands` (`off`, `warn`, `on`; ships `warn`, which records
+what it would allow and still asks). 1c is `approvalWaitMinutes` (ships `0`, which keeps `defer`).
+
+**ADR.** One new ADR records 1b as a policy rule under ADR-0038 and supersedes ADR-0039's
+"a run deferred on an approval ends as a failure" with 1c. Before 1c is switched on, a supervised
+check on the pinned SDK proves four things: the hook's `ask` reaches `canUseTool`; a pending
+callback holds the query for the bound; `deny` with `interrupt` ends it cleanly; and the resumed
+session's re-issued call matches the approved request.
+
+**Measure.** Agent runs that end on an approval (goal 2), command requests a week, the asks 1b
+would have removed (its `warn` records), attempt wall time.
 
 ### 2. The ledger counts each session's spend once (resources)
 
-**Change.** For an agent run that resumed a session, the runtime records the difference between
-its result and the session's previous result (tokens, cost, turns); the first run of a session
-records its result as is. A migration recomputes the stored records the same way and marks them
-`recomputed`. Caps, budgets, the report, and `metrics` then read right values.
+**Change.** The runtime reads a resumed session's result as a running total, which the SDK
+documents ([cost tracking](https://code.claude.com/docs/en/agent-sdk/cost-tracking)). A run's own
+spend is its result minus the session's latest result already recorded in the ledger:
 
-**Switch.** None: a wrong count is a defect, not a mode.
+- the first result of a session is recorded as it is;
+- a run that ended with no result leaves its spend in the next result's difference; that record
+  says so (`includesUnrecorded`), and the earlier run stays a `usage.unknown` fact, as today;
+- a difference that is negative in any counter (a reset, or a session the ledger saw only in part)
+  is recorded as the full result, flagged `notDifferenced`, never as a negative or a zero (INV-2);
+- one session is resumed by one run at a time (INV-15), so there is no fork to divide.
 
-**ADR.** None; the `usage-record` semantics in the [reference](../reference/schemas.md) gain one
-sentence (a record is the run's own spend).
+A migration recomputes stored records the same way, from the original figures, which stay in each
+record's `record` column; it is idempotent (it recomputes from the originals, never from its own
+output).
 
-**Measure.** The week's recomputed totals against the session maxima (they must match), and the
-conformance case of a resumed session.
+**Switch.** None for the counting: a double count is a defect. The migration can be re-run.
+
+**ADR.** None; the `usage-record` semantics in the [reference](../reference/schemas.md) gain the
+rule above.
+
+**Measure.** The week's recomputed totals equal each session's latest result summed over sessions;
+the `workers` conformance suite gains a resumed session's case under its existing contract.
 
 ### 3. One attempt: develop, then checks and one review, then land (workflow, profile)
 
 **Now.** develop, self-review, verification of each finding, fix, re-review, review, verification,
-an approval-gated fix, re-review (up to 3 cycles), a second-family review on a heavy change, checks,
-digest, merge approval, rebase and recheck, land.
+an approval-gated fix, re-review (up to 3 reviews), a second-family review on a heavy change,
+checks, digest, merge approval, rebase and recheck, land.
 
-**Change.** `algorithm-development` becomes:
+**Change.** `algorithm-development` with `pipeline: lean`:
 
 ```text
-develop:1 ──► checks (exact tree) ─┐
-          └─► review:1 (other family, read-only) ─┤─► at most 2 fix rounds ─► land
-                                                   (heavy: + review:1:second, another family)
+develop:1 ─► tree T ─┬─► required checks on T ─────────────┐
+                     └─► review:1 on T (other family) ──────┴─► both pass on T ─► land
+                          (heavy: + review:1:second)         └─► a fix ─► tree T' ─► both again on T'
 ```
 
-- The required checks and the review run in parallel on the same exact tree; a fix invalidates
-  both, and both run again on the fixed tree (INV-5).
-- Self-review is off. Its agreement with the review is near chance (kappa 0.17) and the literature
-  finds self-review weak; the switch keeps it for an A/B if the operator wants one.
-- Verification runs only when the author disputes an important finding in its fix step, not on
-  every finding. An undisputed important finding goes straight to the fix.
-- A fix runs inside the attempt with no approval of its own (remediation approvals go; the merge
-  approval or auto-land of change 5 is the gate).
-- `maxReviewCycles` default becomes 2.
-- The task digest leaves the critical path: it is written after landing, on economy, and only for
-  a task the lead marks (or on request).
+- **One subject.** The required checks and the review run in parallel on one exact tree `T`. A fix
+  makes a new tree; every result bound to an older tree is stale and ignored (INV-5, as the
+  exact-subject gate does today). Landing needs both results on the same tree.
+- **Self-review off.** Its agreement with the independent review is near chance (kappa 0.17) and
+  self-review is weak in the literature.
+- **A finding blocks only when confirmed** ([ADR-0075](../decisions/adr/0075-a-review-finding-has-a-severity-and-only-a-verified-important-one-blocks.md)).
+  The author's fix step is shown the important findings first, and answers each one: `accept`
+  (it is confirmed, and the fix answers it) or `dispute` with evidence. Only a disputed finding is
+  verified by a second reviewer, as today, before the fix goes on. A finding the author accepts is
+  confirmed by the author and the reviewer together, two parties, so no third read is spent on it.
+- **At most two fix rounds.** `maxReviewCycles` counts reviews, the first included; it stays 3,
+  which allows two fix rounds. A review that still has a confirmed important finding after the last
+  round ends the attempt as `changes`, as today: the task's next attempt starts fresh (change 4) or
+  the lead decides.
+- **No remediation approval.** A fix is part of the attempt; the merge decision (change 5) remains
+  the operator's gate on what lands.
+- **Digest after landing.** The task's digest leaves the critical path: `digestsPerHour: 0` for
+  task results, and a digest on request.
 
-**Switch.** `profile-software-development.selfReview` (`off` by default), `workflow.verify`
-(`disputed` by default, `every` for today's), `workflow.maxReviewCycles`.
+**Switches.** `profile-software-development.pipeline` (`full`, today's graph; `lean`); the policy's
+`remediation` class (`ask` today, `auto` under `lean`); `workflow.digestsPerHour`. `pipeline: full`
+restores every step, so self-review can still be run as an A/B.
 
-**ADR.** A new ADR amends ADR-0075 (verification only on a disputed finding) and records the
-pipeline; T267's self-review step is reversed by it.
+**ADR.** One new ADR records the `lean` pipeline and amends ADR-0075 (an author-accepted finding is
+confirmed; verification only on a dispute); it reverses T267's self-review step for `lean`.
 
-**Measure.** Attempt wall time, fix rounds per attempt, escaped defects and reverts (goal 5),
-review findings that the checks also caught.
+**Measure.** Attempt wall time, fix rounds per attempt, findings disputed and their verification
+outcomes, escaped defects and reverts (goal 5).
 
-### 4. A step's tier is set by the step (routing)
+### 4. A step's tier is set by the step; a new attempt starts fresh (routing)
 
-**Change.** Each template step names its own minimum tier, and `tierByRisk` raises only `develop`
-and the first `review`:
+**Change.** Each template step names its own minimum tier; `tierByRisk` raises only `develop` and
+`review:1`:
 
 | Step | Tier |
 |---|---|
-| develop | standard; frontier on a heavy change or on the task's second attempt |
-| review:1 | standard; frontier on a heavy change |
-| fix | standard (it no longer takes the tier of the step it fixes) |
-| re-review, verify, review:1:second | standard |
+| develop | standard; frontier on a heavy change or on a task's second attempt |
+| fix | the develop session's tier, since it continues that session (standard unless develop ran at frontier) |
+| review:1, review:1:second | standard; frontier on a heavy change |
+| re-review | the tier of the review it repeats |
+| verify (a disputed finding) | standard |
 | digest, tally, triage | economy |
 
-A failed required check, or a second fix round, raises the next step one tier, recorded as an
-escalation decision as today.
+Today a fix takes the tier of the step it fixes, so a frontier review made a frontier fix; under
+this table a fix follows its session. A failed required check, or a second fix round, raises the
+next step one tier, recorded as an escalation decision, as today.
 
 **Sessions.** A fix continues the develop session within the attempt. A new attempt starts a fresh
-session from a handoff (the diff, the checks' output, the open findings, the task's dossier),
-never the previous attempt's transcript.
+session from its brief and the task's dossier
+([ADR-0070](../decisions/adr/0070-workers-that-share-no-session-work-through-a-tasks-dossier.md)):
+the previous attempt's diff, its checks' output, and its open findings, which the brief already
+carries ([board tasks](../design/workflow-engine.md#board-tasks)). The previous attempt's
+transcript is not resumed.
 
-**Switch.** The policy's `tierByRisk` and a template `tiers` map in the profile's `Config`.
+**Switches.** The template's tiers sit in the profile's `Config` (`tiers`, by step); the policy's
+`tierByRisk`; `workflow.resumeAcrossAttempts` (`true` today, `false` under `lean`).
 
-**ADR.** An amendment to ADR-0073 (tiers per step); the session rule amends the resume rule of
-[board tasks](../design/workflow-engine.md#board-tasks).
+**ADR.** An amendment to ADR-0073 (tiers per step).
 
 **Measure.** Frontier share of steps and of cost per accepted result, acceptance by tier, the
-largest session's cache reads.
+largest session's size.
 
 ### 5. The operator decides what only the operator can (approvals, dispatch, landing)
 
-**Change.**
+**5a. Without reversing a decision.**
 
-- `dispatch` is `auto` for ready tasks of an active project with a charter (the policy's own
-  switch).
-- A light-tier change (by the policy's path map, [ADR-0071](../decisions/adr/0071-a-changes-risk-tier-comes-from-the-policys-path-map.md))
-  lands on its own when its required checks pass on the exact tree and its review is clean, through
-  the same serialized, rebased, and rechecked landing.
-- A normal-tier change lands on one `merge` approval the operator gives in a batch; a heavy one
-  keeps its own.
+- `dispatch` is `auto` for ready tasks of an active project with a charter, within dispatch's
+  existing bounds and breakers (the policy's own mode).
 - Remediation approvals go (change 3).
+- Merges are decided in the queue's existing batches: one verdict covers a batch, and each request
+  in it stays bound to its own base and head (INV-5); a result rebased after the verdict is
+  rechecked and, if its tree changed, asks again, as today
+  ([ADR-0068](../decisions/adr/0068-an-accepted-result-is-rebased-onto-its-target-and-checked-again-before-it-lands.md)).
 
-**Switch.** The policy (`dispatch`, `merge` per risk tier), changed through the approval queue.
+**5b. Only if the operator reverses D56.** [ADR-0060](../decisions/adr/0060-an-accepted-result-lands-on-the-operators-merge-approval.md)
+puts `merge` in `ALWAYS_ASK` by the operator's decision D56, and a policy that gives it `auto` is
+refused when loaded. A light-tier change landing on its own needs a new operator decision and a new
+ADR superseding that part of ADR-0060. If decided: `merge` leaves `ALWAYS_ASK` for the light tier
+only; the light tier is computed by the policy's path map at the target's tip on the exact diff
+([ADR-0071](../decisions/adr/0071-a-changes-risk-tier-comes-from-the-policys-path-map.md)), never by
+the change's own files; a change lands only when its required checks pass on the exact tree after
+rebase and its review has no confirmed important finding on that tree; the landing is recorded as a
+`merge` decision by System with those references (INV-13); and an escaped defect of an auto-landed
+result is recorded through `board_escape`, which the metrics count against goal 5.
 
-**ADR.** An amendment to ADR-0060 (auto-land for the light tier, on the conditions above).
+**Switches.** The policy (`dispatch`, `remediation`); for 5b, the policy's `merge` mode per risk
+tier once ADR-0060 is superseded.
 
-**Measure.** Operator decisions a day (goal 4), unattended completion, escaped defects of
-auto-landed results.
+**Measure.** Operator decisions a day (goal 4), unattended completion, escaped defects of results
+that landed without a person.
 
 ### 6. Park what is not used (bundle)
 
-Each part is turned off in the bundle and frozen: no change except a security fix, its tests still
-run. After 30 days with no use, a separate change deletes it. Three changes, by risk:
+A parked plugin's row is turned off in the bundle and its package frozen: no change except a
+security fix, its tests still run. A parked library with no row is only frozen. Three changes, by
+risk:
 
 | Change | Parts | Evidence |
 |---|---|---|
-| 6a | `feedback-core` experiments, evaluations, statistics; `gateway-anthropic`, `gateway-responses`; `runtime-antigravity-cli`, `runtime-acp`; the dispatch advisor; templates `panel`, `panel-led`, `study`, `investigate`, `develop` | no runtime use, 16 gateway conversations ever, rows already off, 0 advice, 1 to 4 runs each |
-| 6b | `scheduled-review`; `digest-extractive` | 6 runs all failed; a second provider of one seam |
-| 6c | session handoffs, board breakers, board escapes; `enforce` switches whose mechanism is on and never toggled | 0 rows; switches with one value in practice |
+| 6a | `feedback-core`'s experiments, evaluations, and statistics (frozen; no package imports them); `gateway-anthropic`, `gateway-responses`; `runtime-antigravity-cli`, `runtime-acp`; the dispatch advisor; templates `panel`, `panel-led`, `study`, `investigate`, `develop` | no runtime use; 16 gateway conversations ever; rows already off; 0 advice; 1 to 4 runs each |
+| 6b | `scheduled-review`; `digest-extractive` | 6 runs, all failed; the second provider of one seam, row off |
+| 6c | enforce switches that are `on` and were never set otherwise, removed with their `off` path | one value in practice |
 
-**ADR.** None for a row turned off ([ADR-0078](../decisions/adr/0078-a-plugin-or-a-mechanism-is-turned-off-at-runtime.md));
-a deletion after 30 days supersedes the ADR that introduced the part.
+Not parked, though rarely used, because a kept part needs it: session handoffs (`workflow`'s
+sessions), board escapes (goal 5's escaped defects), board breakers (dispatch's bounds, INV-9), and
+`check:reviewer-eval` (`scripts/experiments`, a required check that imports none of the parked
+packages).
+
+**Switch.** The row's `disabled` in the bundle, or `system plugin` at runtime
+([ADR-0078](../decisions/adr/0078-a-plugin-or-a-mechanism-is-turned-off-at-runtime.md)); 6c has none,
+it removes switches.
+
+**Measure.** Each parked row's events and tool calls over 30 days, read from the event log; a part
+with none is proposed for deletion in its own change, which supersedes the ADR that introduced it,
+on the operator's decision.
 
 ### What stays
 
-The store, leases, event log, and reconciliation (INV-4); the workflow engine's task, attempt,
-step, and result; the Claude Code and Codex runtimes, worktrees, both confinements; the board; the
-approval queue for merges and calls that leave the sandbox; the required checks and serialized
-landing; the resource ledger; the website Workers and `turns` for `ask`, `research`, and
-`brainstorm`; the MCP server, CLI, and `/ui`.
+The store, leases, event log, and reconciliation (INV-4); the workflow engine's task, attempt, step,
+and result; the Claude Code and Codex runtimes, worktrees, both confinements; the board, with its
+escapes and breakers; the approval queue for merges and for calls the policy asks; the required
+checks and serialized landing ([ADR-0077](../decisions/adr/0077-landings-queue-per-target-branch-one-at-a-time.md));
+the resource ledger; the website Workers and `turns` for `ask`, `research`, and `brainstorm`; the
+MCP server, CLI, and `/ui`.
 
 ### Task sizing
 
 A board task is one independently testable behaviour with criteria a command can check. A task
-whose develop step runs past 15 minutes, or whose criteria need more than one test file of new
-behaviour, is split by the lead before it is ready. This is a heuristic to measure, not a gate:
-the evidence does not support a line-count limit.
+whose develop step runs past 15 minutes, or whose criteria need new behaviour in more than one
+test file, is split by the lead before it is ready. This is a heuristic to measure, not a gate: the
+evidence does not support a line-count limit.
 
 ## Alternatives considered
 
 - **Keep the pipeline and cap cycles only** (brainstorm option B1): leaves 59 % review-type steps.
 - **No review on the light tier** (B4): drops the one independent check a light change has; the
-  review is short (median 0.9 minutes) and the checks miss what a reader sees.
+  review is short (median 0.9 minutes).
 - **A self-review A/B first** (B3): the research run favoured it; the brainstorm chose to switch it
-  off and keep the switch. The A/B stays possible through `selfReview`.
-- **A model classifier before the operator** (A4): miss rate too high for a gate (non-goals).
-- **Delete unused parts now** (F3): not reversible if a use appears; 30 days of zero use first.
+  off. `pipeline: full` keeps the A/B possible.
+- **Verify every finding** (today): a third read of findings the author already accepts.
+- **The sandbox as the authority** (the first draft): reverses ADR-0038's split; replaced by a
+  policy rule (1b).
+- **A model classifier before the operator** (A4): miss rate too high for a gate.
+- **Delete unused parts now** (F3): not reversible if a use appears.
 - **Fresh sessions for every step** (D3): loses the develop context a fix needs.
 
 ## Validation plan
 
-- Each change ships with its switch off or at its current behaviour on the test profile first,
+- Each change ships with its switch at today's behaviour (or `warn`), on the test profile first,
   then on the live install, one change at a time.
-- The baseline is the week of 2026-10-25 to 2026-11-01 (the research's numbers, ledger recomputed
-  after change 2). After each change, one week (or 30 finished tasks) is read with `system
-  metrics` and `system report`.
-- Kept only if goal 5 holds: escaped defects and reverts per 100 landed, required checks failed
-  after landing, and review findings confirmed after landing do not rise.
-- The crash suite covers change 1 (a host stop while a call waits in the query falls back to
-  `defer` and resumes) and change 3 (a host stop between the parallel checks and review).
-- Conformance: the `workers` suite gains a resumed session's usage case (change 2) and an asked
-  call that waits (change 1).
+- The baseline is the week of 2026-10-25 to 2026-11-01, its ledger figures recomputed by change 2.
+  After each change, one week or 30 finished tasks is read with `system metrics` and `system
+  report`.
+- A change is kept only if goal 5 holds: escaped defects and reverts per 100 landed, required checks
+  failed after landing, and findings confirmed after landing do not rise.
+- The crash suite covers 1c (a host stop while a call waits in the query: the liveness verdict, then
+  the deferred path) and 3 (a host stop between the parallel checks and review; a stale result after
+  a fix is ignored).
+- Conformance: the `workers` suite gains a resumed session's usage case (2) and an asked call that
+  waits and one that passes the bound (1c), under its existing contract.
 
 ## Rollout and rollback
 
-Order: 1.1 (configuration, today), 2, 1.2 and 1.3, 3, 4, 5, then 6a, 6b, 6c. Each is reversed by
-its switch; a parked row is turned back on with `system plugin`. Change 2's migration keeps the
-original figures in each record's `record` column, so it can be recomputed again.
+Order: 1a (configuration), 2, 1b in `warn`, then `on`, 1c, 3, 4, 5a, then 6a, 6b, 6c; 5b only on the
+operator's decision. Each is reversed by its switch; a parked row is turned back on with
+`system plugin`; change 2's figures can be recomputed from the originals.
 
 ## Observability and operations
 
-`system metrics` gains no metric; the existing ones measure every goal. Health shows a run whose
-call waits in the query (its liveness names the request). The runbooks for
-[a deferred tool call](../operations/runbooks.md) and accepting a review change with changes 1, 3,
-and 5.
+`system metrics` and `system report` already measure every goal; they gain no metric. A run whose
+call waits in the query shows the request in its liveness, in `status` and the roster. The runbooks
+change: [a deferred tool call](../operations/runbooks.md#a-workers-tool-call-is-deferred-on-an-approval)
+for 1c, [change the autonomy policy](../operations/runbooks.md#change-the-autonomy-policy) for 1a and
+1b, and [accept or reject a review](../operations/runbooks.md#accept-or-reject-a-review) for 3 and 5.
 
 ## Security and privacy
 
-Change 1.2 allows, without the operator, only what the proven sandbox already confines: writes to
-the run's worktree and no network. Everything that leaves it asks, as today. If the probe cannot
-prove the sandbox, the run reports `executes: false` and no Bash runs (INV-2). Change 5 lets a
-light change land without a person: only on green required checks on the exact tree and a clean
-independent review, through the same landing; the light tier is the policy's path map, changed only
-through the approval queue.
+Every loosening, and what holds it:
+
+- **1a** puts in force rules the operator already wrote, through the queue.
+- **1b** lets a Bash call run without a person when the policy forbids or asks for nothing about it
+  and the proven sandbox holds it to the worktree with no network. A call that leaves the sandbox
+  fails; a call the policy names still asks; no sandbox, no Bash (INV-2). It is a trust-boundary
+  change and is decided by the operator through a policy change, in `warn` first.
+- **1c** changes how long an asked call waits, not who decides it: the operator still approves the
+  exact call (INV-5).
+- **3** drops self-review and the third read of accepted findings, and the remediation approval; the
+  independent review on the exact tree, the required checks, and the merge decision remain. Goal 5
+  measures the effect, and `pipeline: full` restores it.
+- **5b**, if decided, lets a light change land without a person, only on its checks and a review
+  with no confirmed important finding on the exact tree, the tier computed by the target's path map.
+- **6c** removes only switches that were never used to turn a mechanism off.
+
+Egress (INV-12) and credentials (INV-8) are unchanged.
 
 ## Compatibility and migration
 
-Change 2 migrates `resource_usage` (recompute, originals kept). Change 3 changes the
-`algorithm-development` nodes: a run started before it finishes on its old spec (the spec hash is
-stored with the run). Old runs of parked templates stay explainable. No client contract changes.
+Change 2 migrates `resource_usage` (recompute, originals kept). Change 3 adds a pipeline; a run
+started before it finishes on its stored spec. Old runs of parked templates stay explainable. No
+MCP tool, CLI command, or seam contract changes.
 
 ## Decision
 
-Pending the operator.
+Pending the operator. Two decisions are the operator's alone: 1b (a trust-boundary change) and 5b
+(a reversal of D56).
 
 ## Implementation
 
