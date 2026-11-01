@@ -38,6 +38,13 @@ describe('removability matrix harness', () => {
     expect([...required, ...optional].sort()).toEqual([...ids].sort())
   })
 
+  it('mounts none of the parked rows in the shipped composition (PROP-0022 change 6)', () => {
+    const parked = ['gateway-anthropic', 'gateway-responses', 'runtime-antigravity-cli', 'runtime-acp', 'digest-extractive']
+    const rows = bundleRows()
+    expect(rows.filter((r) => parked.includes(r.id) && !r.disabled).map((r) => r.id)).toEqual([])
+    expect(rows.filter((r) => parked.includes(r.id)).map((r) => r.id).sort()).toEqual([...parked].sort())
+  })
+
   it('smokes the bundle as shipped, with the digest row off, and with the profile row off, and names the row and the step of a failure', async () => {
     const on = ['profile-software-development']
     const base = await bootBundle(undefined, on)

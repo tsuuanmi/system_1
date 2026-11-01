@@ -1,5 +1,7 @@
 # @tsuuanmi/system-runtime-antigravity-cli
 
+> **Parked and frozen (security fixes only)** since 2026-11-01: [components](../../../docs/architecture/components.md#parked).
+
 Agent runtime provider **`antigravity-cli`**: the Antigravity CLI (`agy`) as a
 Worker, in print mode (`agy --print=<prompt> --output-format stream-json
 --disable-slash-commands [--model=<model>]`). It runs the operator's installed

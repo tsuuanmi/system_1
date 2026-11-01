@@ -1,5 +1,7 @@
 # @tsuuanmi/system-runtime-acp
 
+> **Parked and frozen (security fixes only)** since 2026-11-01: [components](../../../docs/architecture/components.md#parked).
+
 Agent runtime providers **`acp:<name>`**: any
 [Agent Client Protocol](https://agentclientprotocol.com) agent as a Worker,
 through the official ACP SDK. This is the generic path; Claude Code has its own

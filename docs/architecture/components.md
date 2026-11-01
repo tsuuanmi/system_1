@@ -415,3 +415,37 @@ runs the work the router admitted to them. Callers never reach a source directly
   [gateway-responses](../../packages/plugins/gateway-responses/README.md),
   [web-ui](../../packages/plugins/web-ui/README.md), [report](../../packages/plugins/report/README.md),
   [notify](../../packages/plugins/notify/README.md), [cli](../../packages/cli/README.md).
+
+## Parked
+
+Parked on 2026-11-01 ([PROP-0022](../proposals/0022-lean-core.md#6-park-what-is-not-used-bundle)
+changes 6a and 6b; evidence: [lean-core research](../research/lean-core-2026-11-01.md#5-what-is-used)).
+A parked plugin's row is off in the shipped bundle and its package frozen: no change except a
+security fix, its tests still run. A parked library with no row is only frozen. No code is removed.
+
+**What turns it back on.** A row: its `disabled` in the bundle, or `system plugin on`
+([ADR-0078](../decisions/adr/0078-a-plugin-or-a-mechanism-is-turned-off-at-runtime.md)). A part
+with its own key: that key. A template: naming it in a run. A frozen library: nothing to turn on;
+the first change that needs it unfreezes it.
+
+**Deletion.** A separate decided change may delete a parked part after 30 days (from 2026-12-01)
+with no use, read from the event log; this section does not delete anything.
+
+| Part | Why (research, section 5) | Turned back on by |
+|---|---|---|
+| `feedback-core`'s experiments, evaluations, statistics (about 3,200 source lines; frozen, no row, no package imports them) | no runtime use | the first change that needs them |
+| `gateway-anthropic`, `gateway-responses` | 16 conversations ever | their rows: `disabled: false` |
+| `runtime-antigravity-cli`, `runtime-acp` | rows off; no run | their rows: `disabled: false` |
+| `digest-extractive` | the second provider of one seam, row off | the row on and `digest` off, in one patch |
+| `scheduled-review` (in `workflow`) | 6 runs, all failed (`stale_subject`) | `workflow.scheduledReview.enabled` |
+| the dispatch advisor | 0 advice given, 323 unavailable | `dispatch.advisor.provider` |
+| templates `panel`, `panel-led`, `study`, `investigate`, and the stand-alone `develop` (not the `develop:1` step of `algorithm-development`) | 1 to 4 runs each in 30 days | naming the template in a run |
+
+**Kept though rarely used**, because a kept part needs it:
+
+| Part | Why kept |
+|---|---|
+| session handoffs (`workflow`'s sessions) | 0 rows, but a run's continuation needs them |
+| board escapes | goal 5's escaped defects are counted from them |
+| board breakers | dispatch's bounds (INV-9) |
+| `check:reviewer-eval` (`scripts/experiments`) | a required check; it imports none of the parked packages |
