@@ -14,7 +14,10 @@ REQ-WRK-10). One row, `models`, mounts two parts from one configuration:
   - **A stalled stream:** an attempt whose stream is silent for `idleTimeoutMs`
     (default 5 min) is stopped and fails as DSH `TIMEOUT`, saying how many
     events and characters it got. A slow answer that keeps streaming is not
-    stopped.
+    stopped. The bound covers every phase: opening the stream, the first
+    event, and each gap. It is enforced by racing each wait against the timer,
+    not only by aborting the request's signal, so a connection that ignores
+    the abort cannot hold the call.
   - **Re-attempts:** a failure the route's retry policy calls transient is sent
     again with that policy's backoff, at most `maxRetries` times (default 2,
     at most 5), even under an unbounded route policy.

@@ -133,8 +133,24 @@ export class LlmModels extends Models {
     let output = false
     const stalled = (): Attempt => ({ ok: false, failure: { code: 'TIMEOUT', message: `no progress for ${idleMs} ms (idleTimeoutMs) after ${events} stream event(s) and ${chars} characters of answer; the stream was stopped` } })
     const stopped = (): boolean => stall.signal.aborted && !signal?.aborted
+    // The timer only aborts a signal; a stream that ignores it (never opens, never yields) would hold
+    // every await below forever. So each await races this promise: the bound covers connect, first
+    // byte, and every gap, whatever the stream does with the signal.
+    const STOP = Symbol('stop')
+    const ended = new Promise<typeof STOP>((resolve) => {
+      stall.signal.addEventListener('abort', () => resolve(STOP), { once: true })
+      signal?.addEventListener('abort', () => resolve(STOP), { once: true })
+      if (signal?.aborted) resolve(STOP)
+    })
+    const bounded = <T>(pending: T | PromiseLike<T>): Promise<T | typeof STOP> => {
+      const work = Promise.resolve(pending)
+      work.catch(() => undefined)
+      return Promise.race([work, ended])
+    }
+    const callerAborted = (): Attempt => ({ ok: false, failure: { code: 'ABORTED', message: 'aborted by the caller' }, output })
+    let iterator: AsyncIterator<StreamChunk> | undefined
     try {
-      const stream = this.ctx.llm.stream({
+      const opened = this.ctx.llm.stream({
         provider: entry.route, model: entry.model, maxTokens,
         // A session's earlier turns, then the prompt (ADR-0031).
         messages: [
@@ -145,7 +161,14 @@ export class LlmModels extends Models {
         ],
         signal: signal ? AbortSignal.any([signal, stall.signal]) : stall.signal,
       })
-      for await (const chunk of stream as AsyncIterable<StreamChunk>) {
+      const stream = await bounded(opened as AsyncIterable<StreamChunk> | PromiseLike<AsyncIterable<StreamChunk>>)
+      if (stream === STOP) return stopped() ? stalled() : callerAborted()
+      iterator = stream[Symbol.asyncIterator]()
+      for (;;) {
+        const step = await bounded(iterator.next())
+        if (step === STOP) return stopped() ? stalled() : callerAborted()
+        if (step.done) break
+        const chunk = step.value
         if (stopped()) return stalled()
         timer.refresh()
         events++
@@ -172,6 +195,8 @@ export class LlmModels extends Models {
       throw error
     } finally {
       clearTimeout(timer)
+      // Close the stream; a stalled one may never answer, so this is not awaited.
+      void Promise.resolve(iterator?.return?.()).catch(() => undefined)
     }
   }
 }
