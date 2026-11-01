@@ -5,7 +5,7 @@ status: draft
 owners: [operator]
 created: 2026-11-01
 summary: No new features. System is made small and fast around what it is for: route work to the right Worker, durable runs that survive a restart, independent review, checks before landing, and quota and usage accounting. The command rules the project already wrote are put in force, and the policy allows a sandboxed Bash call it does not forbid or ask for, so a command rarely waits on the operator (a quarter of all agent runs end on such a wait today); a call that still asks waits inside the live query for a bounded time; the ledger counts a resumed session's spend once (3.9 times too high today); an attempt is develop, then the required checks and one independent review in parallel on one exact tree, at most two fix rounds, then landing; a step's tier is set by the step; the operator decides merges in a batch, and, if the operator reverses D56, a light change lands on its own; little-used parts are turned off and frozen. Target: a small task accepted in 20 to 30 minutes from ready (median 1.6 hours to done today), with quality held, each change switched and measured.
-evidence: [operator request 2026-11-01, docs/research/lean-core-2026-11-01.md, docs/research/model-routing.md, System runs run_e0e7591e03d02a95, run_fe9811153a832a00, run_1502579e9af30240, run_eec67360b1246709, review runs run_523389e965124793, run_c2f305b07b4ec54b]
+evidence: [operator request 2026-11-01, docs/research/lean-core-2026-11-01.md, docs/research/model-routing.md, System runs run_e0e7591e03d02a95, run_fe9811153a832a00, run_1502579e9af30240, run_eec67360b1246709, review runs run_523389e965124793, run_c2f305b07b4ec54b, run_a93019aaa87dfabe, run_50df07bbe48476f0]
 related: [PROP-0016, PROP-0018, PROP-0021, ADR-0038, ADR-0039, ADR-0060, ADR-0067, ADR-0070, ADR-0071, ADR-0073, ADR-0075, ADR-0077, ADR-0078, INV-2, INV-4, INV-5, INV-8, INV-9, INV-12, INV-13, INV-15]
 implementation: []
 ---
@@ -80,7 +80,10 @@ policy's precedence, the wait's fallback, merges that always ask, the review cyc
 parked parts that kept parts need. Its re-review (`run_c2f305b07b4ec54b`) confirmed all of them
 resolved and found three more, also addressed here: one writer for a verdict that races the wait's
 bound, the author's acceptance kept apart from the fix's verification, and the review's subject
-across a rebase.
+across a rebase. A last check (`run_a93019aaa87dfabe`) asked for the compare-and-set to be stated
+and for a moved target to be read again before an automatic landing; a final check
+(`run_50df07bbe48476f0`) asked for a binding left `decided` by a host stop, which fails closed. All
+are stated here.
 
 ## Proposed design
 
@@ -121,21 +124,32 @@ When the bound passes first, the callback denies with `interrupt`: the query end
 today's deferred run naming the request, and an approval later resumes the session through
 today's path, where the hook finds the bound request and lets the exact call run once.
 
-One writer decides which path a verdict takes (INV-15). The request is bound to the waiting run in
-the store, as a deferred request is today. The callback's end is one store transition on that
-binding, from `waiting` to `decided` (a verdict arrived in time) or to `deferred` (the bound
-passed, or the query ended for any other reason); a verdict is applied to whichever state the
-binding is in when it lands, once. A `deferred` binding resumes only after the run's agent process
-is known gone (the liveness verdict, ADR-0056), so an old and a new invocation never both hold the
-session (INV-4). A host stop while a call waits leaves the binding `waiting`; reconciliation
-moves it to `deferred` once the process is gone, never resumes it in place.
+One writer decides which path a verdict takes (INV-15). A verdict is written only to its request,
+in the queue, as today; it never moves the run. The request is bound to the waiting run in the
+store, as a deferred request is today, and only two writers move that binding, each by a
+compare-and-set from `waiting`, so exactly one succeeds:
 
-`approvalWaitMinutes` must be below the run's time limit and its stall threshold; the
-configuration is refused otherwise (INV-9). A run that waits is `running`; its liveness shows the
-pending request, so the stall check does not count the wait as silence. These are the existing
-binding, liveness, and reconciliation records; no new one. The `workers` contract does not change:
-a run still ends with a result or a failure, and goal 2 counts the runs that ended at the bound from
-the deferral events, not from the failure's kind.
+- the live callback, when it reads a verdict on the request: `waiting` to `decided`; on an
+  approval it runs the exact call, once, and on a rejection it returns the denial to the model at
+  once;
+- the bound's timer, the query's end for any other reason, or reconciliation after a host stop:
+  `waiting` to `deferred`, with the reason (`bound`, `ended`, `host-stop`) in the deferral event.
+
+A `deferred` binding is consumed only by today's deferred path, which reads the request's verdict,
+whenever it was written, and resumes the session only after the run's agent process is known gone
+(the liveness verdict, ADR-0056), so an old and a new invocation never both hold the session
+(INV-4). That path lets the exact call run once, as today (INV-5).
+
+A binding left `decided` by a host stop is never replayed (INV-4): whether the approved call ran is
+not known, so reconciliation fails the run closed, as it does any started agent run it cannot
+account for, the approval is spent, and the call, if the model makes it again, asks again (INV-2).
+
+A wait's bound is the lesser of `approvalWaitMinutes` and the run's remaining time (INV-9); either
+way its end is recorded as `bound`. A run that waits is
+`running`; its liveness shows the pending request, so the stall check does not count the wait as
+silence. These are the existing binding, liveness, and reconciliation records, and the existing
+deferral event gains its reason; no new record. The `workers` contract does not change: a run still
+ends with a result or a failure, and goal 2 counts the deferral events whose reason is `bound`.
 
 The bound matters only for what 1a and 1b leave asking (pushes, network, the unusual), which is rare
 by design; those requests are sent to the operator at once (`notify`), not held for a batch.
@@ -277,7 +291,10 @@ largest session's size.
   in it stays bound to its own base and head (INV-5). The rebase and its recheck run before the
   request is asked, as today
   ([ADR-0068](../decisions/adr/0068-an-accepted-result-is-rebased-onto-its-target-and-checked-again-before-it-lands.md));
-  a target that moves after the verdict makes the merge ask again on the new base and head.
+  a target that moves after the verdict makes the merge ask again on the new base and head. Within
+  this binding, a batch helps only for results on different targets: on one target, landing the
+  first member moves the target for the rest, which ask again. Landing a batch on one target in
+  order under one verdict changes what a merge approval binds, and is part of 5b.
 
 **5b. Only if the operator reverses D56.** [ADR-0060](../decisions/adr/0060-an-accepted-result-lands-on-the-operators-merge-approval.md)
 puts `merge` in `ALWAYS_ASK` by the operator's decision D56, and a policy that gives it `auto` is
@@ -288,9 +305,19 @@ only; the light tier is computed by the policy's path map at the target's tip on
 the change's own files; a change lands only when its required checks pass on the exact rebased
 tree, its review had no confirmed important finding on the accepted tree, and the rebase needed no
 conflict resolution (a resolved conflict is a change no reviewer read, so it asks); the landing is
-recorded as a
-`merge` decision by System with those references (INV-13); and an escaped defect of an auto-landed
-result is recorded through `board_escape`, which the metrics count against goal 5.
+recorded as a `merge` decision by System with those references (INV-13); and an escaped defect of
+an auto-landed result is recorded through `board_escape`, which the metrics count against goal 5.
+
+The landing queue holds one landing per target at a time
+([ADR-0077](../decisions/adr/0077-landings-queue-per-target-branch-one-at-a-time.md)), and its
+update of the target is a compare-and-set against the tip the rebase, the checks, and the tier were
+computed from. If the target moved, nothing lands: the change is rebased again, its checks run
+again, its tier is computed again at the new tip, and the conditions above are read again; any one
+failing makes it ask. The same rule lets the members of a batch verdict land in order on one target
+(5a), each under the verdict only while its rebase is clean, its rebased change is the reviewed
+change (the same `git patch-id`), and its checks pass; this changes what a
+merge approval binds (the reviewed change and those conditions, not one base and head) and is part
+of the same operator decision and ADR.
 
 **Switches.** The policy (`dispatch`, `remediation`); for 5b, the policy's `merge` mode per risk
 tier once ADR-0060 is superseded.
