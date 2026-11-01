@@ -2969,6 +2969,19 @@ your repeated approvals; it still applies only on your approval
    asks the operator (D56). A research role's web calls run unasked only under a `webAccess` grant
    (`autonomy-policy@1.3`), which moves no mode ([turn on the research Worker](#turn-on-the-research-worker)).
 
+   **To let a sandboxed Bash call the policy does not name run without you** (ADR-0080,
+   `autonomy-policy@1.7`): raise the studio policy to `schema: 'autonomy-policy@1.7'` and add
+   `sandboxedCommands` to it ([example](../../schemas/examples/autonomy-policy.sandboxed.json)):
+   an `id`, the `forbid` and `ask` shapes (a program's name, the words after it, an `anyWord`
+   pattern) that must still deny or wait for you (a push, a download, a path outside the worktree),
+   and a note. A project policy can add shapes only
+   ([example](../../schemas/examples/autonomy-policy.project-sandboxed.json)). Then set
+   `agent-workers.enforce.sandboxedCommands`: the default `warn` records the verdict the rule would
+   give (a `gate` decision with `sandboxedWould`; read them with `system explain` or MCP `events`)
+   and every call still asks, so read a week of them before `system enforce set sandboxed-commands on`.
+   The rule reaches only a `workspace-write` run of a runtime that proved both confinements
+   (Claude Code); a Codex Worker is unchanged. `off` ignores the rule.
+
    **If a change you approved on `/ui` is in force** (`source: store`), a changed configuration
    does not replace it silently: at start the queue is refused, and its log names the stored
    set's hash and the configuration's. Either keep the configuration the change was derived from,

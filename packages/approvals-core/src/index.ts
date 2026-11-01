@@ -94,9 +94,9 @@ export function waitSeconds(policies: readonly AutonomyPolicy[], actionClass: Ac
   return Math.min(seconds, ...policies.map((p) => p.expiry.maxSeconds))
 }
 
-/** `autonomy-policy@1.x`: `@1.1` adds the optional path map `riskTiers` (ADR-0071); `@1.2` the tier a step takes at its task's risk tier, `tierByRisk` (ADR-0073); `@1.3` the optional `webAccess` grants (ADR-0074); `@1.5` the check `red-on-base` a rule may require (ADR-0079); `@1.6` a command rule's `enforce` and an option's path `scope` (T326). */
+/** `autonomy-policy@1.x`: `@1.1` adds the optional path map `riskTiers` (ADR-0071); `@1.2` the tier a step takes at its task's risk tier, `tierByRisk` (ADR-0073); `@1.3` the optional `webAccess` grants (ADR-0074); `@1.5` the check `red-on-base` a rule may require (ADR-0079); `@1.6` a command rule's `enforce` and an option's path `scope` (T326); `@1.7` the sandboxed-command rule `sandboxedCommands` (ADR-0080). */
 export interface AutonomyPolicy {
-  schema: 'autonomy-policy@1.0' | 'autonomy-policy@1.1' | 'autonomy-policy@1.2' | 'autonomy-policy@1.3' | 'autonomy-policy@1.4' | 'autonomy-policy@1.5' | 'autonomy-policy@1.6'
+  schema: 'autonomy-policy@1.0' | 'autonomy-policy@1.1' | 'autonomy-policy@1.2' | 'autonomy-policy@1.3' | 'autonomy-policy@1.4' | 'autonomy-policy@1.5' | 'autonomy-policy@1.6' | 'autonomy-policy@1.7'
   id: string
   version: number
   scope: 'studio' | 'project'
@@ -130,6 +130,65 @@ export interface AutonomyPolicy {
    * option may take a path.
    */
   commandRules?: CommandRule[]
+  /**
+   * `@1.7`, optional: the sandboxed-command rule (ADR-0080, {@link sandboxedCommandOf}). Only the
+   * studio policy's grants; a project policy's only adds `forbid` and `ask` shapes.
+   */
+  sandboxedCommands?: SandboxedCommands
+}
+
+/** What a `forbid` or `ask` entry of the sandboxed-command rule matches (the schema's `commandShape`). */
+export interface CommandShape {
+  id: string
+  /** The first word's base name. */
+  program?: string
+  /** Literal words right after the program. */
+  words?: string[]
+  /** A regular expression that at least one word after the program matches. */
+  anyWord?: string
+  note: string
+}
+
+/** `autonomy-policy@1.7`'s `sandboxedCommands`: a Bash call no shape names is `auto` in a proved sandbox. */
+export interface SandboxedCommands {
+  id: string
+  forbid?: CommandShape[]
+  ask?: CommandShape[]
+  note: string
+}
+
+/** What the sandboxed-command rule gives a command: `forbid` or `ask` by the shape named, else `auto`. */
+export type SandboxedOutcome = { rule: string; outcome: 'auto' } | { rule: string; outcome: 'ask' | 'forbid'; by: string }
+
+/** Whether `shape` matches `argv`: its program (by base name), its literal words, and any word. */
+function shapeMatches(shape: CommandShape, argv: readonly string[]): boolean {
+  if (shape.program !== undefined && argv[0]?.split('/').pop() !== shape.program) return false
+  const rest = shape.program !== undefined ? argv.slice(1) : argv
+  if (!(shape.words ?? []).every((word, i) => rest[i] === word)) return false
+  if (shape.anyWord === undefined) return true
+  try {
+    const pattern = new RegExp(shape.anyWord)
+    return rest.slice((shape.words ?? []).length).some((word) => pattern.test(word))
+  } catch {
+    // A pattern that is no regular expression matches nothing (the policy does not load with one).
+    return false
+  }
+}
+
+/**
+ * The sandboxed-command rule (ADR-0080) for an argv, over a policy set (the studio's, then the
+ * project's): undefined when the studio policy holds no rule. Else the order is forbid, then ask
+ * (the shapes of every policy of the set, so a project only adds), then the rule itself, `auto`.
+ * Pure: the caller says the run's confinements are proved; this only reads the policies.
+ */
+export function sandboxedCommandOf(policies: readonly AutonomyPolicy[], argv: readonly string[]): SandboxedOutcome | undefined {
+  const grant = policies[0]?.sandboxedCommands
+  if (!grant || argv.length === 0) return undefined
+  for (const kind of ['forbid', 'ask'] as const) {
+    const hit = policies.flatMap((p) => p.sandboxedCommands?.[kind] ?? []).find((shape) => shapeMatches(shape, argv))
+    if (hit) return { rule: grant.id, outcome: kind, by: hit.id }
+  }
+  return { rule: grant.id, outcome: 'auto' }
 }
 
 /**
@@ -224,6 +283,13 @@ export interface Action {
    * (unless the `command` class is forbidden), and the decision names the rule.
    */
   commandRule?: string
+  /**
+   * For `command`: the caller's word that the run's confinements are proved (a `workspace-write`
+   * run whose runtime proved the host read confinement and a sandbox with writes to the worktree
+   * only, no network, no unsandboxed command), so the sandboxed-command rule
+   * ({@link sandboxedCommandOf}) applies to an argv no list line or command rule allows.
+   */
+  sandboxed?: boolean
   /** For auto and notify rules: which of their required checks passed. */
   checks?: Partial<Record<Check, boolean>>
 }

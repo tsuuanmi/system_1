@@ -88,7 +88,7 @@ describe('claude-agent-sdk: the configured policy, exactly', () => {
     expect(await runtime(scripted()).probe()).toEqual({
       available: true, detail: 'Claude Code 2.1.294; host state hidden by /usr/bin/bwrap; commands confined: a sandbox with no network starts inside it', version: '2.1.294',
       sandboxes: ['read-only', 'workspace-write'], resume: true, executes: true, readsConfined: true, gatesToolCalls: true, homes: true, cleanShells: false,
-      readTools: ['Read', 'Grep', 'Glob'], hostTools: true, webTools: true,
+      readTools: ['Read', 'Grep', 'Glob'], hostTools: true, webTools: true, sandboxedCommands: true,
     })
     expect(await runtime(scripted(), null).probe()).toMatchObject({ available: false, detail: expect.stringMatching(/not installed/) })
   })
@@ -939,7 +939,7 @@ describe('claude-agent-sdk: two confinements, reads by the host and commands by 
 
   it('never reports cleanShells: Claude Code starts its shells its own way, sourcing a snapshot of its own, so no gate takes its shell command for a read (T198)', async () => {
     expect(await runtime(scripted()).probe()).toMatchObject({ executes: true, cleanShells: false })
-    expect(await runtime(scripted(), '/usr/bin/claude', { nested: failing('no namespace') }).probe()).toMatchObject({ executes: false, cleanShells: false })
+    expect(await runtime(scripted(), '/usr/bin/claude', { nested: failing('no namespace') }).probe()).toMatchObject({ executes: false, cleanShells: false, sandboxedCommands: false })
   })
 })
 
