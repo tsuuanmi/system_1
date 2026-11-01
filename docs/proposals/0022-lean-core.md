@@ -5,7 +5,7 @@ status: draft
 owners: [operator]
 created: 2026-11-01
 summary: No new features. System is made small and fast around what it is for: route work to the right Worker, durable runs that survive a restart, independent review, checks before landing, and quota and usage accounting. The command rules the project already wrote are put in force, and the policy allows a sandboxed Bash call it does not forbid or ask for, so a command rarely waits on the operator (a quarter of all agent runs end on such a wait today); a call that still asks waits inside the live query for a bounded time; the ledger counts a resumed session's spend once (3.9 times too high today); an attempt is develop, then the required checks and one independent review in parallel on one exact tree, at most two fix rounds, then landing; a step's tier is set by the step; the operator decides merges in a batch, and, if the operator reverses D56, a light change lands on its own; little-used parts are turned off and frozen. Target: a small task accepted in 20 to 30 minutes from ready (median 1.6 hours to done today), with quality held, each change switched and measured.
-evidence: [operator request 2026-11-01, docs/research/lean-core-2026-11-01.md, docs/research/model-routing.md, System runs run_e0e7591e03d02a95, run_fe9811153a832a00, run_1502579e9af30240, run_eec67360b1246709, review run_523389e965124793]
+evidence: [operator request 2026-11-01, docs/research/lean-core-2026-11-01.md, docs/research/model-routing.md, System runs run_e0e7591e03d02a95, run_fe9811153a832a00, run_1502579e9af30240, run_eec67360b1246709, review runs run_523389e965124793, run_c2f305b07b4ec54b]
 related: [PROP-0016, PROP-0018, PROP-0021, ADR-0038, ADR-0039, ADR-0060, ADR-0067, ADR-0070, ADR-0071, ADR-0073, ADR-0075, ADR-0077, ADR-0078, INV-2, INV-4, INV-5, INV-8, INV-9, INV-12, INV-13, INV-15]
 implementation: []
 ---
@@ -75,9 +75,12 @@ target is an estimate to be measured, not a promise.
 the cited external evidence, and the four live System runs (three brainstorms and one research)
 that chose the options below. The research run's verdict applies to all of them: the mechanisms
 are documented, but no study proves the whole pipeline. A team review of the first draft
-(`run_523389e965124793`, ChatGPT and Claude) found seven blocking issues, all addressed in this
-version: the sandbox and the policy's precedence, the wait's fallback, merges that always ask,
-the review cycle count, and two parked parts that kept parts need.
+(`run_523389e965124793`, ChatGPT and Claude) found seven blocking issues: the sandbox and the
+policy's precedence, the wait's fallback, merges that always ask, the review cycle count, and
+parked parts that kept parts need. Its re-review (`run_c2f305b07b4ec54b`) confirmed all of them
+resolved and found three more, also addressed here: one writer for a verdict that races the wait's
+bound, the author's acceptance kept apart from the fix's verification, and the review's subject
+across a rebase.
 
 ## Proposed design
 
@@ -98,8 +101,10 @@ code. This alone removes the asks for the project's tests, type checks, and read
 **1b. The policy allows a sandboxed Bash call it does not forbid or ask for.** The policy, not the
 sandbox, decides ([ADR-0038](../decisions/adr/0038-confined-commands-for-claude-code-workers.md):
 "the sandbox confines where it can act, the policy decides whether it should"). The autonomy policy
-gains one rule for the `command` class: in a `workspace-write` run whose sandbox the probe proved
-(writes to the worktree only, no network, `allowUnsandboxedCommands: false`), a Bash call that no
+gains one rule for the `command` class: in a `workspace-write` run whose two confinements the probe
+proved (the host's read confinement, which hides every agent's credentials and the paths of
+ADR-0024's list; and the SDK sandbox, which allows writes to the worktree only, no network, and
+`allowUnsandboxedCommands: false`), a Bash call that no
 `forbid` or `ask` rule matches is `auto`. The order is the policy's own: `forbid`, then `ask`
 (for example `git push`, `curl`, `ssh`, a package manager's network commands, anything naming a path
 outside the worktree), then this rule, then the class default. A call the sandbox would refuse
@@ -108,18 +113,29 @@ model sees the failure, as today. A call that asks to run unsandboxed is never a
 allowed call is an autonomy decision (INV-13), as today. This changes the policy's defaults, not the
 sandbox, and so it is a change to the trust boundary, decided by the operator through the queue.
 
-**1c. An asked call waits inside the live query, bounded.** The hook answers `ask` instead of
-`defer`, and the runtime's `canUseTool` callback holds the call while its request is pending, for at
-most `approvalWaitMinutes`. An approval runs exactly the call the request names (INV-5); a
-rejection returns the denial to the model, which continues. When the bound passes first, the
-callback denies with `interrupt`: the query ends, the run ends as today's deferred run naming the
-request, and an approval later resumes the session through today's path, where the hook finds the
-bound request and lets the exact call run once. A late approval that races the bound is the queue's
-one verdict; whichever path holds the run when it lands uses it, once. A host stop while a call
-waits is today's reconciliation: the liveness verdict (ADR-0056) shows the agent process gone before
-anything resumes (INV-4, INV-15). A run waiting in the query is `running` with its pending request
-shown by its liveness, and its wait counts against the run's existing time bounds (INV-9). The
-`workers` contract does not change: a run still ends with a result or a failure.
+**1c. An asked call waits inside the live query, bounded.** The hook returns `ask` at once, so its
+own timeout (600 s) never runs out; the wait is in the runtime's `canUseTool` callback, which holds
+the call while its request is pending, for at most `approvalWaitMinutes`. An approval runs exactly
+the call the request names (INV-5); a rejection returns the denial to the model, which continues.
+When the bound passes first, the callback denies with `interrupt`: the query ends, the run ends as
+today's deferred run naming the request, and an approval later resumes the session through
+today's path, where the hook finds the bound request and lets the exact call run once.
+
+One writer decides which path a verdict takes (INV-15). The request is bound to the waiting run in
+the store, as a deferred request is today. The callback's end is one store transition on that
+binding, from `waiting` to `decided` (a verdict arrived in time) or to `deferred` (the bound
+passed, or the query ended for any other reason); a verdict is applied to whichever state the
+binding is in when it lands, once. A `deferred` binding resumes only after the run's agent process
+is known gone (the liveness verdict, ADR-0056), so an old and a new invocation never both hold the
+session (INV-4). A host stop while a call waits leaves the binding `waiting`; reconciliation
+moves it to `deferred` once the process is gone, never resumes it in place.
+
+`approvalWaitMinutes` must be below the run's time limit and its stall threshold; the
+configuration is refused otherwise (INV-9). A run that waits is `running`; its liveness shows the
+pending request, so the stall check does not count the wait as silence. These are the existing
+binding, liveness, and reconciliation records; no new one. The `workers` contract does not change:
+a run still ends with a result or a failure, and goal 2 counts the runs that ended at the bound from
+the deferral events, not from the failure's kind.
 
 The bound matters only for what 1a and 1b leave asking (pushes, network, the unusual), which is rare
 by design; those requests are sent to the operator at once (`notify`), not held for a batch.
@@ -129,7 +145,8 @@ model, never to a resume; the Codex SDK has no channel to answer an approval ins
 
 **Switches.** 1a is the policy (reverted by another policy change). 1b is the rule in the policy
 plus `agent-workers.enforce.sandboxedCommands` (`off`, `warn`, `on`; ships `warn`, which records
-what it would allow and still asks). 1c is `approvalWaitMinutes` (ships `0`, which keeps `defer`).
+what it would allow and still asks, so the operator sees the calls it would allow before deciding
+the policy change). 1c is `approvalWaitMinutes` (ships `0`, which keeps `defer`).
 
 **ADR.** One new ADR records 1b as a policy rule under ADR-0038 and supersedes ADR-0039's
 "a run deferred on an approval ends as a failure" with 1c. Before 1c is switched on, a supervised
@@ -171,7 +188,8 @@ the `workers` conformance suite gains a resumed session's case under its existin
 an approval-gated fix, re-review (up to 3 reviews), a second-family review on a heavy change,
 checks, digest, merge approval, rebase and recheck, land.
 
-**Change.** `algorithm-development` with `pipeline: lean`:
+**Change.** The `algorithm-development` template, when the profile's configuration says
+`pipeline: lean` (one key, `profile-software-development.pipeline`; the template keeps its name):
 
 ```text
 develop:1 ─► tree T ─┬─► required checks on T ─────────────┐
@@ -181,22 +199,29 @@ develop:1 ─► tree T ─┬─► required checks on T ───────�
 
 - **One subject.** The required checks and the review run in parallel on one exact tree `T`. A fix
   makes a new tree; every result bound to an older tree is stale and ignored (INV-5, as the
-  exact-subject gate does today). Landing needs both results on the same tree.
+  exact-subject gate does today). Acceptance needs both results on the same tree. Landing then
+  follows [ADR-0068](../decisions/adr/0068-an-accepted-result-is-rebased-onto-its-target-and-checked-again-before-it-lands.md)
+  unchanged: the accepted change is rebased onto its target and the rebased tree is checked again,
+  not reviewed again; a conflict's resolution is the author's, recorded, and the merge request says
+  so.
 - **Self-review off.** Its agreement with the independent review is near chance (kappa 0.17) and
   self-review is weak in the literature.
 - **A finding blocks only when confirmed** ([ADR-0075](../decisions/adr/0075-a-review-finding-has-a-severity-and-only-a-verified-important-one-blocks.md)).
-  The author's fix step is shown the important findings first, and answers each one: `accept`
-  (it is confirmed, and the fix answers it) or `dispute` with evidence. Only a disputed finding is
-  verified by a second reviewer, as today, before the fix goes on. A finding the author accepts is
-  confirmed by the author and the reviewer together, two parties, so no third read is spent on it.
+  Two questions are kept apart: is the finding real, and does the fix resolve it. The author's fix
+  step is shown the important findings first and answers each one: `accept` or `dispute` with
+  evidence. A finding the reviewer raised and the author accepts is confirmed as real, by two
+  parties, so no third read is spent on it. A disputed finding is verified by a second reviewer, as
+  today, before the fix goes on. A finding the author answers with neither is confirmed (INV-2).
+  Whether the fix resolves a confirmed finding is never the author's word: the re-review on the
+  fixed tree `T'` and the required checks on `T'` decide it, as they do today.
 - **At most two fix rounds.** `maxReviewCycles` counts reviews, the first included; it stays 3,
   which allows two fix rounds. A review that still has a confirmed important finding after the last
   round ends the attempt as `changes`, as today: the task's next attempt starts fresh (change 4) or
   the lead decides.
 - **No remediation approval.** A fix is part of the attempt; the merge decision (change 5) remains
   the operator's gate on what lands.
-- **Digest after landing.** The task's digest leaves the critical path: `digestsPerHour: 0` for
-  task results, and a digest on request.
+- **Digest after landing.** The task's digest leaves the critical path: `workflow.digestsPerHour: 0`
+  (it bounds only the digests of task results), and a digest on request.
 
 **Switches.** `profile-software-development.pipeline` (`full`, today's graph; `lean`); the policy's
 `remediation` class (`ask` today, `auto` under `lean`); `workflow.digestsPerHour`. `pipeline: full`
@@ -249,9 +274,10 @@ largest session's size.
   existing bounds and breakers (the policy's own mode).
 - Remediation approvals go (change 3).
 - Merges are decided in the queue's existing batches: one verdict covers a batch, and each request
-  in it stays bound to its own base and head (INV-5); a result rebased after the verdict is
-  rechecked and, if its tree changed, asks again, as today
-  ([ADR-0068](../decisions/adr/0068-an-accepted-result-is-rebased-onto-its-target-and-checked-again-before-it-lands.md)).
+  in it stays bound to its own base and head (INV-5). The rebase and its recheck run before the
+  request is asked, as today
+  ([ADR-0068](../decisions/adr/0068-an-accepted-result-is-rebased-onto-its-target-and-checked-again-before-it-lands.md));
+  a target that moves after the verdict makes the merge ask again on the new base and head.
 
 **5b. Only if the operator reverses D56.** [ADR-0060](../decisions/adr/0060-an-accepted-result-lands-on-the-operators-merge-approval.md)
 puts `merge` in `ALWAYS_ASK` by the operator's decision D56, and a policy that gives it `auto` is
@@ -259,8 +285,10 @@ refused when loaded. A light-tier change landing on its own needs a new operator
 ADR superseding that part of ADR-0060. If decided: `merge` leaves `ALWAYS_ASK` for the light tier
 only; the light tier is computed by the policy's path map at the target's tip on the exact diff
 ([ADR-0071](../decisions/adr/0071-a-changes-risk-tier-comes-from-the-policys-path-map.md)), never by
-the change's own files; a change lands only when its required checks pass on the exact tree after
-rebase and its review has no confirmed important finding on that tree; the landing is recorded as a
+the change's own files; a change lands only when its required checks pass on the exact rebased
+tree, its review had no confirmed important finding on the accepted tree, and the rebase needed no
+conflict resolution (a resolved conflict is a change no reviewer read, so it asks); the landing is
+recorded as a
 `merge` decision by System with those references (INV-13); and an escaped defect of an auto-landed
 result is recorded through `board_escape`, which the metrics count against goal 5.
 
@@ -278,7 +306,7 @@ risk:
 
 | Change | Parts | Evidence |
 |---|---|---|
-| 6a | `feedback-core`'s experiments, evaluations, and statistics (frozen; no package imports them); `gateway-anthropic`, `gateway-responses`; `runtime-antigravity-cli`, `runtime-acp`; the dispatch advisor; templates `panel`, `panel-led`, `study`, `investigate`, `develop` | no runtime use; 16 gateway conversations ever; rows already off; 0 advice; 1 to 4 runs each |
+| 6a | `feedback-core`'s experiments, evaluations, and statistics (frozen; no package imports them); `gateway-anthropic`, `gateway-responses`; `runtime-antigravity-cli`, `runtime-acp`; the dispatch advisor; the templates `panel`, `panel-led`, `study`, `investigate`, and the stand-alone `develop` template (not the `develop:1` step of `algorithm-development`, which has its own definition) | no runtime use; 16 gateway conversations ever; rows already off; 0 advice; 1 to 4 runs each |
 | 6b | `scheduled-review`; `digest-extractive` | 6 runs, all failed; the second provider of one seam, row off |
 | 6c | enforce switches that are `on` and were never set otherwise, removed with their `off` path | one value in practice |
 
@@ -368,8 +396,9 @@ Every loosening, and what holds it:
 - **3** drops self-review and the third read of accepted findings, and the remediation approval; the
   independent review on the exact tree, the required checks, and the merge decision remain. Goal 5
   measures the effect, and `pipeline: full` restores it.
-- **5b**, if decided, lets a light change land without a person, only on its checks and a review
-  with no confirmed important finding on the exact tree, the tier computed by the target's path map.
+- **5b**, if decided, lets a light change land without a person, only on its checks on the exact
+  rebased tree, a review with no confirmed important finding on the accepted tree, and a rebase
+  with no conflict resolution, the tier computed by the target's path map.
 - **6c** removes only switches that were never used to turn a mechanism off.
 
 Egress (INV-12) and credentials (INV-8) are unchanged.
