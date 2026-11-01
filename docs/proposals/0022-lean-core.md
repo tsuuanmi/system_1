@@ -441,9 +441,17 @@ MCP tool, CLI command, or seam contract changes.
 Accepted by the operator on 2026-11-01 (D113: "implement it as proposed"). Two parts stay the
 operator's own decisions and are not taken by that acceptance:
 
-- **1b** ships with `agent-workers.enforce.sandboxedCommands: warn`; turning it `on` and adding the
-  policy rule is a policy change the operator approves (D114).
-- **5b** needs the operator to reverse D56 (D115); until then a merge always asks, and 5a holds.
+- **1b** ships with `agent-workers.enforce.sandboxedCommands: warn`. D114 (the operator, 2026-11-01,
+  on a System brainstorm's choice): `warn` for 7 days or 300 would-be decisions, whichever is later
+  and at most 14 days; every recorded call is audited (arguments, working directory, rule matches,
+  sandbox state); `on` only if none would have written outside the worktree, reached the network,
+  read a sensitive path, or broken the `forbid`, `ask`, sandboxed order. One confirmed violation
+  turns it back to `warn`.
+- **5b**: D115 (the same day and way) reverses D56 for the light tier only after the `lean` pipeline
+  has run 7 consecutive days and at least 30 eligible light results, with escaped defects and
+  reverts not rising; the conditions of 5b apply, with a kill switch. One escaped defect or revert
+  of an automatically landed light result in 14 days, or a non-light path in a light landing,
+  turns it back. Until then a merge always asks, and 5a holds.
 
 Changes 1a and 5a's policy modes are the operator's policy changes through the queue.
 
