@@ -301,6 +301,8 @@ export class ClaudeAgentRuntime implements AgentRuntimeProvider {
     return {
       ...found, detail: `Claude Code ${version}; ${reads.detail}; ${commands.detail}`,
       sandboxes: commands.proven ? ['read-only', 'workspace-write'] : ['read-only'], executes: commands.proven, readsConfined: true, cleanShells: false,
+      // Both confinements proven (reads above, the no-network sandbox in proveCommands); every run's sandbox allows no unsandboxed command (ADR-0080).
+      sandboxedCommands: commands.proven,
     }
   }
 

@@ -233,8 +233,19 @@ const clip = (text: string, max: number): string => { const chars = [...text]; r
 /** The fields of a recorded `autonomy` decision that `request` checks. */
 interface AutonomyDecision {
   decisionType?: string
-  outcome?: { option?: string; detail?: { actionClass?: unknown; policies?: unknown } }
+  outcome?: { option?: string; detail?: { actionClass?: unknown; policies?: unknown; sandboxedCommand?: unknown } }
   decider?: { type?: string; id?: string; version?: string; hash?: string }
+}
+
+/**
+ * The sandboxed-command rule's outcome a recorded `autonomy` decision names (ADR-0080), when it
+ * names one: the context its action was judged in (`sandboxed: true`), which the request's record
+ * does not keep. Read from the decision, this provider's own record, never from a caller's word.
+ */
+function sandboxedOutcomeOf(body: AutonomyDecision | undefined): { rule: string; outcome: string; by?: string } | undefined {
+  const named = body?.outcome?.detail?.sandboxedCommand
+  if (!isRecord(named) || typeof named.rule !== 'string' || typeof named.outcome !== 'string') return undefined
+  return { rule: named.rule, outcome: named.outcome, ...(typeof named.by === 'string' ? { by: named.by } : {}) }
 }
 
 /** Who resolved a request that no verdict resolved, and why: the decider rule and the reason it records. */
@@ -376,9 +387,10 @@ export class StoreApprovals extends Approvals {
 
   async check(action: Action): Promise<AutonomyVerdict> {
     this.validAction(action)
-    const { actionClass, rule: { policy, mode, named, raised }, failedChecks, policies, forbidden, commandRule } = this.set.judge(action)
+    const { actionClass, rule: { policy, mode, named, raised }, failedChecks, policies, forbidden, commandRule, sandboxedCommand } = this.set.judge(action)
     const source = named ? `${policy.id}'s rule for ${actionClass}` : `${policy.id}'s default, as no rule of it names ${actionClass}`
     const reason = (m: typeof mode): string => forbidden ? (m === mode ? `${forbidden}: forbidden whatever a rule says` : `not ${m}: ${forbidden}`)
+      : sandboxedCommand?.outcome === 'auto' && m === mode && mode === 'auto' ? `the sandboxed-command rule ${sandboxedCommand.rule}: the run's confinements are proved and no forbid or ask shape matches, so the call is auto, not ${policy.id}'s ${actionClass} mode`
       : raised ? (m === mode ? `${source} says ${raised}, raised to ask: ${actionClass} always asks` : rank(m) < rank(mode) ? `not ${m}: ${actionClass} always asks` : `not ${m}: nothing that applies to ${actionClass} is that strict`)
       : m === mode ? `the strictest that applies is ${source}`
       : rank(m) < rank(mode) ? `not ${m}: laxer than ${source} (${mode}), the strictest that applies`
@@ -387,7 +399,7 @@ export class StoreApprovals extends Approvals {
       schema: 'decision@1.4', decisionType: 'autonomy', question: `Which mode does the policy give a ${action.class} action?`, inputs: [],
       candidates: MODES.map((m) => ({ option: m, selected: m === mode, reasons: [reason(m)] })),
       decider: { type: 'policy', id: policy.id, version: String(policy.version), hash: this.set.hash(action.projectId) },
-      outcome: { option: mode, detail: { actionClass, policies: policies.map((p) => p.id), ...(failedChecks.length ? { failedChecks } : {}), ...(forbidden ? { forbidden } : {}), ...(commandRule ? { commandRule } : {}) } }, deterministic: true,
+      outcome: { option: mode, detail: { actionClass, policies: policies.map((p) => p.id), ...(failedChecks.length ? { failedChecks } : {}), ...(forbidden ? { forbidden } : {}), ...(commandRule ? { commandRule } : {}), ...(sandboxedCommand ? { sandboxedCommand } : {}) } }, deterministic: true,
     }, { producer: { type: 'policy', ref: policy.id } })
     return { mode, ...(failedChecks.length ? { failedChecks } : {}), policy: { id: policy.id, version: policy.version }, decision: decision.id as ArtifactRef }
   }
@@ -819,6 +831,9 @@ export class StoreApprovals extends Approvals {
     if (request.action.class !== 'command' || projectId !== undefined || request.classification === 'local-private' || argv === undefined || !argv.length) return undefined
     const line = argv.join(' ')
     if ([...line].length > 200 || commandProblems(line).length || !sameList(line.split(' '), argv)) return undefined
+    // A call the sandboxed-command rule judged (ADR-0080) is never counted: listing it would put it beyond its shapes.
+    const cited = typeof request.verdict.decision === 'string' ? this.ctx.artifacts.get(request.verdict.decision)?.body as AutonomyDecision | undefined : undefined
+    if (sandboxedOutcomeOf(cited) !== undefined) return undefined
     return this.set.judge({ class: 'command', command: argv }).actionClass === 'command' ? line : undefined
   }
 
@@ -1214,7 +1229,10 @@ export class StoreApprovals extends Approvals {
     if (!sameList(body.outcome.detail?.policies, this.set.of(projectId).map((p) => p.id)) || body.decider.hash !== this.set.hash(projectId)) {
       throw notAsked(`the decision it cites was made under other policies than ${of}'s, as loaded now`)
     }
-    const judged = this.set.judge({ class: request.action.class, ...(projectId !== undefined ? { projectId } : {}), ...(request.command !== undefined ? { command: request.command } : {}) })
+    // Judged again in the context the decision was: a call the sandboxed-command rule judged (ADR-0080)
+    // is judged with it again, so an ask shape still asks where the class alone would not.
+    const sandboxed = sandboxedOutcomeOf(body) !== undefined
+    const judged = this.set.judge({ class: request.action.class, ...(projectId !== undefined ? { projectId } : {}), ...(request.command !== undefined ? { command: request.command } : {}), ...(sandboxed ? { sandboxed: true } : {}) })
     if (judged.rule.mode !== 'ask') throw notAsked(`the policy now says ${judged.rule.mode}${judged.forbidden ? ` (${judged.forbidden})` : ''}`)
     if (body.outcome.detail?.actionClass !== judged.actionClass || judged.rule.policy.id !== policy.id) {
       throw notAsked(`the decision it cites is for ${String(body.outcome.detail?.actionClass)} by ${policy.id}, but the action is judged as ${judged.actionClass} by ${judged.rule.policy.id}`)
@@ -1238,11 +1256,17 @@ export class StoreApprovals extends Approvals {
       if (problems.length) return `the set it proposes no longer loads: ${problems[0]}`
     }
     if (!this.set.current(request.policy, projectId)) return `${request.policy.id} at version ${request.policy.version} is not a policy of ${projectId === undefined ? 'the studio' : `project ${projectId}`} now`
-    const judgedAs = (this.ctx.artifacts.get(request.policy.decision)?.body as AutonomyDecision | undefined)?.outcome?.detail?.actionClass
+    const decided = this.ctx.artifacts.get(request.policy.decision)?.body as AutonomyDecision | undefined
+    const judgedAs = decided?.outcome?.detail?.actionClass
     const classes = new Set<ActionClass>([request.action.class, ...(ACTION_CLASSES.includes(judgedAs as ActionClass) ? [judgedAs as ActionClass] : [])])
+    // A call an ask shape of the sandboxed-command rule asked for (ADR-0080) asks whatever laxer mode its
+    // class has: it stays while that shape is still an ask shape of the rule in force, and the class is not forbidden.
+    const shaped = sandboxedOutcomeOf(decided)
     for (const actionClass of classes) {
       const { mode } = this.set.effective(actionClass, projectId)
-      if (mode !== 'ask') return `it now gives ${actionClass} ${mode}`
+      if (mode === 'ask') continue
+      if (shaped?.outcome === 'ask' && shaped.by !== undefined && mode !== 'forbid' && this.set.sandboxedAskHolds({ rule: shaped.rule, by: shaped.by }, projectId)) continue
+      return `it now gives ${actionClass} ${mode}`
     }
     return undefined
   }
@@ -1280,6 +1304,7 @@ export class StoreApprovals extends Approvals {
     if (action.projectId !== undefined && (typeof action.projectId !== 'string' || !ID.test(action.projectId))) throw invalid(`projectId ${JSON.stringify(action.projectId)} is not an id`)
     if (action.command !== undefined && (!Array.isArray(action.command) || action.command.some((word) => typeof word !== 'string'))) throw invalid('command must be an argv: a list of strings')
     if (action.commandRule !== undefined && (typeof action.commandRule !== 'string' || !/^[a-z][a-z0-9.-]{0,63}$/.test(action.commandRule))) throw invalid('commandRule must be a command rule id')
+    if (action.sandboxed !== undefined && typeof action.sandboxed !== 'boolean') throw invalid('sandboxed must be a boolean')
     if (action.checks !== undefined && !isRecord(action.checks)) throw invalid('checks must be an object of check names to whether they passed')
   }
 

@@ -18,7 +18,7 @@ import { promisify } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
 import { COMMIT_ID, HOST_TOOLS_SERVER, type ToolCall, type ToolGate, type ToolVerdict, WORKSPACE_GIT_TOOLS, WORKSPACE_READS_SERVER, WORKSPACE_READ_TOOLS } from '@tsuuanmi/system-agent-runtime-core'
 import {
-  type ActionClass, type ApprovalRequest, type Approvals, type ArtifactRef, type AutonomyVerdict, type Check, type CommandPathScope, commandRulesOf, SHELL_METACHARACTER, warnedCommandRulesOf, webAccessOf, type WebTool, withinClassification,
+  type ActionClass, type ApprovalRequest, type Approvals, type ArtifactRef, type AutonomyVerdict, type Check, type CommandPathScope, commandRulesOf, type SandboxedOutcome, sandboxedCommandOf, SHELL_METACHARACTER, warnedCommandRulesOf, webAccessOf, type WebTool, withinClassification,
 } from '@tsuuanmi/system-approvals-core'
 import type {} from '@tsuuanmi/system-ledger-core'
 import { contentId, isRecord } from '@tsuuanmi/system-libs'
@@ -1128,6 +1128,19 @@ export interface GateRun {
    * only these of `mcp__system__…` are classified; any other is denied.
    */
   hostTools?: readonly string[] | undefined
+  /** The Worker's sandbox: the sandboxed-command rule (ADR-0080) reaches only a `workspace-write` run. */
+  sandbox?: 'read-only' | 'workspace-write' | undefined
+  /**
+   * The run's runtime proved both confinements (`RuntimeEvidence.sandboxedCommands` with its read
+   * confinement): only then may the sandboxed-command rule apply. Absent: it did not (a Codex Worker).
+   */
+  commandsSandboxed?: boolean | undefined
+  /**
+   * The mode of `agent-workers.enforce.sandboxedCommands` now, read at each call (ADR-0078): `on`
+   * applies the rule, `warn` records the verdict it would give and the call still asks, `off` ignores it.
+   * Absent: `off`.
+   */
+  sandboxedCommands?: (() => 'off' | 'warn' | 'on') | undefined
 }
 
 /** The call a run's gate deferred: the run stops there and does not complete. */
@@ -1362,6 +1375,24 @@ export function runGate(ctx: Context, run: GateRun): RunGate {
         { option: 'ask', selected: true, reasons: [`command rule ${ruleId} grants nothing while its enforce is warn: the call asks the operator`] },
       ],
       decider: RULE, outcome: { option: 'ask', detail: { agentRun: run.runId, tool: call.tool.slice(0, 100), warnedRule: ruleId, command: clamp(command.join(' ')) } }, deterministic: true,
+    }, { producer: { type: 'system', ref: 'agent-workers' }, ...(run.workflowRunId ? { runId: run.workflowRunId } : {}), classification: run.classification })
+  }
+
+  /**
+   * Record the verdict the sandboxed-command rule would give a call (`enforce.sandboxedCommands` is
+   * warn, ADR-0080): a `gate` decision naming the rule, its outcome, and the shape that decided it.
+   * The call is then judged as if the rule did not exist, so it still asks.
+   */
+  const warnSandboxed = (call: ToolCall, would: SandboxedOutcome, command: readonly string[]): void => {
+    ctx.artifacts.recordDecision({
+      decisionType: 'gate', question: `Would the autonomy policy's sandboxed-command rule run the ${call.tool} call ${run.worker} asked for in run ${run.runId} without the operator?`, inputs: [],
+      candidates: [
+        { option: 'allow', selected: false, reasons: [`would be ${would.outcome}: sandboxed-command rule ${would.rule}${'by' in would ? `, shape ${would.by}` : ''}, but enforce.sandboxedCommands is warn`] },
+        { option: 'ask', selected: true, reasons: [`the rule grants nothing while enforce.sandboxedCommands is warn: the call asks the operator as before`] },
+      ],
+      decider: RULE,
+      outcome: { option: 'ask', detail: { agentRun: run.runId, tool: call.tool.slice(0, 100), sandboxedWould: would.outcome, sandboxedRule: would.rule, ...('by' in would ? { sandboxedBy: would.by } : {}), command: clamp(command.join(' ')) } },
+      deterministic: true,
     }, { producer: { type: 'system', ref: 'agent-workers' }, ...(run.workflowRunId ? { runId: run.workflowRunId } : {}), classification: run.classification })
   }
 
@@ -1614,7 +1645,23 @@ export function runGate(ctx: Context, run: GateRun): RunGate {
         if (warned) warnWouldAllow(call, warned.id, action.command)
       }
     }
-    let verdict = await approvals.check({ class: action.class, ...(action.command ? { command: action.command } : {}), ...(ruled ? { commandRule: ruled } : {}), ...(projectId !== undefined ? { projectId } : {}) })
+    // The sandboxed-command rule (ADR-0080) reaches a command no command rule allowed, in a workspace-write
+    // run whose runtime proved both confinements, never a review member's or a research run's. `on`
+    // lets the policy apply it; `warn` records the verdict it would give, and the call still asks.
+    let sandboxed = false
+    if (action.class === 'command' && !ruled && action.command && run.profile === undefined && run.sandbox === 'workspace-write' && run.commandsSandboxed === true) {
+      const mode = run.sandboxedCommands?.() ?? 'off'
+      const forProject = run.projectId ?? projectId
+      if (mode === 'on') {
+        sandboxed = true
+        projectId = forProject
+      } else if (mode === 'warn') {
+        const set = await approvals.policy(forProject)
+        const would = sandboxedCommandOf(set.policies, action.command)
+        if (would && set.effective.find((e) => e.actionClass === 'command')?.mode !== 'forbid') warnSandboxed(call, would, action.command)
+      }
+    }
+    let verdict = await approvals.check({ class: action.class, ...(action.command ? { command: action.command } : {}), ...(ruled ? { commandRule: ruled } : {}), ...(sandboxed ? { sandboxed: true } : {}), ...(projectId !== undefined ? { projectId } : {}) })
     // The rule made it a workspace write unless commands are forbidden (then the verdict is forbid, and the class stays command).
     if (ruled && verdict.mode !== 'forbid') action = { class: 'workspace-write', summary: action.summary, consequences: action.consequences, ...(action.command ? { command: action.command } : {}) }
     // A git history read (T276) the policy asks about as a command is judged as a workspace write, as
@@ -1656,7 +1703,7 @@ export function runGate(ctx: Context, run: GateRun): RunGate {
         return { decision: 'allow' }
       }
       case 'ask':
-        return ask(approvals, call, action, verdict, ruled ? projectId : undefined)
+        return ask(approvals, call, action, verdict, ruled || sandboxed ? projectId : undefined)
       default:
         return refuse(call, `the autonomy policy gave a mode the gate does not know (${String(verdict.mode)})`, 'unknown-mode', [verdict.decision], action.class)
     }

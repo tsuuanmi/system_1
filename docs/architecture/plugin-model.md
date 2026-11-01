@@ -248,7 +248,9 @@ code change ([ADR-0078](../decisions/adr/0078-a-plugin-or-a-mechanism-is-turned-
   that a result's new tests fail on its base, ADR-0079; it starts in warn), `lockfile-verification`
   (off, warn, on; the online verification of a new lockfile, [a lockfile's verification](../design/agent-runtimes.md#a-lockfiles-verification);
   it starts in warn), `disk-floor` (off, warn, on; no new worktree is cut under a free-space floor of
-  the worktrees' filesystem, T345; it starts in warn), and `lead-rights` (on
+  the worktrees' filesystem, T345; it starts in warn), `sandboxed-commands` (off, warn, on; the
+  autonomy policy's rule that lets a sandboxed Bash call it does not name run without the operator,
+  ADR-0080; it starts in warn), and `lead-rights` (on
   only: every refusal is a bound of authority, INV-6; revoke the lead's token instead).
 
 **The rule for a new mechanism** (its check: the review; no automated check yet):

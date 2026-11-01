@@ -1,0 +1,26 @@
+{
+  "schema": "autonomy-policy@1.7",
+  "id": "studio-sandboxed",
+  "version": 3,
+  "scope": "studio",
+  "rules": [
+    { "actionClass": "read", "mode": "auto" },
+    { "actionClass": "workspace-write", "mode": "auto" },
+    { "actionClass": "command", "mode": "ask", "note": "a command nothing below names still asks outside a proved sandbox" },
+    { "actionClass": "merge", "mode": "ask" }
+  ],
+  "default": "ask",
+  "expiry": { "defaultSeconds": 43200, "maxSeconds": 604800 },
+  "sandboxedCommands": {
+    "id": "sandboxed-bash",
+    "forbid": [
+      { "id": "no-sudo", "program": "sudo", "note": "never as another user" }
+    ],
+    "ask": [
+      { "id": "git-push", "program": "git", "words": ["push"], "note": "a push leaves the machine" },
+      { "id": "curl", "program": "curl", "note": "a download is the operator's to allow" },
+      { "id": "outside-worktree", "anyWord": "^(/etc/|/home/)", "note": "a path outside the worktree" }
+    ],
+    "note": "a sandboxed Bash call the policy does not name runs without the operator (ADR-0080)"
+  }
+}

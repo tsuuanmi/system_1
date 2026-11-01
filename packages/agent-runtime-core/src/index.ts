@@ -69,6 +69,14 @@ export interface RuntimeEvidence {
    */
   cleanShells?: boolean
   /**
+   * Every Bash call of a `workspace-write` run is confined by the runtime's own sandbox, proven on
+   * this host now together with {@link readsConfined}: writes to the worktree only, no network, and
+   * no command ever runs outside it (`allowUnsandboxedCommands: false`). Only then may the autonomy
+   * policy's sandboxed-command rule (ADR-0080) apply to a run. Absent or false: it never does (a
+   * Codex Worker keeps `approvalPolicy: never` inside its own sandbox, and is unchanged).
+   */
+  sandboxedCommands?: boolean
+  /**
    * It gives every run's agent the workspace reads server ({@link WORKSPACE_READS_SCRIPT}, T200b),
    * started under the run's read confinement with the workspace bound read-only, proven to start on
    * this host now: its read-only tools (`read_file`, `list_dir`, `search`, and the git views

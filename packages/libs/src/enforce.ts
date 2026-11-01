@@ -54,6 +54,10 @@ export const MECHANISMS: readonly Mechanism[] = [
     what: 'the disk floor (T345, docs/research/resource-capacity.md): on cuts no new worktree, so no run starts, and dispatch says why, while the worktrees\' filesystem has less free space than diskFloorGb; warn records the refusal it would make and refuses nothing; off does not look; it starts in warn',
   },
   {
+    id: 'sandboxed-commands', row: 'agent-workers', key: 'sandboxedCommands', modes: ['off', 'warn', 'on'], start: 'warn',
+    what: 'the policy\'s sandboxed-command rule (PROP-0022 1b, ADR-0080, autonomy-policy@1.7): on lets a Bash call that no forbid or ask shape names run unasked in a workspace-write run whose runtime proved both confinements; warn records the verdict the rule would give and the call still asks; off ignores the rule; it starts in warn, and turning it on is the operator\'s decision (D114)',
+  },
+  {
     id: 'lead-rights', row: 'approvals', modes: ['on'],
     what: 'the lead\'s closed list of rights (ADR-0076): every refusal is a bound of authority, so it is only on (INV-6); to stop a lead deciding, revoke its token (system lead-token revoke)',
   },

@@ -3,8 +3,8 @@
  * `autonomy-policy@1.x` cannot state (docs/reference/schemas.md#autonomy-policy), and the mode a
  * policy set gives an action. Pure: no store, no clock. Code decides, never a model.
  */
-import type { Action, ActionClass, AutonomyPolicy, Check, CommandRule, ContentHash, Mode, ModeChange } from '@tsuuanmi/system-approvals-core'
-import { ALWAYS_ASK, applyingPolicies as applying, commandRulesOf, MODES, riskMapProblems, SHELL_METACHARACTER, tierByRiskProblems, waitSeconds as expiryOf, webAccessLines, webAccessProblems } from '@tsuuanmi/system-approvals-core'
+import type { Action, ActionClass, AutonomyPolicy, Check, CommandRule, ContentHash, Mode, ModeChange, SandboxedOutcome } from '@tsuuanmi/system-approvals-core'
+import { ALWAYS_ASK, applyingPolicies as applying, commandRulesOf, MODES, riskMapProblems, sandboxedCommandOf, SHELL_METACHARACTER, tierByRiskProblems, waitSeconds as expiryOf, webAccessLines, webAccessProblems } from '@tsuuanmi/system-approvals-core'
 import { contentId, SchemaRegistry, unique } from '@tsuuanmi/system-libs'
 
 /** Every action class (`common@1`'s `actionClass`), in the order `policy()` reports them. */
@@ -38,6 +38,8 @@ export interface Judgement {
   forbidden?: string
   /** The command rule that made a command `workspace-write` (the caller's matcher named it; the policies hold it). */
   commandRule?: string
+  /** The sandboxed-command rule's outcome for the argv (ADR-0080), when the caller said the run is sandboxed and the studio policy holds the rule. */
+  sandboxedCommand?: SandboxedOutcome
 }
 
 /** The policies a set holds at most: the studio's and 100 projects' (INV-9; `policy-change@1.0`). */
@@ -123,6 +125,24 @@ function commandRuleProblems(rules: readonly CommandRule[]): string[] {
   return problems
 }
 
+/** The problems of a policy's sandboxed-command rule that the schema cannot state: a shape id used twice, an `anyWord` that is no regular expression. */
+function sandboxedProblems(policy: AutonomyPolicy): string[] {
+  const problems: string[] = []
+  const ids = new Set<string>()
+  for (const shape of [...(policy.sandboxedCommands?.forbid ?? []), ...(policy.sandboxedCommands?.ask ?? [])]) {
+    if (ids.has(shape.id)) problems.push(`sandboxed command shape ${shape.id}: another shape has the same id`)
+    ids.add(shape.id)
+    if (shape.anyWord !== undefined) {
+      try {
+        new RegExp(shape.anyWord)
+      } catch {
+        problems.push(`sandboxed command shape ${shape.id}: anyWord is not a regular expression`)
+      }
+    }
+  }
+  return problems
+}
+
 /**
  * Every problem of a configured policy set, in order; empty when it loads. Each policy must be a
  * valid `autonomy-policy@1.x` with one rule per action class, `expiry.defaultSeconds` and every
@@ -165,6 +185,7 @@ export function policyProblems(policies: unknown, schemas: SchemaRegistry = new 
     }
     for (const line of policy.commands ?? []) for (const problem of commandProblems(line)) problems.push(`${name}: ${problem}`)
     for (const problem of commandRuleProblems(policy.commandRules ?? [])) problems.push(`${name}: ${problem}`)
+    for (const problem of sandboxedProblems(policy)) problems.push(`${name}: ${problem}`)
     // The path map's patterns are read by code the schema's pattern cannot state in full (a `..` segment, `**` inside a segment).
     if (policy.riskTiers !== undefined) for (const problem of riskMapProblems(policy.riskTiers)) problems.push(`${name}: ${problem}`)
     // The tier-by-risk map's keys and tiers, read by code as the schema states them (ADR-0073).
@@ -293,9 +314,27 @@ export class PolicySet {
     const named = action.commandRule
     const ruled = open && named !== undefined && argv!.length > 0 && commandRulesOf(policies).some((r) => r.id === named)
     const actionClass: ActionClass = listed || ruled ? 'workspace-write' : action.class
-    const rule = this.effective(actionClass, action.projectId)
+    let rule = this.effective(actionClass, action.projectId)
+    // The sandboxed-command rule (ADR-0080): for a command no list line or command rule allows, in a run
+    // the caller says is sandboxed. Forbid, then ask, then the rule, then the class default; never
+    // laxer than a `command` mode of forbid (open is false then).
+    const sandboxedCommand = open && !listed && !ruled && action.sandboxed === true && action.class === 'command' ? sandboxedCommandOf(policies, argv!) : undefined
+    if (sandboxedCommand?.outcome === 'forbid') {
+      return { actionClass, rule: { ...rule, mode: 'forbid' }, failedChecks: [], policies, forbidden: `command shape ${sandboxedCommand.by} of the sandboxed-command rule ${sandboxedCommand.rule} forbids it`, sandboxedCommand }
+    }
+    if (sandboxedCommand?.outcome === 'ask' && rank(rule.mode) < rank('ask')) rule = { ...rule, mode: 'ask' }
+    if (sandboxedCommand?.outcome === 'auto' && rule.mode === 'ask') rule = { ...rule, mode: 'auto' }
     const failedChecks = rule.mode === 'auto' || rule.mode === 'notify' ? rule.requires.filter((c) => action.checks?.[c] !== true) : []
-    return { actionClass, rule, failedChecks, policies, ...(ruled && !listed ? { commandRule: named! } : {}) }
+    return { actionClass, rule, failedChecks, policies, ...(ruled && !listed ? { commandRule: named! } : {}), ...(sandboxedCommand ? { sandboxedCommand } : {}) }
+  }
+
+  /**
+   * Whether an ask shape of the sandboxed-command rule (ADR-0080) still holds for a project's set:
+   * the studio policy holds the rule of that id, and a policy of the set holds an ask shape of that id.
+   */
+  sandboxedAskHolds(shape: { rule: string; by: string }, projectId?: string): boolean {
+    const policies = this.of(projectId)
+    return policies[0]?.sandboxedCommands?.id === shape.rule && policies.some((p) => (p.sandboxedCommands?.ask ?? []).some((s) => s.id === shape.by))
   }
 
   /** How long a request for the class waits: the shortest applying rule's expiry, else the stricter default, never more than the stricter maximum. */

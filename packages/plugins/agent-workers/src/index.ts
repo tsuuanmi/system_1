@@ -271,9 +271,13 @@ export interface Config {
    * host's network once approved; `warn` records the request it would open and opens none; `off` does
    * not look. `diskFloor` (unset: `warn`, T345): `on` cuts no new worktree while the worktrees'
    * filesystem has less than `diskFloorGb` free, and dispatch starts none; `warn` records the refusal it
-   * would make and refuses nothing; `off` does not look.
+   * would make and refuses nothing; `off` does not look. `sandboxedCommands` (unset: `warn`,
+   * ADR-0080): `on` lets the autonomy policy's sandboxed-command rule run a Bash call no forbid or ask
+   * shape names without the operator, in a workspace-write run whose runtime proved both
+   * confinements; `warn` records the verdict the rule would give and the call still asks; `off`
+   * ignores the rule.
    */
-  enforce?: { lockfileVerification?: EnforceMode; diskFloor?: EnforceMode }
+  enforce?: { lockfileVerification?: EnforceMode; diskFloor?: EnforceMode; sandboxedCommands?: EnforceMode }
 }
 
 interface RunRow {
@@ -643,6 +647,7 @@ export class AgentWorkers extends Service {
     enforce: z.object({
       diskFloor: z.union(['off', 'warn', 'on']).description('The disk floor (default warn, the mechanism\'s start mode, T345): on cuts no new worktree while the worktrees\' filesystem has less than diskFloorGb free, and dispatch starts none; warn records the refusal it would make and refuses nothing; off does not look'),
       lockfileVerification: z.union(['off', 'warn', 'on']).description('The supply-chain verification of a new lockfile (default warn, the mechanism\'s start mode): on opens one approval request per lockfile digest and runs the verification once on the host\'s network when approved; warn records the request it would open and opens none; off does not look (T333)'),
+      sandboxedCommands: z.union(['off', 'warn', 'on']).description('The policy\'s sandboxed-command rule (default warn, the mechanism\'s start mode, ADR-0080): on lets a Bash call that no forbid or ask shape of the rule names run without the operator, in a workspace-write run whose runtime proved both confinements; warn records the verdict the rule would give and the call still asks; off ignores the rule'),
     }).description('Each gate-like mechanism\'s start mode (ADR-0078); the plugin host\'s live override (system enforce set) wins, read at each use'),
     workspaceReads: z.object(Object.fromEntries(Object.entries(WORKSPACE_READ_BOUNDS).map(([name, bound]) => [
       name, z.natural().min(bound.min).max(bound.max).default(bound.default).description(`${bound.description} (${bound.min} to ${bound.max})`),
@@ -2648,6 +2653,9 @@ export class AgentWorkers extends Service {
       readTools: readToolsOf(evidence, this.atTier(worker, row.tier).tools),
       // Only the host tools this run was given are classified (ADR-0070).
       hostTools: hostTools.map((tool) => tool.name),
+      // The sandboxed-command rule (ADR-0080): a workspace-write run whose runtime proved both confinements, under its enforce switch read at each call.
+      sandbox: worker.sandbox, commandsSandboxed: evidence.sandboxedCommands === true && evidence.readsConfined,
+      sandboxedCommands: () => enforceMode(this.ctx.get('pluginHost' as never) as EnforceSource | undefined, 'sandboxed-commands', this.config.enforce?.sandboxedCommands),
     })
     // What it runs at its tier (ADR-0073): that tier's model, tools, and turn limit, else the Worker's own
     // (one it still offers, with the model it was started for: checked before the egress check).

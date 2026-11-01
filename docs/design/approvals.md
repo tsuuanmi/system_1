@@ -468,6 +468,46 @@ with judges of its own scripts are policy, decided at the gate, so they never as
   the template's rules (the first of them, not those of T326) into every new project's policy, and into the studio change it files when the
   studio lacks them, as it does for missing commands.
 
+### The sandboxed-command rule
+
+`autonomy-policy@1.7` adds `sandboxedCommands` (T363, PROP-0022 1b,
+[ADR-0080](../decisions/adr/0080-a-sandboxed-bash-call-the-policy-does-not-name-runs-without-the-operator.md)):
+the policy, not the sandbox, decides ([ADR-0038](../decisions/adr/0038-confined-commands-for-claude-code-workers.md)),
+and it may say that a Bash call it does not name runs without the operator.
+
+```json
+"sandboxedCommands": { "id": "sandboxed-bash",
+  "forbid": [ { "id": "no-sudo", "program": "sudo", "note": "never as another user" } ],
+  "ask": [ { "id": "git-push", "program": "git", "words": ["push"], "note": "a push leaves the machine" },
+           { "id": "outside-worktree", "anyWord": "^(/etc/|/home/)", "note": "a path outside the worktree" } ],
+  "note": "…" }
+```
+
+- **When.** A `command` call that no commands-list line and no command rule allows, in a
+  `workspace-write` run whose runtime reports `sandboxedCommands` with `readsConfined` (Claude Code:
+  the host's read confinement and the SDK sandbox with writes to the worktree only, no network, and
+  `allowUnsandboxedCommands: false`, both proved by the probe). Never in a read-only run, an unproved
+  run, a review member's or research run, or a Codex Worker (which reports none and keeps
+  `approvalPolicy: never` inside its sandbox).
+- **Order.** `forbid` shapes, `ask` shapes, the rule (`auto`), the class default. A shape is a
+  program's base name, the literal words after it, and an `anyWord` pattern; the shapes of every
+  policy of the set count, so a project only adds. A `command` mode of forbid still forbids. A call
+  asking to run unsandboxed is never allowed by it: the gate denies the `dangerouslyDisableSandbox`
+  field before the policy is asked.
+- **Recorded.** The gate passes `sandboxed: true` to `check`; the `autonomy` decision's detail names
+  the rule: `sandboxedCommand: { rule, outcome, by? }`. A call an `ask` shape asked for opens its
+  request as any other, even where the `command` mode alone is laxer: the queue judges the request
+  again in the context that decision names (read from the decision, never from the caller), keeps
+  it open while that shape is still an ask shape of the rule in force, and never counts it toward a
+  commands-list proposal, which would put the call past its shape.
+- **The switch** `agent-workers.enforce.sandboxedCommands` ([configuration](../reference/configuration.md),
+  default `warn`): `on` applies the rule; `warn` records a `gate` decision (`agent-workers.tool-gate`,
+  option `ask`, `sandboxedWould`, `sandboxedRule`, `sandboxedBy`, `command`) and the call asks as
+  before; `off` ignores it.
+- **Taking effect** takes a [policy change](#a-policy-change) that adds the rule to the studio policy,
+  and the switch `on`: the operator's, never the lead's
+  ([how](../operations/runbooks.md#change-the-autonomy-policy)).
+
 ### A deferred call
 
 - **The request** binds to the exact call (INV-5): subject `{ type: content, ref:
