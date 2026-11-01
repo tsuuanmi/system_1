@@ -1,5 +1,7 @@
 # @tsuuanmi/system-gateway-anthropic
 
+> **Parked and frozen (security fixes only)** since 2026-11-01: [components](../../../docs/architecture/components.md#parked).
+
 The **Anthropic Messages gateway**, on the DSH webserver under `/anthropic`
 (loopback only). Claude Code points its base URL here and uses website Workers
 as its model ([gateways](../../../docs/design/gateways.md),

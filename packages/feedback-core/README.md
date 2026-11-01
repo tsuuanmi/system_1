@@ -1,5 +1,7 @@
 # @tsuuanmi/system-feedback-core
 
+> **Parked and frozen (security fixes only)** since 2026-11-01, for its experiments, evaluations, and statistics: [components](../../docs/architecture/components.md#parked).
+
 The feedback loop's **seam definitions and library** ([PROP-0011](../../docs/proposals/0011-feedback-loop.md#milestones)):
 two guarantee seams and the statistics they pin, in one package (PROP-0018 T12).
 ([plugin model](../../docs/architecture/plugin-model.md#seam-catalog), plugin rule 2). A seam's

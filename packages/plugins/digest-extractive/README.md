@@ -1,5 +1,7 @@
 # @tsuuanmi/system-digest-extractive
 
+> **Parked and frozen (security fixes only)** since 2026-11-01: [components](../../../docs/architecture/components.md#parked).
+
 A second provider of **`ctx.digests`**, extractive-first
 ([digests](../../../docs/design/digests.md#extractive-first); definition
 [`digest-core`](../../digest-core/README.md)): before any Worker writes, code selects verbatim spans
