@@ -197,6 +197,15 @@ accepted/implemented -> superseded
   are unchanged. Six tasks, the switch `enforce.sharedNodeModules` (off, warn, on) and its test on the
   test profile. It changes no code.
 
+- [PROP-0022: Lean core, a small System that runs smoothly](0022-lean-core.md), **accepted** (D113,
+  2026-11-01; 1b and 5b stay the operator's decisions D114 and D115; from the operator's request of
+  that day and four live System runs). No new features. A command no longer ends
+  its run while it waits for an approval (a quarter of all agent runs); the ledger counts a resumed
+  session's spend once (3.9 times too high today); an attempt is develop, then checks and one
+  independent review in parallel, at most two fix rounds, then landing; a step's tier is set by the
+  step; the operator decides merges in a batch and a light change lands on its own; little-used parts
+  are turned off and frozen. Target: a small task landed in 20 to 30 minutes, quality held.
+
 Use [0000-template.md](0000-template.md) for new proposals. The
 [roadmap](roadmap.md) is a non-normative queue of milestones, not a substitute for
 a reviewed proposal.
