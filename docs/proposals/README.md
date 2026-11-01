@@ -170,7 +170,7 @@ accepted/implemented -> superseded
   It changes no code.
 
 - [PROP-0019: The lead is a session; its logic lives in System](0019-lead-logic-in-system.md),
-  **draft** (T324, from the operator's words of 2026-10-27, D109). About 1,400 lines of scripts and
+  **accepted** (D119, 2026-11-01; rank 6 dropped for PROP-0022 change 3, rank 8 within D115) (T324, from the operator's words of 2026-10-27, D109). About 1,400 lines of scripts and
   state files in the lead's coordination directory do eleven jobs System should do. For each:
   what System has (command rules, the lead inbox, the lead principal, auto-accept, the report), what
   is missing, the design at its seam, and its switch (off or warn, D108) and test profile case;

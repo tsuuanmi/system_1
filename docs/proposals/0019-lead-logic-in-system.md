@@ -1,7 +1,7 @@
 ---
 id: PROP-0019
 type: proposal
-status: draft
+status: accepted
 owners: [operator]
 created: 2026-10-27
 summary: The lead is a session talking to System (operator, D109, 2026-10-27), so all logic, the lead's too, belongs in System, so the session can change, and another project's lead works the same. Today about 1,400 lines of scripts and state files in the lead's coordination directory do eleven jobs that System should do (a watcher loop, command judges, routine remediation approvals, auto-accept and auto-merge sweeps, pushing dev and syncing checkouts, a task registry, a decision log, the live profile patch history, salvage and hand landings, the morning report and health table, the handover). For each, this proposal says what System already has (the command rules, the lead inbox, the lead principal, auto-accept, the report) and what is missing, and gives the design in System, its switch (off or warn first, D108, T322) and its test on the test profile (T323). It designs `system lead brief --project <id>`, the one page a new lead session needs to take over, with a handover note the outgoing session leaves. The end state is a coordination directory that holds LEAD.md and nothing a script reads. Thirteen ranked tasks, each small and each with its switch, start after the core loop (T293b, T318b, T321) runs clean. Nothing in this proposal changes code.
@@ -556,8 +556,19 @@ Each has a recommendation; the operator decides.
 
 ## Decision
 
-Draft. Record the operator's review outcome and the resulting ADRs (the merge rule, the publish
-action class) here.
+Accepted by the operator on 2026-11-01 (D119: "the logic should be in System"), read together with
+[PROP-0022](0022-lean-core.md), accepted the same day:
+
+- **Rank 6 (remediation rules) is not built.** PROP-0022 change 3 removes the remediation approval
+  from the `lean` pipeline (T366), so no rule is needed to decide it.
+- **Rank 7 (the accept sweep) needs no rank 6.** It follows the board's auto-accept rule (ADR-0067).
+- **Rank 8 (the merge rule)** decides a merge only within D115: `on` for the light tier alone, after
+  the `lean` pipeline has run 7 days and 30 light results with quality held; every other merge asks.
+- **Rank 3's audit of commands** also serves D114's audit of the sandboxed rule's `warn` records.
+- Ranks 1, 4 and 10 are built (T327, T328, T329); their rows (`lead-inbox`, `decisions`) are off on
+  the live install until the operator turns them on.
+
+The resulting ADRs (the merge rule, the publish action class) are recorded by their tasks.
 
 ## Implementation
 
