@@ -63,6 +63,10 @@
       "sensitive": false
     },
     {
+      "key": "defaultBudget",
+      "sensitive": false
+    },
+    {
       "key": "maxFreeRetries",
       "sensitive": false
     },

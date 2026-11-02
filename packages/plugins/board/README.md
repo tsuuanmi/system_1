@@ -170,6 +170,10 @@ charters, and their tasks.
   - `board_propose` and each item of `board_propose_plan` take a template `variant` (`mcp-board`
     1.7, `board-task@1.5`, PROP-0023): every run of the task starts in it, so dispatch routes its
     writing step by the variant's kind of work; it needs `template`;
+  - a proposal that names no `budget` gets the configuration's `defaultBudget` (empty by default):
+    lines on a pool or on a template's pools, such as `{pool: claude-code.agents, unit: usd, amount: 6}`,
+    which caps the task whichever account serves it
+    ([ADR-0083](../../../docs/decisions/adr/0083-a-budget-line-on-a-template-counts-every-accounts-pool.md));
   - `board_propose` takes the attempts the task gets (`maxAttempts`, 1 to 10, `mcp-board` 1.2);
     without it, the task gets the configuration's `templateAttempts` for its template, else
     `maxAttempts` (3) ([attempts](../../../docs/design/board.md#attempts));

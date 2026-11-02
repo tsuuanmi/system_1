@@ -282,7 +282,12 @@ flowchart LR
   counted whole: read without `partial`, it reconciles its run); `<runtime>:<run>:again-<n>` and a
   streamed lower bound stay lower bounds.
 - A cap counts, for its scope (a task, else a project), every counted record of its pool in its
-  unit, plus every unexpired reservation held for that scope: `tokens` are input plus output, `usd` the
+  unit, plus every unexpired reservation held for that scope. Its pool is a name: it counts that
+  pool and every pool named under it, `<name>/<account>`, so a line on a template's id counts every
+  account's pool of it, and a line on a concrete pool that pool alone; a line with no pool of its own
+  is available while one pool under it is
+  ([ADR-0083](../decisions/adr/0083-a-budget-line-on-a-template-counts-every-accounts-pool.md)).
+  Units: `tokens` are input plus output, `usd` the
   record's cost, `turns` its turns, `runs` one per record, `minutes` its duration.
 - A record counts for a task when it names the task or its run was reserved for it: an agent
   Worker's record names the task its brief serves, and a task's run is reserved for its task. A

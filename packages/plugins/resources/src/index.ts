@@ -75,6 +75,16 @@ const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 /** The bounds `mcp-resources@1` puts on `resources_pools`: pools per answer, readings per pool. */
 export const MAX_POOLS = 64
 export const MAX_WINDOWS = 8
+/**
+ * Whether a budget line on `line` counts pool `pool` (ADR-0083): the pool itself, and every pool a
+ * template makes of it for an account, `<line>/<account>`, so one line caps a task whichever account
+ * serves it. A line on a concrete pool counts that pool only: no pool is named under it.
+ */
+export const covers = (line: string, pool: string): boolean => pool === line || pool.startsWith(`${line}/`)
+/** {@link covers} in SQL, over a row's `pool`, with the parameters {@link coveredBy} gives. */
+const COVERED = '(pool = ? OR substr(pool, 1, ?) = ?)'
+const coveredBy = (line: string): [string, number, string] => [line, line.length + 1, `${line}/`]
+
 /** Lines and caps one reservation may name (INV-9). */
 export const MAX_LINES = 64
 /** How far in the future a reading's time may be (clock skew) before it is refused. */
@@ -435,8 +445,14 @@ export class StoreResources extends Resources {
       const fine: string[] = []
       for (const pool of new Set(request.lines.map((l) => l.pool))) {
         const state = pools.find((p) => p.pool === pool)
-        if (!state) faults.push(`pool ${pool} is not configured`)
-        else if (!state.available) faults.push(`pool ${pool} is unavailable${state.until ? ` until ${state.until}` : `: ${this.unknownWindows(state).join(', ')} without a reading that says ok`}`)
+        const group = state ? [] : pools.filter((p) => covers(pool, p.pool))
+        if (!state && !group.length) faults.push(`pool ${pool} is not configured`)
+        else if (!state) {
+          // A line on a template's pools (ADR-0083): the run draws on one of them, so one available is enough.
+          const open = group.filter((p) => p.available)
+          if (!open.length) faults.push(`no pool of ${pool} is available (${group.map((p) => p.pool).join(', ')})`)
+          else fine.push(`${open.length} of ${group.length} pool(s) of ${pool} are available`)
+        } else if (!state.available) faults.push(`pool ${pool} is unavailable${state.until ? ` until ${state.until}` : `: ${this.unknownWindows(state).join(', ')} without a reading that says ok`}`)
         else fine.push(`pool ${pool} is available`)
       }
       for (const cap of request.caps ?? []) {
@@ -449,7 +465,7 @@ export class StoreResources extends Resources {
         else fine.push(`cap ${cap.amount} ${cap.unit} of ${cap.pool} holds: ${sum}`)
       }
       // A cap never counts usage it cannot see as 0 (INV-2, ADR-0065).
-      faults.push(...this.uncountable(db, request))
+      faults.push(...this.uncountable(db, request, pools.map((p) => p.pool)))
       const state = faults.length ? 'refused' : 'reserved'
       const reservationId = `res-${randomUUID()}`
       const inputs = [...new Set(request.lines.flatMap((l) => pools.some((p) => p.pool === l.pool) ? this.readingArtifacts(db, l.pool) : []))]
@@ -644,7 +660,7 @@ export class StoreResources extends Resources {
       tokens: 'SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))', usd: 'SUM(COALESCE(cost_usd, 0))', turns: 'SUM(COALESCE(turns, 0))',
       runs: 'COUNT(*)', minutes: 'SUM(COALESCE(duration_ms, 0)) / 60000.0',
     }[cap.unit]
-    const row = db.prepare(`SELECT ${amount} AS n FROM resource_usage WHERE ${scope.column} = ? AND pool = ?`).get(scope.value, cap.pool) as { n: number | null }
+    const row = db.prepare(`SELECT ${amount} AS n FROM resource_usage WHERE ${scope.column} = ? AND ${COVERED}`).get(scope.value, ...coveredBy(cap.pool)) as { n: number | null }
     return round6(row.n ?? 0)
   }
 
@@ -660,11 +676,13 @@ export class StoreResources extends Resources {
    * there is one is unknown, and the caps are refused as well. A request without caps, or without a
    * scope (its caps bound its own lines only), is not concerned.
    */
-  private uncountable(db: DatabaseSync, request: ReservationRequest): string[] {
+  private uncountable(db: DatabaseSync, request: ReservationRequest, known: readonly string[]): string[] {
     const scope = this.scope(request)
     if (!scope || !request.caps?.length) return []
-    const pools = new Set(request.caps.map((c) => c.pool))
-    const named = [...pools].sort().join(', ')
+    const capped = new Set(request.caps.map((c) => c.pool))
+    const named = [...capped].sort().join(', ')
+    // Each pool a cap counts (ADR-0083): its own, and every known pool of a template it names.
+    const pools = new Set([...capped, ...known.filter((p) => [...capped].some((c) => covers(c, p)))])
     const eventLog = this.ctx.get('eventLog')
     if (!eventLog) return [`the caps of ${named} cannot be held: no event log (ctx.eventLog) is loaded, so whether a run of ${scope.value} has usage the ledger could not count is unknown, and a cap never counts unknown usage as 0 (INV-2)`]
     const reservedFor = db.prepare('SELECT project_id, task_id FROM resource_reservations WHERE run_id = ? ORDER BY reserved_at DESC LIMIT 1')
@@ -714,8 +732,8 @@ export class StoreResources extends Resources {
   private held(db: DatabaseSync, request: ReservationRequest, cap: BudgetLine, at: Date): number {
     const scope = this.scope(request)
     if (!scope) return 0
-    const row = db.prepare(`SELECT SUM(amount) AS n FROM resource_holds WHERE ${scope.column} = ? AND pool = ? AND unit = ? AND expires_ms > ?`)
-      .get(scope.value, cap.pool, cap.unit, at.getTime()) as { n: number | null }
+    const row = db.prepare(`SELECT SUM(amount) AS n FROM resource_holds WHERE ${scope.column} = ? AND ${COVERED} AND unit = ? AND expires_ms > ?`)
+      .get(scope.value, ...coveredBy(cap.pool), cap.unit, at.getTime()) as { n: number | null }
     return round6(row.n ?? 0)
   }
 

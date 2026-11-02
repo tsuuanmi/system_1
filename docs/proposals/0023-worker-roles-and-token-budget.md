@@ -7,7 +7,7 @@ created: 2026-11-02
 summary: Each kind of Worker does the work it is for, so Claude's tokens go to building only. Claude (standard tier by default) writes code; Codex and Antigravity review, write tests and documentation, and run the checks; website Workers ask, research, brainstorm, and review a change when the review packet fits. A session stops growing past a ceiling, every task carries a token budget, and a decompose template splits a goal into small tasks that run in parallel.
 evidence: [operator request 2026-11-02, docs/research/token-use-2026-11-02.md, docs/research/lean-core-2026-11-01.md, System run run_fab7b75f346d6d2d]
 related: [PROP-0004, PROP-0016, PROP-0022, ADR-0049, ADR-0057, ADR-0063, ADR-0070, ADR-0073, ADR-0075, INV-2, INV-5, INV-11, INV-13]
-implementation: [packages/plugins/board, packages/plugins/profile-software-development, packages/plugins/workflow]
+implementation: [ADR-0083, packages/plugins/board, packages/plugins/profile-software-development, packages/plugins/workflow, packages/plugins/resources]
 ---
 
 # Proposal: Worker roles and a token budget
@@ -164,11 +164,13 @@ packet-reviewed changes against agent-reviewed ones.
   16, fix 8, review 12 (the team's pilot values; build averages 28 today). A run that reaches its cap ends, and its result says so.
 - **A default task budget.** The board task's `budget` is already enforced by reservation before
   each step ([a task's budget](../design/workflow-engine.md#a-tasks-budget)). No task of the last
-  week declared one. A budget line caps one pool, and each Claude account is its own pool
-  (`<template>/<account>`), so a line cannot cap a task whichever account serves it. The ledger
-  first gains a cap over a pool template's pools (all of `claude-code.agents`), with its own ADR;
-  then the board's configuration gains a default (first value 6 USD API-equivalent per attempt). A
-  spent budget ends the attempt as today; the lead decides to rescope, escalate, or defer.
+  week declared one. A budget line capped one pool, and each Claude account is its own pool
+  (`<template>/<account>`), so no line could cap a task whichever account serves it. A line on a
+  template's id now counts every account's pool of it
+  ([ADR-0083](../decisions/adr/0083-a-budget-line-on-a-template-counts-every-accounts-pool.md)), and
+  the board's `defaultBudget` gives a task with no budget its lines (empty by default; first value
+  `{pool: claude-code.agents, unit: usd, amount: 6}`). A spent budget ends the attempt as today; the
+  lead decides to rescope, escalate, or defer.
 
 A fresh run starts small: about 10 k tokens of fixed context plus its prompt (a one-turn run's
 context, [research §4](../research/token-use-2026-11-02.md#4-prompt-sizes)). The large contexts are

@@ -1031,8 +1031,11 @@ export class TaskRuns {
     }
     for (const pool of new Set(lines.map((l) => l.pool))) {
       const state = pools.find((p) => p.pool === pool)
-      if (!state) refuse('config_error', `task ${task.taskId}'s budget draws on pool ${pool}, which the resource ledger does not configure`)
-      else if (!state.available) refuse('overloaded', `pool ${pool} of task ${task.taskId}'s budget is unavailable${state.until ? ` until ${state.until}` : ' (a window has no reading that says ok)'}: retry once it is available`)
+      // A line on a template's pools, <pool>/<account> (ADR-0083): one of them available is enough.
+      const group = state ? [] : pools.filter((p) => p.pool.startsWith(`${pool}/`))
+      if (!state && !group.length) refuse('config_error', `task ${task.taskId}'s budget draws on pool ${pool}, which the resource ledger does not configure`)
+      else if (!state && !group.some((p) => p.available)) refuse('overloaded', `no pool of ${pool} in task ${task.taskId}'s budget is available (${group.map((p) => p.pool).join(', ')}): retry once one is`)
+      else if (state && !state.available) refuse('overloaded', `pool ${pool} of task ${task.taskId}'s budget is unavailable${state.until ? ` until ${state.until}` : ' (a window has no reading that says ok)'}: retry once it is available`)
     }
   }
 

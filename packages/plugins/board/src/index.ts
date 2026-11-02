@@ -40,6 +40,12 @@ export interface Config {
    */
   templateAttempts?: Record<string, number>
   /**
+   * The budget a task gets when its proposal names none (PROP-0023 change 3): budget lines, each on
+   * a pool or a template's pools (`claude-code.agents`, ADR-0083). Empty (the default): a task with
+   * no budget reserves nothing, as before.
+   */
+  defaultBudget?: BudgetLine[]
+  /**
    * Failed runs of one task that failed only on the infrastructure (the host stopped them, nothing
    * of them was sent, a Worker became unavailable) and are not counted as attempts, at most (default
    * 3, 0 to 10; INV-9, ADR-0069). Past it such a run counts as any failed run does.
@@ -376,6 +382,11 @@ export class StoreBoard extends Board {
     leaseTtlSeconds: z.natural().min(30).max(3600).default(600).description('Lease length when a claim names none, in seconds (leases.maxTtlMs caps it)'),
     maxAttempts: z.natural().min(1).max(10).default(3).description('Attempts a task gets when its proposal names none and templateAttempts names none for its template'),
     templateAttempts: z.dict(z.natural().min(1).max(10)).default({}).description('Attempts a task of a template gets when its proposal names none, by template name (1 to 10 each)'),
+    defaultBudget: z.array(z.object({
+      pool: z.string().pattern(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/).required().description('A pool, or a template whose pools <template>/<account> the line counts together (ADR-0083)'),
+      unit: z.union(UNITS.map((u) => z.const(u))).required(),
+      amount: z.number().min(0).max(AMOUNT_MAX).required(),
+    })).max(16).default([]).description('The budget a task gets when its proposal names none (PROP-0023): lines on a pool or on a template\'s pools, such as {pool: claude-code.agents, unit: usd, amount: 6}. Empty: such a task has no budget, as before'),
     maxFreeRetries: z.natural().max(FREE_RETRIES_MAX).default(FREE_RETRIES_DEFAULT).description('Failed runs of one task that failed only on the infrastructure (the host stopped them, nothing of them was sent, a Worker became unavailable) and are not counted as attempts, at most; past it such a run counts as any failed run (INV-9)'),
     pageBound: z.natural().min(1).max(100).default(100).description('The most items one page of board_projects or board_tasks holds'),
     projectionMaxTasks: z.natural().min(1).max(10_000).default(200).description('The most tasks the TASKS.md projection lists, open ones first'),
@@ -733,13 +744,15 @@ export class StoreBoard extends Board {
       const writes = writesKey(input.writes)
       if (writes && db.prepare('SELECT 1 FROM board_tasks WHERE writes = ?').get(writes)) throw new BoardError('conflict', `another open task writes ${input.writes!.type} ${input.writes!.ref} (INV-15)`)
       const defect = input.fixes ? this.defectOf(input.fixes.taskId, input.fixes.sha, input.projectId, 'filed', at) : undefined
+      // Its own budget, else the board's default (PROP-0023): what its runs are held to.
+      const budget = input.budget ?? this.config.defaultBudget ?? []
       const task: BoardTask = {
         schema: tagOf(input, defect ? 'board-task@1.2' : 'board-task@1.0'), taskId: newId('task'), projectId: input.projectId, title: input.title, goal: input.goal,
         acceptance: input.acceptance, dependsOn: input.dependsOn ?? [], actionClass: input.actionClass, state: 'proposed',
         attempts: { count: 0, max }, createdAt: at.toISOString(), revision: 0,
         ...(input.milestone !== undefined ? { milestone: input.milestone } : {}), ...(input.template !== undefined ? { template: input.template } : {}),
         ...(input.variant !== undefined ? { variant: input.variant } : {}),
-        ...(input.writes ? { writes: input.writes } : {}), ...(input.budget ? { budget: input.budget } : {}), ...(defect ? { defect } : {}),
+        ...(input.writes ? { writes: input.writes } : {}), ...(input.budget ? { budget: input.budget } : budget.length ? { budget } : {}), ...(defect ? { defect } : {}),
       }
       this.validTask(task)
       db.prepare('INSERT INTO board_tasks (task_id, project_id, state, created_at, revision, record, writes) VALUES (?, ?, ?, ?, ?, ?, ?)')

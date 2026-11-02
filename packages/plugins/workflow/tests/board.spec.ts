@@ -104,7 +104,7 @@ interface Booted {
 /** The store-backed ledger's one pool, as the ledger fake configures it. */
 const POOLS = [{ pool: 'max.programmatic', account: 'max', kind: 'programmatic' as const, windows: [{ id: 'monthly', kind: 'credit' as const }] }]
 
-async function boot(options: { workflow?: Config; board?: boolean | 'short'; boardConfig?: BoardConfig; workspace?: string; resources?: boolean | 'store'; policy?: AutonomyPolicy } = {}): Promise<Booted> {
+async function boot(options: { workflow?: Config; board?: boolean | 'short'; boardConfig?: BoardConfig; workspace?: string; resources?: boolean | 'store'; resourcesConfig?: Record<string, unknown>; policy?: AutonomyPolicy } = {}): Promise<Booted> {
   const dir = mkdtempSync(join(tmpdir(), 'system-workflow-board-'))
   const ctx = new Context()
   const workers = options.workspace ? new AgentWorkers(options.workspace, () => ctx.artifacts) : new ScriptedWorkers()
@@ -119,7 +119,7 @@ async function boot(options: { workflow?: Config; board?: boolean | 'short'; boa
   ]
   const boardAt = fibers.length
   if (options.board !== false) fibers.push(ctx.plugin(boardPlugin, boardConfig))
-  if (options.resources === 'store') fibers.push(ctx.plugin(StoreResources, { pools: POOLS }))
+  if (options.resources === 'store') fibers.push(ctx.plugin(StoreResources, { pools: POOLS, ...options.resourcesConfig }))
   else if (options.resources) fibers.push(ctx.plugin(FakeResources))
   await Promise.all(fibers)
   let engine = ctx.plugin(Workflow, config)
@@ -1049,6 +1049,23 @@ describe('ctx.workflow serves board tasks over the store-backed board and approv
     expect(bare.workers.started).toHaveLength(0)
     for (const [c, t] of [[bare.ctx, unledgered], [ctx, unknown], [ctx, unread]] as const) expect(await c.board.task(t.taskId)).toMatchObject({ state: 'ready', attempts: { count: 0 } })
     expect(decisionsOf(ctx, 'admission', 'workflow.task-admission').filter((d) => d.outcome.option === 'refuse')).toHaveLength(2)
+  })
+
+  it('holds a task to the board\'s default budget on a template\'s pools, whichever account serves it, and refuses one no pool of the template is under (ADR-0083, PROP-0023)', async () => {
+    const plan = { template: 'plan', group: 'runtime', kind: 'programmatic', windows: [{ id: 'w', kind: 'rolling' }], unknown: 'available' }
+    const { ctx, workers } = await boot({ resources: 'store', resourcesConfig: { templates: [plan] }, boardConfig: { defaultBudget: [{ pool: 'plan', unit: 'runs', amount: 5 }] } })
+    await project(ctx)
+    const none = await ready(ctx, 'no account yet')
+    expect(none.budget).toEqual([{ pool: 'plan', unit: 'runs', amount: 5 }])
+    expect(await refusalOf(() => ctx.workflow.start({ template: 'solo', input: 'q', classification: 'public', task: { taskId: none.taskId } }))).toMatch(/^config_error: .*draws on pool plan, which the resource ledger does not configure/)
+    await ctx.resources.declare!('agents', [{ account: 'acc-1', group: 'runtime' }])
+    const task = await ready(ctx, 'budgeted')
+    workers.reply = () => ({ text: 'done' })
+    const run = await ctx.workflow.start({ template: 'solo', input: 'q', classification: 'public', task: { taskId: task.taskId } })
+    expect(await settled(ctx, run.runId)).toMatchObject({ status: 'completed' })
+    expect(decisionOf(ctx, (await reported(ctx, run.runId)).task!.budget!.decision)).toMatchObject({ outcome: { option: 'reserved' } })
+    // A proposal's own budget wins over the default.
+    expect((await ready(ctx, 'own', { budget: [{ pool: 'max.programmatic', unit: 'runs', amount: 1 }] })).budget).toEqual([{ pool: 'max.programmatic', unit: 'runs', amount: 1 }])
   })
 
   it('blocks a task on the questions a step asks instead of answering (question); answered, the attempt continues, its next run briefed with the answers (PROP-0010, INV-6, T291)', async () => {

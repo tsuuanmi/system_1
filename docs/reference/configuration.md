@@ -180,6 +180,10 @@
 | `leaseTtlSeconds` | number (30…3600) | `600` | Lease length when a claim names none, in seconds (leases.maxTtlMs caps it) |
 | `maxAttempts` | number (1…10) | `3` | Attempts a task gets when its proposal names none and templateAttempts names none for its template |
 | `templateAttempts` | Record<string, number> | `{}` | Attempts a task of a template gets when its proposal names none, by template name (1 to 10 each) |
+| `defaultBudget` | object[] (…16) | `[]` | The budget a task gets when its proposal names none (PROP-0023): lines on a pool or on a template's pools, such as {pool: claude-code.agents, unit: usd, amount: 6}. Empty: such a task has no budget, as before |
+| `defaultBudget[].pool` (required) | string |  | A pool, or a template whose pools <template>/<account> the line counts together (ADR-0083) |
+| `defaultBudget[].unit` (required) | "tokens" \| "usd" \| "turns" \| "runs" \| "minutes" |  |  |
+| `defaultBudget[].amount` (required) | number (0…1000000000000) |  |  |
 | `maxFreeRetries` | number (0…10) | `3` | Failed runs of one task that failed only on the infrastructure (the host stopped them, nothing of them was sent, a Worker became unavailable) and are not counted as attempts, at most; past it such a run counts as any failed run (INV-9) |
 | `pageBound` | number (1…100) | `100` | The most items one page of board_projects or board_tasks holds |
 | `projectionMaxTasks` | number (1…10000) | `200` | The most tasks the TASKS.md projection lists, open ones first |
