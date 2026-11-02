@@ -250,6 +250,37 @@ flowchart LR
 - One record per `(source, requestId)`; a duplicate is stored as an artifact but not counted.
 - A unit is counted once across sources: a `transcript` record of a run that has a
   `runtime-result` record is a duplicate.
+- **A usage record is the run's own spend** (`usage-record@1.2`, PROP-0022 change 2). A runtime's
+  result may report its session's running totals, not what its run alone used: the Claude Agent
+  SDK's result on a resumed session does
+  ([cost tracking](https://code.claude.com/docs/en/agent-sdk/cost-tracking)). Its source then names
+  the session in `sessionTotals`, and the ledger counts by the **difference rule**:
+  - the run's own spend is the result minus the session's latest result already in the ledger, in
+    every counter (tokens, per-model tokens and cost, turns, cost);
+  - the first result of a session is counted as it is (from zero), unless a run of the session
+    ended before it with no result: then the next two rules hold for it too;
+  - a run of the session that ended with no result leaves its spend in the next difference, and that
+    record says so (`includesUnrecorded`): a run whose lower bound (`partial`) was counted since the
+    agent session's latest result (since it began, before its first), by its agent session or by the
+    result's own run (a run the host's stop cut, then resumed), or one with no record at all, as its
+    `usage.unknown` fact of the session says (the event log's; without one loaded, the flag cannot be
+    read, and the numbers are the same);
+  - those lower bounds are taken from the difference, each counter floored at 0 (at most 100 of
+    them), so they are not counted twice and the session totals its last result's;
+  - a difference negative in any counter (a session that started over) is counted as the full
+    result, `notDifferenced`, never negative or zero.
+
+  The original stays in the stored record (`resource_usage.record`, and the `receipt` artifact); the
+  counted columns, and the record `usage()` returns, are the run's own spend, without
+  `sessionTotals`. A run the host's stop cut and ran again (T283) whose result carries
+  `sessionTotals` is counted whole: the session's totals hold what it used before the stop. Store
+  migration 2 of `resources` recomputes every stored record the same way from its original, in the
+  order counted, and changes nothing when run again. It reads a record stored before `sessionTotals`
+  existed by the same rule: a `runtime-result` whose id `<runtime>:<session>:<uuid>` names its
+  runtime's result is a result of that session, with or without an agent session, and so is one whose
+  only `partial` says it ran again after the host's stop (its numbers are the session's totals, now
+  counted whole: read without `partial`, it reconciles its run); `<runtime>:<run>:again-<n>` and a
+  streamed lower bound stay lower bounds.
 - A cap counts, for its scope (a task, else a project), every counted record of its pool in its
   unit, plus every unexpired reservation held for that scope: `tokens` are input plus output, `usd` the
   record's cost, `turns` its turns, `runs` one per record, `minutes` its duration.
@@ -314,7 +345,9 @@ case is visible and durable:
   restart is only what it used since, so its record is a lower bound of the run (`partial`: it ran
   again after the host's stop cut it), a unit of its own (without the runtime's own result id, its
   `requestId` is the run's with `:again-<n>`), and never reconciles the run: what it used before the
-  stop is left to transcript reconciliation, never invented.
+  stop is left to transcript reconciliation, never invented. Unless its result reports its session's
+  running totals (`sessionTotals`): those hold what it used before the stop, so its record is whole
+  and reconciles the run ([counting](#counting)).
 - **A run with a lower bound counted** (it ended before its runtime's final count, and its runtime
   reported some usage while it ran) gets its record of that lower bound, `usage-record@1.1` whose
   `partial` says why it is one, and a `not-reported` fact (`usage-unknown@1.1`) whose `partial`

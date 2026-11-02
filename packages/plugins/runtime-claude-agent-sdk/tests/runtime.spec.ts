@@ -126,7 +126,8 @@ describe('claude-agent-sdk: the configured policy, exactly', () => {
   it('runs read-only: no prompts, no settings files, only the allowed tools, in the workspace', async () => {
     const calls: Call[] = []
     const result = await runtime(scripted(calls)).run({ prompt: 'review', workspace, sandbox: 'read-only', model: 'model-x', maxTurns: 5, resume: 'h-0' }, new AbortController().signal)
-    expect(result).toEqual({ text: 'echo: review', nativeHandle: 'h-1', turns: 2, costUsd: 0.01, resultId: 'h-1:r-1', model: 'model-main', ...NORMALIZED })
+    // The result reports its session's running totals: it names the session, so the ledger counts the difference (PROP-0022).
+    expect(result).toEqual({ text: 'echo: review', nativeHandle: 'h-1', turns: 2, costUsd: 0.01, resultId: 'h-1:r-1', sessionTotals: 'h-1', model: 'model-main', ...NORMALIZED })
     expect(calls[0]!.options).toMatchObject({
       cwd: workspace, permissionMode: 'dontAsk', permissionPrompts: 'none', allowedTools: ['Read(./**)', 'Grep(./**)', 'Glob(./**)'], tools: ['Read', 'Grep', 'Glob'],
       settingSources: [], mcpServers: {}, strictMcpConfig: true, pathToClaudeCodeExecutable: '/usr/bin/claude', model: 'model-x', maxTurns: 5, resume: 'h-0',

@@ -99,9 +99,11 @@ export interface LimitState {
   evidence?: ArtifactRef
 }
 
-/** `usage-record@1.0`, or `@1.1` with `partial`. */
+export { ownSpend, type SessionSince } from './own-spend.ts'
+
+/** `usage-record@1.0`, `@1.1` with `partial`, or `@1.2` with a session's running totals or the flags of a run's own spend. */
 export interface UsageRecord {
-  schema: 'usage-record@1.0' | 'usage-record@1.1'
+  schema: 'usage-record@1.0' | 'usage-record@1.1' | 'usage-record@1.2'
   requestId: string
   source: 'runtime-result' | 'provider-usage' | 'transcript' | 'turn-count' | 'invoice'
   observedAt: string
@@ -128,6 +130,16 @@ export interface UsageRecord {
    * no record there without it (INV-2, ADR-0065).
    */
   partial?: string
+  /**
+   * (1.2, given by a source) The numbers are the running totals of the runtime session this id names,
+   * as of this result. The ledger counts the run's own spend ({@link ownSpend}), and a record it
+   * returns never carries this. Never with `partial`.
+   */
+  sessionTotals?: string
+  /** (1.2, set by the ledger) The difference spans a run of the session that ended with no result. */
+  includesUnrecorded?: true
+  /** (1.2, set by the ledger) A counter went down, so the record is the full result, not a difference. */
+  notDifferenced?: true
 }
 
 /** A pool now: its configuration, the latest reading of each window, and whether new work may draw on it. */

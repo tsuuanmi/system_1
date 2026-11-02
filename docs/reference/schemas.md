@@ -653,6 +653,15 @@ guesses.
 - The ledger keeps one record per `(source, requestId)`; another with the same key is a
   duplicate and is not counted. A unit is counted once across sources: a `transcript` record is
   written only for a run that has no `runtime-result` record, the case of a crashed process.
+- **A usage record is the run's own spend**, never a session's running total. A source whose
+  result reports its session's running totals names the session in `sessionTotals` (`@1.2`, never
+  with `partial`); the ledger counts and returns the result minus the session's latest result already
+  in the ledger (from zero for its first result), less the session's lower bounds counted since, so
+  the first result is counted as it is unless a run of the session ended before it with no result. It sets `includesUnrecorded` (a run of the session ended with no result, so its spend is in
+  the difference) and `notDifferenced` (a counter went down, so the record is the full result, never
+  negative or zero) on the record it returns, which carries no `sessionTotals`; a source never sets
+  them. The original stays in the stored record. The rule:
+  [resources, counting](../design/resources.md#counting).
 - `inputTokens` includes cached input, and `cacheReadInputTokens` and
   `cacheCreationInputTokens` are subsets of it (OpenTelemetry GenAI). So
   `inputTokens ≥ cacheReadInputTokens + cacheCreationInputTokens`, and when `models` is present

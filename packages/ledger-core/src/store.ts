@@ -11,6 +11,8 @@ declare module '@deepseek-ai/cordis' {
 export interface Migration {
   version: number
   sql: string
+  /** Runs after `sql`, in the same transaction, for a step SQL cannot state (a recomputation of stored rows). Must be idempotent. */
+  run?: (db: DatabaseSync) => void
 }
 
 /** Thrown when a revision-guarded write finds a newer revision (docs/design/scheduling-and-leases.md). */

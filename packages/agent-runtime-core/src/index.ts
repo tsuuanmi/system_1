@@ -874,6 +874,14 @@ export async function readLimits(provider: AgentRuntimeProvider, options: Limits
 export interface RunMetering {
   /** The runtime's own identity of the result the numbers come from (a deduplication key, opaque). */
   resultId?: string | undefined
+  /**
+   * Present when the numbers of this result are the running totals of a runtime session as of this
+   * result, not what this run alone consumed (a resumed Claude Agent SDK session reports its whole
+   * session so far): the session's id as the runtime names it. The ledger then counts the run's own
+   * spend, the difference from the session's latest result (`usage-record@1.2`, `sessionTotals`).
+   * Never on a `partial` report.
+   */
+  sessionTotals?: string | undefined
   /** The model the run's main loop answered with, as the runtime names it. */
   model?: string | undefined
   /** The whole run's usage, every model and subagent included. */
