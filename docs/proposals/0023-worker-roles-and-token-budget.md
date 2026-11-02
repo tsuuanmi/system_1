@@ -7,7 +7,7 @@ created: 2026-11-02
 summary: Each kind of Worker does the work it is for, so Claude's tokens go to building only. Claude (standard tier by default) writes code; Codex and Antigravity review, write tests and documentation, and run the checks; website Workers ask, research, brainstorm, and review a change when the review packet fits. A session stops growing past a ceiling, every task carries a token budget, and a decompose template splits a goal into small tasks that run in parallel.
 evidence: [operator request 2026-11-02, docs/research/token-use-2026-11-02.md, docs/research/lean-core-2026-11-01.md, System run run_fab7b75f346d6d2d]
 related: [PROP-0004, PROP-0016, PROP-0022, ADR-0049, ADR-0057, ADR-0063, ADR-0070, ADR-0073, ADR-0075, INV-2, INV-5, INV-11, INV-13]
-implementation: []
+implementation: [packages/plugins/board, packages/plugins/profile-software-development]
 ---
 
 # Proposal: Worker roles and a token budget
@@ -88,6 +88,10 @@ Six changes, in the order they land. Each names its switch and what it measures.
 - The Claude `develop` Workers keep only `code`; `docs` and `tests` move to the Codex and
   Antigravity writers. A step's kind already routes it
   ([route work by kind](../operations/runbooks.md#route-work-by-kind)).
+- **One code gap.** A step's kind comes from the template's variant (`algorithm-development
+  --variant docs`), and a board task carries no variant: dispatch starts every task's `develop:1` as
+  `code`, so a docs or tests task still goes to Claude. The board task gains an optional `variant`,
+  which dispatch passes to the run (`board-task` minor version).
 - The Claude `review` and `review-2` roles are removed from the operator's patch: a Claude build is
   never reviewed by Claude, and no review draws Claude quota.
 - The Claude `research` role stays only as the last fallback of `research`, after website and model
@@ -151,9 +155,11 @@ packet-reviewed changes against agent-reviewed ones.
   16, fix 8, review 12 (the team's pilot values; build averages 28 today). A run that reaches its cap ends, and its result says so.
 - **A default task budget.** The board task's `budget` is already enforced by reservation before
   each step ([a task's budget](../design/workflow-engine.md#a-tasks-budget)). No task of the last
-  week declared one. The project's charter gains a default (first value 6 USD API-equivalent of
-  `agent-plan` quota per attempt). A spent budget ends the attempt as today; the lead decides to
-  rescope, escalate, or defer.
+  week declared one. A budget line caps one pool, and each Claude account is its own pool
+  (`<template>/<account>`), so a line cannot cap a task whichever account serves it. The ledger
+  first gains a cap over a pool template's pools (all of `claude-code.agents`), with its own ADR;
+  then the board's configuration gains a default (first value 6 USD API-equivalent per attempt). A
+  spent budget ends the attempt as today; the lead decides to rescope, escalate, or defer.
 
 A fresh run starts small: about 10 k tokens of fixed context plus its prompt (a one-turn run's
 context, [research §4](../research/token-use-2026-11-02.md#4-prompt-sizes)). The large contexts are
@@ -180,33 +186,27 @@ step, read by a standard builder.
 
 ### 5. A goal is decomposed into small tasks
 
-**Change.** A `decompose` template in `profile-software-development`:
+**Change.** Two parts, with no new engine step. The planner advises and the lead files
+([ADR-0028](../decisions/adr/0028-local-lead-final-authority.md)).
 
-```text
-plan:1 (website; a two-member team for a heavy goal) ─► check:1 (deterministic) ─► file:1 (ctx.board, proposed)
-```
+- **`decompose`**, a template of `profile-software-development`: one step, `plan:1`, needing only
+  `reason`, so a website Worker takes it first
+  ([nodes](../reference/workflow-templates.md#decompose)).
+  - It reads the goal and what the lead shows it (a file map, the charter's criteria).
+  - It answers with a plan: tasks with a key, a title, a goal, criteria a check names, and
+    `dependsOn` by key.
+  - Each task is one independently testable behaviour
+    ([PROP-0022 task sizing](0022-lean-core.md#task-sizing)). A test for a change of behaviour goes
+    in the code task, which works test-first; a docs task depends on its code task.
+- **`board_propose_plan`** (`mcp-board` 1.6) files the plan: every task or none, in one
+  transaction ([a plan of tasks](../design/board.md#a-plan-of-tasks)).
+  - Refused before anything is stored: a cycle, a key named twice, an unknown dependency, or two
+    tasks writing one subject.
+  - Each task is `proposed`, and the board's sweep makes it ready once its dependencies are done,
+    as for any proposal, so independent tasks run at once.
 
-- `plan:1` reads the goal, the charter, and a file map of the repository. It proposes tasks, each
-  with:
-  - a title, a goal, and criteria a command can check;
-  - its kind (`code`, `tests`, or `docs`);
-  - the paths it `writes`;
-  - `dependsOn`;
-  - a size: one independently testable behaviour
-    ([PROP-0022 task sizing](0022-lean-core.md#task-sizing)).
-- `check:1` is code, not a model. It refuses a plan when:
-  - a dependency forms a cycle;
-  - a criterion names no command;
-  - two tasks with no dependency path between them write one path;
-  - a task is over the size heuristic.
-- A refused plan returns once to `plan:1` with the reasons.
-- `file:1` files the tasks as `proposed` in one batch. The lead accepts the batch with one decision.
-
-A `tests` task can be written from a code task's criteria at the same time as the code (test
-first), on a Codex or Antigravity writer. A `docs` task depends on its code task.
-
-**Switch.** The template's row (`profile-software-development.templates`). **Measure.** Tasks per
-goal, their sizes, attempts per accepted result (2.47 today), created-to-landed time (goal 4).
+**Switch.** The profile's row; the tool is the board's. **Measure.** Tasks per goal, their sizes,
+attempts per accepted result (2.47 today), created-to-landed time (goal 4).
 
 ### 6. More work runs at once
 
@@ -263,7 +263,7 @@ Each step is measured over a week of self-build before the next.
 
 1. May the System repository's diffs go to website Workers as `operator-shared`? The repository is
    public.
-2. Should decomposed tasks be filed `proposed` (one batch decision), or `ready` when `check:1`
-   passes?
+2. Should a filed plan's tasks wait for the policy's verdict as any proposal does (today), or
+   should one approval cover the whole plan?
 3. Are the team's pilot values (50 k ceiling, 6 USD an attempt, turn caps 16, 8, 12) the right starting
    points?
