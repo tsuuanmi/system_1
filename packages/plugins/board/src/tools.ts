@@ -16,9 +16,9 @@ import { BoardError, type BoardTask, type Breaker, type CharterInput, type Claim
 import { outline, reply, type ToolContext, type ToolHandler, type ToolScope, type ToolSpec } from '@tsuuanmi/system-gateway-core'
 import { clampText, SchemaRegistry } from '@tsuuanmi/system-libs'
 import { z as zod } from 'zod'
-import type { Chartered, Checked, Closed, Renewed, StoreBoard } from './index.ts'
+import type { Chartered, Checked, Closed, PlanItem, PlannedTask, Renewed, StoreBoard } from './index.ts'
 
-export const BOARD_TOOLS = ['board_projects', 'board_charter', 'board_brief', 'board_tasks', 'board_task', 'board_propose', 'board_claim', 'board_update', 'board_cancel', 'board_pause', 'board_resume', 'board_close', 'board_escape', 'board_breakers', 'board_breaker_reset', 'board_reopen_review', 'board_defect'] as const
+export const BOARD_TOOLS = ['board_projects', 'board_charter', 'board_brief', 'board_tasks', 'board_task', 'board_propose', 'board_claim', 'board_update', 'board_cancel', 'board_pause', 'board_resume', 'board_close', 'board_escape', 'board_breakers', 'board_breaker_reset', 'board_reopen_review', 'board_defect', 'board_propose_plan'] as const
 type BoardTool = typeof BOARD_TOOLS[number]
 
 /**
@@ -28,12 +28,12 @@ type BoardTool = typeof BOARD_TOOLS[number]
 const SCOPES: Record<BoardTool, ToolScope> = {
   board_projects: 'client', board_charter: 'client', board_brief: 'client', board_tasks: 'client', board_task: 'client', board_propose: 'client', board_claim: 'client',
   board_update: 'client', board_cancel: 'client', board_pause: 'operator', board_resume: 'operator', board_close: 'operator',
-  board_escape: 'client', board_breakers: 'client', board_breaker_reset: 'client', board_reopen_review: 'client', board_defect: 'client',
+  board_escape: 'client', board_breakers: 'client', board_breaker_reset: 'client', board_reopen_review: 'client', board_defect: 'client', board_propose_plan: 'client',
 }
 
 const schemas = new SchemaRegistry()
-/** The tools' schema: 1.1 adds the operator's project moves, 1.2 `board_propose`'s `maxAttempts`, 1.3 the circuit breaker's tools, 1.4 `board_reopen_review`, 1.5 the `defect` link (`board_propose`'s `fixes`, `board_defect`). */
-const MCP_BOARD = 'mcp-board@1.5'
+/** The tools' schema: 1.1 adds the operator's project moves, 1.2 `board_propose`'s `maxAttempts`, 1.3 the circuit breaker's tools, 1.4 `board_reopen_review`, 1.5 the `defect` link (`board_propose`'s `fixes`, `board_defect`), 1.6 `board_propose_plan`. */
+const MCP_BOARD = 'mcp-board@1.6'
 /** The `$defs` name of a tool's input or output: underscores written as hyphens. */
 const defOf = (tool: BoardTool, part: 'input' | 'output'): string => `${tool.replaceAll('_', '-')}-${part}`
 
@@ -66,6 +66,14 @@ const milestone = () => zod.strictObject({
   id: id(), title: zod.string().min(1).max(200), criteria: zod.array(id()).max(32).optional(), state: zod.enum(['planned', 'funded', 'done', 'dropped']),
   due: timestamp().optional(), budget: zod.array(budgetLine()).max(16).optional(), funding: artifactRef().optional(),
 })
+/** What a task's proposal holds beside its project and dependencies: `board_propose`'s, and each item of `board_propose_plan`. */
+const proposal = (dependsOn: zod.ZodOptional<zod.ZodArray<zod.ZodString>>) => ({
+  title: zod.string().min(1).max(200), goal: zod.string().min(1).max(4000),
+  acceptance: zod.array(zod.strictObject({ id: id(), statement: shortText(), check: zod.enum(['tests', 'typecheck', 'lint', 'schema', 'quote-check', 'review', 'operator']).optional() })).min(1).max(32),
+  dependsOn, actionClass: actionClass(), milestone: id().optional(), template: id().optional(),
+  writes: subject().optional(), budget: zod.array(budgetLine()).max(16).optional(),
+  maxAttempts: zod.number().int().min(1).max(10).optional().describe('Attempts the task gets (default: the board\'s for its template, else its maxAttempts, 3); each run that serves it is one, a rejected review included'),
+})
 const page = { limit: zod.number().int().min(1).max(100).optional().describe('Page size (default 20)'), after: zod.string().min(1).max(200).optional().describe('The `next` cursor of the previous page') }
 const generation = () => zod.number().int().min(1).describe('The lease generation the caller holds (a fence, INV-4)')
 
@@ -81,11 +89,7 @@ export const INPUTS: Record<BoardTool, ToolSpec['inputSchema']> = {
   board_tasks: { projectId: id(), states: zod.array(taskState()).min(1).max(9).optional(), milestone: id().optional(), ...page },
   board_task: { taskId: id() },
   board_propose: {
-    projectId: id(), title: zod.string().min(1).max(200), goal: zod.string().min(1).max(4000),
-    acceptance: zod.array(zod.strictObject({ id: id(), statement: shortText(), check: zod.enum(['tests', 'typecheck', 'lint', 'schema', 'quote-check', 'review', 'operator']).optional() })).min(1).max(32),
-    dependsOn: zod.array(id()).max(64).optional(), actionClass: actionClass(), milestone: id().optional(), template: id().optional(),
-    writes: subject().optional(), budget: zod.array(budgetLine()).max(16).optional(),
-    maxAttempts: zod.number().int().min(1).max(10).optional().describe('Attempts the task gets (default: the board\'s for its template, else its maxAttempts, 3); each run that serves it is one, a rejected review included'),
+    projectId: id(), ...proposal(zod.array(id()).max(64).optional()),
     fixes: zod.strictObject({ taskId: id().describe('The done task whose landed change held the defect'), sha: sha().describe('The landing sha of that change') }).optional()
       .describe('The defect this task fixes: system metrics counts the task fixed as an escaped defect'),
     clientRequestId: zod.string().min(1).max(200).optional().describe('Retry-safe request key'),
@@ -116,6 +120,14 @@ export const INPUTS: Record<BoardTool, ToolSpec['inputSchema']> = {
     sha: sha().describe('The landing sha of that change'),
     as: zod.enum(['lead', 'reviewer']).optional().describe('Who sets it (default the lead); the operator\'s token always sets it as the operator'),
   },
+  board_propose_plan: {
+    projectId: id(),
+    tasks: zod.array(zod.strictObject({
+      key: id().describe('The item\'s name in the plan, unique in it; other items depend on it by this key'),
+      ...proposal(zod.array(id()).max(64).optional().describe('Keys of other items of the plan, or ids of the project\'s tasks')),
+    })).min(1).max(32),
+    clientRequestId: zod.string().min(1).max(200).optional().describe('Retry-safe request key: a retry returns the tasks the first call proposed'),
+  },
 }
 
 const DESCRIPTIONS: Record<BoardTool, string> = {
@@ -133,6 +145,7 @@ const DESCRIPTIONS: Record<BoardTool, string> = {
   board_close: 'Close an active or paused project as achieved or stopped; refused while one of its tasks runs or is in review. Its open tasks are cancelled (project-closed), the approval requests they and a pending amendment waited on are withdrawn, and the project takes no task again. Recorded as a board decision.',
   board_escape: 'Record a defect found after a result the auto-accept rule accepted (a done task whose last decision is rule board.auto-accept), once per task, as the caller (the operator, else the lead). At the line (board.autoAccept.breaker, default 2 escapes in 7 days) for the result\'s project and landing branch, auto-accept turns off for them: a board decision names every escape counted, and results are held for the operator until the operator or the lead turns it on again with board_breaker_reset. system metrics reads the escapes as escaped defects.',
   board_breakers: 'List where the auto-accept circuit breaker turned auto-accept off: per project and landing branch, the escapes it counted, its decision, and whether the line holds now (fewer escapes than the line in its window). A breaker never resets by itself.',
+  board_propose_plan: 'Propose a plan of tasks at once, such as a decompose run\'s answer: every task or none. Each item has a key; its dependsOn names other items by key, or the project\'s tasks by id. A cycle, a dependency on a key the plan does not have, or two items writing one subject is refused, and nothing is proposed. Each task is then proposed as board_propose proposes one.',
   board_defect: 'Record that a task fixes a defect of a done task\'s landed change (`fixes` and its landing `sha`), once per task, when the fix task was not filed with `fixes`: set by the lead (or the reviewer, with as: reviewer), or by the operator. No state moves. system metrics counts the tasks fixed as escaped defects per 100 landed.',
   board_breaker_reset: 'Turn auto-accept on again for a project and landing branch whose breaker tripped, as the caller (the operator, else the lead): only once the line holds (fewer escapes than the line within its window now), refused otherwise. Recorded as a board decision naming the trip\'s.',
   board_reopen_review: 'Bring a task that waits for input as review-expired back to review, held for the operator for the policy\'s wait, as the caller (the operator, else the lead, for its own project). Only while the task has its result and its run\'s worktree is still recorded and on disk (refused otherwise). Recorded as a board decision; no attempt is counted.',
@@ -344,6 +357,15 @@ function handlers(board: StoreBoard, options: { leaseTtlSeconds: number }): Reco
       const { scope } = context
       const by = scope === 'operator' ? 'operator' as const : args.as === 'reviewer' ? 'reviewer' as const : 'lead' as const
       return moved(await board.linkDefect(String(args.taskId), { fixes: String(args.fixes), sha: String(args.sha), by }, new Date(), sees(check, moved)))
+    },
+    board_propose_plan: async (args, context, check) => {
+      const { projectId, tasks, clientRequestId } = args as unknown as { projectId: string; tasks: PlanItem[]; clientRequestId?: string }
+      ownProject(context, projectId)
+      // A lead's plan depends on its own project's tasks only; a key of the plan is no task.
+      const keys = new Set(tasks.map((t) => t.key))
+      for (const dependency of new Set(tasks.flatMap((t) => t.dependsOn ?? []))) if (!keys.has(dependency)) await ownTask(context, dependency)
+      const out = (planned: PlannedTask[]) => ({ tasks: planned.map(({ key, task }) => ({ key, ...moved(task) })) })
+      return out(board.proposePlan(projectId, tasks, new Date(), clientRequestId, sees(check, out)))
     },
   }
 

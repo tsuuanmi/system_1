@@ -11,6 +11,7 @@ import Store from '@tsuuanmi/system-store'
 import WorkerSessions from '@tsuuanmi/system-worker-sessions'
 import WorkerRouter from '@tsuuanmi/system-workers'
 import Workflow, { type NodeTemplate } from '@tsuuanmi/system-workflow'
+import { SchemaRegistry } from '@tsuuanmi/system-libs'
 import { describe, expect, it, onTestFinished } from 'vitest'
 import * as SoftwareDevelopment from '../src/index.ts'
 
@@ -30,6 +31,7 @@ async function boot() {
 const { profileConformance } = await import('../../workflow/conformance/profiles.ts')
 profileConformance('software-development', async () => ({ ctx: await boot(), dispose: async () => undefined }), SoftwareDevelopment, {
   'agent-review': SoftwareDevelopment.AGENT_REVIEW, 'algorithm-development': SoftwareDevelopment.ALGORITHM_DEVELOPMENT, 'scheduled-review': SoftwareDevelopment.SCHEDULED_REVIEW_TEMPLATE,
+  decompose: SoftwareDevelopment.DECOMPOSE,
 })
 
 describe('the profiles seam (REQ-WF-9)', () => {
@@ -168,5 +170,22 @@ describe('the kind of work each step of algorithm-development names (ADR-0057)',
     const ctx = await boot()
     await expect(ctx.plugin(SoftwareDevelopment, { kinds: { validation: 'validation' } } as never)).rejects.toThrow(/kinds\.validation is not a step/)
     expect(ctx.workflow.templateNames()).not.toContain('algorithm-development')
+  })
+})
+
+describe('the decompose template (PROP-0023 change 5)', () => {
+  it('is one step that only reasons, so a website Worker takes it first, and never reads the machine\'s data', () => {
+    expect(SoftwareDevelopment.DECOMPOSE).toHaveLength(1)
+    const plan = SoftwareDevelopment.DECOMPOSE[0]!
+    expect(plan).toMatchObject({ nodeId: 'plan:1', capabilities: ['reason'], conversation: 'temporary', acceptance: 'acceptance.answer' })
+    expect(plan.capabilities).not.toContain('local-data')
+    expect(plan.prompt).toContain('{{input}}')
+  })
+
+  it('asks for the board_propose_plan input, and the shape its prompt shows is one that tool takes', () => {
+    const prompt = SoftwareDevelopment.DECOMPOSE[0]!.prompt
+    expect(prompt).toMatch(/board_propose_plan/)
+    const shown = JSON.parse(prompt.split('\n').find((line) => line.startsWith('{"tasks"'))!) as Record<string, unknown>
+    new SchemaRegistry().assertDef('mcp-board@1.6', 'board-propose-plan-input', { projectId: 'system', ...shown })
   })
 })

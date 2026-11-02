@@ -2032,3 +2032,82 @@ describe('ctx.board (store-backed): the TASKS.md projection', () => {
     expect(await failureOf(b.board().tasksMarkdown('nope'))).toBe('unknown-project')
   })
 })
+
+describe('ctx.board (store-backed): a plan of tasks (board_propose_plan, PROP-0023 change 5)', () => {
+  const item = (key: string, extra: Record<string, unknown> = {}) => ({ key, title: `do ${key}`, goal: `do ${key}`, acceptance: [{ id: 'a1', statement: 'tests pass', check: 'tests' }], actionClass: 'read', ...extra })
+  type Reply = { isError?: boolean; content: Array<{ text: string }>; structuredContent?: { tasks: Array<{ key: string; taskId: string; state: string; revision: number }> } }
+  const plan = (b: Booted, args: Record<string, unknown>, context: Record<string, unknown> = { scope: 'client' }) =>
+    b.mcp().tools.get('board_propose_plan')!.handler({ projectId: 'p2', ...args }, context as never) as unknown as Promise<Reply>
+
+  it('proposes every task of the plan in dependency order, each key\'s dependents depending on the task proposed for it, and its output valid against mcp-board 1.6', async () => {
+    const b = await boot()
+    await active(b.ctx)
+    const before = await ready(b.ctx, task('p2', 'existing'))
+    // Listed before what it depends on: the board proposes the dependency first all the same.
+    const reply = await plan(b, { tasks: [item('docs', { dependsOn: ['code'] }), item('code', { dependsOn: ['tests', before.taskId] }), item('tests')] })
+    expect(reply.isError, reply.content[0]?.text).toBeFalsy()
+    schemas.assertDef('mcp-board@1.6', 'board-propose-plan-output', reply.structuredContent)
+    const out = reply.structuredContent!.tasks
+    // The output is in the plan's own order.
+    expect(out.map((t) => t.key)).toEqual(['docs', 'code', 'tests'])
+    expect(out.every((t) => t.state === 'proposed' && t.revision === 0)).toBe(true)
+    const id = Object.fromEntries(out.map((t) => [t.key, t.taskId]))
+    expect((await b.ctx.board.task(id.docs!))!.dependsOn).toEqual([id.code])
+    expect((await b.ctx.board.task(id.code!))!.dependsOn).toEqual([id.tests, before.taskId])
+    expect((await b.ctx.board.task(id.tests!))!.dependsOn).toEqual([])
+    // The board's own gate takes them as it takes any proposal: only the one with nothing left to wait for is ready.
+    await b.ctx.board.sweep(at(3))
+    expect((await b.ctx.board.task(id.tests!))!.state).toBe('ready')
+    expect((await b.ctx.board.task(id.code!))!.state).toBe('proposed')
+  })
+
+  it('refuses a cycle, a key named twice, an unknown dependency, two items writing one subject, or an empty plan, and proposes none of it', async () => {
+    const b = await boot()
+    await active(b.ctx)
+    const refusals: Array<[unknown[], RegExp]> = [
+      [[item('a', { dependsOn: ['b'] }), item('b', { dependsOn: ['c'] }), item('c', { dependsOn: ['a'] })], /^invalid: the plan's dependencies form a cycle: a -> b -> c -> a/],
+      [[item('a'), item('a')], /^invalid: the plan names key a twice/],
+      [[item('a'), item('b', { dependsOn: ['task-unknown'] })], /^invalid: dependency task-unknown is not a task of p2/],
+      [[item('a', { writes: HEAD }), item('b', { writes: HEAD })], /^conflict: plan items a and b both write git-head:HEAD \(INV-15\)/],
+      [[], /^invalid input, nothing done/],
+    ]
+    for (const [tasks, why] of refusals) {
+      const reply = await plan(b, { tasks })
+      expect(reply.isError, String(why)).toBe(true)
+      expect(reply.content[0]!.text).toMatch(why)
+    }
+    // The item proposed before the unknown dependency was refused is not on the board either.
+    expect(await b.ctx.board.tasks({ projectId: 'p2' })).toEqual([])
+  })
+
+  it('is retry-safe under clientRequestId: a retry returns the tasks the first call proposed, and proposes no more', async () => {
+    const b = await boot()
+    await active(b.ctx)
+    const args = { tasks: [item('a'), item('b', { dependsOn: ['a'] })], clientRequestId: 'plan-1' }
+    const first = await plan(b, args)
+    const again = await plan(b, args)
+    expect(again.structuredContent).toEqual(first.structuredContent)
+    expect(await b.ctx.board.tasks({ projectId: 'p2' })).toHaveLength(2)
+  })
+
+  it('holds a lead token to its own project: a plan of another project, or one depending on another project\'s task, is refused whole (T285)', async () => {
+    const b = await boot()
+    await active(b.ctx, 'p2')
+    await active(b.ctx, 'p3')
+    const theirs = await ready(b.ctx, task('p3', 'theirs'))
+    const lead = { scope: 'client', lead: 'p2' }
+    expect((await plan(b, { projectId: 'p3', tasks: [item('a')] }, lead)).content[0]!.text).toMatch(/the lead token of project p2 reaches only project p2/)
+    expect((await plan(b, { tasks: [item('a', { dependsOn: [theirs.taskId] })] }, lead)).content[0]!.text).toMatch(/belongs to project p3, so nothing was done/)
+    // A key of its own plan is no task of another project.
+    expect((await plan(b, { tasks: [item('a'), item('b', { dependsOn: ['a'] })] }, lead)).isError).toBeFalsy()
+    expect((await b.ctx.board.tasks({ projectId: 'p3' })).map((t) => t.title)).toEqual(['theirs'])
+  })
+
+  it('validates its schema example, and its input shape matches the schema', () => {
+    const ex = example('mcp-board.propose-plan')
+    schemas.assertDef('mcp-board@1.6', 'board-propose-plan-input', ex.input)
+    schemas.assertDef('mcp-board@1.6', 'board-propose-plan-output', ex.output)
+    expect(zod.object(INPUTS.board_propose_plan).safeParse(ex.input).success).toBe(true)
+    expect(zod.object(INPUTS.board_propose_plan).safeParse({ ...ex.input, tasks: [{ ...ex.input.tasks[0], fixes: { taskId: 't', sha: 'a'.repeat(40) } }] }).success).toBe(false)
+  })
+})

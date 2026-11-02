@@ -143,7 +143,7 @@ charters, and their tasks.
   at client scope, the lead's; `board_pause`, `board_resume`, and `board_close` at operator scope
   ([the operator's project moves](../../../docs/design/board.md#the-operators-project-moves)).
   Each input and structured output is validated against
-  [`schemas/mcp-board.v1.json`](../../../schemas/mcp-board.v1.json) (1.5) `$defs/<tool>-input` and
+  [`schemas/mcp-board.v1.json`](../../../schemas/mcp-board.v1.json) (1.6) `$defs/<tool>-input` and
   `-output`; a refused input does nothing, a refusal is an MCP error naming the `BoardError`. A
   tool that changes the board checks the output it would give inside the move's transaction,
   before it commits (each such method takes an optional `check`), so an output its schema refuses
@@ -163,6 +163,10 @@ charters, and their tasks.
     filed or later, once, by the lead (`as: reviewer` for the reviewer) or the operator, and counted by
     `system metrics` as an escaped defect ([runbook](../../../docs/operations/runbooks.md#link-a-defect));
     a lead token reaches its own project's tasks only (T285), as for every board tool;
+  - `board_propose_plan` (`mcp-board` 1.6, PROP-0023 change 5): a plan's tasks, every one or none, in
+    one transaction; each item names a `key`, and its `dependsOn` names other items by key or the
+    project's tasks by id; a cycle, a key named twice, or two items writing one subject is refused
+    before anything is stored ([a plan of tasks](../../../docs/design/board.md#a-plan-of-tasks));
   - `board_propose` takes the attempts the task gets (`maxAttempts`, 1 to 10, `mcp-board` 1.2);
     without it, the task gets the configuration's `templateAttempts` for its template, else
     `maxAttempts` (3) ([attempts](../../../docs/design/board.md#attempts));

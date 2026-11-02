@@ -421,6 +421,18 @@ Scope: `client`
 | `maxAttempts` | integer |  | Attempts the task gets (default: the board's for its template, else its maxAttempts, 3); each run that serves it is one, a rejected review included |
 | `clientRequestId` | string |  | Retry-safe request key |
 
+## `board_propose_plan`
+
+Propose a plan of tasks at once, such as a decompose run's answer: every task or none. Each item has a key; its dependsOn names other items by key, or the project's tasks by id. A cycle, a dependency on a key the plan does not have, or two items writing one subject is refused, and nothing is proposed. Each task is then proposed as board_propose proposes one.
+
+Scope: `client`
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `projectId` | string | yes |  |
+| `tasks` | array | yes |  |
+| `clientRequestId` | string |  | Retry-safe request key: a retry returns the tasks the first call proposed |
+
 ## `board_reopen_review`
 
 Bring a task that waits for input as review-expired back to review, held for the operator for the policy's wait, as the caller (the operator, else the lead, for its own project). Only while the task has its result and its run's worktree is still recorded and on disk (refused otherwise). Recorded as a board decision; no attempt is counted.

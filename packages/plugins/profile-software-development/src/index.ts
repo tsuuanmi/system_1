@@ -265,10 +265,44 @@ export const SCHEDULED_REVIEW_TEMPLATE: NodeTemplate[] = SCHEDULED_REVIEW_NODES
 /** `algorithm-development` with the shipped kinds. */
 export const ALGORITHM_DEVELOPMENT: NodeTemplate[] = algorithmDevelopment()
 
+/**
+ * What `plan:1` of `decompose` answers: a plan the lead files with `board_propose_plan`, which checks
+ * it (a cycle, a key named twice, two tasks writing one subject) and proposes every task or none.
+ */
+const DECOMPOSE_PROMPT = [
+  'Split the goal below into small board tasks that can run in parallel where they do not depend on each other.',
+  '',
+  '{{input}}',
+  '',
+  'Rules for the plan:',
+  '- Each task is one independently testable behaviour, finished in one short attempt (about 15 minutes of an agent\'s work). Split a task whose criteria need new behaviour in more than one test file.',
+  '- Each task has acceptance criteria a command can check: name the check (tests, typecheck, lint, schema, or review for documentation).',
+  '- A task depends on another only when it needs that task\'s change; tasks that change different files depend on nothing and run at once.',
+  '- Put tests for a change of behaviour in the code task itself (it works test-first), and a documentation change in a task of its own that depends on the code task.',
+  '- Name what you do not know as a question in the goal of the task that needs it; never invent a file, function, or command you were not shown.',
+  '',
+  'End your answer with one JSON object, and nothing after it, of this shape (the board_propose_plan input without projectId):',
+  '{"tasks": [{"key": "short-name", "title": "...", "goal": "...", "acceptance": [{"id": "a1", "statement": "...", "check": "tests"}], "dependsOn": ["other-key"], "actionClass": "workspace-write", "template": "algorithm-development"}]}',
+  'Keys are letters, digits, dots, hyphens, or underscores; at most 32 tasks.',
+].join('\n')
+
+/**
+ * A goal split into small tasks (PROP-0023 change 5): one step on a Worker that reasons, a website
+ * Worker first by the router's quota-class order, which proposes the plan. It advises: the lead reads
+ * it and files it with `board_propose_plan`, which checks it and proposes every task or none.
+ */
+export const DECOMPOSE: NodeTemplate[] = [
+  {
+    nodeId: 'plan:1', objective: 'Split the goal into small, independently testable board tasks with their dependencies', prompt: DECOMPOSE_PROMPT,
+    capabilities: ['reason'], tier: 'standard', conversation: 'temporary', acceptance: 'acceptance.answer',
+  },
+]
+
 export function apply(ctx: Context, config: Config = {}): void {
   const problems = checkConfig(config)
   if (problems.length) throw new Error(`profile-software-development: ${problems.join('; ')}`)
   ctx.effect(() => ctx.workflow.template('agent-review', AGENT_REVIEW, { version: VERSION }))
   ctx.effect(() => ctx.workflow.template('algorithm-development', algorithmDevelopment(config.kinds, config.pipeline), { version: templateVersion(config.pipeline) }))
   ctx.effect(() => ctx.workflow.template(SCHEDULED_REVIEW, SCHEDULED_REVIEW_TEMPLATE, { version: VERSION }))
+  ctx.effect(() => ctx.workflow.template('decompose', DECOMPOSE, { version: VERSION }))
 }

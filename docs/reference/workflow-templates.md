@@ -380,6 +380,26 @@ on a writing Worker (a `workspace-write` sandbox) only. No such file committed, 
 applies, is no section; a review member's empty workspace holds no repository, so it has none. The
 lead or a review adds a lesson by committing a line to that file; nothing else changes.
 
+### `decompose`
+
+Provided by
+[`profile-software-development`](../../packages/plugins/profile-software-development/README.md)
+([PROP-0023](../proposals/0023-worker-roles-and-token-budget.md) change 5). It splits a goal into
+small board tasks that can run in parallel, and only advises: the lead reads the plan and files it
+with `board_propose_plan`, which checks it and proposes every task or none
+([a plan of tasks](../design/board.md#a-plan-of-tasks)).
+
+| Node | Capabilities | Tier | Conversation | Acceptance |
+|---|---|---|---|---|
+| `plan:1` | `reason` | standard | temporary | `acceptance.answer` |
+
+`plan:1` reads the caller's input: the goal, and what the planner should see of the repository (a
+file map, the charter's criteria). It needs `reason` only, so the router's quota-class order gives
+it to a website Worker first; it never needs `local-data`. Its answer ends with one JSON object,
+the `board_propose_plan` input without `projectId`. Each task is one independently testable
+behaviour with criteria a check names; a task depends on another only when it needs that change,
+so tasks on different files run at once.
+
 ## Removed templates
 
 PROP-0004 removed `investigate`, `deep-research`, `develop`, and `panel`, and replaced

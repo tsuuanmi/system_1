@@ -98,6 +98,50 @@ const checkedBy = <T>(check: Checked<T> | undefined, value: T): T => {
   return value
 }
 
+/** One task of a plan (`board_propose_plan`): a task's proposal, named in the plan by `key`, its `dependsOn` items' keys or the project's task ids. */
+export type PlanItem = Omit<TaskInput, 'projectId' | 'fixes'> & { key: string }
+/** A plan's item and the task proposed for it. */
+export interface PlannedTask { key: string; task: BoardTask }
+/** Items a plan holds at most. */
+export const PLAN_ITEMS = 32
+
+/**
+ * The order a plan's items are proposed in, each after the items it depends on; `invalid` for an
+ * empty or oversized plan, a key named twice, or a cycle among the items, and `conflict` for two
+ * items that write one subject (INV-15). A dependency that is not one of the plan's keys is left
+ * for {@link StoreBoard.proposeTask} to resolve as a task id of the project.
+ */
+export function planOrder(items: readonly PlanItem[]): PlanItem[] {
+  if (items.length < 1 || items.length > PLAN_ITEMS) throw new BoardError('invalid', `a plan holds 1 to ${PLAN_ITEMS} tasks`)
+  const byKey = new Map<string, PlanItem>()
+  const writers = new Map<string, string>()
+  for (const item of items) {
+    if (byKey.has(item.key)) throw new BoardError('invalid', `the plan names key ${item.key} twice`)
+    byKey.set(item.key, item)
+    if (item.writes) {
+      const subject = `${item.writes.type}:${item.writes.ref}`
+      const other = writers.get(subject)
+      if (other !== undefined) throw new BoardError('conflict', `plan items ${other} and ${item.key} both write ${subject} (INV-15): one task at a time writes a subject`)
+      writers.set(subject, item.key)
+    }
+  }
+  const order: PlanItem[] = []
+  const state = new Map<string, 'visiting' | 'done'>()
+  const visit = (item: PlanItem, path: string[]): void => {
+    if (state.get(item.key) === 'done') return
+    if (state.get(item.key) === 'visiting') throw new BoardError('invalid', `the plan's dependencies form a cycle: ${[...path, item.key].join(' -> ')}`)
+    state.set(item.key, 'visiting')
+    for (const dep of item.dependsOn ?? []) {
+      const on = byKey.get(dep)
+      if (on) visit(on, [...path, item.key])
+    }
+    state.set(item.key, 'done')
+    order.push(item)
+  }
+  for (const item of items) visit(item, [])
+  return order
+}
+
 export const TASK_STATES: readonly TaskState[] = ['proposed', 'ready', 'claimed', 'running', 'review', 'waiting-for-input', 'waiting-for-approval', 'done', 'cancelled']
 const OPEN: readonly TaskState[] = TASK_STATES.filter((s) => !TERMINAL.includes(s))
 const CANCELLABLE: readonly TaskState[] = ['proposed', 'ready', 'claimed', 'waiting-for-input', 'waiting-for-approval']
@@ -692,6 +736,27 @@ export class StoreBoard extends Board {
         .run(task.taskId, task.projectId, task.state, task.createdAt, task.revision, JSON.stringify(task), writes)
       if (clientRequestId !== undefined) this.recordRequest(clientRequestId, 'board_propose', task.projectId, task.taskId, undefined, at)
       return checkedBy(check, task)
+    })
+  }
+
+  /**
+   * Propose a plan's tasks together (`board_propose_plan`): every task, or none. The items are
+   * proposed in dependency order ({@link planOrder}) through {@link proposeTask}, in one store
+   * transaction, each `dependsOn` key replaced by the id of the task proposed for it, so a refusal of
+   * any one stores none. Retry-safe under `clientRequestId`: each item's proposal is recorded under
+   * `<clientRequestId>#<key>`, so a retry returns the tasks it made.
+   */
+  proposePlan(projectId: string, items: readonly PlanItem[], at: Date = new Date(), clientRequestId?: string, check?: Checked<PlannedTask[]>): PlannedTask[] {
+    const order = planOrder(items)
+    return this.ctx.store.transaction(() => {
+      const ids = new Map<string, string>()
+      for (const { key, dependsOn, ...rest } of order) {
+        const task = this.proposeTask({ ...rest, projectId, dependsOn: (dependsOn ?? []).map((d) => ids.get(d) ?? d) }, at,
+          clientRequestId === undefined ? undefined : `${clientRequestId}#${key}`)
+        ids.set(key, task.taskId)
+      }
+      // In the plan's own order, so a reader matches the tasks to its items by position too.
+      return checkedBy(check, items.map((i) => ({ key: i.key, task: this.taskOf(ids.get(i.key)!).task })))
     })
   }
 

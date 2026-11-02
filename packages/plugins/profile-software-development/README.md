@@ -1,6 +1,6 @@
 # @tsuuanmi/system-profile-software-development
 
-The **software-development profile**: templates for local agent Workers,
+The **software-development profile**: templates for local agent Workers (and `decompose`, for any Worker that reasons),
 contributed to the workflow engine with `ctx.workflow.template` (REQ-WF-9). It
 holds no engine code and no rules of its own.
 
@@ -8,6 +8,11 @@ holds no engine code and no rules of its own.
   `local-data`, at the caller's tier and in the caller's session. Only a
   read-only local agent Worker proves both, so it never routes to a website
   account ([nodes](../../../docs/reference/workflow-templates.md#agent-review)).
+- **`decompose`** (PROP-0023 change 5) is one node, `plan:1`, requiring `reason` only, so a
+  website Worker takes it first: it splits a goal into small, independently testable board tasks
+  with their dependencies, and ends with the `board_propose_plan` input. It advises; the lead files
+  the plan with that tool, which checks it and proposes every task or none
+  ([nodes](../../../docs/reference/workflow-templates.md#decompose)).
 - **`scheduled-review`** (T290, D93 item 8) is the review the workflow engine's own scheduler runs
   once a day over one area of a repository, read whole at the tip of its branch: `review:1` at the
   frontier tier, and `verify:1`, a second reviewer that prefers another family, voting on each

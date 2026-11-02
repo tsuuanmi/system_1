@@ -68,7 +68,7 @@ result, `reconcileRun`) belong to the run that serves the attempt: the
 has one writer ([INV-15](../architecture/invariants.md#inv-15-one-writer-per-subject)). A lead
 takes a task with `board_claim` and hands that claim to the run; no MCP tool makes those moves.
 
-A `board_*` tool that changes the board (`board_charter`, `board_propose`, `board_claim`,
+A `board_*` tool that changes the board (`board_charter`, `board_propose`, `board_propose_plan`, `board_claim`,
 `board_update`, `board_cancel`, and the operator's moves) checks the output it would give inside
 the move's store transaction, before it commits: an output its schema refuses (a defect) is
 refused with nothing moved, decided, or withdrawn, and a request the move opened on the queue is
@@ -570,6 +570,29 @@ D82 #3): its owner reports it failed with `infrastructure`, a kind and a reason
   as before; so does a run the operator stopped, even before anything of it was sent (its owner
   never reports a stop as the infrastructure's). A malformed `infrastructure` (another kind, a reason that is empty or over 500
   characters, any other field) is `invalid`, and nothing moves.
+
+### A plan of tasks
+
+> From [PROP-0023](../proposals/0023-worker-roles-and-token-budget.md) change 5 (draft).
+
+`board_propose_plan` (`mcp-board` 1.6) proposes a plan's tasks together, such as the answer of a
+`decompose` run: a lead or a planner splits a goal into small tasks, and the board files all of
+them or none.
+
+- **Items.** Each item is a task's proposal (as `board_propose` takes one, without `fixes`) with a
+  `key`, unique in the plan. Its `dependsOn` names other items by key, or the project's tasks by id.
+- **Refused before anything is stored.** A plan of no item or more than 32, a key named twice, a
+  cycle among the items (`invalid`), or two items that write one subject (`conflict`,
+  [INV-15](../architecture/invariants.md#inv-15-one-writer-per-subject)).
+- **One transaction.** The items are proposed in dependency order, each through the same move as
+  `board_propose`, with each key replaced by the id of the task proposed for it. Any refusal (an
+  unknown dependency, a subject an open task already writes, a closed project) rolls the whole plan
+  back.
+- **Retry-safe** under `clientRequestId`: each item's proposal is recorded as
+  `<clientRequestId>#<key>`, so a retry returns the tasks the first call proposed.
+- **Nothing else changes.** Each task is `proposed`, and the board's sweep takes it as it takes any
+  proposal: ready once its dependencies are done and the policy allows its action class. A lead
+  token reaches its own project only (T285).
 
 ### The defect link
 
