@@ -538,6 +538,7 @@ export class TaskRuns {
     let fresh: string | undefined
     let handle: string | undefined
     if (!nodes.some((n) => n.session.persist)) fresh = `template ${template} keeps no conversation across its steps, so there is no session to resume`
+    else if (previous.via === 'attempt' && this.e.config.resumeAcrossAttempts === false) fresh = `workflow.resumeAcrossAttempts is off: attempt ${task.attempts.count + 1} starts a fresh session from its brief and the task's dossier, not ${what}'s transcript (T369)`
     else {
       handle = workers.handle(previous.sessionId)
       const bound = workers.affinity(previous.sessionId) ?? []

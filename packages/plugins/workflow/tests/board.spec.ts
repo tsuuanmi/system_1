@@ -1174,6 +1174,37 @@ describe('ctx.workflow serves board tasks over the store-backed board and approv
     expect(workers.started).toHaveLength(1)
   })
 
+  it('starts a task\'s next attempt in a fresh session when workflow.resumeAcrossAttempts is off, and resumes it by default (T369)', async () => {
+    const at = '2026-10-23T00:00:00Z'
+    const keeper = () => worker('w:keeper', {
+      schema: 'capability-descriptor@1.4', tier: 'standard',
+      capabilities: [{ capability: 'reason', evidence: { kind: 'conformance', at } }, { capability: 'persistent-conversation', evidence: { kind: 'conformance', at } }],
+    })
+    const twoAttempts = async (resumeAcrossAttempts?: boolean) => {
+      const { ctx, workers } = await boot({ workflow: { ...(resumeAcrossAttempts !== undefined ? { resumeAcrossAttempts } : {}) } })
+      workers.extra = [keeper()]
+      await project(ctx)
+      const attempt = async (task: BoardTask): Promise<RunView> => {
+        const run = await ctx.workflow.start({ template: 'kept', input: 'q', classification: 'public', task: { taskId: task.taskId } })
+        await settled(ctx, run.runId)
+        return reported(ctx, run.runId)
+      }
+      workers.reply = () => ({ fail: 'invalid_input', disposition: 'NONE', sent: true })
+      const task = await ready(ctx, 'kept', { maxAttempts: 3 })
+      const first = await attempt(task)
+      await ctx.board.sweep(new Date())
+      const second = await attempt((await ctx.board.task(task.taskId))!)
+      return { first, second, decision: decisionsOf(ctx, 'admission', 'workflow.task-session')[0] }
+    }
+    const off = await twoAttempts(false)
+    expect(off.decision).toMatchObject({ outcome: { option: 'fresh' } })
+    expect(off.decision!.candidates.find((c) => c.option === 'fresh')!.reasons.join(' ')).toMatch(/workflow\.resumeAcrossAttempts is off: attempt 2 starts a fresh session/)
+    expect(off.second.sessionId).not.toBe(off.first.sessionId)
+    const on = await twoAttempts()
+    expect(on.decision!.outcome.option).not.toBe('fresh')
+    expect(on.second.sessionId).toBe(on.first.sessionId)
+  })
+
   it('resumes a task\'s session only on a conversation its Worker keeps for any work, never on one it keeps for a review member\'s steps alone (ADR-0049)', async () => {
     const { ctx, workers } = await boot()
     const at = '2026-10-23T00:00:00Z'

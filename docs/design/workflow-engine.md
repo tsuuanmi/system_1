@@ -348,6 +348,11 @@ exactly one other (a chain), resumes the session of the run before it when:
   [ADR-0056](../decisions/adr/0056-a-failed-lease-renewal-is-not-a-lost-lease-and-death-needs-a-verdict.md),
   workflow contract 1.6);
 - the session has served fewer than `maxSessionRuns` runs (default 5, INV-9).
+- for a task's next attempt (not a chain), `workflow.resumeAcrossAttempts` is on (the default).
+  Off, the attempt starts a fresh session from its brief and the task's dossier, which carry the
+  previous attempt's diff, checks, and open findings, so the next attempt does not re-read a long
+  transcript on every turn (T369, PROP-0022 change 4,
+  [token use](../research/token-use-2026-11-02.md#3-sessions-grow-and-every-resume-re-reads-them)).
 
 The run then continues that session, and the new brief is its next message, so the Worker keeps
 the context it built (an agent Worker resumes its SDK session). Otherwise the run starts a fresh

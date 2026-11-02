@@ -742,6 +742,12 @@ export interface Config {
    */
   maxSessionRuns?: number
   /**
+   * Whether a board task's next attempt resumes the session of its previous attempt (default true).
+   * False: it starts a fresh session given its brief and the task's dossier, which carry the previous
+   * attempt's diff, checks, and open findings (PROP-0022 change 4, PROP-0023; T369).
+   */
+  resumeAcrossAttempts?: boolean
+  /**
    * Digests of board task results the engine asks `ctx.digests` for in any hour, at most (default
    * 6; INV-9); 0 asks for none. Past it, a result keeps no digest, recorded with why.
    */
