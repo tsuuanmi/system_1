@@ -76,8 +76,15 @@ const LEASE_TTL_MS = 60_000
 /** How long one wait on the Worker's run lasts before the request looks at its deadline again. */
 const POLL_MS = 30_000
 const PRODUCER = { type: 'system', ref: 'digests' } as const
-/** What a digest asks of routing: a Worker that reviews a provided subject on this machine, read-only (a read-only agent Worker proves both). */
-const CAPABILITIES = ['review', 'local-data']
+/**
+ * What a digest asks of routing, in turn: `reason` only first. Its sources are placed inline in its brief and
+ * its claims are quote-checked by code, so a website Worker serves it; a local-private source still reaches
+ * only a local Worker (the router's locality and egress checks), and a brief longer than a Worker takes is not
+ * admitted there (ADR-0032). When no Worker is admitted for that, it asks for a Worker that reviews a provided
+ * subject on this machine, read-only, which a read-only agent Worker proves (it proves `reason` for
+ * review-member work only).
+ */
+const CAPABILITIES: readonly string[][] = [['reason'], ['review', 'local-data']]
 const now = (): string => new Date().toISOString()
 
 function digestView(row: DigestRow): DigestView {
@@ -311,21 +318,31 @@ export class DigestEngine {
     const { draft, inputs, extract } = prepared
     const held = extract ? { ...row, extract } : row
     const tier = row.tier ?? this.spec.tier
-    const requirement: WorkRequirement = {
-      schema: 'work-requirement@1.0', objective: this.spec.goal, capabilities: CAPABILITIES, data: { classification: row.classification, refs: sources },
+    const requirementOf = (capabilities: string[]): WorkRequirement => ({
+      schema: 'work-requirement@1.0', objective: this.spec.goal, capabilities, data: { classification: row.classification, refs: sources },
       egressPolicy: 'egress.classification-and-secrets',
       tier: row.escalation ? { min: tier, max: tier, source: 'decision', decision: row.escalation as ArtifactRef } : { min: tier, max: tier, source: 'profile' },
       acceptance: { contract: 'digests.quote-check', resultSchema: 'digest@1.0' },
-    }
+    })
     const chars = [...renderBrief({ ...draft, sandbox: NO_LOCAL_SANDBOX }, (ref) => this.ctx.artifacts.get(ref))].length
     let admitted
-    try {
-      admitted = await this.ctx.workers.route(requirement, { producer: 'digests', input: { chars } })
-    } catch (error) {
-      if (!(error instanceof AdmissionFailure)) throw error
-      this.fail(held, `no Worker can write it (a read-only Worker on the ${tier} tier): ${error.message}`, lease, [error.decision])
-      return undefined
+    let requirement = requirementOf(CAPABILITIES[0]!)
+    const refused: ArtifactRef[] = []
+    for (const capabilities of CAPABILITIES) {
+      requirement = requirementOf(capabilities)
+      try {
+        admitted = await this.ctx.workers.route(requirement, { producer: 'digests', input: { chars } })
+        break
+      } catch (error) {
+        if (!(error instanceof AdmissionFailure)) throw error
+        refused.push(error.decision)
+        if (capabilities === CAPABILITIES.at(-1)) {
+          this.fail(held, `no Worker can write it (a read-only Worker on the ${tier} tier): ${error.message}`, lease, refused)
+          return undefined
+        }
+      }
     }
+    if (!admitted) return undefined
     try {
       if (signal.aborted) return undefined
       const source = this.ctx.workers.source(admitted.source)

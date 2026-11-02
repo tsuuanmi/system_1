@@ -1,6 +1,7 @@
 /**
- * A scripted digest Worker for the tests of every provider of `ctx.digests`: a read-only Worker on
- * this machine (it proves `review` and `local-data`) on each of `tiers` (`w:digest` on economy,
+ * A scripted digest Worker for the tests of every provider of `ctx.digests`: by default a read-only
+ * agent Worker on this machine (it proves `review` and `local-data`, never plain `reason`, as a real
+ * one does; see {@link DigestWorkerProfile}) on each of `tiers` (`w:digest` on economy,
  * `w:digest:<tier>` above), that answers each run as the drafter says, given the request's sources,
  * its tier, and the prompt its brief rendered to (as any text-prompted Worker source renders it).
  * With no drafter it describes no Worker at all. Its runs outlive a restart of the provider, as a
@@ -13,7 +14,18 @@ import { type ArtifactRef, type Tier, TIERS, type WorkerExecution, type WorkerSo
 import { worker } from '../../workers-core/conformance/workers.ts'
 import type { Drafter } from './digests.ts'
 
-const idOf = (tier: Tier): string => (tier === 'economy' ? 'w:digest' : `w:digest:${tier}`)
+/**
+ * What a scripted Worker is: by default a read-only agent Worker on this machine (it proves `review` and
+ * `local-data`, as a real one does). A website Worker proves `reason` only, is remote, and may take a bounded input.
+ */
+export interface DigestWorkerProfile {
+  /** The prefix of its Worker ids (default `w:digest`), and so of its source's name. */
+  id?: string
+  proves?: string[]
+  locality?: 'local' | 'remote'
+  quotaClass?: 'subscription-chat' | 'agent-plan' | 'metered' | 'local'
+  maxInputChars?: number
+}
 
 /**
  * The request's sources as a provider's brief names them: by default the brief's pointers. A
@@ -36,13 +48,22 @@ export class DigestWorker {
   private readonly waiters = new Map<string, Set<() => void>>()
   private ctx: Context | undefined
 
-  constructor(private readonly drafter: Drafter | undefined, private readonly sourcesOf: SourcesOf = (brief) => brief.artifacts.map((p) => p.ref as ArtifactRef)) {}
+  private readonly base: string
+
+  constructor(private readonly drafter: Drafter | undefined, private readonly sourcesOf: SourcesOf = (brief) => brief.artifacts.map((p) => p.ref as ArtifactRef), private readonly profile: DigestWorkerProfile = {}) {
+    this.base = profile.id ?? 'w:digest'
+  }
+
+  private idOf(tier: Tier): string {
+    return tier === 'economy' ? this.base : `${this.base}:${tier}`
+  }
 
   readonly source = (ctx: Context): WorkerSource => {
     this.ctx = ctx
+    const { proves = ['review', 'local-data'], locality = 'local', quotaClass = locality === 'local' ? 'agent-plan' : 'subscription-chat', maxInputChars } = this.profile
     return {
-      name: 'digest-worker',
-      describe: async () => (this.drafter ? this.tiers.map((tier) => worker(idOf(tier), { tier, locality: 'local', proves: ['review', 'local-data'] })) : []),
+      name: `digest-worker${this.base === 'w:digest' ? '' : `-${this.base.replace(/\W+/g, '-')}`}`,
+      describe: async () => (this.drafter ? this.tiers.map((tier) => worker(this.idOf(tier), { tier, locality, quotaClass, proves, ...(maxInputChars ? { schema: 'capability-descriptor@1.2' as const, maxInputChars } : {}) })) : []),
       start: (request) => this.start(request),
       get: (id) => {
         const execution = this.executions.get(id)
@@ -73,7 +94,7 @@ export class DigestWorker {
     const prompt = startPrompt(request, read).prompt
     const sources = this.sourcesOf(ctx.artifacts.get(request.brief!)!.body as Brief, read)
     const id = `d-${this.started.length + 1}`
-    const tier = TIERS.find((t) => idOf(t) === request.worker)!
+    const tier = TIERS.find((t) => this.idOf(t) === request.worker)!
     this.keys.set(request.key, id)
     this.started.push({ ...request, id, prompt, sources, tier })
     this.executions.set(id, { id, status: 'running', submitted: true, decisions: [] })
