@@ -32,6 +32,21 @@ abbreviated commit id (`run_65a61f8b37f2c17e`), and a focus larger than the sour
 (`repositories.maxSourceChars`, 24 000) was refused rather than narrowed (`run_cdd56619136656b8`).
 Gemini members stalled (`provider_stalled`) in one of the two reviews that ran.
 
+## PROP-0023: the plan and the review through `system` (2026-11-02)
+
+The [Worker roles proposal](../proposals/0023-worker-roles-and-token-budget.md) and its first change
+were decided and reviewed through `system`'s own website-first teams:
+
+| Run | Template | Members | Outcome | What it gave |
+|---|---|---|---|---|
+| `run_fab7b75f346d6d2d` | `brainstorm` | ChatGPT Web, Gemini API | O1, unanimous | the step graph, session policy, and pilot values the proposal adopts ([research](../research/token-use-2026-11-02.md#6-live-system-run)) |
+| `run_f5151f63ffbcef2c` | `review` of `board_propose_plan` and `decompose` (`7e89f575`, the diff as text) | ChatGPT Web, Claude (`review-2`) | pass, unanimous | 2 of 3 findings held and fixed in `765f1d85`: the prompt's example plan depended on a key it did not define; a plan item's request key could be taken for a `board_propose` key. The third (a lead's error code for an unknown dependency) matches `board_propose` |
+
+| `run_84d326652eb0a664` | `review` of the task `variant` (`c8cb964c`, the diff as text) | ChatGPT Web, Claude (`review-2`) | pass, unanimous | 1 suggestion held and applied: an approved start runs in the variant its Worker was checked in, so a task whose variant changed is refused by the start |
+
+Each review's second member ran on a Claude reviewer role, the Claude review spend the proposal's
+change 1 removes.
+
 ## Not yet through `system`
 
 The rest of that loop ran outside `system`: the lead was a Claude Code session, the Workers were

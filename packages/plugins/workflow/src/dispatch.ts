@@ -1313,7 +1313,8 @@ export class Dispatcher {
     const dispatch: TaskDispatch = { askId: row.ask_id, decisions: choice.decisions, prefer: { node: row.node_id, worker: row.worker, decision: choice.decisions[1]! } }
     try {
       const run = await this.e.tasks.start({
-        template: choice.template, ...(task.variant !== undefined ? { variant: task.variant } : {}), input: `${task.title}\n\n${task.goal}`.slice(0, 32_000), task: { taskId: task.taskId, revision: task.revision }, clientRequestId: `dispatch:${row.ask_id}`,
+        // The variant its Worker was checked in: a task whose variant differs now is refused by the start (INV-5).
+        template: choice.template, ...(choice.variant !== undefined ? { variant: choice.variant } : {}), input: `${task.title}\n\n${task.goal}`.slice(0, 32_000), task: { taskId: task.taskId, revision: task.revision }, clientRequestId: `dispatch:${row.ask_id}`,
       }, { dispatch })
       allowance.left -= 1
       this.move(row, 'started', { run_id: run.runId, outcome: { status: 'started', reason: `run ${run.runId} serves attempt ${row.attempt + 1}`, at: now() } })
