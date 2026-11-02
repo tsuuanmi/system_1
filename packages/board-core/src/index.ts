@@ -194,9 +194,9 @@ export const DEFECT_SHA = { min: 7, max: 64 } as const
  */
 export interface Defect { fixes: string; sha: string; at: string; by: DefectBy }
 
-/** `board-task@1.0`; `board-task@1.1` once it carries a funding ask (`waiting.funding`) or a raise (`funding`); `board-task@1.2` once it carries a `defect` link; `board-task@1.3` once it waits for its landing (`waiting.reason` `landing`, T293). */
+/** `board-task@1.0`; `board-task@1.1` once it carries a funding ask (`waiting.funding`) or a raise (`funding`); `board-task@1.2` once it carries a `defect` link; `board-task@1.3` once it waits for its landing (`waiting.reason` `landing`, T293); `board-task@1.5` once it names a template `variant`. */
 export interface BoardTask {
-  schema: 'board-task@1.0' | 'board-task@1.1' | 'board-task@1.2' | 'board-task@1.3'
+  schema: 'board-task@1.0' | 'board-task@1.1' | 'board-task@1.2' | 'board-task@1.3' | 'board-task@1.5'
   taskId: string
   projectId: string
   milestone?: string
@@ -206,6 +206,8 @@ export interface BoardTask {
   dependsOn: string[]
   actionClass: ActionClass
   template?: string
+  /** The template variant its runs start with (`board-task@1.5`). */
+  variant?: string
   writes?: Subject
   budget?: BudgetLine[]
   state: TaskState
@@ -246,6 +248,8 @@ export interface TaskInput {
   actionClass: ActionClass
   milestone?: string
   template?: string
+  /** The variant of its template a run of it starts with (`board-task@1.5`), so the writing step's kind of work routes it (ADR-0057). */
+  variant?: string
   writes?: Subject
   budget?: BudgetLine[]
   /** Attempts allowed (default 3, at most 10). */

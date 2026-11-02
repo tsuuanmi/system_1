@@ -1073,6 +1073,9 @@ guesses.
   at most one per attempt. A record carries either only at `@1.1`; every other record stays
   `@1.0`. Example:
   [`board-task.funding.json`](../../schemas/examples/board-task.funding.json).
+- `variant` (`board-task@1.5`) is the variant of `template` every run of the task starts with,
+  so its writing step's kind of work routes it (a `docs` or `tests` task to the Workers given that
+  kind); it needs `template`, and a record that carries it is `@1.4` whatever else it carries.
 - `lastDecision` is the decision behind the latest move: a `board` decision for moves the board
   makes on its own, otherwise the acceptance, approval, route, or reconciliation decision that
   caused it. Examples: [`board-task.review.json`](../../schemas/examples/board-task.review.json),

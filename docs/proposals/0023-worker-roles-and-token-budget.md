@@ -7,7 +7,7 @@ created: 2026-11-02
 summary: Each kind of Worker does the work it is for, so Claude's tokens go to building only. Claude (standard tier by default) writes code; Codex and Antigravity review, write tests and documentation, and run the checks; website Workers ask, research, brainstorm, and review a change when the review packet fits. A session stops growing past a ceiling, every task carries a token budget, and a decompose template splits a goal into small tasks that run in parallel.
 evidence: [operator request 2026-11-02, docs/research/token-use-2026-11-02.md, docs/research/lean-core-2026-11-01.md, System run run_fab7b75f346d6d2d]
 related: [PROP-0004, PROP-0016, PROP-0022, ADR-0049, ADR-0057, ADR-0063, ADR-0070, ADR-0073, ADR-0075, INV-2, INV-5, INV-11, INV-13]
-implementation: [packages/plugins/board, packages/plugins/profile-software-development]
+implementation: [packages/plugins/board, packages/plugins/profile-software-development, packages/plugins/workflow]
 ---
 
 # Proposal: Worker roles and a token budget
@@ -88,10 +88,11 @@ Six changes, in the order they land. Each names its switch and what it measures.
 - The Claude `develop` Workers keep only `code`; `docs` and `tests` move to the Codex and
   Antigravity writers. A step's kind already routes it
   ([route work by kind](../operations/runbooks.md#route-work-by-kind)).
-- **One code gap.** A step's kind comes from the template's variant (`algorithm-development
-  --variant docs`), and a board task carries no variant: dispatch starts every task's `develop:1` as
-  `code`, so a docs or tests task still goes to Claude. The board task gains an optional `variant`,
-  which dispatch passes to the run (`board-task` minor version).
+- **One code gap, closed.** A step's kind comes from the template's variant (`algorithm-development
+  --variant docs`), and a board task carried no variant, so dispatch started every task's
+  `develop:1` as `code`. A board task now names an optional `variant` (`board-task@1.5`,
+  `mcp-board` 1.7), which dispatch routes and starts the run with
+  ([route work by kind](../operations/runbooks.md#route-work-by-kind)).
 - The Claude `review` and `review-2` roles are removed from the operator's patch: a Claude build is
   never reviewed by Claude, and no review draws Claude quota.
 - The Claude `research` role stays only as the last fallback of `research`, after website and model

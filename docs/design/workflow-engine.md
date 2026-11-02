@@ -910,7 +910,8 @@ is refused (`config_error`), and every other run is unaffected.
   generation, or claims the ready task as `workflow:<runId>`. The choice is an `admission`
   decision (`workflow.task-admission`). A task not ready, a stale claim, or a board refusal is
   one too (`refuse`), and refuses the start with no run left and nothing sent. A task that names
-  a template runs only that template, and its run is classified at least as strictly as its
+  a template runs only that template, and one that names a template `variant` (`board-task@1.5`)
+  runs only in that variant, so its writing step keeps the variant's kind of work; its run is classified at least as strictly as its
   project ([INV-12](../architecture/invariants.md#inv-12-data-egress-is-explicit)).
 - **Briefs.** Every execution of the run is briefed from the task
   ([a board task's brief](#a-board-tasks-brief)); its next attempt may resume this run's session.
@@ -1834,6 +1835,9 @@ flowchart TD
   the Worker free again only after it does not start it. Then, or at once when a teams restriction leaves the Worker out, the attempt fails
   for the operator (`USER_ACTION`), not retried, so the board's next attempt is dispatch's to choose
   again. A retry, an escalation, or a `continue` is never pinned back to it.
+- **In the task's variant** (PROP-0023): dispatch resolves the template in the variant the task
+  names (`board-task@1.5`), so its writing step's kind of work, and with it the Workers given that
+  kind, choose the Worker ([work kinds](routing.md#work-kinds)); it starts the run in that variant.
 - **Within the step's own restriction** (T215, INV-6): dispatch chooses the writing step's Worker
   within the restriction routing will apply to it. It asks `TaskRuns.resumes` whether the run would
   resume the session of the task's previous attempt (or of the one task it depends on), with the

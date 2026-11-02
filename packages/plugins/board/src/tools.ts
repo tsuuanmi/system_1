@@ -32,8 +32,8 @@ const SCOPES: Record<BoardTool, ToolScope> = {
 }
 
 const schemas = new SchemaRegistry()
-/** The tools' schema: 1.1 adds the operator's project moves, 1.2 `board_propose`'s `maxAttempts`, 1.3 the circuit breaker's tools, 1.4 `board_reopen_review`, 1.5 the `defect` link (`board_propose`'s `fixes`, `board_defect`), 1.6 `board_propose_plan`. */
-const MCP_BOARD = 'mcp-board@1.6'
+/** The tools' schema: 1.1 adds the operator's project moves, 1.2 `board_propose`'s `maxAttempts`, 1.3 the circuit breaker's tools, 1.4 `board_reopen_review`, 1.5 the `defect` link (`board_propose`'s `fixes`, `board_defect`), 1.6 `board_propose_plan`, 1.7 a task's `variant`. */
+const MCP_BOARD = 'mcp-board@1.7'
 /** The `$defs` name of a tool's input or output: underscores written as hyphens. */
 const defOf = (tool: BoardTool, part: 'input' | 'output'): string => `${tool.replaceAll('_', '-')}-${part}`
 
@@ -71,6 +71,7 @@ const proposal = (dependsOn: zod.ZodOptional<zod.ZodArray<zod.ZodString>>) => ({
   title: zod.string().min(1).max(200), goal: zod.string().min(1).max(4000),
   acceptance: zod.array(zod.strictObject({ id: id(), statement: shortText(), check: zod.enum(['tests', 'typecheck', 'lint', 'schema', 'quote-check', 'review', 'operator']).optional() })).min(1).max(32),
   dependsOn, actionClass: actionClass(), milestone: id().optional(), template: id().optional(),
+  variant: zod.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional().describe('The variant of its template every run of it starts with (algorithm-development: docs, tests), so the writing step\'s kind of work routes it; needs template'),
   writes: subject().optional(), budget: zod.array(budgetLine()).max(16).optional(),
   maxAttempts: zod.number().int().min(1).max(10).optional().describe('Attempts the task gets (default: the board\'s for its template, else its maxAttempts, 3); each run that serves it is one, a rejected review included'),
 })

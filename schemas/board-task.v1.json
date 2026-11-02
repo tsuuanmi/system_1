@@ -2,11 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:tsuuanmi:system:schema:board-task:v1",
   "title": "Board task",
-  "description": "Durable state of one task on a project's board (ctx.board, design/board.md): work that outlives a run. Only the work state machine moves it, and each move names the decision behind it (INV-13). Mutable state that points at immutable artifacts. @1.1 adds a spent budget's funding: the lines a budget-spent wait asks for (`waiting.funding`), and the raises an approved request applied (`funding`). 1.2 adds the `defect` link: the done task this one fixes a defect of, and the landing sha of its change.",
+  "description": "Durable state of one task on a project's board (ctx.board, design/board.md): work that outlives a run. Only the work state machine moves it, and each move names the decision behind it (INV-13). Mutable state that points at immutable artifacts. @1.1 adds a spent budget's funding: the lines a budget-spent wait asks for (`waiting.funding`), and the raises an approved request applied (`funding`). 1.2 adds the `defect` link: the done task this one fixes a defect of, and the landing sha of its change. 1.3 adds the landing wait. 1.5 adds `variant`: the variant of its template every run of the task starts with, so the writing step's kind of work routes it (PROP-0023); a record with a variant is board-task@1.5 whatever else it carries.",
   "type": "object",
   "required": ["schema", "taskId", "projectId", "title", "goal", "acceptance", "dependsOn", "actionClass", "state", "attempts", "createdAt", "revision"],
   "properties": {
-    "schema": { "enum": ["board-task@1.0", "board-task@1.1", "board-task@1.2", "board-task@1.3"] },
+    "schema": { "enum": ["board-task@1.0", "board-task@1.1", "board-task@1.2", "board-task@1.3", "board-task@1.5"] },
     "taskId": { "$ref": "urn:tsuuanmi:system:schema:common:v1#/$defs/id" },
     "projectId": { "$ref": "urn:tsuuanmi:system:schema:common:v1#/$defs/id" },
     "milestone": { "$ref": "urn:tsuuanmi:system:schema:common:v1#/$defs/id" },
@@ -40,6 +40,7 @@
       "$ref": "urn:tsuuanmi:system:schema:common:v1#/$defs/actionClass"
     },
     "template": { "$ref": "urn:tsuuanmi:system:schema:common:v1#/$defs/id" },
+    "variant": { "description": "The variant of `template` every run of the task starts with (1.5).", "type": "string", "pattern": "^[a-z][a-z0-9-]{0,39}$" },
     "writes": {
       "description": "The subject the task writes; one task holds write authority over it at a time (INV-15).",
       "$ref": "urn:tsuuanmi:system:schema:common:v1#/$defs/subject"
@@ -283,7 +284,7 @@
           { "required": ["waiting"], "properties": { "waiting": { "type": "object", "required": ["funding"], "properties": { "funding": true } } } }
         ]
       },
-      "then": { "properties": { "schema": { "enum": ["board-task@1.1", "board-task@1.2", "board-task@1.3"] } } }
+      "then": { "properties": { "schema": { "enum": ["board-task@1.1", "board-task@1.2", "board-task@1.3", "board-task@1.5"] } } }
     },
     {
       "if": { "required": ["waiting"], "properties": { "waiting": { "type": "object", "required": ["funding"], "properties": { "funding": true } } } },
@@ -292,12 +293,17 @@
     {
       "description": "1.2: a record that carries a defect link is board-task@1.2 (or later).",
       "if": { "required": ["defect"], "properties": { "defect": true } },
-      "then": { "properties": { "schema": { "enum": ["board-task@1.2", "board-task@1.3"] } } }
+      "then": { "properties": { "schema": { "enum": ["board-task@1.2", "board-task@1.3", "board-task@1.5"] } } }
     },
     {
       "description": "1.3 (T293): a task that waits for its landing is board-task@1.3, its result accepted (result.acceptance).",
       "if": { "required": ["waiting"], "properties": { "waiting": { "type": "object", "properties": { "reason": { "const": "landing" } } } } },
-      "then": { "required": ["result"], "properties": { "schema": { "const": "board-task@1.3" }, "state": { "const": "review" }, "result": { "type": "object", "required": ["acceptance"], "properties": { "acceptance": true } } } }
+      "then": { "required": ["result"], "properties": { "schema": { "enum": ["board-task@1.3", "board-task@1.5"] }, "state": { "const": "review" }, "result": { "type": "object", "required": ["acceptance"], "properties": { "acceptance": true } } } }
+    },
+    {
+      "description": "1.5 (PROP-0023): a record that names a template variant is board-task@1.5.",
+      "if": { "required": ["variant"], "properties": { "variant": true } },
+      "then": { "required": ["template"], "properties": { "template": true, "schema": { "const": "board-task@1.5" } } }
     }
   ],
   "additionalProperties": false

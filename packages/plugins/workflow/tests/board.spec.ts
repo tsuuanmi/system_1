@@ -1264,6 +1264,9 @@ describe('ctx.workflow serves board tasks over the store-backed board and approv
     await ctx.board.sweep(new Date())
     const task = await ready(ctx, 'templated', { template: 'chain' })
     expect(await refusalOf(() => ctx.workflow.start({ template: 'solo', input: 'q', task: { taskId: task.taskId } }))).toMatch(/runs template chain, not solo/)
+    // A task that names a variant runs in it only (board-task@1.5): its writing step's kind of work is the variant's.
+    const varied = await ready(ctx, 'varied', { template: 'chain', variant: 'deep' })
+    expect(await refusalOf(() => ctx.workflow.start({ template: 'chain', input: 'q', task: { taskId: varied.taskId } }))).toMatch(/runs variant deep of chain, not its default/)
     expect(await refusalOf(() => ctx.workflow.start({ template: 'chain', input: 'q', classification: 'public', task: { taskId: task.taskId } }))).toMatch(/is local-private: .* cannot be public/)
     expect(workers.started).toHaveLength(0)
     expect(await ctx.board.task(task.taskId)).toMatchObject({ state: 'ready' })

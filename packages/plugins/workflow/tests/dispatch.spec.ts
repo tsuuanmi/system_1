@@ -234,6 +234,30 @@ describe('the dispatch pass (ADR-0064, REQ-WF-16)', () => {
     expect(reasonOf(ctx.workflow.dispatchStatus(), task.taskId)).toMatch(/^an ask for attempt 1 is open/)
   })
 
+  it('routes a task by its variant\'s kind of work: a docs task asks for and starts the Worker given docs, the run in that variant (PROP-0023, ADR-0057)', async () => {
+    const kinded = {
+      kinded: [{
+        nodeId: 'develop:1', objective: 'Write it', prompt: '{{input}}', capabilities: ['develop'], tier: 'standard' as const, kind: 'code', conversation: 'temporary' as const, acceptance: 'acceptance.answer',
+        variants: { docs: { kind: 'docs' } },
+      }],
+    }
+    const { ctx, workers, read } = await boot({ workflow: { templates: kinded } })
+    workers.extra = [agent('agent:acc-a/develop', 'acc-a', { schema: 'capability-descriptor@1.6', kinds: ['code'] }), agent('agent:acc-b/develop', 'acc-b', { schema: 'capability-descriptor@1.6', kinds: ['docs'] })]
+    // The code writer has more headroom: by quota alone it would be chosen.
+    await read('acc-a', 0, 30)
+    await read('acc-b', 50, 600)
+    const task = await readyTask(ctx, 'write the docs', { template: 'kinded', variant: 'docs' })
+    await ctx.workflow.sweepDispatch()
+    const ask = askOf(ctx.workflow.dispatchStatus(), task.taskId)!
+    expect(ask.worker).toBe('agent:acc-b/develop')
+    await approve(ctx, ask.requestId!)
+    await ctx.workflow.sweepDispatch()
+    const started = (await ctx.board.task(task.taskId))!
+    expect(started.state).toBe('running')
+    await vi.waitFor(() => expect(workers.started.length).toBe(1), { timeout: 30_000 })
+    expect(workers.started[0]).toMatchObject({ worker: 'agent:acc-b/develop', runId: started.run!.runId })
+  })
+
   it('starts exactly the attempt and the Worker an approval names, through the engine\'s own start, and the run names why it started (INV-5, INV-13)', async () => {
     const { ctx, workers, read } = await boot()
     workers.extra = [agent('agent:acc-a/develop', 'acc-a'), agent('agent:acc-b/develop', 'acc-b')]

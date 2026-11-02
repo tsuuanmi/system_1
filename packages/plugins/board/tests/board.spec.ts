@@ -1625,7 +1625,7 @@ const caller = (b: Booted): Call => async (tool, args, scope = 'client') => {
   expect(registered, tool).toBeDefined()
   const reply = await registered!.handler(args, { scope }) as Awaited<ReturnType<Call>>
   // Every structured output is checked against its definition in schemas/mcp-board.v1.json, with Ajv.
-  if (!reply.isError) schemas.assertDef('mcp-board@1.1', `${tool.replaceAll('_', '-')}-output`, reply.structuredContent)
+  if (!reply.isError) schemas.assertDef('mcp-board@1.7', `${tool.replaceAll('_', '-')}-output`, reply.structuredContent)
   return reply
 }
 const ok = async (reply: ReturnType<Call>): Promise<Record<string, any>> => {
@@ -2114,5 +2114,36 @@ describe('ctx.board (store-backed): a plan of tasks (board_propose_plan, PROP-00
     schemas.assertDef('mcp-board@1.6', 'board-propose-plan-output', ex.output)
     expect(zod.object(INPUTS.board_propose_plan).safeParse(ex.input).success).toBe(true)
     expect(zod.object(INPUTS.board_propose_plan).safeParse({ ...ex.input, tasks: [{ ...ex.input.tasks[0], fixes: { taskId: 't', sha: 'a'.repeat(40) } }] }).success).toBe(false)
+  })
+})
+
+describe('ctx.board (store-backed): a task\'s template variant (board-task@1.5, PROP-0023 change 1)', () => {
+  it('keeps the variant a proposal names, tagged board-task@1.5 through its later moves, and refuses one without a template', async () => {
+    const b = await boot()
+    await active(b.ctx)
+    const docs = await b.ctx.board.propose(task('p2', 'docs', { template: 'algorithm-development', variant: 'docs' }), at(2))
+    expect(docs).toMatchObject({ schema: 'board-task@1.5', template: 'algorithm-development', variant: 'docs' })
+    schemas.assertRecord(docs)
+    // A later move that needs an older tag keeps 1.4: the record still carries its variant.
+    const done = await ready(b.ctx, task('p2', 'shipped'))
+    const { generation } = await b.ctx.board.claim(done.taskId, 'lead', 600_000, at(3))
+    await b.ctx.board.start(done.taskId, generation, { runId: 'run-shipped' }, at(3))
+    const r = result(b.ctx, 'shipped')
+    await b.ctx.board.submit(done.taskId, generation, { artifacts: [r], subject: HEAD }, at(4))
+    await b.ctx.board.accept(done.taskId, acceptance(b.ctx, 'accept', done.taskId, r), at(5))
+    const linked = await b.board().linkDefect(docs.taskId, { fixes: done.taskId, sha: 'a'.repeat(40), by: 'lead' }, at(6))
+    expect(linked).toMatchObject({ schema: 'board-task@1.5', variant: 'docs', defect: { fixes: done.taskId } })
+    expect(await failureOf(b.ctx.board.propose(task('p2', 'loose', { variant: 'docs' }), at(2)))).toBe('invalid')
+  })
+
+  it('takes a variant on board_propose and on each item of board_propose_plan (mcp-board 1.7)', async () => {
+    const b = await boot()
+    await active(b.ctx)
+    const call = caller(b)
+    const one = await ok(call('board_propose', { ...task('p2', 'one'), template: 'algorithm-development', variant: 'tests' }))
+    expect((await b.ctx.board.task(one.taskId as string))!.variant).toBe('tests')
+    const plan = await ok(call('board_propose_plan', { projectId: 'p2', tasks: [{ key: 'd', title: 'd', goal: 'd', acceptance: [{ id: 'a1', statement: 's', check: 'review' }], actionClass: 'read', template: 'algorithm-development', variant: 'docs' }] }))
+    expect((await b.ctx.board.task((plan.tasks as Array<{ taskId: string }>)[0]!.taskId))!.variant).toBe('docs')
+    expect((await call('board_propose', { ...task('p2', 'bad'), template: 'algorithm-development', variant: 'Docs' })).isError).toBe(true)
   })
 })

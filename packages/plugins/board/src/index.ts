@@ -101,6 +101,9 @@ const checkedBy = <T>(check: Checked<T> | undefined, value: T): T => {
 /** The calls that propose a task, under whose name a retry-safe key is recorded. */
 type ProposeTool = 'board_propose' | 'board_propose_plan'
 
+/** The schema tag a task's record takes for a move that needs `tag`: `board-task@1.5` once it names a variant, whatever else it carries. */
+const tagOf = (task: { variant?: string }, tag: BoardTask['schema']): BoardTask['schema'] => task.variant !== undefined ? 'board-task@1.5' : tag
+
 /** One task of a plan (`board_propose_plan`): a task's proposal, named in the plan by `key`, its `dependsOn` items' keys or the project's task ids. */
 export type PlanItem = Omit<TaskInput, 'projectId' | 'fixes'> & { key: string }
 /** A plan's item and the task proposed for it. */
@@ -723,6 +726,7 @@ export class StoreBoard extends Board {
         if (this.readTask(dep)?.task.projectId !== input.projectId) throw new BoardError('invalid', `dependency ${dep} is not a task of ${input.projectId}`)
       }
       if (input.milestone !== undefined && !project.milestones.some((m) => m.id === input.milestone)) throw new BoardError('invalid', `${input.projectId} has no milestone ${input.milestone}`)
+      if (input.variant !== undefined && input.template === undefined) throw new BoardError('invalid', 'a variant is of a template: a task that names a variant names its template')
       // The proposal's own, else the template's, else the board's default.
       const max = input.maxAttempts ?? (input.template !== undefined ? this.config.templateAttempts?.[input.template] : undefined) ?? this.config.maxAttempts ?? 3
       if (!Number.isInteger(max) || max < 1 || max > 10) throw new BoardError('invalid', 'maxAttempts is a whole number from 1 to 10')
@@ -730,10 +734,11 @@ export class StoreBoard extends Board {
       if (writes && db.prepare('SELECT 1 FROM board_tasks WHERE writes = ?').get(writes)) throw new BoardError('conflict', `another open task writes ${input.writes!.type} ${input.writes!.ref} (INV-15)`)
       const defect = input.fixes ? this.defectOf(input.fixes.taskId, input.fixes.sha, input.projectId, 'filed', at) : undefined
       const task: BoardTask = {
-        schema: defect ? 'board-task@1.2' : 'board-task@1.0', taskId: newId('task'), projectId: input.projectId, title: input.title, goal: input.goal,
+        schema: tagOf(input, defect ? 'board-task@1.2' : 'board-task@1.0'), taskId: newId('task'), projectId: input.projectId, title: input.title, goal: input.goal,
         acceptance: input.acceptance, dependsOn: input.dependsOn ?? [], actionClass: input.actionClass, state: 'proposed',
         attempts: { count: 0, max }, createdAt: at.toISOString(), revision: 0,
         ...(input.milestone !== undefined ? { milestone: input.milestone } : {}), ...(input.template !== undefined ? { template: input.template } : {}),
+        ...(input.variant !== undefined ? { variant: input.variant } : {}),
         ...(input.writes ? { writes: input.writes } : {}), ...(input.budget ? { budget: input.budget } : {}), ...(defect ? { defect } : {}),
       }
       this.validTask(task)
@@ -790,7 +795,7 @@ export class StoreBoard extends Board {
       const current = this.taskOf(taskId)
       if (current.task.defect) throw new BoardError('invalid', `${taskId} already fixes a defect of ${current.task.defect.fixes}`)
       const defect = this.defectOf(input.fixes, input.sha, current.task.projectId, input.by, at, taskId)
-      return checkedBy(check, this.commit(current, { changes: { schema: 'board-task@1.2', defect } }, at))
+      return checkedBy(check, this.commit(current, { changes: { schema: tagOf(current.task, 'board-task@1.2'), defect } }, at))
     })
   }
 
@@ -1737,7 +1742,7 @@ export class StoreBoard extends Board {
     const move = this.nextAttemptMove(project, { ...task, budget, funding: raises }, next, {
       decision, why: `the operator approved going on after budget-spent (request ${request.requestId}), its budget raised by ${linesText(funding, '+')}`,
     }, at)
-    return { changes: { schema: task.defect ? 'board-task@1.2' : 'board-task@1.1', budget, funding: raises, ...move.changes } }
+    return { changes: { schema: tagOf(task, task.defect ? 'board-task@1.2' : 'board-task@1.1'), budget, funding: raises, ...move.changes } }
   }
 
   /**
@@ -1996,7 +2001,7 @@ export class StoreBoard extends Board {
     try {
       return this.commitLater(task, at, generation, () => ({
         changes: {
-          state: 'waiting-for-approval', holder: undefined, ...(funding ? { schema: task.defect ? 'board-task@1.2' as const : 'board-task@1.1' as const } : {}),
+          state: 'waiting-for-approval', holder: undefined, ...(funding ? { schema: tagOf(task, task.defect ? 'board-task@1.2' : 'board-task@1.1') } : {}),
           waiting: { reason, approvalRequest: request.requestId, ...(funding ? { funding } : {}), since: at.toISOString(), expiresAt: request.expiresAt }, lastDecision: request.policy.decision,
         },
       }))
@@ -2393,7 +2398,7 @@ export class StoreBoard extends Board {
     const to = lands ? 'landing' : 'done'
     const accepted = (lastDecision: ArtifactRef): Move => ({
       changes: lands
-        ? { schema: 'board-task@1.3', state: 'review', result: { ...result, acceptance }, holder: undefined, waiting: { reason: 'landing', since: at.toISOString(), expiresAt: new Date(at.getTime() + LANDING_WAIT_SECONDS * 1000).toISOString() }, lastDecision }
+        ? { schema: tagOf(task, 'board-task@1.3'), state: 'review', result: { ...result, acceptance }, holder: undefined, waiting: { reason: 'landing', since: at.toISOString(), expiresAt: new Date(at.getTime() + LANDING_WAIT_SECONDS * 1000).toISOString() }, lastDecision }
         : { state: 'done', result: { ...result, acceptance }, holder: undefined, waiting: undefined, lastDecision },
     })
     // The operator accepted past a required check that did not run, naming it with a note (T293): its own decision says so.

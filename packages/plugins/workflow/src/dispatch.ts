@@ -196,6 +196,8 @@ export interface DispatchWindow {
 /** What chose a start, kept on its row. */
 interface AskChoice {
   template: string
+  /** The task's template variant (`board-task@1.5`), which its run starts with. */
+  variant?: string
   title: string
   /** The decisions, in order: select, choice, autonomy, then the approval (the queue's, or the board approval's gate). */
   decisions: ArtifactRef[]
@@ -723,7 +725,7 @@ export class Dispatcher {
         }
       }
       // The run's writing step, and the requirement the engine would route it with (INV-6).
-      const step = this.writingStep(task.template)
+      const step = this.writingStep(task.template, task.variant)
       if ('problem' in step) {
         why(step.problem)
         continue
@@ -832,7 +834,7 @@ export class Dispatcher {
         account: scored.accountOf.get(chosen.worker) ?? null, repository: scored.repositoryOf.get(chosen.worker) ?? null, node_id: step.node.nodeId, version: choice.version,
         request_id: null, run_id: null, outcome: null, approved_at: go ? now() : null, mode, started_at: null, created_at: now(), updated_at: now(),
         choice: JSON.stringify({
-          template: task.template, title: task.title, decisions, verdict, why: chosen.line, windows: choice.windows, classification,
+          template: task.template, ...(task.variant !== undefined ? { variant: task.variant } : {}), title: task.title, decisions, verdict, why: chosen.line, windows: choice.windows, classification,
           summary: choice.summary, consequences: choice.consequences, ...(task.writes ? { writes: task.writes } : {}),
           ...(advice ? { advice } : {}), ...(step.node.kind !== undefined ? { kind: step.node.kind } : {}),
           ...(byBoard ? { board: { requestId: byBoard.requestId, approval: byBoard.approval ?? byBoard.decision } } : {}),
@@ -890,12 +892,13 @@ export class Dispatcher {
 
   /**
    * The run's writing step: its first Worker step that proves `develop`, else its first Worker step
-   * (a team's tally and decision, a review's source, and a gate run no Worker).
+   * (a team's tally and decision, a review's source, and a gate run no Worker), in the task's
+   * variant, whose kind of work routes it (ADR-0057).
    */
-  private writingStep(template: string): { node: ResolvedNode } | { problem: string } {
+  private writingStep(template: string, variant?: string): { node: ResolvedNode } | { problem: string } {
     let spec
     try {
-      spec = resolve(template, this.e.templates[template]!, {})
+      spec = resolve(template, this.e.templates[template]!, variant !== undefined ? { variant } : {})
     } catch (error) {
       return { problem: `template ${template} does not resolve: ${errorText(error)}` }
     }
@@ -913,9 +916,10 @@ export class Dispatcher {
   private async restrictionOf(task: BoardTask, template: string, nodeId: string, classification: Classification): Promise<{ restrict?: { workers: string[]; reason: string }; session?: string } | { problem: string }> {
     let spec
     try {
-      spec = resolve(template, this.e.templates[template]!, {})
+      const variant = task.variant !== undefined ? { variant: task.variant } : {}
+      spec = resolve(template, this.e.templates[template]!, variant)
       const session = await this.e.tasks.resumes(task, template, spec.nodes)
-      if (session) spec = resolve(template, this.e.templates[template]!, { sessionId: session })
+      if (session) spec = resolve(template, this.e.templates[template]!, { ...variant, sessionId: session })
       const node = spec.nodes.find((n) => n.nodeId === nodeId)
       if (!node) return {}
       const bound = await admittedRestriction(this.e, `dispatch:${task.taskId}`, node, classification)
@@ -1309,7 +1313,7 @@ export class Dispatcher {
     const dispatch: TaskDispatch = { askId: row.ask_id, decisions: choice.decisions, prefer: { node: row.node_id, worker: row.worker, decision: choice.decisions[1]! } }
     try {
       const run = await this.e.tasks.start({
-        template: choice.template, input: `${task.title}\n\n${task.goal}`.slice(0, 32_000), task: { taskId: task.taskId, revision: task.revision }, clientRequestId: `dispatch:${row.ask_id}`,
+        template: choice.template, ...(task.variant !== undefined ? { variant: task.variant } : {}), input: `${task.title}\n\n${task.goal}`.slice(0, 32_000), task: { taskId: task.taskId, revision: task.revision }, clientRequestId: `dispatch:${row.ask_id}`,
       }, { dispatch })
       allowance.left -= 1
       this.move(row, 'started', { run_id: run.runId, outcome: { status: 'started', reason: `run ${run.runId} serves attempt ${row.attempt + 1}`, at: now() } })
@@ -1344,7 +1348,7 @@ export class Dispatcher {
     const resources = this.e.ctx.get('resources')
     if (!resources?.quota || !this.e.ctx.workers.candidates) return 'no Worker can be shown free (the ledger or the router cannot tell)'
     const choice = JSON.parse(row.choice) as AskChoice
-    const step = this.writingStep(choice.template)
+    const step = this.writingStep(choice.template, choice.variant)
     if ('problem' in step) return step.problem
     const own = this.e.requirementOf(step.node, step.node.session.persist === true, choice.classification)
     const atRisk = await lookTierAtRisk(this.e, { taskId: row.task_id, projectId: row.project_id }, step.node, own)

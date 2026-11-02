@@ -416,6 +416,7 @@ Scope: `client`
 | `actionClass` | "read" \| "workspace-write" \| "merge" \| "command" \| "external-send" \| "deploy" \| "delete-data" \| "spend" \| "charter" \| "funding" \| "remediation" \| "policy-change" \| "promotion" | yes |  |
 | `milestone` | string |  |  |
 | `template` | string |  |  |
+| `variant` | string |  | The variant of its template every run of it starts with (algorithm-development: docs, tests), so the writing step's kind of work routes it; needs template |
 | `writes` | object |  |  |
 | `budget` | array |  |  |
 | `maxAttempts` | integer |  | Attempts the task gets (default: the board's for its template, else its maxAttempts, 3); each run that serves it is one, a rejected review included |

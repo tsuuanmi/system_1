@@ -221,6 +221,10 @@ export class TaskRuns {
     if (task.template !== undefined && task.template !== plain.template) {
       throw new WorkflowFailure('invalid_input', `board task ${task.taskId} runs template ${task.template}, not ${plain.template}; nothing was started`)
     }
+    // Its variant too (board-task@1.5): the writing step's kind of work is the variant's, so another one would route it elsewhere.
+    if (task.variant !== undefined && task.variant !== plain.variant) {
+      throw new WorkflowFailure('invalid_input', `board task ${task.taskId} runs variant ${task.variant} of ${task.template}, not ${plain.variant ?? 'its default'}; nothing was started`)
+    }
     const project = await board.project(task.projectId)
     const classification = classificationOf(plain.classification, project?.classification, task)
     // A task with a budget runs only where the ledger can hold it to its lines (INV-2), checked before it is taken.

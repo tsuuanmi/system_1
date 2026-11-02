@@ -444,6 +444,11 @@ A Worker given kinds takes only steps of those kinds, and never a step that name
 given none takes any step it proves the capabilities for. With no Worker given kinds, everything
 routes as before.
 
+A board task reaches a variant's kind by naming the variant: `board_propose` (or an item of
+`board_propose_plan`) with `template: algorithm-development` and `variant: docs` or `tests`. Dispatch
+then routes its writing step to the Workers given that kind and starts the run in that variant; a
+lead's own start must name the same variant.
+
 These are the shipped kinds. The `profile-software-development` row's `kinds` sets the kind a step
 names, by step (`develop`, `docs`, `tests`), so moving a step to other Workers is a
 configuration change, never a code change; a review names none, whatever is set
