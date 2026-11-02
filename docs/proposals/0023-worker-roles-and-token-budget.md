@@ -185,6 +185,11 @@ budget or a cap.
 PROP-0022 change 4 makes the tier per step. This change removes `tierByRisk`'s raise of `develop`: a
 heavy change gets a deeper review (change 2's agent reviewer), not a stronger builder.
 
+The raise is configuration today: the project policy in force (`system.policy` v6) holds
+`tierByRisk: { heavy: { develop: frontier, review: frontier } }`. Dropping `develop` from `heavy`,
+through a `policy-change` approval, keeps a heavy change's build at standard with no code change;
+`review` stays at frontier there. The escalation below is the code part (with T368).
+
 `develop` moves to frontier only by an escalation decision:
 
 - on a task's second attempt after a failed check or a confirmed finding;
