@@ -441,6 +441,7 @@ No options.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
+| `pipeline` | "full" \| "lean" | `"full"` | The graph algorithm-development has (ADR-0082): full (default) is develop, the author's own review (selfreview:1), then the review; lean has no selfreview:1. A run keeps the spec it started with, so a change applies to the runs started after it |
 | `kinds` | object | `{}` | The kind of work (ADR-0057) each algorithm-development step names, by step, so which Worker takes which step is the Workers' kinds: a Worker given kinds takes a step only when it lists that step's kind. The reviews name none |
 | `kinds.develop` | string | `"code"` | The kind of work develop:1 is, and the fix a review grows from it (default code) |
 | `kinds.docs` | string | `"docs"` | The kind of work develop:1 is in the docs variant (default docs) |

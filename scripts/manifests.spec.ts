@@ -63,7 +63,7 @@ describe('the manifests the workspace ships (REQ-HOST-7)', () => {
     expect(derived.filter((d) => d.manifest.config).length).toBe(38)
     // The decisions row (T328): a surface with no seam of its own, and its one key.
     expect(of('decisions').manifest).toMatchObject({ class: { kind: 'family', family: 'surface' }, provides: [], config: [{ key: 'pageSize', sensitive: false }] })
-    expect(of('profile-software-development').manifest.config).toEqual([{ key: 'kinds', sensitive: false }])
+    expect(of('profile-software-development').manifest.config).toEqual([{ key: 'pipeline', sensitive: false }, { key: 'kinds', sensitive: false }])
     // The notifier's webhook URL is a credential reference's value, never configuration.
     expect(of('notify').manifest.config?.find((c) => c.key === 'webhook')).toEqual({ key: 'webhook', sensitive: false })
     expect(of('notify').manifest).toMatchObject({ class: { kind: 'family', family: 'surface' }, provides: [] })

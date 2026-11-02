@@ -16,6 +16,10 @@
   ],
   "config": [
     {
+      "key": "pipeline",
+      "sensitive": false
+    },
+    {
       "key": "kinds",
       "sensitive": false
     }

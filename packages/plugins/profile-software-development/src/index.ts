@@ -39,12 +39,23 @@ const STEPS = Object.keys(DEFAULT_KINDS) as Array<keyof StepKinds>
 /** A step the template no longer has: a configuration that still names it is accepted and ignored (T267), so an update never stops a row from loading. */
 const RETIRED = ['validate'] as const
 
+/**
+ * The graph `algorithm-development` has (ADR-0082, PROP-0022 change 3): `full` is the graph with the
+ * author's own review (`selfreview:1`); `lean` has none.
+ */
+export type Pipeline = 'full' | 'lean'
+
+const PIPELINES: readonly Pipeline[] = ['full', 'lean']
+
 export interface Config {
   /** The kind each step names, by step; an unset step names its shipped kind ({@link DEFAULT_KINDS}). */
   kinds?: Partial<StepKinds> & { validate?: string }
+  /** The graph `algorithm-development` has: `full` (default), or `lean` without the author's own review. */
+  pipeline?: Pipeline
 }
 
 export const Config: z<Config> = z.object({
+  pipeline: z.union(PIPELINES.map((p) => z.const(p))).default('full').description('The graph algorithm-development has (ADR-0082): full (default) is develop, the author\'s own review (selfreview:1), then the review; lean has no selfreview:1. A run keeps the spec it started with, so a change applies to the runs started after it'),
   kinds: z.object({
     develop: z.string().pattern(WORK_KIND).default(DEFAULT_KINDS.develop).description('The kind of work develop:1 is, and the fix a review grows from it (default code)'),
     docs: z.string().pattern(WORK_KIND).default(DEFAULT_KINDS.docs).description('The kind of work develop:1 is in the docs variant (default docs)'),
@@ -59,11 +70,23 @@ export const Config: z<Config> = z.object({
  * `WORK_KIND`). Empty when the configuration is fine.
  */
 export function checkConfig(config: Partial<Config> = {}): string[] {
+  const pipeline: unknown = config.pipeline
+  const bad = pipeline !== undefined && !PIPELINES.includes(pipeline as Pipeline) ? [`pipeline must be ${PIPELINES.join(' or ')}, not ${JSON.stringify(pipeline)}`] : []
   const kinds: unknown = config.kinds
-  if (kinds === undefined) return []
-  if (typeof kinds !== 'object' || kinds === null || Array.isArray(kinds)) return [`kinds must be an object of steps (${STEPS.join(', ')}), each naming a kind of work`]
-  return Object.entries(kinds).flatMap(([step, kind]) => !STEPS.includes(step as keyof StepKinds) && !(RETIRED as readonly string[]).includes(step) ? [`kinds.${step} is not a step; kinds takes ${STEPS.join(', ')}`]
-    : typeof kind !== 'string' || !WORK_KIND.test(kind) ? [`kinds.${step}: ${JSON.stringify(kind)} is not a kind of work (${WORK_KIND})`] : [])
+  if (kinds === undefined) return bad
+  if (typeof kinds !== 'object' || kinds === null || Array.isArray(kinds)) return [...bad, `kinds must be an object of steps (${STEPS.join(', ')}), each naming a kind of work`]
+  return bad.concat(Object.entries(kinds).flatMap(([step, kind]) => !STEPS.includes(step as keyof StepKinds) && !(RETIRED as readonly string[]).includes(step) ? [`kinds.${step} is not a step; kinds takes ${STEPS.join(', ')}`]
+    : typeof kind !== 'string' || !WORK_KIND.test(kind) ? [`kinds.${step}: ${JSON.stringify(kind)} is not a kind of work (${WORK_KIND})`] : []))
+}
+
+/**
+ * The version a run's steps name their playbook by (docs/design/handbook.md, layer 4): the package's
+ * for `full`, which is unchanged, and with `+lean` for `lean`. A step's brief reads it when the brief
+ * is built, so it labels the pipeline in force then (ADR-0082); the run's own record of its graph is
+ * its spec hash and stored spec.
+ */
+export function templateVersion(pipeline: Pipeline = 'full'): string {
+  return pipeline === 'lean' ? `${VERSION}+lean` : VERSION
 }
 
 /** A review on this machine by a local agent Worker, which alone proves `review` and `local-data`. */
@@ -205,8 +228,9 @@ const TESTS_PROMPT = [
  * before. The two reviews name no kind, so any reviewer the operator gives none takes them; the
  * self-review runs on the author's account (its read-only role: a writer never proves `review`).
  */
-export function algorithmDevelopment(configured: Partial<StepKinds> = {}): NodeTemplate[] {
+export function algorithmDevelopment(configured: Partial<StepKinds> = {}, pipeline: Pipeline = 'full'): NodeTemplate[] {
   const kinds: StepKinds = { ...DEFAULT_KINDS, ...Object.fromEntries(Object.entries(configured).filter(([key, kind]) => kind !== undefined && key in DEFAULT_KINDS)) }
+  const lean = pipeline === 'lean'
   return [
     {
       nodeId: 'develop:1', objective: 'Test one hypothesis toward the task: state it, and change the code to try it', prompt: DEVELOP_PROMPT,
@@ -216,13 +240,13 @@ export function algorithmDevelopment(configured: Partial<StepKinds> = {}): NodeT
         tests: { kind: kinds.tests, objective: 'Change the tests toward the task: state what they should check, and write them', prompt: TESTS_PROMPT },
       },
     },
-    {
+    ...(lean ? [] : [{
       nodeId: 'selfreview:1', objective: 'Review your own change in a new session, as a stranger would: the task, the exact diff, and the review guides only', dependsOn: ['develop:1'], prompt: SELFREVIEW_PROMPT,
-      capabilities: ['review', 'local-data'], tier: 'standard', conversation: 'temporary', acceptance: 'acceptance.answer', selfReview: 'develop:1',
-    },
+      capabilities: ['review', 'local-data'], tier: 'standard' as const, conversation: 'temporary' as const, acceptance: 'acceptance.answer', selfReview: 'develop:1',
+    }]),
     {
-      // The self-review first, so the change's workspace is read from `develop:1`'s result (the last of its dependencies).
-      nodeId: 'review:1', objective: 'Review the exact change against the task, independently of its developer', dependsOn: ['selfreview:1', 'develop:1'], prompt: REVIEW_PROMPT,
+      // In `full`, the self-review first, so the change's workspace is read from `develop:1`'s result (the last of its dependencies).
+      nodeId: 'review:1', objective: 'Review the exact change against the task, independently of its developer', dependsOn: lean ? ['develop:1'] : ['selfreview:1', 'develop:1'], prompt: REVIEW_PROMPT,
       capabilities: ['review', 'local-data'], tier: 'standard', conversation: 'temporary', acceptance: 'acceptance.answer',
     },
   ]
@@ -245,6 +269,6 @@ export function apply(ctx: Context, config: Config = {}): void {
   const problems = checkConfig(config)
   if (problems.length) throw new Error(`profile-software-development: ${problems.join('; ')}`)
   ctx.effect(() => ctx.workflow.template('agent-review', AGENT_REVIEW, { version: VERSION }))
-  ctx.effect(() => ctx.workflow.template('algorithm-development', algorithmDevelopment(config.kinds), { version: VERSION }))
+  ctx.effect(() => ctx.workflow.template('algorithm-development', algorithmDevelopment(config.kinds, config.pipeline), { version: templateVersion(config.pipeline) }))
   ctx.effect(() => ctx.workflow.template(SCHEDULED_REVIEW, SCHEDULED_REVIEW_TEMPLATE, { version: VERSION }))
 }

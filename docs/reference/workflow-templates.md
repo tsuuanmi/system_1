@@ -225,6 +225,16 @@ acceptance did not. It is gone: the author shows its own checks' output, a fresh
 reviews the diff, and `review:1` is the final step. A row's `kinds.validate` is still accepted and
 ignored, so an update never stops a row from loading; remove it.
 
+- **Pipeline** ([ADR-0082](../decisions/adr/0082-the-lean-pipeline-of-algorithm-development.md)).
+  The row's `pipeline` (`full` or `lean`, default `full`;
+  [configuration](configuration.md#profile-software-development)) says which graph the template has;
+  it keeps its name. `full` is the table above. Under `lean` there is no `selfreview:1` (and so none
+  of its `:verify`, `:fix:<n>`, `:review:<n>`), and `review:1` depends on `develop:1` alone; every
+  other step, gate, and bound is as in `full`. A run keeps the resolved spec it was admitted with
+  (its spec hash differs between the two), so a change of the key reaches the runs started after it;
+  under `lean` the template's playbook version is the package's with `+lean`, which each step's
+  brief records (layer 4). Parts 2 and 3 of the lean pipeline (a finding's confirmation, parallel
+  checks and review) are pending (T366, T367).
 - **Kinds of work** ([ADR-0057](../decisions/adr/0057-route-work-by-kind.md)). With no Worker given
   kinds, every step routes as it always did. Once the operator gives Workers kinds
   ([route work by kind](../operations/runbooks.md#route-work-by-kind)), `develop:1` and its fix run
