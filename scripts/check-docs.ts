@@ -38,8 +38,10 @@ export function duplicateNumbers(root: string, series: readonly string[] = NUMBE
   return problems
 }
 
-// `.claude` is an agent harness's own directory (settings, loop files), never documentation.
-const SKIP_DIRS = new Set(['.git', '.claude', 'node_modules', 'lib', 'dist', 'coverage'])
+// `.claude` is an agent harness's own directory (settings, loop files), never documentation; `.system`
+// holds what the System writes into a run's worktree (the board, the task's dossier), which quotes
+// text from elsewhere, so its relative links resolve from nowhere here.
+const SKIP_DIRS = new Set(['.git', '.claude', '.system', 'node_modules', 'lib', 'dist', 'coverage'])
 
 function walk(dir: string, visit: (path: string, isDir: boolean) => void): void {
   for (const entry of readdirSync(dir)) {

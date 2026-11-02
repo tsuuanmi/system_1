@@ -10,9 +10,12 @@ depends on seam definitions only, and fails open.
 - **On request** (`request`, MCP `digests_request`): 1 to 64 stored artifacts; durable at once,
   idempotent by `key` (`clientRequestId`), at most `maxPending` pending (default 4). Nothing
   digests on its own.
-- **Its Worker** is whatever `ctx.workers` admits for the capabilities `review` and `local-data`
-  on the configured `tier` as minimum and maximum (default `economy`): a read-only agent Worker on
-  this machine (a Claude Code Worker in Base). No Worker is named in code (INV-11).
+- **Its Worker** is whatever `ctx.workers` admits for the capability `reason` only, on the
+  configured `tier` as minimum and maximum (default `economy`): a website Worker first, by the
+  router's quota-class order (a busy one is still admitted, after less busy ones). When none is
+  admitted (a `local-private` source, a brief over every such Worker's input bound, or none ready
+  or busy on the tier), it asks once more for `review` and `local-data`: a read-only agent Worker
+  on this machine (a Claude Code Worker in Base). No Worker is named in code (INV-11).
 - **Its brief** (`brief@1.1`, an `objective` artifact) is recorded before the run: the sources by
   content id, never their content, the instructions, and the `digest@1.0` schema. The Worker's
   source renders it, each source between `<artifact id="…">` tags, and checks egress on what it
@@ -26,7 +29,7 @@ depends on seam definitions only, and fails open.
 - **Settled once**, in one transaction under the request's lease: the digest (a `report` whose
   envelope inputs are its sources, as strict as the strictest), the `acceptance` decision
   (`digests.quote-check`) that names it, and the event `digests.settled` (with `ctx.eventLog`).
-- **Fails open:** no Worker admitted (its `admission` decision is named), a start refused, a
+- **Fails open:** no Worker admitted for either ask (both `admission` decisions are named), a start refused, a
   failed run, an execution gone, or a run past `timeoutMinutes` (default 30; the run is
   cancelled) settles the request `bypassed`, recorded with why; nothing waits on it.
 - **Restart:** each pending request goes on where it stood: routed again if nothing started (on
@@ -38,8 +41,8 @@ depends on seam definitions only, and fails open.
   `escalation`); both may wait up to 55 s for the request to settle. A request's `check`
   (contract 1.2), through which `digests_request` checks its output, runs inside the transaction
   that records it, before it commits: one that throws records nothing and schedules nothing.
-- **Bundle row:** on. With no read-only Worker on its tier (the agent rows off), every request
-  settles `bypassed`, recorded, which is safe.
+- **Bundle row:** on. With no Worker admitted for either ask on its tier (no Worker that proves
+  `reason`, and the agent rows off), every request settles `bypassed`, recorded, which is safe.
 - **Injects:** `store`, `artifacts`, `leases`, `workers`; reads `eventLog` when present; `mcp`
   is optional.
 - **Replaced by configuration:** the [`digest-extractive`](../digest-extractive/README.md) row

@@ -83,13 +83,23 @@ sources, 50 claims checked, `maxClaims` kept (default 20).
 
 ## The Worker
 
-The provider asks `ctx.workers` for work, never for a Worker by name (INV-11): capabilities
-`review` and `local-data`, which only a read-only agent Worker proves
+The provider asks `ctx.workers` for work, never for a Worker by name (INV-11): first the capability
+`reason` only, then, if no Worker is admitted for that, `review` and `local-data`
 ([routing](routing.md#capability-vocabulary)), on the configured tier as both its minimum and its
 maximum (`tier`, default `economy`; [once on `standard`](#one-escalation) after an escalation), at
-the sources' strictest classification. With the agent
-rows on and a read-only Claude Code Worker configured on the economy tier, that is the Worker
-PROP-0010 names; with none, the request is bypassed.
+the sources' strictest classification.
+
+A digest needs no more than `reason`: its sources are placed inline in its brief and its claims are
+quote-checked by code. So a website Worker at economy, first in the router's quota-class order and
+on a quota apart from the agents', writes it; a busy one is still admitted, ordered after less busy
+ones (ADR-0033). The router's checks bind it as any work: a `local-private` source never reaches a
+website Worker (the locality and egress checks refuse it), and a brief longer than a Worker takes
+(`maxInputChars`, ADR-0032) is not admitted there. When no Worker is admitted for `reason` (those
+two cases, or no Worker that proves it is ready or busy on the tier), the provider asks once more
+for `review` and `local-data`, which only a read-only agent Worker proves (it proves `reason` for
+review-member work only), so the digest runs on it, a read-only Claude Code Worker in Base, as
+before. With no Worker admitted either time, the request is bypassed, naming both admission
+decisions.
 
 The tier is never raised because no Worker of it is configured: that would be a silent fallback
 across tiers ([INV-2](../architecture/invariants.md#inv-2-fail-closed)), and the one escalation to
@@ -150,7 +160,8 @@ contract 1.1, the same for every provider:
 
 A digest is a capability, not a guarantee (ADR-0036, plugin rule 2): a digest that cannot be
 written is bypassed and recorded, and nothing waits on it. A request no Worker serves still
-settles, with its decision and reason. The bundle row is therefore on: with the agent rows off,
+settles, with its decision and reason. The bundle row is therefore on: with no Worker
+admitted for either ask (no Worker that proves `reason` on its tier, and the agent rows off),
 every request settles `bypassed`. A digest never accepts anything: a lead or a reviewer still
 judges the work, and the raw artifacts stay one `artifact` call away.
 
