@@ -282,7 +282,8 @@ const DECOMPOSE_PROMPT = [
   '- Name what you do not know as a question in the goal of the task that needs it; never invent a file, function, or command you were not shown.',
   '',
   'End your answer with one JSON object, and nothing after it, of this shape (the board_propose_plan input without projectId):',
-  '{"tasks": [{"key": "short-name", "title": "...", "goal": "...", "acceptance": [{"id": "a1", "statement": "...", "check": "tests"}], "dependsOn": ["other-key"], "actionClass": "workspace-write", "template": "algorithm-development"}]}',
+  '{"tasks": [{"key": "parse", "title": "...", "goal": "...", "acceptance": [{"id": "a1", "statement": "...", "check": "tests"}], "actionClass": "workspace-write", "template": "algorithm-development"}, {"key": "use-parse", "title": "...", "goal": "...", "acceptance": [{"id": "a1", "statement": "...", "check": "tests"}], "dependsOn": ["parse"], "actionClass": "workspace-write", "template": "algorithm-development"}]}',
+  'Each dependsOn entry is the key of another task of this plan, or the id of an existing task you were given.',
   'Keys are letters, digits, dots, hyphens, or underscores; at most 32 tasks.',
 ].join('\n')
 

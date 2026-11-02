@@ -589,7 +589,8 @@ them or none.
   unknown dependency, a subject an open task already writes, a closed project) rolls the whole plan
   back.
 - **Retry-safe** under `clientRequestId`: each item's proposal is recorded as
-  `<clientRequestId>#<key>`, so a retry returns the tasks the first call proposed.
+  `<clientRequestId>#<key>`, under `board_propose_plan`, so a retry returns the tasks the first call
+  proposed, and a `board_propose` naming such a key is refused (`conflict`).
 - **Nothing else changes.** Each task is `proposed`, and the board's sweep takes it as it takes any
   proposal: ready once its dependencies are done and the policy allows its action class. A lead
   token reaches its own project only (T285).

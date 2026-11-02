@@ -98,6 +98,9 @@ const checkedBy = <T>(check: Checked<T> | undefined, value: T): T => {
   return value
 }
 
+/** The calls that propose a task, under whose name a retry-safe key is recorded. */
+type ProposeTool = 'board_propose' | 'board_propose_plan'
+
 /** One task of a plan (`board_propose_plan`): a task's proposal, named in the plan by `key`, its `dependsOn` items' keys or the project's task ids. */
 export type PlanItem = Omit<TaskInput, 'projectId' | 'fixes'> & { key: string }
 /** A plan's item and the task proposed for it. */
@@ -707,10 +710,12 @@ export class StoreBoard extends Board {
   /**
    * Propose a task (`propose`), retry-safe under `clientRequestId`: a key already used returns the
    * task it made. `check` sees the task before the proposal commits: one that throws stores nothing.
+   * `tool` is the call the key was given to (a plan's items are `board_propose_plan`'s), so a key of
+   * one is never taken for the other's.
    */
-  proposeTask(input: TaskInput, at: Date = new Date(), clientRequestId?: string, check?: Checked<BoardTask>): BoardTask {
+  proposeTask(input: TaskInput, at: Date = new Date(), clientRequestId?: string, check?: Checked<BoardTask>, tool: ProposeTool = 'board_propose'): BoardTask {
     return this.ctx.store.transaction((db) => {
-      const prior = clientRequestId === undefined ? undefined : this.priorRequest(clientRequestId, 'board_propose', input.projectId)
+      const prior = clientRequestId === undefined ? undefined : this.priorRequest(clientRequestId, tool, input.projectId)
       if (prior) return checkedBy(check, this.taskOf(prior.task_id!).task)
       const { project } = this.projectOf(input.projectId)
       if (project.state === 'closed') throw new BoardError('invalid-transition', `${input.projectId} is closed`)
@@ -734,7 +739,7 @@ export class StoreBoard extends Board {
       this.validTask(task)
       db.prepare('INSERT INTO board_tasks (task_id, project_id, state, created_at, revision, record, writes) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(task.taskId, task.projectId, task.state, task.createdAt, task.revision, JSON.stringify(task), writes)
-      if (clientRequestId !== undefined) this.recordRequest(clientRequestId, 'board_propose', task.projectId, task.taskId, undefined, at)
+      if (clientRequestId !== undefined) this.recordRequest(clientRequestId, tool, task.projectId, task.taskId, undefined, at)
       return checkedBy(check, task)
     })
   }
@@ -744,7 +749,8 @@ export class StoreBoard extends Board {
    * proposed in dependency order ({@link planOrder}) through {@link proposeTask}, in one store
    * transaction, each `dependsOn` key replaced by the id of the task proposed for it, so a refusal of
    * any one stores none. Retry-safe under `clientRequestId`: each item's proposal is recorded under
-   * `<clientRequestId>#<key>`, so a retry returns the tasks it made.
+   * `<clientRequestId>#<key>` as `board_propose_plan`'s, so a retry returns the tasks it made and a
+   * `board_propose` naming that key is refused (`conflict`), never given a plan's task.
    */
   proposePlan(projectId: string, items: readonly PlanItem[], at: Date = new Date(), clientRequestId?: string, check?: Checked<PlannedTask[]>): PlannedTask[] {
     const order = planOrder(items)
@@ -752,7 +758,7 @@ export class StoreBoard extends Board {
       const ids = new Map<string, string>()
       for (const { key, dependsOn, ...rest } of order) {
         const task = this.proposeTask({ ...rest, projectId, dependsOn: (dependsOn ?? []).map((d) => ids.get(d) ?? d) }, at,
-          clientRequestId === undefined ? undefined : `${clientRequestId}#${key}`)
+          clientRequestId === undefined ? undefined : `${clientRequestId}#${key}`, undefined, 'board_propose_plan')
         ids.set(key, task.taskId)
       }
       // In the plan's own order, so a reader matches the tasks to its items by position too.
@@ -2614,14 +2620,14 @@ export class StoreBoard extends Board {
     }
   }
 
-  private priorRequest(clientRequestId: string, tool: 'board_charter' | 'board_propose', projectId: string | undefined): PriorRequest | undefined {
+  private priorRequest(clientRequestId: string, tool: 'board_charter' | ProposeTool, projectId: string | undefined): PriorRequest | undefined {
     const row = this.ctx.store.db.prepare('SELECT tool, project_id, task_id, approval_request, charter_version FROM board_client_requests WHERE client_request_id = ?').get(clientRequestId) as (PriorRequest & { tool: string }) | undefined
     if (!row) return undefined
     if (row.tool !== tool || (projectId !== undefined && row.project_id !== projectId)) throw new BoardError('conflict', `client request ${clientRequestId} was used for another call`)
     return row
   }
 
-  private recordRequest(clientRequestId: string, tool: 'board_charter' | 'board_propose', projectId: string, taskId: string | undefined, approvalRequest: string | undefined, at: Date, charterVersion?: number): void {
+  private recordRequest(clientRequestId: string, tool: 'board_charter' | ProposeTool, projectId: string, taskId: string | undefined, approvalRequest: string | undefined, at: Date, charterVersion?: number): void {
     this.ctx.store.db.prepare('INSERT INTO board_client_requests (client_request_id, tool, project_id, task_id, approval_request, created_at, charter_version) VALUES (?, ?, ?, ?, ?, ?, ?)')
       .run(clientRequestId, tool, projectId, taskId ?? null, approvalRequest ?? null, at.toISOString(), charterVersion ?? null)
   }

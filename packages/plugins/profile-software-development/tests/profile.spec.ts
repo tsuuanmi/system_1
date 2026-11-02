@@ -187,5 +187,10 @@ describe('the decompose template (PROP-0023 change 5)', () => {
     expect(prompt).toMatch(/board_propose_plan/)
     const shown = JSON.parse(prompt.split('\n').find((line) => line.startsWith('{"tasks"'))!) as Record<string, unknown>
     new SchemaRegistry().assertDef('mcp-board@1.6', 'board-propose-plan-input', { projectId: 'system', ...shown })
+    // The board would take it as it is: every dependency is a key of the same plan, so a planner copying it makes no refused plan.
+    const tasks = shown.tasks as Array<{ key: string; dependsOn?: string[] }>
+    const keys = new Set(tasks.map((t) => t.key))
+    expect(tasks.flatMap((t) => t.dependsOn ?? []).every((d) => keys.has(d))).toBe(true)
+    expect(tasks.some((t) => t.dependsOn?.length)).toBe(true)
   })
 })

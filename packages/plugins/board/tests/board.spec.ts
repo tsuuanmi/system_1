@@ -2088,6 +2088,11 @@ describe('ctx.board (store-backed): a plan of tasks (board_propose_plan, PROP-00
     const again = await plan(b, args)
     expect(again.structuredContent).toEqual(first.structuredContent)
     expect(await b.ctx.board.tasks({ projectId: 'p2' })).toHaveLength(2)
+    // A plan item's key is the plan's: board_propose naming it is refused, never given that task.
+    const single = await b.mcp().tools.get('board_propose')!.handler({ ...task('p2', 'single'), clientRequestId: 'plan-1#a' }, { scope: 'client' }) as unknown as { isError?: boolean; content: Array<{ text: string }> }
+    expect(single.isError).toBe(true)
+    expect(single.content[0]!.text).toMatch(/^conflict: client request plan-1#a was used for another call/)
+    expect(await b.ctx.board.tasks({ projectId: 'p2' })).toHaveLength(2)
   })
 
   it('holds a lead token to its own project: a plan of another project, or one depending on another project\'s task, is refused whole (T285)', async () => {
