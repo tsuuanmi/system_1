@@ -527,6 +527,28 @@ describe('a line on a template\'s pools (ADR-0083, PROP-0023)', () => {
     expect((await ctx.resources.reserve({ runId: 'r-one', taskId: 't1', lines: [{ pool: 'plan/acc-2', unit: 'usd', amount: 0.000001 }], caps: [{ pool: 'plan/acc-2', unit: 'usd', amount: 3.5 }] }, at(1))).state).toBe('reserved')
   })
 
+  it('still refuses a group cap on usage it could not count on an account no longer declared (INV-2, ADR-0065)', async () => {
+    const ctx = await boot(undefined, { pools: POOLS, templates: [plan] })
+    await ctx.resources.declare!('agents', [{ account: 'acc-1', group: 'runtime' }, { account: 'acc-2', group: 'runtime' }])
+    // A lower bound only: the run was cut before its runtime's count.
+    await ctx.resources.record(spend('u1', 'acc-1', 1, { schema: 'usage-record@1.1', partial: 'the run stopped before its result' } as Partial<UsageRecord>))
+    // The account goes; its pool is no longer listed, and its usage is still the task's.
+    await ctx.resources.declare!('agents', [{ account: 'acc-2', group: 'runtime' }])
+    const refused = await ctx.resources.reserve({ runId: 'r-next', taskId: 't1', lines: [{ pool: 'plan', unit: 'usd', amount: 0.000001 }], caps: [{ pool: 'plan', unit: 'usd', amount: 100 }] }, at(1))
+    expect(refused.state).toBe('refused')
+    expect(refused.reasons!.join(' ')).toMatch(/cap of plan\/acc-1 cannot be held: run run-u1 .*only a lower bound counted/)
+  })
+
+  it('counts a line on a pool that exists as that pool alone, even with pools named under it', async () => {
+    // A template whose id is also a configured pool's: the configured pool's lines keep their meaning.
+    const ctx = await boot(undefined, { pools: POOLS, templates: [{ ...plan, template: 'local' }] })
+    await ctx.resources.declare!('agents', [{ account: 'acc-1', group: 'runtime' }])
+    await ctx.resources.record(spend('u1', 'acc-1', 9, { pool: 'local/acc-1' }))
+    await ctx.resources.record(usage('u2', { account: 'here', pool: 'local', taskId: 't1', runId: 'run-u2', cost: { amount: 1, currency: 'USD', basis: 'runtime-estimate' } }))
+    const reserved = await ctx.resources.reserve({ runId: 'r-next', taskId: 't1', lines: [{ pool: 'local', unit: 'usd', amount: 0.000001 }], caps: [{ pool: 'local', unit: 'usd', amount: 2 }] }, at(1))
+    expect(reserved.state).toBe('reserved')
+  })
+
   it('refuses a line on a name no pool is under, and one whose every pool is unavailable', async () => {
     const ctx = await boot(undefined, { pools: POOLS, templates: [{ ...plan, unknown: 'unavailable' }] })
     const none = await ctx.resources.reserve({ runId: 'r1', taskId: 't1', lines: [{ pool: 'plan', unit: 'usd', amount: 1 }] }, at(1))

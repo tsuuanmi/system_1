@@ -34,10 +34,15 @@ budget, and Claude usage was about 52 USD API-equivalent per accepted result
 
 Option 3. In the ledger (`resources`):
 
-- A cap counts its scope's usage records and unexpired holds of every pool its line covers.
-- A line is available when its own pool is; a line on a name with no pool of its own is available
-  when one pool under it is, and `not configured` when none is (fail closed, INV-2).
-- Usage the ledger could not count (ADR-0065) is looked for in every known pool a cap covers.
+- A line on a name that is a pool counts that pool alone, as before, even when pools are named
+  under it. A line on a name that is no pool (a *group*) counts every pool named under it.
+- A cap counts its scope's usage records and unexpired holds of those pools, matched on the stored
+  rows, so an account no longer declared still counts.
+- A group line is available when one pool under it is, and `not configured` when none is (fail
+  closed, INV-2).
+- Usage the ledger could not count (ADR-0065) is looked for under the same rule: a lower bound or a
+  `usage.unknown` fact of a pool under the group refuses the cap, whether or not that pool is
+  declared now.
 
 In the engine, a task's start checks its budget's lines the same way. The board's configuration
 gains `defaultBudget`, the lines a task gets when its proposal names none; empty by default, so
@@ -49,7 +54,7 @@ nothing changes until the operator sets it.
   account serves it.
 - No line in use changes meaning: a pool id is never a prefix of another pool's id followed by `/`
   unless a template made it so.
-- A pool configured by hand whose id has a `/` (`plan/acc-a`) is counted by a line on `plan` too,
-  which is the same grouping a template makes.
+- A pool configured by hand whose id has a `/` (`plan/acc-a`) is counted by a line on `plan` too
+  when no pool is named `plan`, which is the same grouping a template makes.
 - The engine still reserves the step's least amount on the line's own name, so the hold counts
   against the cap before any account is chosen.

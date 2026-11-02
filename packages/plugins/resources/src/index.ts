@@ -81,9 +81,14 @@ export const MAX_WINDOWS = 8
  * serves it. A line on a concrete pool counts that pool only: no pool is named under it.
  */
 export const covers = (line: string, pool: string): boolean => pool === line || pool.startsWith(`${line}/`)
-/** {@link covers} in SQL, over a row's `pool`, with the parameters {@link coveredBy} gives. */
-const COVERED = '(pool = ? OR substr(pool, 1, ?) = ?)'
-const coveredBy = (line: string): [string, number, string] => [line, line.length + 1, `${line}/`]
+/**
+ * The pools a cap on `line` counts, as SQL over `column` with its parameters: `line` itself, and, for a
+ * line on a group (a name that is no pool of its own, `group`), every pool named under it, matched by
+ * prefix with `substr` (no LIKE wildcards). A line on a pool that exists counts that pool only, as
+ * before ADR-0083.
+ */
+const poolsOf = (line: string, group: boolean, column = 'pool'): { sql: string; params: Array<string | number> } =>
+  group ? { sql: `(${column} = ? OR substr(${column}, 1, ?) = ?)`, params: [line, line.length + 1, `${line}/`] } : { sql: `${column} = ?`, params: [line] }
 
 /** Lines and caps one reservation may name (INV-9). */
 export const MAX_LINES = 64
@@ -455,17 +460,19 @@ export class StoreResources extends Resources {
         } else if (!state.available) faults.push(`pool ${pool} is unavailable${state.until ? ` until ${state.until}` : `: ${this.unknownWindows(state).join(', ')} without a reading that says ok`}`)
         else fine.push(`pool ${pool} is available`)
       }
+      // A cap's name is a group when no pool has it (ADR-0083): then it counts every pool named under it.
+      const group = (name: string): boolean => !pools.some((p) => p.pool === name)
       for (const cap of request.caps ?? []) {
-        const used = this.used(db, request, cap)
-        const held = this.held(db, request, cap, at)
-        const wanted = round6(request.lines.filter((l) => l.pool === cap.pool && l.unit === cap.unit).reduce((n, l) => n + l.amount, 0))
+        const used = this.used(db, request, cap, group(cap.pool))
+        const held = this.held(db, request, cap, at, group(cap.pool))
+        const wanted = round6(request.lines.filter((l) => (l.pool === cap.pool || (group(cap.pool) && covers(cap.pool, l.pool))) && l.unit === cap.unit).reduce((n, l) => n + l.amount, 0))
         const total = round6(used + held + wanted)
         const sum = `${used} used, ${held} held, ${wanted} wanted`
         if (total > cap.amount) faults.push(`cap ${cap.amount} ${cap.unit} of ${cap.pool} would be exceeded: ${sum}`)
         else fine.push(`cap ${cap.amount} ${cap.unit} of ${cap.pool} holds: ${sum}`)
       }
       // A cap never counts usage it cannot see as 0 (INV-2, ADR-0065).
-      faults.push(...this.uncountable(db, request, pools.map((p) => p.pool)))
+      faults.push(...this.uncountable(db, request, group))
       const state = faults.length ? 'refused' : 'reserved'
       const reservationId = `res-${randomUUID()}`
       const inputs = [...new Set(request.lines.flatMap((l) => pools.some((p) => p.pool === l.pool) ? this.readingArtifacts(db, l.pool) : []))]
@@ -653,14 +660,15 @@ export class StoreResources extends Resources {
     return undefined
   }
 
-  private used(db: DatabaseSync, request: ReservationRequest, cap: BudgetLine): number {
+  private used(db: DatabaseSync, request: ReservationRequest, cap: BudgetLine, group = false): number {
     const scope = this.scope(request)
     if (!scope) return 0
     const amount = {
       tokens: 'SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))', usd: 'SUM(COALESCE(cost_usd, 0))', turns: 'SUM(COALESCE(turns, 0))',
       runs: 'COUNT(*)', minutes: 'SUM(COALESCE(duration_ms, 0)) / 60000.0',
     }[cap.unit]
-    const row = db.prepare(`SELECT ${amount} AS n FROM resource_usage WHERE ${scope.column} = ? AND ${COVERED}`).get(scope.value, ...coveredBy(cap.pool)) as { n: number | null }
+    const pools = poolsOf(cap.pool, group)
+    const row = db.prepare(`SELECT ${amount} AS n FROM resource_usage WHERE ${scope.column} = ? AND ${pools.sql}`).get(scope.value, ...pools.params) as { n: number | null }
     return round6(row.n ?? 0)
   }
 
@@ -676,13 +684,14 @@ export class StoreResources extends Resources {
    * there is one is unknown, and the caps are refused as well. A request without caps, or without a
    * scope (its caps bound its own lines only), is not concerned.
    */
-  private uncountable(db: DatabaseSync, request: ReservationRequest, known: readonly string[]): string[] {
+  private uncountable(db: DatabaseSync, request: ReservationRequest, group: (name: string) => boolean): string[] {
     const scope = this.scope(request)
     if (!scope || !request.caps?.length) return []
-    const capped = new Set(request.caps.map((c) => c.pool))
+    const capped = [...new Set(request.caps.map((c) => c.pool))]
     const named = [...capped].sort().join(', ')
-    // Each pool a cap counts (ADR-0083): its own, and every known pool of a template it names.
-    const pools = new Set([...capped, ...known.filter((p) => [...capped].some((c) => covers(c, p)))])
+    // Each pool a cap counts (ADR-0083): its own, and for a group every pool named under it, whether
+    // or not that pool is configured or declared now, so a removed account's usage still counts (INV-2).
+    const pools = { has: (pool: string) => capped.some((c) => pool === c || (group(c) && covers(c, pool))) }
     const eventLog = this.ctx.get('eventLog')
     if (!eventLog) return [`the caps of ${named} cannot be held: no event log (ctx.eventLog) is loaded, so whether a run of ${scope.value} has usage the ledger could not count is unknown, and a cap never counts unknown usage as 0 (INV-2)`]
     const reservedFor = db.prepare('SELECT project_id, task_id FROM resource_reservations WHERE run_id = ? ORDER BY reserved_at DESC LIMIT 1')
@@ -702,7 +711,7 @@ export class StoreResources extends Resources {
     // A run of the scope whose only records in a capped pool are lower bounds, whether or not a fact
     // names it (a crash, or a failed append, between its record and its fact): the record says it.
     const facts = new Set(found.runs.map((r) => `${r.pool}\0${r.runId}`))
-    const lower = this.lowerBounds(db, scope, [...pools])
+    const lower = this.lowerBounds(db, scope, capped.map((c) => poolsOf(c, group(c), 'u.pool')))
     for (const r of lower.runs) {
       if (facts.has(`${r.pool}\0${r.runId}`)) continue
       faults.push(`cap of ${r.pool} cannot be held: run ${r.runId}${r.worker ? ` on ${r.worker}` : ''} of ${scope.value} has usage the ledger could not count (only a lower bound counted: ${r.partial})`)
@@ -716,12 +725,12 @@ export class StoreResources extends Resources {
    * and no whole record there, the first {@link MAX_LOWER_BOUND_RUNS} by when they were recorded
    * (INV-9); `more` when there were more.
    */
-  private lowerBounds(db: DatabaseSync, scope: { column: 'task_id' | 'project_id'; value: string }, pools: string[]): { runs: Array<{ pool: string; runId: string; worker?: string; partial: string }>; more: boolean } {
+  private lowerBounds(db: DatabaseSync, scope: { column: 'task_id' | 'project_id'; value: string }, pools: Array<{ sql: string; params: Array<string | number> }>): { runs: Array<{ pool: string; runId: string; worker?: string; partial: string }>; more: boolean } {
     if (!pools.length) return { runs: [], more: false }
     const rows = db.prepare(`SELECT u.pool AS pool, u.run_id AS run_id, MIN(u.seq) AS first, json_extract(u.record, '$.worker') AS worker, json_extract(u.record, '$.partial') AS partial
-      FROM resource_usage u WHERE u.${scope.column} = ? AND u.pool IN (${pools.map(() => '?').join(', ')}) AND u.run_id IS NOT NULL AND NOT ${whole('u.')}
+      FROM resource_usage u WHERE u.${scope.column} = ? AND (${pools.map((p) => p.sql).join(' OR ')}) AND u.run_id IS NOT NULL AND NOT ${whole('u.')}
         AND NOT EXISTS (SELECT 1 FROM resource_usage w WHERE w.run_id = u.run_id AND w.pool = u.pool AND ${whole('w.')})
-      GROUP BY u.pool, u.run_id ORDER BY first LIMIT ${MAX_LOWER_BOUND_RUNS + 1}`).all(scope.value, ...pools) as Array<{ pool: string; run_id: string; worker: string | null; partial: string }>
+      GROUP BY u.pool, u.run_id ORDER BY first LIMIT ${MAX_LOWER_BOUND_RUNS + 1}`).all(scope.value, ...pools.flatMap((p) => p.params)) as Array<{ pool: string; run_id: string; worker: string | null; partial: string }>
     return {
       runs: rows.slice(0, MAX_LOWER_BOUND_RUNS).map((r) => ({ pool: r.pool, runId: r.run_id, ...(r.worker !== null ? { worker: r.worker } : {}), partial: r.partial })),
       more: rows.length > MAX_LOWER_BOUND_RUNS,
@@ -729,11 +738,12 @@ export class StoreResources extends Resources {
   }
 
   /** What unexpired holds of the request's scope keep of a cap: a hold nobody released stops counting when it expires (INV-9). */
-  private held(db: DatabaseSync, request: ReservationRequest, cap: BudgetLine, at: Date): number {
+  private held(db: DatabaseSync, request: ReservationRequest, cap: BudgetLine, at: Date, group = false): number {
     const scope = this.scope(request)
     if (!scope) return 0
-    const row = db.prepare(`SELECT SUM(amount) AS n FROM resource_holds WHERE ${scope.column} = ? AND ${COVERED} AND unit = ? AND expires_ms > ?`)
-      .get(scope.value, ...coveredBy(cap.pool), cap.unit, at.getTime()) as { n: number | null }
+    const pools = poolsOf(cap.pool, group)
+    const row = db.prepare(`SELECT SUM(amount) AS n FROM resource_holds WHERE ${scope.column} = ? AND ${pools.sql} AND unit = ? AND expires_ms > ?`)
+      .get(scope.value, ...pools.params, cap.unit, at.getTime()) as { n: number | null }
     return round6(row.n ?? 0)
   }
 
