@@ -29,6 +29,7 @@ decisions, architecture, or design.
 | [model-routing.md](model-routing.md) | cost and value of each algorithm-development step by tier and Worker family, the cause of the fix rate, an A/B design for self-review, ranked recommendations; the per-step store pull it still needs | 2026-10-28 |
 | [shared-node-modules-experiment.md](shared-node-modules-experiment.md) | PROP-0020 task 1: what an agent sandbox can measure about a shared read-only `node_modules` (shims and `.modules.yaml` paths read; installs blocked by pnpm's store lock; the host commands that remain) | 2026-10-31 |
 | [lean-core-2026-11-01.md](lean-core-2026-11-01.md) | where a task's time, tokens and the operator's attention go (live store, one week), the ledger's double count of resumed sessions, the gate ending a quarter of agent runs, what is used, the SDK and review evidence, the options four System runs chose for PROP-0022 | 2026-11-01 |
+| [token-use-2026-11-02.md](token-use-2026-11-02.md) | where an accepted task's Claude tokens go (live store, one week, each session counted once): cost by step and tier, sessions re-read on every resume, prompt sizes, who does the work, and the System brainstorm on Worker roles for PROP-0023 | 2026-11-02 |
 
 Each analysis ends with **Adopted** and **Not adopted** lists. Once its findings
 are fully promoted, an analysis may be pruned, because git history keeps it.
