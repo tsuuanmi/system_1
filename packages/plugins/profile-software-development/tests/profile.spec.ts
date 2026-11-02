@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -82,6 +83,58 @@ describe('the inputs each step of algorithm-development reads (docs/reference/wo
   })
 })
 
+describe('the pipeline of algorithm-development (T365, ADR-0082)', () => {
+  // The sha256 of JSON.stringify of the spec before T365, recorded from the base commit's own
+  // algorithmDevelopment() (b7507401), copied out of that tree and run: a change to any byte of the
+  // full graph (a prompt, a capability, a field) fails this, whatever the code builds today.
+  const BEFORE_T365 = '20ca0612093a8e83b386bf6c5c4bb855c0d65836fea9c79cdf73eb0d8972ece5'
+  const BEFORE_T365_KINDS = '7bf526c81b78180821d10e0491c42018df80e923beec3275c699e89a8b81f1ac' // with { develop: 'docs', docs: 'writing' }
+  const sha256 = (nodes: NodeTemplate[]): string => createHash('sha256').update(JSON.stringify(nodes)).digest('hex')
+
+  it('is full by default, and the full spec is the one before the switch, byte for byte (no pipeline given, or full; shipped and configured kinds)', () => {
+    expect(sha256(SoftwareDevelopment.ALGORITHM_DEVELOPMENT)).toBe(BEFORE_T365)
+    expect(sha256(SoftwareDevelopment.algorithmDevelopment())).toBe(BEFORE_T365)
+    expect(sha256(SoftwareDevelopment.algorithmDevelopment({}, 'full'))).toBe(BEFORE_T365)
+    expect(sha256(SoftwareDevelopment.algorithmDevelopment({ develop: 'docs', docs: 'writing' }))).toBe(BEFORE_T365_KINDS)
+    expect(sha256(SoftwareDevelopment.algorithmDevelopment({ develop: 'docs', docs: 'writing' }, 'full'))).toBe(BEFORE_T365_KINDS)
+    expect(SoftwareDevelopment.Config({}).pipeline).toBe('full')
+  })
+
+  it('serves the full graph, byte for byte, from a row that does not set the pipeline (the live profile unchanged)', async () => {
+    const ctx = await boot()
+    const served: NodeTemplate[][] = []
+    const template = ctx.workflow.template.bind(ctx.workflow)
+    ctx.workflow.template = (name: string, nodes: NodeTemplate[], options?: { version?: string }) => {
+      if (name === 'algorithm-development') served.push(nodes)
+      return template(name, nodes, options)
+    }
+    await ctx.plugin(SoftwareDevelopment, {})
+    expect(served.map(sha256)).toEqual([BEFORE_T365])
+  })
+
+  it('has no selfreview node under lean, and the review depends on the writer only; the rest is as in full', () => {
+    const lean = SoftwareDevelopment.algorithmDevelopment({}, 'lean')
+    expect(lean.map((n) => n.nodeId)).toEqual(['develop:1', 'review:1'])
+    const full = SoftwareDevelopment.ALGORITHM_DEVELOPMENT
+    expect(lean[0]).toEqual(full[0])
+    expect(lean[1]).toEqual({ ...full[2]!, dependsOn: ['develop:1'] })
+    expect(lean.some((n) => n.selfReview)).toBe(false)
+  })
+
+  it('serves the lean graph when the row says so, records the pipeline in the template\'s playbook version, and refuses another value (INV-2)', async () => {
+    const ctx = await boot()
+    await ctx.plugin(SoftwareDevelopment, { pipeline: 'lean' })
+    expect(ctx.workflow.templateSteps('algorithm-development')!.map((s) => s.nodeId)).toEqual(['develop:1', 'review:1'])
+    expect(SoftwareDevelopment.checkConfig({ pipeline: 'lean' })).toEqual([])
+    expect(SoftwareDevelopment.checkConfig({ pipeline: 'fast' } as never)).toEqual(['pipeline must be full or lean, not "fast"'])
+    expect(() => SoftwareDevelopment.Config({ pipeline: 'fast' } as never)).toThrow()
+    const other = await boot()
+    await expect(other.plugin(SoftwareDevelopment, { pipeline: 'fast' } as never)).rejects.toThrow(/pipeline expected "full" \| "lean" but got "fast"/)
+    expect(SoftwareDevelopment.templateVersion('full')).not.toContain('lean')
+    expect(SoftwareDevelopment.templateVersion('lean')).toMatch(/\+lean$/)
+  })
+})
+
 describe('the kind of work each step of algorithm-development names (ADR-0057)', () => {
   const kinds = (nodes: NodeTemplate[]) => Object.fromEntries(nodes.flatMap((n) => [
     [n.nodeId, n.kind ?? null], ...Object.entries(n.variants ?? {}).map(([variant, v]) => [`${n.nodeId} (${variant})`, v.kind ?? null]),
@@ -91,7 +144,7 @@ describe('the kind of work each step of algorithm-development names (ADR-0057)',
     expect(kinds(SoftwareDevelopment.ALGORITHM_DEVELOPMENT)).toEqual({
       'develop:1': 'code', 'develop:1 (docs)': 'docs', 'develop:1 (tests)': 'tests', 'selfreview:1': null, 'review:1': null,
     })
-    expect(SoftwareDevelopment.Config({})).toEqual({ kinds: SoftwareDevelopment.DEFAULT_KINDS })
+    expect(SoftwareDevelopment.Config({})).toEqual({ kinds: SoftwareDevelopment.DEFAULT_KINDS, pipeline: 'full' })
   })
 
   it('takes each step\'s kind from the row\'s configuration, the rest keeping theirs, and the reviews still none; a retired validate kind is ignored', async () => {

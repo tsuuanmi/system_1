@@ -82,6 +82,16 @@ holds no engine code and no rules of its own.
     `checkConfig` (for `system check`) and the load refuse a key that is not a
     step and a kind that is not a kind of work (INV-2); no key gives a review a
     kind. A `validate` key of an earlier version is accepted and ignored.
+  - **Config `pipeline`** (`full`, the default, or `lean`;
+    [ADR-0082](../../../docs/decisions/adr/0082-the-lean-pipeline-of-algorithm-development.md))
+    says which graph `algorithm-development` has. `full` is the graph above, unchanged.
+    `lean` has no `selfreview:1` and none of the steps grown from it, and `review:1` depends
+    on `develop:1` alone; the rest is as in `full`. A run keeps the spec it started with, so
+    changing the key reaches the runs started after it; under `lean` the template's playbook
+    version is the package's with `+lean`, recorded in each step's brief. Any other value is
+    refused (`checkConfig`, the load). The operator turns `lean` on; this package's default
+    never does. Its parts for a finding's confirmation and for parallel checks and review are
+    pending (T366, T367).
   - The project's charter and milestones are the board's, the exact-subject
     review, remediation through the approval queue, briefs, and digests the
     engine's, for any template ([workflow engine](../workflow/README.md)).

@@ -158,6 +158,32 @@ describe('the algorithm-development template (PROP-0010 B8, T267)', () => {
     expect(pilot.ctx.workflow.templateSteps('algorithm-development')!.map((s) => s.nodeId)).toEqual(['develop:1', 'selfreview:1', 'review:1'])
   })
 
+  it('lands a change under pipeline lean without a self-review: develop, then the review, the review\'s brief recording the lean pipeline (T365, ADR-0082)', async () => {
+    const pilot = await boot({ profile: { pipeline: 'lean' } })
+    const { ctx, agent } = pilot
+    await charter(ctx, 'p1')
+    const task = await propose(pilot, 'p1', 'make add() add')
+    const run = await attempt(ctx, task.taskId)
+    const done = await reported(ctx, run.runId)
+    expect(done.status).toBe('completed')
+    expect(done.nodes.map((n) => [n.nodeId, n.state])).toEqual([['develop:1', 'COMPLETED'], ['review:1', 'COMPLETED']])
+    expect(agent.runs.map((r) => r.role).filter((role) => role !== 'digest')).toEqual(['develop', 'review'])
+    // The run's spec is the lean one: it was built, and is kept, without the node.
+    expect(ctx.workflow.get(run.runId)!.nodes.some((n) => n.nodeId.startsWith('selfreview'))).toBe(false)
+    // Each step's brief names the playbook of the pipeline that built the spec.
+    const brief = ctx.artifacts.get(done.nodes.find((n) => n.nodeId === 'review:1')!.brief!)!.body as { handbook: { layers: Array<{ layer: number; version: string }> } }
+    expect(brief.handbook.layers.find((l) => l.layer === 4)!.version).toMatch(/^playbook:algorithm-development@\S+\+lean:/)
+    // The change landed as it does with the self-review: accepted on its checks, waiting for its landing.
+    const held = await until(async () => {
+      const t = await ctx.board.task(task.taskId)
+      return t?.result?.digest ? t : undefined
+    }, 'the digest on the task\'s result')
+    expect(held).toMatchObject({ state: 'review', waiting: { reason: 'landing' } })
+    expect(readFileSync(join(agent.runs[0]!.workspace, 'calc.py'), 'utf8')).toBe(FIXED)
+    const acceptance = ctx.artifacts.get(done.task!.outcome!.decision!)!.body as { outcome: { option: string; detail: { checks: Record<string, boolean> } } }
+    expect(acceptance.outcome).toMatchObject({ option: 'accept', detail: { checks: { review: true, tests: true, lint: true } } })
+  })
+
   it('passes a develop step whose Worker ran the check, recorded by the System with its exit code, though it wrote no evidence; the dossier lists the recorded command (T284)', async () => {
     const pilot = await boot({ ran: true, evidence: false })
     const { ctx, agent } = pilot

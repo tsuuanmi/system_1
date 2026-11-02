@@ -221,7 +221,8 @@ describe('Workers = account × role: derivation (ADR-0051)', () => {
     expect(workers.filter((w) => w.sandbox === 'workspace-write').map((w) => [w.id, w.runtime, w.kinds])).toEqual([['claude-code', 'claude-agent-sdk', ['code', 'docs', 'tests']], ['codex-writer', 'codex-sdk', ['validation']]])
     const profile = rowOf('work-kinds.patch.yml', 'profile-software-development')
     expect(SoftwareDevelopment.checkConfig(profile)).toEqual([])
-    expect(SoftwareDevelopment.Config(profile as never)).toEqual({ kinds: SoftwareDevelopment.DEFAULT_KINDS })
+    // The live profile sets no pipeline (ADR-0082): it reads as full, the graph unchanged; the operator turns lean on.
+    expect(SoftwareDevelopment.Config(profile as never)).toEqual({ kinds: SoftwareDevelopment.DEFAULT_KINDS, pipeline: 'full' })
     const system = workers.filter((w) => w.workspace === '/home/tan/workspaces/system')
     expect(system.every((w) => w.worktreePerRun === true)).toBe(true)
     // T99 D5: a digest asks for a read-only Worker on the economy tier only, never one of the
