@@ -151,7 +151,15 @@ packet-reviewed changes against agent-reviewed ones.
   fix starts a fresh session from the brief and the task's dossier
   ([ADR-0070](../decisions/adr/0070-workers-that-share-no-session-work-through-a-tasks-dossier.md)):
   the diff, the open findings, the checks' output. The choice is a `routing` decision naming the
-  size.
+  size (board task T386).
+  - **How, in the code.** Leaving `resume` off the fix's brief is not enough: an agent Worker resumes
+    a session's native conversation whenever the session has one (`agent-workers` `turnOf`). The fix
+    moves to a new session through the session move a lost session already takes
+    (`workflow/src/session-moves.ts`, a `workflow.session-move` decision), its brief carrying the
+    author's earlier turns as pointers (`fix-sessions.ts` `authorDraft`).
+  - **Measuring a session's size.** A usage record holds a run's totals, not its last turn's
+    context. The ceiling reads the session's latest run: its input (uncached, cache read, and cache
+    written) divided by its turns, an average context per turn that grows with the session.
 - **Turn caps by step**, in the operator's patch (`maxTurns` per role and tier, as today): build
   16, fix 8, review 12 (the team's pilot values; build averages 28 today). A run that reaches its cap ends, and its result says so.
 - **A default task budget.** The board task's `budget` is already enforced by reservation before
