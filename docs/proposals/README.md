@@ -206,8 +206,8 @@ accepted/implemented -> superseded
   step; the operator decides merges in a batch and a light change lands on its own; little-used parts
   are turned off and frozen. Target: a small task landed in 20 to 30 minutes, quality held.
 
-- [PROP-0023: Worker roles and a token budget](0023-worker-roles-and-token-budget.md), **draft**
-  (from the operator's decisions of 2026-11-02). Claude builds, at the standard tier; Codex and
+- [PROP-0023: Worker roles and a token budget](0023-worker-roles-and-token-budget.md), **accepted**
+  (2026-11-03; from the operator's decisions of 2026-11-02). Claude builds, at the standard tier; Codex and
   Antigravity review, write tests and documentation, and run the checks; website Workers ask,
   research, brainstorm, and review a change from a packet when it fits. A session stops growing past
   a ceiling, every task has a default budget, frontier is reached only by escalation, and a

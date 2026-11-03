@@ -1,7 +1,7 @@
 ---
 id: PROP-0023
 type: proposal
-status: draft
+status: accepted
 owners: [operator]
 created: 2026-11-02
 summary: Each kind of Worker does the work it is for, so Claude's tokens go to building only. Claude (standard tier by default) writes code; Codex and Antigravity review, write tests and documentation, and run the checks; website Workers ask, research, brainstorm, and review a change when the review packet fits. A session stops growing past a ceiling, every task carries a token budget, and a decompose template splits a goal into small tasks that run in parallel.
@@ -283,3 +283,16 @@ Each step is measured over a week of self-build before the next.
    should one approval cover the whole plan?
 3. Are the team's pilot values (50 k ceiling, 6 USD an attempt, turn caps 16, 8, 12) the right starting
    points?
+
+## Decision
+
+Accepted by the operator on 2026-11-03, with the open questions answered as follows:
+
+1. **Yes.** The System repository is public, so its diffs may go to website Workers as
+   `operator-shared` (change 2, T387).
+2. **One approval covers the whole plan.** A plan filed with `board_propose_plan` waits for one
+   verdict, not one per task. This is not built yet: today each of a plan's tasks waits for the
+   policy's verdict as any proposal does.
+3. **The pilot values are the starting points:** a 50 k context ceiling, 6 USD an attempt, and turn
+   caps of 16 (build), 8 (fix) and 12 (review), read weekly. The live patch caps a Claude build at 30
+   turns for now, since build averages 28 today.
