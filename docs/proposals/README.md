@@ -206,6 +206,13 @@ accepted/implemented -> superseded
   step; the operator decides merges in a batch and a light change lands on its own; little-used parts
   are turned off and frozen. Target: a small task landed in 20 to 30 minutes, quality held.
 
+- [PROP-0023: Capability reuse and measured code deletion](0023-capability-reuse-and-deletion.md),
+  **draft** (2026-11-03). A bounded, evidence-first program to reuse DSH/Hermes/SDK
+  capabilities only where they reduce maintained code or supply a needed feature:
+  baseline and prune duplicate paths, then evaluate Skills, memory, outbound
+  notifications and Hermes Kanban UI with conformance and rollback gates.
+  No Hermes Worker, second board, or runtime change; [research audit](../research/capability-reuse-audit-2026-11-03.md).
+
 Use [0000-template.md](0000-template.md) for new proposals. The
 [roadmap](roadmap.md) is a non-normative queue of milestones, not a substitute for
 a reviewed proposal.
