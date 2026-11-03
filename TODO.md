@@ -43,3 +43,12 @@ large file is inventoried by section, or by a Gemini API Worker (a large context
 | 4.3 | regenerate generated files; `pnpm check` | todo |
 | 5.1 | cross-family team review of the whole diff | todo |
 | 6.1 | measures in the PR; delete PLAN.md and TODO.md | todo |
+
+## System defects found while running this work (separate tasks, after it)
+
+| # | Defect | Evidence |
+|---|---|---|
+| S1 | Routing ranks load after quota class, so a queued subscription Worker wins over idle metered ones: five parallel economy `ask`s all queued on ChatGPT while seven Gemini Workers were free | runs `run_482254d60538648b` to `run_01115fa195636975` |
+| S2 | Model Workers report no load and no quota, so every Gemini Worker ties and the id decides: every team member went to `model:gemini-2-std`, keys 3 and 4 were never used | `system usage`, 2026-11-03 10:05 to 10:15 UTC |
+| S3 | A model Worker whose provider answers 429 `QUOTA` gets no cooldown: routing kept sending members to the exhausted key | `run_bd3027ed288d9064`, `run_f3c0438019b019dc` |
+| S4 | A profile patch was reverted to an older backup by another session (16:09 local), silently undoing PROP-0023 change 1's roles | `cordis.patch.yml` against `cordis.patch.before-prop-0023-2026-11-03.yml` |
