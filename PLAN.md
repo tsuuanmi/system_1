@@ -66,16 +66,14 @@ never rewrite" for deletion. An accepted ADR is still never edited in place.
 
 ## Workers
 
-No Claude Worker writes in this work (operator, 2026-11-03).
+Changed by the operator on 2026-11-03: the work runs directly, not through System, after phase 1
+on System stalled on Gemini free-tier quota (20 requests a day per key and model) and routing
+defects (TODO.md, S1 to S4). No System Worker runs in this work.
 
-| Worker | Tier | Work |
+| Who | Model | Work |
 |---|---|---|
-| ChatGPT Web | economy | inventory, classification, summaries of research and proposals |
-| Gemini API (one Worker per key) | economy | inventory beside ChatGPT, for a second family; synthesis |
-| Gemini API | standard | review team member |
-| Codex `develop-2` (kinds docs, tests) | economy | writers of phases 3 and 4 |
-| Codex `review` | economy | each unit's review |
-| Antigravity, and agent Workers on an API key | — | writers of later rewrite waves, once tasks A and B land |
+| inventory subagents, one per area, read-only | Haiku | phase 1: a verdict per file or section, with evidence and inbound links |
+| the lead | — | checks every delete and merge verdict, phase 2's list, rewrites, links, the gate |
 
 ## Handoff
 
