@@ -523,6 +523,29 @@ async function callToolOf(cli: string): Promise<CallTool> {
   return module.callTool
 }
 
+/** Waits before each retry of a read whose call failed in transport: at most 3 more tries, about 35 s in all (INV-9). */
+export const READ_RETRY_MS = [5_000, 10_000, 20_000] as const
+
+/**
+ * `call` for read-only tools only (status, explain, result, roster), which are safe to repeat: a call
+ * that throws (the daemon did not answer, `fetch failed`, while it lands or sweeps under load) is tried
+ * again after each wait of `waits`; the last failure is thrown. A tool's own error is an answer and is
+ * never retried.
+ */
+export function retryingReads(call: CallTool, waits: readonly number[] = READ_RETRY_MS, wait: (ms: number) => Promise<unknown> = sleep): CallTool {
+  return async (name, args, home) => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await call(name, args, home)
+      } catch (error) {
+        if (attempt >= waits.length) throw error
+        console.error(`${name}: ${error instanceof Error ? error.message : String(error)}; trying again in ${waits[attempt]! / 1000} s`)
+        await wait(waits[attempt]!)
+      }
+    }
+  }
+}
+
 /**
  * The profile's whole health. `status` lists only the checks that are not ok unless asked for every
  * one (`checks: true`, mcp-status@1.0); a profile from before that ignores the argument and lists them
@@ -553,7 +576,7 @@ async function answerOf(call: CallTool, home: string, runId: string): Promise<Ru
 }
 
 export async function capture(cli: string, home: string, out: string): Promise<number> {
-  const call = await callToolOf(cli)
+  const call = retryingReads(await callToolOf(cli))
   const health = await healthOf(call, home)
   const broken = baselineProblems(health)
   if (broken.length) {
@@ -584,7 +607,7 @@ export async function capture(cli: string, home: string, out: string): Promise<n
 
 export async function verify(cli: string, home: string, beforePath: string, snapshot: string, newWorkers: readonly string[], settleSeconds: number, workersWaitSeconds: number, removedWorkers: readonly string[] = []): Promise<number> {
   const before = JSON.parse(readFileSync(beforePath, 'utf8')) as Capture
-  const call = await callToolOf(cli)
+  const call = retryingReads(await callToolOf(cli))
   const problems: string[] = []
   const notes: string[] = []
 

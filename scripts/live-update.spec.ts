@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
 import {
   awaitIdle, awaitWorkers, baselineProblems, cutOutcomes, cutReportLines, type CutSteps, type Health, healthOf, healthProblems, idle, type Running, runningInStore, runningLines, runningOf, runProblems,
-  workerProblems, type Workers, workersNow, workersOf, workersTable,
+  retryingReads, workerProblems, type Workers, workersNow, workersOf, workersTable,
 } from './live-update-check.ts'
 import { daemonEnv, type FakeSystem, fakeSystem, type FakeWork, standInUnit, type StandInUnit } from './systemd-stand-in.ts'
 
@@ -1103,6 +1103,32 @@ const ROSTER_AFTER = {
   },
   counts: { ready: 0, busy: 0, resting: 0, unavailable: 5, quarantined: 0 },
 }
+
+describe('live-update-check: a read the daemon did not answer is tried again, bounded', () => {
+  it('retries a call that throws after each wait, returns its answer, and never retries a tool error', async () => {
+    const waits: number[] = []
+    let calls = 0
+    const flaky = retryingReads(async () => {
+      if (++calls < 3) throw new Error('fetch failed')
+      return { isError: false, text: 'ok', structured: undefined }
+    }, [5, 10, 20], async (ms) => { waits.push(ms) })
+    expect((await flaky('explain', { id: 'r' }, '/nowhere')).text).toBe('ok')
+    expect(calls).toBe(3)
+    expect(waits).toEqual([5, 10])
+
+    let errors = 0
+    const refused = retryingReads(async () => { errors++; return { isError: true, text: 'unknown run', structured: undefined } }, [5], async () => undefined)
+    expect((await refused('explain', { id: 'r' }, '/nowhere')).isError).toBe(true)
+    expect(errors).toBe(1)
+  })
+
+  it('throws the last failure once the waits are spent', async () => {
+    let calls = 0
+    const down = retryingReads(async () => { calls++; throw new Error(`fetch failed ${calls}`) }, [1, 2], async () => undefined)
+    await expect(down('status', {}, '/nowhere')).rejects.toThrow('fetch failed 3')
+    expect(calls).toBe(3)
+  })
+})
 
 describe('live-update-check: the Workers take work again after the update (T219)', () => {
   it('reads each Worker\'s availability, and why one takes no work, from the roster', async () => {
