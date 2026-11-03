@@ -4,7 +4,7 @@
  * it as it is (types stripped); it needs no install of its own.
  *
  *   node scripts/live-update-check.ts capture <cli> <DSH_HOME> <before.json>
- *   node scripts/live-update-check.ts verify <cli> <DSH_HOME> <before.json> <snapshot dir> [--new-workers <prefix,…>] [--settle <seconds>] [--workers-wait <seconds>]
+ *   node scripts/live-update-check.ts verify <cli> <DSH_HOME> <before.json> <snapshot dir> [--new-workers <prefix,…>] [--removed-workers <id,…>] [--settle <seconds>] [--workers-wait <seconds>]
  *   node scripts/live-update-check.ts running <cli> <DSH_HOME>
  *   node scripts/live-update-check.ts await-idle <cli> <DSH_HOME> --wait <seconds> [--every <seconds>] [--cut-running [--cut-file <path>]]
  *   node scripts/live-update-check.ts stop-cut <cli> <DSH_HOME> --deadline <seconds>
@@ -193,10 +193,11 @@ export async function workersNow(call: CallTool, home: string): Promise<Workers>
  * What the update did to the Workers: each one that took work before it (`ready` or `busy`) must
  * take work again. One that is `unavailable` or `quarantined` now, or no longer listed, is a problem
  * with its reason; one `resting` at a usage limit is a note (a limit is no update's doing). Workers
- * that took no work before, and Workers new in the update, are not held to it. `waiting` names the
- * Workers that do not take work again yet.
+ * that took no work before, and Workers new in the update, are not held to it, nor is a Worker of
+ * `removed` (exact ids) that the update's patch removes on purpose: gone, it is a note. `waiting`
+ * names the Workers that do not take work again yet.
  */
-export function workerProblems(before: Workers | undefined, after: Workers): { problems: string[]; notes: string[]; waiting: string[] } {
+export function workerProblems(before: Workers | undefined, after: Workers, removed: readonly string[] = []): { problems: string[]; notes: string[]; waiting: string[] } {
   const problems: string[] = []
   const notes: string[] = []
   const waiting: string[] = []
@@ -213,7 +214,9 @@ export function workerProblems(before: Workers | undefined, after: Workers): { p
   const now = new Map(after.workers.map((w) => [w.worker, w]))
   for (const was of ready) {
     const is = now.get(was.worker)
-    if (!is) {
+    if (!is && removed.includes(was.worker)) {
+      notes.push(`Worker ${was.worker} was ${was.state} before the update and is not listed now: the update removes it (--removed-workers)`)
+    } else if (!is) {
       problems.push(`Worker ${was.worker} was ${was.state} before the update and is not listed now (its source does not describe it)`)
       waiting.push(was.worker)
     } else if (is.state === 'resting') {
@@ -231,13 +234,13 @@ export function workerProblems(before: Workers | undefined, after: Workers): { p
  * has passed (bounded: two probe TTLs by default, so a runtime's first probe after the start, and one
  * more, have had their time). Returns the last read and what it judged.
  */
-export async function awaitWorkers(read: () => Promise<Workers>, before: Workers | undefined, options: { waitMs: number; everyMs: number; sleep?: (ms: number) => Promise<unknown>; now?: () => number }): Promise<{ after: Workers; problems: string[]; notes: string[] }> {
+export async function awaitWorkers(read: () => Promise<Workers>, before: Workers | undefined, options: { waitMs: number; everyMs: number; sleep?: (ms: number) => Promise<unknown>; now?: () => number; removed?: readonly string[] }): Promise<{ after: Workers; problems: string[]; notes: string[] }> {
   const wait = options.sleep ?? sleep
   const clock = options.now ?? Date.now
   const until = clock() + options.waitMs
   for (;;) {
     const after = await read()
-    const judged = workerProblems(before, after)
+    const judged = workerProblems(before, after, options.removed)
     if (!judged.waiting.length || clock() >= until) return { after, problems: judged.problems, notes: judged.notes }
     await wait(Math.max(0, Math.min(options.everyMs, until - clock())))
   }
@@ -579,7 +582,7 @@ export async function capture(cli: string, home: string, out: string): Promise<n
   return 0
 }
 
-export async function verify(cli: string, home: string, beforePath: string, snapshot: string, newWorkers: readonly string[], settleSeconds: number, workersWaitSeconds: number): Promise<number> {
+export async function verify(cli: string, home: string, beforePath: string, snapshot: string, newWorkers: readonly string[], settleSeconds: number, workersWaitSeconds: number, removedWorkers: readonly string[] = []): Promise<number> {
   const before = JSON.parse(readFileSync(beforePath, 'utf8')) as Capture
   const call = await callToolOf(cli)
   const problems: string[] = []
@@ -587,7 +590,7 @@ export async function verify(cli: string, home: string, beforePath: string, snap
 
   // The Workers, given up to the wait to take work again: a start probes each runtime anew, and a
   // Worker that took work before and stays unavailable (a probe failing on the host) fails the check.
-  const workers = await awaitWorkers(() => workersNow(call, home), before.workers, { waitMs: workersWaitSeconds * 1000, everyMs: 10_000 })
+  const workers = await awaitWorkers(() => workersNow(call, home), before.workers, { waitMs: workersWaitSeconds * 1000, everyMs: 10_000, removed: removedWorkers })
   console.log('the Workers before and after the update:')
   for (const line of workersTable(before.workers, workers.after)) console.log(`  ${line}`)
   problems.push(...workers.problems)
@@ -907,7 +910,7 @@ export async function policyDrift(call: CallTool, home: string, repo: string, co
 export const WORKERS_WAIT_SECONDS = 600
 
 const USAGE = `usage: node scripts/live-update-check.ts capture <cli> <DSH_HOME> <before.json>
-       node scripts/live-update-check.ts verify <cli> <DSH_HOME> <before.json> <snapshot dir> [--new-workers <prefix,…>] [--settle <seconds>] [--workers-wait <seconds>]
+       node scripts/live-update-check.ts verify <cli> <DSH_HOME> <before.json> <snapshot dir> [--new-workers <prefix,…>] [--removed-workers <id,…>] [--settle <seconds>] [--workers-wait <seconds>]
        node scripts/live-update-check.ts running <cli> <DSH_HOME>
        node scripts/live-update-check.ts await-idle <cli> <DSH_HOME> --wait <seconds> [--every <seconds>] [--cut-running [--cut-file <path>]]
        node scripts/live-update-check.ts stop-cut <cli> <DSH_HOME> --deadline <seconds>
@@ -986,10 +989,11 @@ async function main(argv: string[]): Promise<number> {
   }
   if (command === 'verify') {
     const newWorkers = option('--new-workers', '').split(',').filter(Boolean)
+    const removedWorkers = option('--removed-workers', '').split(',').filter(Boolean)
     const settle = Number(option('--settle', '120'))
     const workersWait = Number(option('--workers-wait', String(WORKERS_WAIT_SECONDS)))
     if (args.length === 4 && Number.isFinite(settle) && settle >= 0 && Number.isFinite(workersWait) && workersWait >= 0) {
-      return verify(args[0]!, args[1]!, args[2]!, args[3]!, newWorkers, settle, workersWait)
+      return verify(args[0]!, args[1]!, args[2]!, args[3]!, newWorkers, settle, workersWait, removedWorkers)
     }
   }
   console.error(USAGE)

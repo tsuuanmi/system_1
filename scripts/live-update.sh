@@ -44,7 +44,7 @@ usage() {
   cat <<'EOF'
 usage: scripts/live-update.sh <target sha> [--stage | --apply] [--check-with <built checkout of the target>]
          [--patch <candidate cordis.patch.yml>] [--from <sha>] [--live <checkout>] [--dsh-home <dir>]
-         [--node-dir <dir>] [--pnpm-dir <dir>] [--backups <dir>] [--new-workers <prefix,...>]
+         [--node-dir <dir>] [--pnpm-dir <dir>] [--backups <dir>] [--new-workers <prefix,...>] [--removed-workers <id,...>]
          [--workers-wait <seconds>] [--runs-wait <minutes>] [--runs-every <seconds>] [--cut-running | --no-cut]
          [--cut-deadline <seconds>] [--keep <updates>]
 
@@ -72,7 +72,9 @@ drains). The defaults are this host's live install: --from e218ae7, --live ~/wor
 --dsh-home $DSH_HOME or ~/.dsh, --node-dir Node 24's bin, --pnpm-dir Node 22's bin (appended to
 PATH, for pnpm only), --backups ~/system-backups, --new-workers agent:, --workers-wait 600 (how
 long the Workers that took work before the update have to take work again after it: two probe
-TTLs), --runs-wait 5, --runs-every 30, --cut-deadline 60.
+TTLs), --runs-wait 5, --runs-every 30, --cut-deadline 60. --removed-workers names, by exact id, the
+Workers the patch removes on purpose (a role taken off an account): gone after the update, each is
+a note, not a failure; none by default.
 Exit status: 0 done (or nothing to do), 1 stopped or rolled back, 2 usage, or a state to look at.
 EOF
 }
@@ -88,6 +90,7 @@ NODE_DIR=$HOME/.nvm/versions/node/v24.21.0/bin
 PNPM_DIR=$HOME/.nvm/versions/node/v22.23.2/bin
 BACKUPS=$HOME/system-backups
 NEW_WORKERS=agent:
+REMOVED_WORKERS=''
 WORKERS_WAIT=600
 RUNS_WAIT=5         # minutes: how long the update waits for the steps in flight before it cuts (T269)
 RUNS_EVERY=30       # seconds between two reads of what runs
@@ -104,7 +107,7 @@ while (($#)); do
     --stage) STAGE=1; APPLY=1 ;;
     --cut-running) CUT_RUNNING=1 ;;
     --no-cut) CUT_RUNNING=0 ;;
-    --check-with | --patch | --from | --live | --dsh-home | --node-dir | --pnpm-dir | --backups | --new-workers | --workers-wait | --runs-wait | --runs-every | --cut-deadline | --keep)
+    --check-with | --patch | --from | --live | --dsh-home | --node-dir | --pnpm-dir | --backups | --new-workers | --removed-workers | --workers-wait | --runs-wait | --runs-every | --cut-deadline | --keep)
       if (($# < 2)); then usage >&2; exit 2; fi
       case $1 in
         --check-with) CHECK_WITH=$2 ;;
@@ -116,6 +119,7 @@ while (($#)); do
         --pnpm-dir) PNPM_DIR=$2 ;;
         --backups) BACKUPS=$2 ;;
         --new-workers) NEW_WORKERS=$2 ;;
+        --removed-workers) REMOVED_WORKERS=$2 ;;
         --workers-wait)
           if [[ ! $2 =~ ^[0-9]+$ ]]; then usage >&2; exit 2; fi
           WORKERS_WAIT=$2 ;;
@@ -881,7 +885,7 @@ verify() {
   fi
   log "the upgrade checks: the Workers (up to ${WORKERS_WAIT} s for each that took work before to take work again), health, old runs, migrations, records"
   node24 --disable-warning=ExperimentalWarning "$SCRIPT_DIR/live-update-check.ts" verify "$LIVE/packages/cli/lib/index.js" "$DSH_HOME_DIR" \
-    "$ATTEMPT/before.json" "$after" --new-workers "$NEW_WORKERS" --workers-wait "$WORKERS_WAIT" 2>&1 | tee -a "$LOG_FILE" >&2 || return 1
+    "$ATTEMPT/before.json" "$after" --new-workers "$NEW_WORKERS" --removed-workers "$REMOVED_WORKERS" --workers-wait "$WORKERS_WAIT" 2>&1 | tee -a "$LOG_FILE" >&2 || return 1
   log "system plugins"
   if ! cli "$LIVE" plugins >"$ATTEMPT/plugins.txt" 2>&1; then
     cat "$ATTEMPT/plugins.txt" >&2

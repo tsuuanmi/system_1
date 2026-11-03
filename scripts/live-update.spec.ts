@@ -1152,6 +1152,23 @@ describe('live-update-check: the Workers take work again after the update (T219)
     })
   })
 
+  it('a Worker the update removes on purpose (--removed-workers, by exact id) is a note once gone, never awaited', async () => {
+    const before: Workers = { workers: [{ worker: 'agent:x/review', state: 'ready' }, { worker: 'agent:x/review-2', state: 'busy' }, { worker: 'agent:x/develop', state: 'ready' }] }
+    const after: Workers = { workers: [{ worker: 'agent:x/develop', state: 'ready' }] }
+    expect(workerProblems(before, after, ['agent:x/review'])).toEqual({
+      problems: ['Worker agent:x/review-2 was busy before the update and is not listed now (its source does not describe it)'],
+      notes: ['Worker agent:x/review was ready before the update and is not listed now: the update removes it (--removed-workers)'],
+      waiting: ['agent:x/review-2'],
+    })
+    // Still listed and unable to take work: the removal did not happen, so it is held to the check as any Worker.
+    expect(workerProblems(before, { workers: [...after.workers, { worker: 'agent:x/review', state: 'unavailable', reason: 'r' }, { worker: 'agent:x/review-2', state: 'ready' }] }, ['agent:x/review']).problems)
+      .toEqual(['Worker agent:x/review was ready before the update and is unavailable now: r'])
+    const sleeps: number[] = []
+    const gone = await awaitWorkers(async () => after, before, { waitMs: 600_000, everyMs: 10_000, sleep: async (ms) => { sleeps.push(ms) }, removed: ['agent:x/review', 'agent:x/review-2'] })
+    expect(gone.problems).toEqual([])
+    expect(sleeps).toEqual([])
+  })
+
   it('a capture without the Workers, or that could not read them, compares nothing and says so', () => {
     expect(workerProblems(undefined, workersOf(ROSTER_AFTER))).toEqual({ problems: [], notes: ['the capture holds no Workers (made before the check read them): their availability is not compared'], waiting: [] })
     expect(workerProblems({ unread: 'roster: unknown tool roster' }, workersOf(ROSTER_AFTER)).notes).toEqual(['the Workers were not read before the update (roster: unknown tool roster): their availability is not compared'])
