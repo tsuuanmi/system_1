@@ -5,7 +5,7 @@
 - **Related:** [ADR-0005](0005-provider-runtime-interface.md) (provider drivers),
   [ADR-0016](0016-invisible-headed-browser-and-portable-accounts.md),
   [INV-13](../../architecture/invariants.md#inv-13-every-decision-is-an-artifact),
-  [research](../../research/browser-interaction-and-self-healing.md),
+  research (removed; in Git history),
   [design](../../design/ui-operations.md)
 
 ## Context

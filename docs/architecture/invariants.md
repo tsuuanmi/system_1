@@ -121,4 +121,4 @@ subject: a workspace, a branch or PR, or a dataset output. Parallel fan-out is
 allowed only for read-only work, such as research, analysis, and review.
 Additional agents contribute intelligence, not actions. A subgraph that writes
 starts only after its plan is approved
-([reference architectures](../research/reference-architectures.md)).
+(reference architectures).

@@ -7,7 +7,7 @@ summary: Review of the current design, production multi-agent lessons, neighbour
 
 Non-normative. Reviewed and researched on 2026-10-22. Supports
 [PROP-0008](../proposals/0008-studio-operating-model.md) and
-[PROP-0009](../proposals/0009-core-and-plugin-decomposition.md). The mechanism behind
+PROP-0009. The mechanism behind
 the token numbers is explained in
 [provider-context-and-caching.md](provider-context-and-caching.md).
 
@@ -44,7 +44,7 @@ healing is only parsed; the Gemini driver disables healing.
 The industry is converging on **"one writer, many contributors of intelligence"**,
 which is INV-15. The largest remaining risks are **context transfer** and
 **verification of results**, not the number of agents. (See also
-[reference-architectures.md](reference-architectures.md), whose findings this extends.)
+reference-architectures.md, whose findings this extends.)
 
 **Anthropic, Research system.** Orchestrator–worker: a lead plans and delegates to
 parallel subagents. A multi-agent setup (Opus 4 lead, Sonnet 4 subagents) beat a

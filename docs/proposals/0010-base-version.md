@@ -70,7 +70,7 @@ contract change needs an ADR (ADR-0036).
   three times in 2026, so pools and windows are configuration.
 - [Design review 2026-10-22](../research/design-review-2026-10-22.md): token economics, the
   waste map, and why operator attention is the scarcest resource.
-- [PROP-0009](0009-core-and-plugin-decomposition.md) and ADR-0036: the six core components and
+- PROP-0009 and ADR-0036: the six core components and
   the eight families.
 - [agent-workers](../../packages/plugins/agent-workers/README.md) and
   [runtime-claude-agent-sdk](../../packages/plugins/runtime-claude-agent-sdk/README.md): the

@@ -1,7 +1,7 @@
 # ADR-0033: Routing prefers the least busy of equally ranked Workers
 
 - **Status:** Accepted; amended 2026-10-19 (pending admissions are counted by the Worker source per account; a describe timeout)
-- **Date:** 2026-10-19 (accepted 2026-10-19, by the operator, with [PROP-0007](../../proposals/0007-account-pools.md))
+- **Date:** 2026-10-19 (accepted 2026-10-19, by the operator, with PROP-0007 (removed; in Git history))
 - **Related:** REQ-WRK-2, REQ-ACC-7, [ADR-0030](0030-session-bound-accounts-use-their-login-profile.md),
   [INV-13](../../architecture/invariants.md#inv-13-every-decision-is-an-artifact)
 

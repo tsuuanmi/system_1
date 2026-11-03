@@ -12,14 +12,14 @@ the chain back.
 
 A job goes from intent to accepted result through the core and the plugin families
 ([core and plugins](README.md#core-and-plugins)). The flow and its failure rules are derived in
-[PROP-0009](../proposals/0009-core-and-plugin-decomposition.md#flow-of-one-job-from-intent-to-result);
+PROP-0009;
 this table places each step on a concrete seam. The [turn](#turn) below is steps 3 to 8 for a
 website Worker, as built today.
 
 | Step | Class | Seam | Status | On failure |
 |---|---|---|---|---|
 | 1. Hand over intent | surface | `ctx.mcp`, gateways, CLI start a workflow run | built | — |
-| 2. Intake: work kind, tier, data class, artifacts to read | decision | `ctx.decisions` ([PROP-0002](../proposals/0002-decision-assisted-routing.md)); today the run's input and template | planned | the work kind's default tier |
+| 2. Intake: work kind, tier, data class, artifacts to read | decision | `ctx.decisions` (PROP-0002); today the run's input and template | planned | the work kind's default tier |
 | 3. Policy and egress gate | core: gate | `ctx.egress`; `approvals` for actions that need a person | built | closed: deny, or queue for approval |
 | 4. Choose a resource | core: resource ledger, gate | `ctx.workers` admission and routing; account cooldowns ([ADR-0034](../decisions/adr/0034-unsent-failover-to-a-sibling-account.md)); `resources` for limits and scarcity; a board task's budget lines reserved before each step ([a task's budget](../design/workflow-engine.md#a-tasks-budget)) | built | wait for the window, or another source; a spent budget starts no new step and blocks the task with a funding request |
 | 5. Worker runs | Worker, context | a Worker source (`ctx.turns`, `ctx.agentWorkers`, `ctx.models`); `context` plugins at agent launch | Workers built, `context` planned | context plugin bypassed; Worker reconciled by the runner |

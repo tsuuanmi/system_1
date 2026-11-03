@@ -17,7 +17,7 @@ implementation: [ADR-0051, ADR-0052]
 The operator holds eight agent subscriptions: three Claude Code, two Codex CLI, and three
 Antigravity CLI accounts, all personal paid plans (operator, 2026-10-23, D24). They want each one
 to serve as a Worker, managed by provider and account, without naming accounts by hand.
-[PROP-0007](0007-account-pools.md) made this work for website accounts. Agent Workers cannot do it
+PROP-0007 made this work for website accounts. Agent Workers cannot do it
 today (code read on `base/next`, 2026-10-23):
 
 - **One account per runtime.** Each runtime row has one `home` (Claude Code's

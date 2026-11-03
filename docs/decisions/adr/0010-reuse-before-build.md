@@ -60,7 +60,7 @@ steps where it is decided, in its proposal or PR:
 2. **The search.**
    - official SDKs and protocols;
    - existing DSH/Cordis plugins (see the
-     [community plugin review](../../research/dsh-community-plugins-review.md));
+     community plugin review (removed; in Git history));
    - maintained open-source alternatives.
 3. **The comparison.** Capabilities, compatibility, security, durability,
    maintainability, and license.

@@ -79,7 +79,7 @@ classification.
 
 The runtime picks the mode from the request and never from the website's
 default. Live observations are in the
-[research](../research/browser-interaction-and-self-healing.md#live-check-2026-10-11-signed-in-account-read-only).
+research.
 
 | Request | Mode | Binding | Why |
 |---|---|---|---|

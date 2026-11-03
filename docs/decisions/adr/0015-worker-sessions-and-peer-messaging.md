@@ -4,7 +4,7 @@
 - **Date:** 2026-10-11
 - **Related:** ADR-0006, ADR-0012, INV-7, INV-15,
   [sessions and messaging](../../design/sessions-and-messaging.md),
-  [A2A vs ACP research](../../research/agent-protocols-a2a-acp.md)
+  A2A vs ACP research (removed; in Git history)
 
 ## Context
 

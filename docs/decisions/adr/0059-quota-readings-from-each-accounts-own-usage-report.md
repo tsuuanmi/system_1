@@ -12,7 +12,7 @@
   [INV-8](../../architecture/invariants.md#inv-8-credentials-never-cross-upward),
   [INV-9](../../architecture/invariants.md#inv-9-everything-is-bounded),
   [INV-11](../../architecture/invariants.md#inv-11-no-tool-lock-in); research:
-  [quota built-ins](../../research/quota-builtins-2026-10-24.md)
+  quota built-ins (removed; in Git history)
 
 ## Context
 
@@ -28,7 +28,7 @@ readings: they come only from inside a run.
 - Claude Code's `rate_limit_event` carries `utilization` only near or at a limit; an ordinary
   event names the binding window and its reset, with no share. That is why the live roster says
   the five-hour window's latest reading "gives no used share" (research,
-  [why](../../research/quota-builtins-2026-10-24.md#why-the-five-hour-windows-used-share-is-unknown-live)).
+  why (removed; in Git history)).
 - Codex's `exec` stream reports a limit only when a turn fails at it; agy's quota report is read
   only after a run that hit its quota ([limit readings](../../design/agent-runtimes.md#limit-readings)).
 - Between runs, nothing is read, and an idle account's windows stay as its last run left them.

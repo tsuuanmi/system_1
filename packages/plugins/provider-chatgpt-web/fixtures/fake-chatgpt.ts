@@ -1,6 +1,6 @@
 /**
  * A local stand-in for chatgpt.com, built from the live accessibility tree recorded on
- * 2026-10-11 (docs/research/browser-interaction-and-self-healing.md#live-check-2026-10-11-signed-in-account-read-only).
+ * 2026-10-11 (a research note, now in Git history).
  * It reproduces what the driver depends on, including the traps seen live:
  * - the composer mode can start on **Work**, and Chat/Work live in `group "Composer mode"`;
  * - Temporary chat (`?temporary-chat=true`) hides the mode group;

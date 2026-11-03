@@ -1,7 +1,7 @@
 # ADR-0035: One-family teams keep distinct accounts before sharing one
 
 - **Status:** Accepted
-- **Date:** 2026-10-19 (accepted 2026-10-19, by the operator, with [PROP-0007](../../proposals/0007-account-pools.md))
+- **Date:** 2026-10-19 (accepted 2026-10-19, by the operator, with PROP-0007 (removed; in Git history))
 - **Related:** REQ-TEAM-4, [ADR-0027](0027-provider-diversity-in-routing.md),
   [ADR-0029](0029-opt-in-same-family-fallback.md) (superseded in part), [ADR-0033](0033-least-busy-routing.md)
 

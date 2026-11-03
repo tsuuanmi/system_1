@@ -3,7 +3,7 @@
 A **`ctx.credentials` provider that encrypts at rest**. It implements DSH's
 `dsh-credentials` seam (refs plus records), so any DSH consumer works unchanged.
 It replaces `dsh-credentials-local`, which stores plain YAML
-([review](../../../docs/research/dsh-community-plugins-review.md),
+(review,
 [ADR-0017](../../../docs/decisions/adr/0017-credential-login-and-linux-remote-browser.md)).
 
 - **Format:** the whole document is sealed with AES-256-GCM (fresh 96-bit nonce,

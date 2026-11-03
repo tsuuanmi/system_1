@@ -23,7 +23,7 @@ the Gemini account, live, on 2026-10-16:
 - A copy of the state worked for one turn, and the next fresh context was signed out; a copy saved
   from the signed-in login profile was signed out a minute later; repeated loads then drew Google's
   unusual-traffic check (a reCAPTCHA) for the host, in turns and in the login profile alike. The
-  runs and outlines are listed in [PROP-0004's implementation record](0004-claude-code-lead-mvp.md#implementation)
+  runs and outlines are listed in PROP-0004's implementation record
   and its roadmap item (P1, Gemini turns in the persistent login profile).
 - Through all of it, the operator saw the login profile itself still signed in, and Save worked.
 

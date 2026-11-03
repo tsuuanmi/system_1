@@ -514,7 +514,7 @@ D91), and differs in family from `literature:1`:
 
 Inferring the tier for work that does not declare one, using a decision model, is
 under consideration in
-[PROP-0002](../proposals/0002-decision-assisted-routing.md). It is not current
+PROP-0002. It is not current
 design.
 
 ## Quota and cost policy

@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-14 (accepted 2026-10-15)
-- **Related:** [PROP-0003](../../proposals/0003-production-readiness.md#m6a-security-hardening),
+- **Related:** PROP-0003 (removed; in Git history),
   [threat model](../../security/threat-model.md#threats-and-controls), QA-5,
   [INV-6](../../architecture/invariants.md#inv-6-authority-comes-from-trusted-envelopes)
 

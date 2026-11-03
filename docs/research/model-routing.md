@@ -71,7 +71,7 @@ Three readings that need no further data:
 
 The usage side is limited by what is recorded: usage is per run step and per account, and the Claude
 Code five-hour window's share is not readable live
-([quota-builtins](quota-builtins-2026-10-24.md)). A per-step cost will be tokens (or the account's
+(quota-builtins). A per-step cost will be tokens (or the account's
 window used between two readings), not money.
 
 ### 1.3 Self-review against review, on the 137 runs (M, D)

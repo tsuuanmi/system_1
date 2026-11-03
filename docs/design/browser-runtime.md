@@ -6,8 +6,8 @@
 > Requirements: REQ-ACC-1..9. Shape: [`account.v1.json`](../../schemas/account.v1.json).
 > Status audited 2026-10-27: nothing of this mechanism changed from T236 to T295 (clean-up T244,
 > `c6341b5b`).
-> Evidence: how [internet](../research/internet-analysis.md) and
-> [codex-chatgpt-web](../research/codex-chatgpt-web-analysis.md) run their browsers.
+> Evidence: how internet and
+> codex-chatgpt-web run their browsers.
 >
 > Implemented in [`display-virtual`](../../packages/plugins/display-virtual/README.md),
 > [`browser-patchright`](../../packages/plugins/browser-patchright/README.md),

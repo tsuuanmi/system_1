@@ -35,8 +35,8 @@
    one login at a time).
 5. Map the account's tiers to modes in the account catalog (`accounts[].tiers`),
    then check `system account list`. A ChatGPT account maps its tiers to
-   `instant`, `medium`, and `high`; one without a model picker cannot be used
-   ([remove it](#remove-the-free-chatgpt-account)). A Gemini account maps them to
+   `instant`, `medium`, and `high`; one without a model picker cannot be used:
+   leave it out of the catalog. A Gemini account maps them to
    `flash-lite`, `flash`, and `pro` (model and thinking level).
 6. Connect the clients: `system mcp-config claude|codex` connects over MCP.
    With a gateway row turned on, `system claude-env` and `system codex-env`
@@ -897,36 +897,6 @@ plugin as unchecked until the finding is cleared.
 A refused manifest in a row that is off makes `manifests` degraded instead: the plugin does not
 run, but its lifecycle is not recorded until its package ships a valid manifest. The DSH rows the
 bundle allows are noted, not found.
-
-## Remove the free ChatGPT account
-
-The ChatGPT driver cannot use an account without a model picker (ChatGPT Free,
-PROP-0004; [modes](../../packages/plugins/provider-chatgpt-web/README.md)).
-Until it is removed, its Workers are `unavailable` (their tiers map to the
-removed `site` preset), so routing never picks them and `system health` reports
-them under `workers`. Remove it from the operator configuration before, or
-together with, the update that removes the preset:
-
-1. **Profile patch:** delete its entry from the `accounts` row's `accounts`
-   list in `~/.dsh/profiles/system/cordis.patch.yml`, and any tier that maps to
-   the old `site` preset. Restart. `system account list` no longer shows it, and
-   routing has no Worker for it.
-2. **Vault entry:** its saved browser state (`system-accounts/<id>`) and login
-   credentials (`system-credentials/<id>`) stay encrypted in the vault. An
-   account outside the catalog is never listed or routed, and `system` has no
-   command that deletes them yet (`system account remove` is planned,
-   [CLI](../reference/cli.md#accounts)).
-3. **Browser profile:** delete its login profile,
-   `~/.dsh/system/login-profiles/<id>`, while no remote login for it is open
-   ([login](../../packages/plugins/login/README.md)).
-
-A team (`brainstorm`, `review`) puts each member on its own provider family and
-account, so with one ChatGPT account left it needs another provider's account,
-such as a Gemini account ([teams](../design/teams.md#membership-model-a)).
-`research` needs Workers of two
-provider families, such as accounts of two providers, one of them proving Web
-search: its two literature reviews run on different families
-([templates](../reference/workflow-templates.md#research)).
 
 ## API and local models
 

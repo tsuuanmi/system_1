@@ -7,7 +7,7 @@
   qualifies when the operator records that they accept the risk under its terms)
 - **Date:** 2026-10-24
 - **Related:** [PROP-0012](../../proposals/0012-agent-accounts.md),
-  [PROP-0007](../../proposals/0007-account-pools.md),
+  PROP-0007 (removed; in Git history),
   [PROP-0008](../../proposals/0008-studio-operating-model.md),
   [ADR-0033](0033-least-busy-routing.md), [ADR-0034](0034-unsent-failover-to-a-sibling-account.md),
   [ADR-0035](0035-one-family-teams-keep-distinct-accounts.md),

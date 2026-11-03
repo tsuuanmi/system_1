@@ -1,7 +1,7 @@
 # ADR-0036: Guarantee seams form the core; capability seams are replaceable plugins
 
 - **Status:** Accepted
-- **Date:** 2026-10-22 (accepted 2026-10-22, by the operator, with [PROP-0009](../../proposals/0009-core-and-plugin-decomposition.md))
+- **Date:** 2026-10-22 (accepted 2026-10-22, by the operator, with PROP-0009 (removed; in Git history))
 - **Related:** [ADR-0007](0007-everything-is-a-plugin.md), [ADR-0008](0008-tool-agnostic.md),
   [ADR-0018](0018-build-on-dsh-core.md), [PROP-0008](../../proposals/0008-studio-operating-model.md),
   [INV-10](../../architecture/invariants.md#inv-10-everything-is-a-plugin)

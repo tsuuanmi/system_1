@@ -51,7 +51,7 @@ export const MECHANISMS: readonly Mechanism[] = [
   },
   {
     id: 'disk-floor', row: 'agent-workers', key: 'diskFloor', modes: ['off', 'warn', 'on'], start: 'warn',
-    what: 'the disk floor (T345, docs/research/resource-capacity.md): on cuts no new worktree, so no run starts, and dispatch says why, while the worktrees\' filesystem has less free space than diskFloorGb; warn records the refusal it would make and refuses nothing; off does not look; it starts in warn',
+    what: 'the disk floor (T345, docs/operations/runbooks.md#a-runs-worktree): on cuts no new worktree, so no run starts, and dispatch says why, while the worktrees\' filesystem has less free space than diskFloorGb; warn records the refusal it would make and refuses nothing; off does not look; it starts in warn',
   },
   {
     id: 'sandboxed-commands', row: 'agent-workers', key: 'sandboxedCommands', modes: ['off', 'warn', 'on'], start: 'warn',

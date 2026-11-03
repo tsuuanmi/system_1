@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-14 (accepted 2026-10-15)
-- **Related:** [PROP-0003](../../proposals/0003-production-readiness.md#m6d-supply-chain-and-release),
+- **Related:** PROP-0003 (removed; in Git history),
   CON-2, CON-8, [release scope](../../requirements/release-scope.md#operational-readiness),
   [ADR-0018](0018-build-on-dsh-core.md)
 

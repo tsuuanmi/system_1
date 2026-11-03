@@ -651,7 +651,7 @@
   home-directory encryption is a **deployment precondition** for hosts holding
   private data: application-level encryption of the store would not help against
   the same user, who holds the key, and SQLCipher does not work with
-  `node:sqlite` ([PROP-0003](../proposals/0003-production-readiness.md#m6a-security-hardening)).
+  `node:sqlite` (PROP-0003).
 - **The vault key read together with the vault.** By default the key sits beside
   the vault, so anyone who can read the account reads both. The key can live
   elsewhere (`keyFile`: another volume or a systemd credential); a key outside the

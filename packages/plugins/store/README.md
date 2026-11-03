@@ -2,7 +2,7 @@
 
 **`ctx.store`**: `system`'s own durable records on `node:sqlite`
 ([ADR-0003](../../../docs/decisions/adr/0003-sqlite-durable-store.md); proven in
-the [M0 spike](../../../docs/research/m0-dsh-core-spike.md)).
+the M0 spike).
 
 - **Owns:**
   - one database file (default `<DSH_HOME>/system/system.db`) in WAL mode, created

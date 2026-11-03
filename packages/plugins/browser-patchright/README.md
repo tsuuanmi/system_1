@@ -111,4 +111,4 @@
 - **Injects:** `display`; reads `eventLog` when present, for its `browser.*` events. **Config:** `chromePath`, `closeAfterMs`, `maxBrowsers`, `maxIndexedDbBytes`.
 - **Ported from:** tsuuanmi/internet `src/browser/runtime.ts` and `chrome.ts`. The
   origin filter and launch patterns come from `@anweat/dsh-browser`
-  ([review](../../../docs/research/dsh-community-plugins-review.md#browser-runtime-second-pass-2026-10-11)).
+  (review).

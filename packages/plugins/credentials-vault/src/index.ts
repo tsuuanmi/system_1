@@ -1,5 +1,5 @@
 /**
- * Encrypted `ctx.credentials` provider (ADR-0017, docs/research/dsh-community-plugins-review.md).
+ * Encrypted `ctx.credentials` provider (ADR-0017, docs/engineering/dependencies.md).
  * DSH's `dsh-credentials-local` keeps secrets as plain YAML; this provider keeps the same
  * seam but seals the whole document with AES-256-GCM. The key is a 32-byte owner-only file —
  * point `keyFile` at a systemd credential (`$CREDENTIALS_DIRECTORY/<name>`) or another

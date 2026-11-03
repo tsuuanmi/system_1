@@ -119,7 +119,7 @@ shows each account's own windows and resets.
 
 > Decision: [ADR-0059](../decisions/adr/0059-quota-readings-from-each-accounts-own-usage-report.md)
 > (accepted 2026-10-24, D55), from the operator's request of 2026-10-24 (T96;
-> [research](../research/quota-builtins-2026-10-24.md)). Implemented in the agent runtimes'
+> research). Implemented in the agent runtimes'
 > `limits` ([an account's usage report](agent-runtimes.md#an-accounts-usage-report)) and the
 > `agents` source ([`agent-workers`](../../packages/plugins/agent-workers/README.md)). Differs
 > from target: each reader is checked on the installed versions and fixtures, not yet on a live

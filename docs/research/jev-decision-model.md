@@ -1,7 +1,7 @@
 # Jev decision model for routing decisions
 
 Non-normative. Researched on 2026-10-11. Supports the draft
-[PROP-0002](../proposals/0002-decision-assisted-routing.md).
+PROP-0002.
 
 > **Source caveat.** Jev entered early access on 2026-09-15. Almost every source
 > below is a third-party guide or a reseller's documentation. TypeSafe's own API

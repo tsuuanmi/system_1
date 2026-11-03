@@ -1,5 +1,5 @@
 /**
- * The host's disk, as the worktrees fill it (T345; docs/research/resource-capacity.md, the disk floor):
+ * The host's disk, as the worktrees fill it (T345; the disk floor: docs/operations/runbooks.md#a-runs-worktree):
  * the free space of the filesystem a path is on, read with `statfs`, never by walking a tree (INV-9).
  * No new worktree is cut while the worktrees' filesystem has less free than a configured floor
  * (`diskFloorGb`), under the `disk-floor` mechanism's mode (ADR-0078).

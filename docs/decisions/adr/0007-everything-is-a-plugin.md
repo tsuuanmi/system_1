@@ -13,7 +13,7 @@ agent loop itself, so each is replaceable from configuration. There is no
 privileged core to patch." DSH implements this on **Cordis**, a plugin runtime
 with contexts, services claimed by key, dependency injection (`inject`), scoped
 isolation, typed events, and effects that are disposed when a plugin unloads
-([analysis](../../research/dsh-analysis.md)).
+(analysis (removed; in Git history)).
 
 [ADR-0001](0001-standalone-host.md) already decided that `system` is a standalone
 host, not a DSH plugin. What remains open is what the host's composition root

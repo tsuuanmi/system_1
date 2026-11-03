@@ -56,7 +56,7 @@ Option 3, with the following rules.
 - Every step has an input receipt, an output receipt, and decision artifacts, so
   "what ran, why, and on what inputs" is answerable after the fact.
 - This matches the published practice of the reference systems
-  ([analysis](../../research/reference-architectures.md)): code paths for
+  (analysis (removed; in Git history)): code paths for
   predictable steps, an agentic loop inside a step, orchestrator-workers for
   unpredictable subtasks, and single-threaded writes.
 - Work that is truly open-ended belongs inside one capable Worker, not spread over

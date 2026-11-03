@@ -54,8 +54,8 @@ In priority order:
 - [provider-context-and-caching.md](../research/provider-context-and-caching.md): how
   context and prompt caching work at Claude, OpenAI, and Gemini, and the rules that follow.
 - [jev-decision-model.md](../research/jev-decision-model.md) and
-  [PROP-0002](0002-decision-assisted-routing.md): the decision seam reused by intake.
-- [PROP-0007](0007-account-pools.md): account pools and cooldowns, which the resource
+  PROP-0002: the decision seam reused by intake.
+- PROP-0007: account pools and cooldowns, which the resource
   ledger generalizes.
 
 **Terms caution.** Max is a personal plan. One person using several accounts of the
@@ -223,7 +223,7 @@ and digests (see the Manus lesson in the research).
 
 A mandatory intake node runs at two points, job arrival and result arrival, and
 answers several typed questions in one call, behind the `ctx.decisions` seam of
-[PROP-0002](0002-decision-assisted-routing.md) with Jev as the reference model.
+PROP-0002 with Jev as the reference model.
 
 | When | Questions asked together |
 |---|---|
@@ -237,7 +237,7 @@ false`, per PROP-0002). High probability decides; low probability escalates to
 external API, so jobs with `local-private` data use a local intake.
 
 Where intake, the digest, and the board sit in the full path of a job is shown once,
-in [PROP-0009](0009-core-and-plugin-decomposition.md#flow-of-one-job-from-intent-to-result).
+in PROP-0009.
 
 ### Worker capability and tier taxonomy
 
@@ -626,4 +626,4 @@ Pending review.
 ## Implementation
 
 None yet. Core and plugin boundaries for this proposal are set out in
-[PROP-0009](0009-core-and-plugin-decomposition.md).
+PROP-0009.

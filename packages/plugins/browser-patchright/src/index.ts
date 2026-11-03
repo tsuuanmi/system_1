@@ -7,7 +7,7 @@
  * driver's origins. A session-bound account's turns are pages of one persistent context on
  * its login profile instead (ADR-0030). Ported from tsuuanmi/internet `src/browser/runtime.ts` and
  * `chrome.ts`; launch and filter patterns from `@anweat/dsh-browser`
- * (docs/research/dsh-community-plugins-review.md#browser-runtime-second-pass-2026-10-11).
+ * (docs/engineering/dependencies.md).
  * @module @tsuuanmi/system-browser-patchright
  */
 import type { Context } from '@deepseek-ai/cordis'

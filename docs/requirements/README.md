@@ -4,7 +4,7 @@ This area defines **what must be true** of `system`. Requirements are normative.
 They say nothing about mechanisms (see [design](../design/README.md)) or about why
 a choice was made (see [decisions](../decisions/README.md)).
 
-> Target state: until [PROP-0001](../proposals/0001-unified-system-architecture.md)
+> Target state: until PROP-0001
 > is implemented, these requirements describe the system being built.
 
 ## Documents

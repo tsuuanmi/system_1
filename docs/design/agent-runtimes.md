@@ -1755,7 +1755,7 @@ Not read in a run: usage percentages of a Codex run (`codex exec` reports none);
 
 > Decision: [ADR-0059](../decisions/adr/0059-quota-readings-from-each-accounts-own-usage-report.md)
 > (accepted 2026-10-24, D55), from the operator's request of 2026-10-24 (T96;
-> [research](../research/quota-builtins-2026-10-24.md)). Implemented in the three runtimes'
+> research). Implemented in the three runtimes'
 > `limits` and in [`agent-workers`](../../packages/plugins/agent-workers/README.md)
 > (`src/reports.ts`). Differs from target: each reader rests on the installed binaries and on
 > fixtures, not yet on a live account ([release checklist](../validation/release-checklist.md)); the

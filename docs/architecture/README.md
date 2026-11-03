@@ -4,7 +4,7 @@ This area owns the **structure** of `system`: its context, layers, plugin seams,
 direction, data flow, deployment, and cross-cutting invariants. It says *where* behavior lives
 and under which constraints. *How* each mechanism works belongs in [design](../design/README.md).
 
-> Target state, proposed in [PROP-0001](../proposals/0001-unified-system-architecture.md); the
+> Target state, proposed in PROP-0001; the
 > core and plugin classes are decided in
 > [ADR-0036](../decisions/adr/0036-guarantee-core-and-capability-plugins.md).
 > Diagrams mark what is **planned**, or only **defined** (a definition and its conformance suite,
@@ -159,7 +159,7 @@ of one of eight plugin families
 plugins; the core's contracts are fixed by the [invariants](invariants.md) and change only by
 ADR. Capability plugins talk to the core, never to each other across families. The
 [plugin model](plugin-model.md#core-and-plugin-classes) assigns every seam and gives the rules;
-[PROP-0009](../proposals/0009-core-and-plugin-decomposition.md) derives the split.
+PROP-0009 derives the split.
 
 ```mermaid
 flowchart TB
