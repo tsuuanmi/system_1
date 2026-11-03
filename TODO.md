@@ -9,10 +9,10 @@ States: `todo`, `inventory`, `decided`, `rewriting`, `review`, `landed`.
 
 | # | Item | State |
 |---|---|---|
-| 0.1 | worktree `system-wt-docs`, branch `docs/lean-docs`, draft PR | in progress |
+| 0.1 | worktree `system-wt-docs`, branch `docs/lean-docs`, draft PR #43 | done |
 | 0.2 | purpose P5 to P7 (artifacts and replaceable Workers, any workflow, the person decides only what matters); README "Why" | done |
 | 0.3 | PLAN.md, TODO.md | done |
-| 0.4 | board tasks A (Antigravity identity reader) and B (`credential` agent accounts) | todo |
+| 0.4 | board tasks A `task-daf2792ab048` (Antigravity identity reader) and B `task-43609e954895` (`credential` agent accounts) | proposed |
 
 ## Units (phases 1 to 3)
 
