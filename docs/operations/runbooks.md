@@ -69,27 +69,25 @@ default, with no Worker; the Codex, ACP, and Antigravity CLI rows are off
   ```
 
   Both name the same workspace, so both set `worktreePerRun`: the reviewer
-  reads the developer's worktree. Then sign Claude Code in inside its Worker
-  home (below), restart, and `system explain` or `/ui` shows each Worker ready,
-  or why not. Every tool call still asks the approval queue first; with the
-  default studio policy a command asks the operator unless a rule lists its
-  exact argv.
+  reads the developer's worktree. Sign Claude Code in inside its Worker home
+  (below) and restart; `system explain` or `/ui` shows each Worker ready, or
+  why not. Every tool call asks the approval queue first; the default studio
+  policy asks the operator for a command unless a rule lists its exact argv.
 - **Credentials:** the agent process starts without the daemon's credentials:
   every variable whose name contains `KEY`, `PASSWORD`, `SECRET`, or `TOKEN`,
   and every `DSH_*` variable, is removed. Forward a credential **by name** with
   the runtime's `forwardEnv`; its value stays in the daemon's environment,
   never in a config file or in `env`.
-  - **Codex on the Responses gateway:** when a Codex Worker's model provider is
-    the system gateway, keep the model token in the daemon's environment as the
-    variable the provider's `env_key` names
-    (`export SYSTEM_MCP_TOKEN="$(system mcp-token --scope model)"`), and set
+  - **Codex on the Responses gateway:** when the Worker's model provider is the
+    system gateway, keep the model token in the daemon's environment under the
+    provider's `env_key` name
+    (`export SYSTEM_MCP_TOKEN="$(system mcp-token --scope model)"`) and set
     `forwardEnv: ['SYSTEM_MCP_TOKEN']` on the `runtime-codex-sdk` row. Such a
-    Worker needs no login. The model token reaches only the model gateways, so
-    the Worker cannot call the `system` MCP tools or the web UI with it
+    Worker needs no login. The token reaches only the model gateways
     ([scopes](../../packages/plugins/mcp-server/README.md#scopes)). Until agent
     Workers are confined for reads
     ([ADR-0024](../decisions/adr/0024-agent-workers-confined-for-reads.md)), a
-    Codex Worker can still read the other token files on disk
+    Codex Worker can still read other token files on disk
     ([threat model](../security/threat-model.md#threats-and-controls)).
   - **Claude Code:** an API key or OAuth token taken from the environment must
     be named in the `runtime-claude-agent-sdk` row's `forwardEnv`.
@@ -104,8 +102,8 @@ default, with no Worker; the Codex, ACP, and Antigravity CLI rows are off
   CLAUDE_CONFIG_DIR=~/.dsh/system/claude-home claude   # then /login, and /exit
   ```
 
-  or forward an API key or a `claude setup-token` token by name instead. Until
-  then each Worker is unavailable with "not signed in inside its home".
+  or forward an API key or a `claude setup-token` token by name. Until then each
+  Worker is unavailable with "not signed in inside its home".
 - **Confined commands**
   ([ADR-0038](../decisions/adr/0038-confined-commands-for-claude-code-workers.md)):
   a `workspace-write` Claude Code Worker runs `Bash` inside the SDK's sandbox, nested in the read
@@ -128,48 +126,39 @@ default, with no Worker; the Codex, ACP, and Antigravity CLI rows are off
 
 - **Read confinement:** every agent (Claude Code, Codex, ACP agents) starts under
   [bubblewrap](https://github.com/containers/bubblewrap)
-  ([ADR-0024](../decisions/adr/0024-agent-workers-confined-for-reads.md)). It
-  hides `~/.dsh`, `/run/user/<uid>`, `/tmp`, `/var/tmp`, `/dev/shm`,
-  `$CREDENTIALS_DIRECTORY`, the credential stores and agent logins in your home
-  (the list is in the
-  [agent-runtimes README](../../packages/plugins/agent-runtimes/README.md)), and
-  wherever you keep the vault, its key, the store, or login profiles. The agent
-  and every worktree-setup command get an empty private `/tmp` as `TMPDIR`.
-  A check that listens on a unix socket (a `tsx` script, whose IPC pipe fails
-  with `listen EPERM … /tmp/tsx-<uid>/<pid>.pipe`) still fails inside a Worker's
-  commands, because the command sandboxes refuse unix sockets: run it outside
-  the Worker, or use `node --import tsx <script>`
-  ([confined commands](../design/agent-runtimes.md#confined-commands)). Only
-  `~/.dsh/system/tools` (read-only), the Worker's own home, and its workspace
-  come back; a workspace that holds one of those paths (your home directory,
-  say) is refused. Install a root-owned bubblewrap
-  (`sudo apt-get install bubblewrap`); it is preferred over any copy in your own
-  directories. If `system explain` or `/ui` shows a Worker unavailable with
-  "reads cannot be confined", the host refuses unprivileged user namespaces: on
-  Ubuntu 23.10 and later, allow them for bwrap (an AppArmor profile for
-  `/usr/bin/bwrap` with `userns`, or
-  `sysctl kernel.apparmor_restrict_unprivileged_userns=0`). Keep the agent CLI
-  outside `~/.dsh` or under `~/.dsh/system/tools`; add other paths to the
+  ([ADR-0024](../decisions/adr/0024-agent-workers-confined-for-reads.md); what it
+  hides: [agent-runtimes README](../../packages/plugins/agent-runtimes/README.md)).
+  Only `~/.dsh/system/tools` (read-only), the Worker's own home, and its workspace
+  come back; a workspace holding one of those paths (your home directory, say) is
+  refused. The agent and every worktree-setup command get an empty private `/tmp`
+  as `TMPDIR`. A check that listens on a unix socket (a `tsx` script fails with
+  `listen EPERM … /tmp/tsx-<uid>/<pid>.pipe`) fails inside a Worker's commands
+  ([confined commands](../design/agent-runtimes.md#confined-commands)): run it
+  outside the Worker, or use `node --import tsx <script>`. Install a root-owned
+  bubblewrap (`sudo apt-get install bubblewrap`); it is preferred over any copy in
+  your own directories. If `system explain` or `/ui` shows "reads cannot be
+  confined", the host refuses unprivileged user namespaces: on Ubuntu 23.10 and
+  later, allow them for bwrap (an AppArmor profile for `/usr/bin/bwrap` with
+  `userns`, or `sysctl kernel.apparmor_restrict_unprivileged_userns=0`). Keep the
+  agent CLI outside `~/.dsh` or under `~/.dsh/system/tools`; add other paths to the
   `agent-runtimes` row's `readOnly`, and other secrets to its `hide`.
-- **`local-private` work:** refused at egress by default (`egress_denied`,
-  nothing sent), because the agent's model is remote. Routing still admits the
-  Worker, since it is local. If the agent's model runs on this machine, set the
-  egress row's `workerClasses` with `local-private` added to `agent`. List
-  `website`, `model`, and `model-local` too: the setting replaces the whole
-  default.
-- **Renaming an agent Worker:** change its `id` in the `agent-workers` row of the
-  profile patch, `system check`, and restart the daemon. The Worker is `agent:<new id>`
-  from then on. Recorded runs, decisions, and usage keep the old id, since records never
-  change. A session bound to the old Worker stays on it, so a new run starts a new session.
-  Its home (`home`) and its account do not change.
+- **`local-private` work:** refused at egress by default (`egress_denied`, nothing
+  sent), because the agent's model is remote. If the agent's model runs on this
+  machine, set the egress row's `workerClasses` with `local-private` added to
+  `agent`; list `website`, `model`, and `model-local` too, since the setting
+  replaces the whole default.
+- **Renaming an agent Worker:** change its `id` in the `agent-workers` row,
+  `system check`, and restart. The Worker is `agent:<new id>` from then on.
+  Recorded runs, decisions, and usage keep the old id. A session bound to the old
+  Worker stays on it, so a new run starts a new session. Its home and account do
+  not change.
 
 ### Keep Claude Code's pinned version
 Claude Code's identity reader is pinned to the versions a check verified (2.1.308 to 2.1.310,
-[identity readers](../design/agent-runtimes.md#identity-readers)). Each probe and run reads
-every `ready` Claude Code account again, so a Claude Code on another version turns them all
-`quarantined (unverified)` and their derived Workers take no work. `system account list` and
-`system health` then name the version found and the ones admitted. Pin the executable with the
-`runtime-claude-agent-sdk` row's `executable`.
+[identity readers](../design/agent-runtimes.md#identity-readers)). A Claude Code on another
+version turns every `ready` Claude Code account `quarantined (unverified)`, and their derived
+Workers take no work; `system account list` and `system health` name the version found and
+the ones admitted. Pin the executable with the `runtime-claude-agent-sdk` row's `executable`.
 
 Do not point the pin into `~/.local/share/claude/versions/`: Claude Code's updater prunes old
 versions there. Keep a checked copy under the Workers' tools directory, which every agent sees
@@ -190,16 +179,16 @@ read-only:
 4. `system check`, restart, and `system account list`: each Claude Code account reads `ready` again
    once verified (`system account verify <accountId>`; a quarantine never lifts by itself).
 
-A newer version is pinned only once its reader is verified (a release adds it to
-`VERIFIED_IDENTITY_VERSIONS`); keep the old copy until then. Signing in again
+A newer version is pinned only once a release adds its reader to
+`VERIFIED_IDENTITY_VERSIONS`; keep the old copy until then. Signing in again
 (`CLAUDE_CONFIG_DIR=… claude`, `/login`) uses whichever `claude` you run; the Workers use the pin.
 
 ### Codex Workers
 
-The `runtime-codex-sdk` row is off by default (PROP-0004). Its Workers are admitted only where the
+The `runtime-codex-sdk` row is off by default. Its Workers are admitted only where the
 probe proves, on this host, that Codex asks the run's tool gate before each tool call
 ([Codex's gate](../design/agent-runtimes.md#codexs-gate)); every call then goes to the approval
-queue as a Claude Code Worker's does. To use one:
+queue. To use one:
 
 1. **Install `codex` where the confinement lets it run.** `npm i --prefix
    ~/.dsh/system/tools/codex @openai/codex`, then `executable:
@@ -260,14 +249,13 @@ queue as a Claude Code Worker's does. To use one:
      bubblewrap nested in the read confinement, or `node` or System's install is hidden from it
      (as for step 1, bind it back read-only in the `agent-runtimes` row).
 
-**How a Codex Worker reads.** Every Codex run, a reviewer's included, has System's own
+**How a Codex Worker reads.** Every Codex run has System's own
 [workspace reads server](../design/agent-runtimes.md#the-workspace-reads-server): `read_file`,
-`list_dir`, and `search` over its workspace, under a confinement of their own, read-only. Under the
-bundle's policy (`read: auto`) they run without asking you; every shell command, `cat` and `rg`
-included, is a `command` and waits for your approval, and each run's brief tells the Worker to read
-with the tools instead. Git's data and secret-named files (`.env`, keys, credentials) are never read
-through them. Their bounds are the `agent-workers` row's `workspaceReads` (defaults shown; a value
-outside its range refuses the row):
+`list_dir`, and `search` over its workspace, read-only. Under the bundle's policy (`read: auto`)
+they run without asking; every shell command, `cat` and `rg` included, is a `command` and waits
+for approval, and each run's brief tells the Worker to read with the tools. Git's data and
+secret-named files (`.env`, keys, credentials) are never read through them. Their bounds are the
+`agent-workers` row's `workspaceReads` (defaults shown; a value outside its range refuses the row):
 
 ```yaml
 - id: agent-workers
@@ -275,24 +263,22 @@ outside its range refuses the row):
     workspaceReads: { maxReadBytes: 262144, maxScanBytes: 8388608, maxEntries: 1000, maxMatches: 200, maxSearchFiles: 20000, maxLineChars: 500, maxPatternChars: 1000, searchTimeoutMs: 10000 }
 ```
 
-A Worker whose reads stall anyway: look for `agent-workers.tool.denied` events on a
-`mcp__workspace__…` tool in the event log (MCP `events` by type), whose `reason` says why
+A Worker whose reads stall: look for `agent-workers.tool.denied` events on a
+`mcp__workspace__…` tool in the event log (MCP `events` by type); `reason` says why
 (`outside-workspace`: outside the workspace or `..`; `git-data`; `unclassified-tool`: a tool the
-server does not have, or a runtime that reports no such server); a run stopped with "an mcp_tool_call item that the
-run's tool gate never allowed" is a Codex release that does not ask its hook before an MCP tool:
-keep the Workers off and report it.
+server does not have, or a runtime that reports no such server). A run stopped with "an
+mcp_tool_call item that the run's tool gate never allowed" is a Codex release that does not ask
+its hook before an MCP tool: keep the Workers off and report it.
 
 ## Antigravity CLI Workers
 
 The `runtime-antigravity-cli` row runs the Antigravity CLI (`agy`) as a Worker
 ([runtime](../../packages/plugins/runtime-antigravity-cli/README.md)). It is off
-by default. agy can be held to a policy only through its PreToolUse hook, so
-the runtime admits only an agy version a supervised live check verified: 1.4.6
+by default, and admits only an agy version a supervised live check verified: 1.4.6
 ([ADR-0043](../decisions/adr/0043-antigravity-cli-workers-gated-on-a-version-verified-live.md)).
-On that version every tool call passes the runtime's own rules, then the
-approval queue, as for a Claude Code Worker. On any other version `system
-explain` and `/ui` show "that agy <version> runs it before each tool call is not
-proven", and no run starts.
+On that version every tool call passes the runtime's own rules, then the approval
+queue. On any other version `system explain` and `/ui` show "that agy <version> runs
+it before each tool call is not proven", and no run starts.
 
 1. Turn the row on in your profile patch ([below](#turn-an-off-row-back-on)):
    `- id: runtime-antigravity-cli` with `disabled: false`. The `api-first`
@@ -343,21 +329,18 @@ proven", and no run starts.
    Worker unavailable or the run refused, and the message names the file.
 
 agy updates itself in your own sessions; a Worker's runs never do
-(`AGY_CLI_DISABLE_AUTO_UPDATE`). A newer agy is unverified, and its Workers
-stop, until a reviewed code change adds it to the runtime's
-`VERIFIED_HOOK_VERSIONS` after a supervised live check (the
-[release checklist](../validation/release-checklist.md) row). Until then, keep
+(`AGY_CLI_DISABLE_AUTO_UPDATE`). A newer agy is unverified, and its Workers stop,
+until a reviewed code change adds it to `VERIFIED_HOOK_VERSIONS` after a supervised
+live check (the [release checklist](../validation/release-checklist.md) row). Keep
 the verified version installed, or the Workers off.
 
 ## Agent Workers as review team members
 
-A read-only agent Worker (a Codex, Antigravity CLI, or Claude Code one) can be a
-member of a `review` team under the **review-member profile**
-([ADR-0049](../decisions/adr/0049-read-only-agent-workers-as-review-members.md)):
-its member steps run with every tool call denied, in an empty
-workspace, so it reviews exactly what its prompt shows, as a website member
-does. It takes no other work for the profile: an ask, a brainstorm, or research
-never reaches it.
+A read-only agent Worker (Codex, Antigravity CLI, or Claude Code) can be a member of
+a `review` team under the **review-member profile**
+([ADR-0049](../decisions/adr/0049-read-only-agent-workers-as-review-members.md)): its
+member steps run with every tool call denied, in an empty workspace, so it reviews
+exactly what its prompt shows. It takes no other work for the profile.
 
 1. Make an empty directory outside any repository for it, for example
    `install -d ~/experiments/review-member/empty`. Nothing goes in it: a step
@@ -374,18 +357,16 @@ never reaches it.
              sandbox: read-only, tier: standard, reviewMember: true, family: <family> }
    ```
 
-   `family` is required: the provider family that keeps two members of one
-   vendor apart. Give it the family other Workers of the vendor whose models it
-   runs carry (a website Worker's is its account's provider; `system explain`
-   shows a Worker's), so a Codex member and a ChatGPT website member never sit
-   on one team unless you turn `allowSameFamily` on
-   ([one provider family](#one-provider-family)). The load refuses a
-   `reviewMember` Worker that is not `read-only`, has no `family`, or works in a
-   worktree per run.
-3. Keep instruction files the runtime reads on its own out of its way: its own
-   home (the Worker's Codex or Antigravity home) and the directories above the
-   empty one hold none for it. The source checks only the workspace and the
-   repository around it.
+   `family` is required: the provider family that keeps two members of one vendor
+   apart. Give it the family other Workers of the vendor whose models it runs carry
+   (a website Worker's is its account's provider; `system explain` shows a Worker's),
+   so a Codex member and a ChatGPT website member never sit on one team unless you
+   turn `allowSameFamily` on ([one provider family](#one-provider-family)). The load
+   refuses a `reviewMember` Worker that is not `read-only`, has no `family`, or works
+   in a worktree per run.
+3. Keep instruction files the runtime reads on its own out of its way: its own home
+   and the directories above the empty one hold none for it. The source checks only
+   the workspace and the repository around it.
 4. Restart, then check with `system explain`: the Worker offers `reason` for
    review-member work only, and, on a runtime that cannot resume (the
    Antigravity CLI), `persistent-conversation` for that work only. A `review`
@@ -405,8 +386,8 @@ characters) fails the same way, and so does an Antigravity turn over its
 
 Give each agent Worker that writes or validates the **kinds of work** it takes, and each step goes
 to a Worker of its kind ([work kinds](../design/routing.md#work-kinds),
-[ADR-0057](../decisions/adr/0057-route-work-by-kind.md), accepted). This is configuration: which
-runtime takes which kind is the Worker list's, never a template's.
+[ADR-0057](../decisions/adr/0057-route-work-by-kind.md)). Which runtime takes which kind is
+configuration of the Worker list, never of a template.
 
 What names a kind today ([templates](../reference/workflow-templates.md#algorithm-development)):
 
@@ -416,21 +397,20 @@ What names a kind today ([templates](../reference/workflow-templates.md#algorith
 | `research` `literature:1` and `literature:2`, which a [research role](#turn-on-the-research-worker) takes | `research` |
 | every review (`algorithm-development` `selfreview:1`, `review:1` and their re-reviews, `agent-review`), a planner's steps, every other website step (`ask`, `brainstorm`, `review` teams, `research`'s frame, evidence, critique, and conclusion), digests | none |
 
-A Worker given kinds takes only steps of those kinds, and never a step that names none; a Worker
-given none takes any step it proves the capabilities for. With no Worker given kinds, everything
-routes as before.
+A Worker given kinds takes only steps of those kinds, never a step that names none; a Worker given
+none takes any step it proves the capabilities for. With no Worker given kinds, everything routes
+as before.
 
 A board task reaches a variant's kind by naming the variant: `board_propose` (or an item of
 `board_propose_plan`) with `template: algorithm-development` and `variant: docs` or `tests`; a
 lead's own start must name the same variant. The `profile-software-development` row's `kinds` sets
-the kind a step names, by step (`develop`, `docs`, `tests`), so moving a step to other Workers is
-configuration ([configuration](../reference/configuration.md#profile-software-development)): for
-example, `kinds: { docs: writing }` makes the `docs` variant's develop step `writing` work. A review
-names none, whatever is set. `system check` refuses a key that is not a step and a kind that is not
-a kind of work.
+the kind a step names, by step (`develop`, `docs`, `tests`)
+([configuration](../reference/configuration.md#profile-software-development)); for example,
+`kinds: { docs: writing }` makes the `docs` variant's develop step `writing` work. A review names
+none. `system check` refuses a key that is not a step and a kind that is not a kind of work.
 
-**A split by role.** For example: Claude Code changes the codebase (source code, docs, and tests),
-Codex runs checks and changes nothing, and every reviewer takes every review.
+**A split by role.** For example: Claude Code changes the codebase (source, docs, tests), Codex runs
+checks and changes nothing, and every reviewer takes every review.
 [`examples/work-kinds.patch.yml`](examples/work-kinds.patch.yml) holds the rows. On accounts × roles
 ([below](#migrate-agent-workers-to-accounts--roles)) the kinds go on the roles:
 
@@ -449,33 +429,31 @@ Codex runs checks and changes nothing, and every reviewer takes every review.
 Keep each role's other settings; only `kinds` changes. The template has no validation step, so a
 `validation` kind names nothing in `algorithm-development`: the developer runs the checks itself and
 shows the output in the task's dossier, and the run's required checks run again on the exact result
-at acceptance. `selfreview:1`, the author's own review, runs on the author's account: give each
-writing account a read-only role given no kinds (`review` above), or it fails admission with nothing
-sent.
+at acceptance. `selfreview:1` runs on the author's account: give each writing account a read-only
+role with no kinds (`review` above), or it fails admission with nothing sent.
 
 1. **Before:** Claude Code's commands are proven confined on this host
-   ([confined commands](#agent-workers): `bubblewrap` and `socat`); otherwise the writing Claude
-   Code Worker is unavailable and nothing takes `code` work. Codex is installed and signed in inside
-   its Worker home ([Codex Workers](#codex-workers)). Back up (`system backup`).
+   ([confined commands](#agent-workers): `bubblewrap` and `socat`), or nothing takes `code` work.
+   Codex is installed and signed in inside its Worker home ([Codex Workers](#codex-workers)).
+   Back up (`system backup`).
 2. **Merge the example's rows** into `~/.dsh/profiles/system/cordis.patch.yml` by row id
    (`runtime-codex-sdk`, `runtime-antigravity-cli`, `agent-workers`,
    `profile-software-development`). What it sets:
-   - `claude-code`: `sandbox: workspace-write`, `worktreePerRun: true`, `kinds: [code, docs, tests]`:
-     it writes every change, with no variant and in the `docs` and `tests` variants. Each workflow
-     run writes in its own worktree on the branch `system/run/<runId>`, never in the checkout
+   - `claude-code`: `sandbox: workspace-write`, `worktreePerRun: true`, `kinds: [code, docs, tests]`.
+     Each run writes in its own worktree on the branch `system/run/<runId>`, never in the checkout
      ([a run's worktree](#a-runs-worktree)); an accepted task's branch is merged on your approval
      ([land an accepted result](#land-an-accepted-result)).
    - `codex-writer`: the same on Codex, `kinds: [validation]`: it takes no step of
      `algorithm-development`.
-   - The reviewers (`claude-research`, `codex-review`, `agy-review`) are given no kinds, so they take
+   - The reviewers (`claude-research`, `codex-review`, `agy-review`) have no kinds, so they take
      every review. Each sets `worktreePerRun: true`: every Worker on a workspace must agree, so a
      reviewer reads the writer's worktree, and the load refuses a row that disagrees.
-   - `claude-digest`: read-only, on the **economy** tier, given no kinds, in the review member's
-     empty directory. It writes the digests of task results: a digest asks for a read-only Worker on
-     the economy tier only (the `digest` row's `tier`), so with only standard reviewers every
-     task's digest is bypassed ("no Worker can write it (a read-only Worker on the economy tier)").
-     Optionally give it the runtime's lighter model (`model:`). Instead, you may set the `digest`
-     row's `tier: standard`: digests then run on a standard reviewer and are never escalated
+   - `claude-digest`: read-only, on the **economy** tier, no kinds, in the review member's empty
+     directory. It writes the digests of task results: a digest asks for a read-only Worker on the
+     economy tier only (the `digest` row's `tier`), so with only standard reviewers every digest is
+     bypassed ("no Worker can write it (a read-only Worker on the economy tier)"). Optionally give it
+     the runtime's lighter model (`model:`), or set the `digest` row's `tier: standard`: digests then
+     run on a standard reviewer and are never escalated
      ([digests](../design/digests.md#the-worker)).
    - `claude-member` keeps its empty directory, never a worktree.
 3. **The approval policy that gates the writers' commands** (ADR-0038) is the bundle's studio
@@ -483,12 +461,12 @@ sent.
    required at acceptance, so a result waits for your review unless the run passed them
    ([let a run pass the required checks](#let-a-run-pass-the-required-checks))), and every command
    asks. In a step with a session (`develop:1`) a command waits on the approval queue
-   ([a deferred tool call](#a-workers-tool-call-is-deferred-on-an-approval)); in a step with none
-   (a review, a one-shot step), it is denied and reported not run. Listing a command
+   ([a deferred tool call](#a-workers-tool-call-is-deferred-on-an-approval)); in a step with none,
+   it is denied and reported not run. Listing a command
    ([change the autonomy policy](#change-the-autonomy-policy)) lets it run unasked, as the exact
    argv. Before you list one, check it runs in a fresh worktree with no network: a run's worktree
    has no `node_modules`, so a check that needs dependencies fails there until they are present;
-   its evidence entry then says the command did not run, and you run it in the worktree yourself.
+   its evidence entry says the command did not run, and you run it in the worktree yourself.
 4. **Check, then restart:** `system check` until it says `ok` (it names a malformed kind, kinds on a
    review member, or Workers of one workspace that disagree on `worktreePerRun`), then
    `system shutdown`, `system start`. `system explain` (or `/ui`) shows each Worker ready, or why
@@ -508,12 +486,11 @@ What this split does not reach:
 - **The Antigravity CLI reviews, and writes nothing here.** `develop:1` keeps a conversation, which
   agy cannot resume, so a writing agy Worker is never admitted to it.
 - **A step that names no kind needs a Worker given none.** Once every writer has kinds, a writing
-  step that names none (a planner's `develop` step, or a configured template's) fails admission,
-  saying `no Worker that proves develop … takes work that names no kind`; give one writer no kinds
+  step that names none (a planner's `develop` step, or a configured template's) fails admission
+  (`no Worker that proves develop … takes work that names no kind`); give one writer no kinds
   to take such steps.
 
-To undo, remove `kinds` from the Workers (and the writers, if you no longer want them) and restart:
-every Worker then takes every step it proves the capabilities for.
+To undo, remove `kinds` from the Workers (and the writers, if you no longer want them) and restart.
 
 ## Give a role tiers
 
@@ -521,9 +498,9 @@ One account serves its plan's economy, standard, and frontier models. Give a rol
 on a runtime, and each account assigned the role gets **one** Worker that offers every tier: routing
 serves it at the lowest tier a step admits and its run uses that tier's model
 ([tiers per role](../design/agent-runtimes.md#tiers-per-role),
-[ADR-0073](../decisions/adr/0073-agent-workers-offer-tiers-per-role-with-quota-per-model.md)). What
-the Worker may do stays the role's (its sandbox, kinds, review-member profile): a tier changes only
-the model and the options you give it. Accounts × roles only
+[ADR-0073](../decisions/adr/0073-agent-workers-offer-tiers-per-role-with-quota-per-model.md)). The
+role still fixes what the Worker may do (sandbox, kinds, review-member profile); a tier changes only
+the model and its options. Accounts × roles only
 ([migrate first](#migrate-agent-workers-to-accounts--roles)).
 
 1. **Name the models in the live profile only** (`~/.dsh/profiles/system/cordis.patch.yml`), never in
@@ -549,14 +526,13 @@ the model and the options you give it. Accounts × roles only
 
    A tier sets `model` and, when it differs there, `tools` and `maxTurns`. `system check` refuses an
    unknown tier, a tier with no model, and a role that gives an assigned runtime no tier at all.
-   Codex roles take the same shape under their Codex runtime (`runtimes: { codex-sdk: { tiers: … } }`),
-   each tier its own Codex model.
+   Codex roles take the same shape under their Codex runtime (`runtimes: { codex-sdk: { tiers: … } }`).
 
-   A run queued before a restart that changes a role's tiers (a tier removed, or the tier's model
-   changed) never runs another model: it fails unsent as `worker_changed`, naming the tier it was
-   started at and the tiers offered now, and the engine routes the work again at once.
-2. **Give a model that has a window of its own its own pool** (optional; with a metered provider
-   only). Claude's usage report gives a weekly window per model, read as
+   A run queued before a restart that changes a role's tiers (a tier removed, or its model changed)
+   never runs another model: it fails unsent as `worker_changed`, naming the tier it was started at
+   and the tiers offered now, and the engine routes the work again at once.
+2. **Give a model that has a window of its own its own pool** (optional; metered provider only).
+   Claude's usage report gives a weekly window per model, read as
    `model_scoped:<display name, lower-cased>`. Add a pool template for it to the `resources` row's
    `templates` (`{ template: claude-frontier, group: claude-agent-sdk, kind: interactive, windows: [{ id: weekly, kind: rolling, seconds: 604800 }] }`)
    and map it on the provider entry:
@@ -570,11 +546,11 @@ the model and the options you give it. Accounts × roles only
              - { model: "<frontier model>", pool: claude-frontier, windows: { "model_scoped:<frontier family>": weekly } }
    ```
 
-   Each account then draws on `claude-frontier/<accountId>` too when it runs the frontier model: at
+   Each account then also draws on `claude-frontier/<accountId>` when it runs the frontier model: at
    its limit, only the frontier tier closes. Codex reports its windows by length, not per model:
-   give a Codex provider no `modelPools`; every tier of a Codex account then shares its windows. Until
-   its first reading, a new model pool is unknown, so its tier is closed (fail closed); the roster
-   shows a tier its model's limit closes as `at its model's limit`, with when it is back.
+   give a Codex provider no `modelPools`; every tier of a Codex account then shares its windows. A
+   new model pool is unknown until its first reading, so its tier is closed (fail closed); the
+   roster shows a tier its model's limit closes as `at its model's limit`, with when it is back.
 3. **Restart** (`system restart`), then check: the roster shows one Worker per account and role, with
    its tiers (`economy, standard, frontier tiers`); `system explain <runId>` and the run's page on
    `/ui` name each step's tier and model.
@@ -592,8 +568,7 @@ the model and the options you give it. Accounts × roles only
    fails unsent with "the tier of task … cannot be read" found the policy or its board task
    unreadable: it was held, not run below its tier; once the policy reads again, continue the run.
 
-To undo, put the role's `tier` and runtime `model` back in place of `tiers` and restart: its Workers
-then offer that one tier, as before.
+To undo, put the role's `tier` and runtime `model` back in place of `tiers` and restart.
 
 ## Turn on the research Worker
 
@@ -602,9 +577,9 @@ Research's second literature review runs on a Claude Worker of another family th
 Code: it reads the workspace and searches the web, and never writes or runs a command
 ([a research role](../design/agent-runtimes.md#a-research-role),
 [ADR-0074](../decisions/adr/0074-a-research-roles-web-calls-run-under-a-bounded-egress-checked-grant.md)).
-Three steps, each yours: the role, the assignment, and the web access grant through a
-`policy-change` approval. Until all three hold, `research` routes as before (Gemini's website, then
-the single-family fallback). Accounts × roles only
+Three steps: the role, the assignment, and the web access grant through a `policy-change`
+approval. Until all three hold, `research` routes as before (Gemini's website, then the
+single-family fallback). Accounts × roles only
 ([migrate first](#migrate-agent-workers-to-accounts--roles)).
 
 1. **The role.** In the `agent-workers` row of the live profile
@@ -627,9 +602,9 @@ the single-family fallback). Accounts × roles only
                  standard: { model: "<standard model>", maxTurns: 40 }
    ```
 
-   It is on the standard tier: with no `tiers` (and no `tier`) it still is, on the runtime's default
-   model. `family` must differ from the ChatGPT website Worker's. `system check` refuses a research
-   role that is not `read-only`, is a review member, or names another tool, a tier's included.
+   It is on the standard tier even with no `tiers` (then on the runtime's default model). `family`
+   must differ from the ChatGPT website Worker's. `system check` refuses a research role that is not
+   `read-only`, is a review member, or names another tool, a tier's included.
 2. **The assignment.** Give the role to the Claude Code account, beside its others:
 
    ```yaml
@@ -657,8 +632,8 @@ the single-family fallback). Accounts × roles only
       ```
 
       **Propose** it, read its `policy-change` request in the queue, and approve it. Its
-      consequences say that no effective mode moves and name the web access it grants. This one
-      approval turns it on.
+      consequences name the web access it grants and say no effective mode moves. This one approval
+      turns it on.
    2. The `system` project's policy, [`policies/system.json`](../../policies/system.json), carries the
       same grant, which narrows the studio's (a project's grant can lower its tools, bound, or
       classification, never raise them; a project with none keeps the studio's). It reaches the live
@@ -666,8 +641,8 @@ the single-family fallback). Accounts × roles only
 4. **Verify.** The roster shows the Worker with `web-search` once its probe searched, and without it
    while the grant is not approved. `system explain <runId>` of a `research` run names
    `agent:<account>/research` in `literature:2`'s route decision and lists the run's **web calls**
-   (how many ran unasked, asked, or were denied, each with its egress verdict); the run's page on
-   `/ui` shows the same under *Web calls*.
+   (unasked, asked, or denied, each with its egress verdict); the run's page on `/ui` shows the same
+   under *Web calls*.
 5. **What asks.** A query or URL that names a path of this machine or holds a credential pattern,
    content above `operator-shared`, a tool the grant does not name, and every call past the bound ask
    as any `external-send`; approve or reject it in the queue. A project that forbids `external-send`
@@ -704,13 +679,13 @@ The default composition keeps these rows in the system bundle but off
 3. Restart: `system shutdown`, then `system start`.
 4. `system start --dump-config` shows the row without `disabled: true`.
 
-To turn it off again, remove the row from your patch, or set `disabled: true`,
-and restart; the Claude Code rows turn off the same way. The `api-first` preset
-turns every agent row on for you ([API-first](#api-first-preset)).
+To turn it off again, remove the row from your patch, or set `disabled: true`, and restart; the
+Claude Code rows turn off the same way. The `api-first` preset turns every agent row on for you
+([API-first](#api-first-preset)).
 
-At the start after the change, the plugin host records it: `system plugins` shows the row's
-plugin `default` once its row is on and `candidate` once it is off, and `system artifact` of
-its lifecycle decision (`system plugins --json`) shows the state it left
+At the next start the plugin host records the change: `system plugins` shows the row's plugin
+`default` while the row is on and `candidate` while it is off, and `system artifact` of its
+lifecycle decision (`system plugins --json`) shows the state it left
 ([plugin host](../design/plugin-host.md)). A start with the same rows records nothing.
 
 ## Read the day
@@ -720,10 +695,10 @@ The lead's digest and the health table read the record only and change nothing
 
 1. `system lead digest --project <id>` is today so far; `--day 2026-10-26` is a finished UTC day,
    stored the first time it is read and read back unchanged. It lists what landed, what the lead
-   decided on its own token, what waits on the operator (with how to read it and when it expires),
-   what failed (a daily check's failure names the task it filed), and the day's measures: landed
-   by System and by hand, lead touches, reruns, red dev, incidents.
-2. A measure shown `unknown (why)` could not be read (no repository known, the daily check off):
+   decided on its own token, what waits on the operator (how to read it, when it expires), what
+   failed (a daily check's failure names the task it filed), and the day's measures: landed by
+   System and by hand, lead touches, reruns, red dev, incidents.
+2. A measure shown `unknown (why)` could not be read (no repository known, the daily check off);
    it is never 0. Commits under "no landing decision" were not landed through System.
 3. `system lead health --project <id>` is one row per source, each `ok`, `degraded`, or `unknown`
    with its reason. Start with the `degraded` rows (a paused dispatch, an unavailable Worker, a
@@ -738,9 +713,9 @@ daemon runs; nothing else restarts ([turning a plugin off](../architecture/plugi
 1. `system plugin list`: each row, `on` or `off`, `required` or `optional`, and its last turn with
    why. Only an optional row turns off.
 2. `system plugin off <row> <reason…>`, for example `system plugin off digest its digests quote
-   the wrong lines`. It returns once the row's plugin has finished or handed back its work and
-   stopped (within the `plugin-host` row's `quiesceSeconds`, 60 by default), the turn is recorded,
-   and `- id: <row>` / `disabled: true` is in `~/.dsh/profiles/system/cordis.patch.yml`, so a restart
+   the wrong lines`. It returns once the plugin has finished or handed back its work and stopped
+   (within the `plugin-host` row's `quiesceSeconds`, 60 by default); the turn is recorded, and
+   `- id: <row>` / `disabled: true` is in `~/.dsh/profiles/system/cordis.patch.yml`, so a restart
    keeps it. What needs the row now says it is not mounted; `system health` stays ok.
 3. `system plugin on <row>` turns it on again the same way, `disabled: false` in the patch.
 
@@ -765,9 +740,9 @@ The lead-rights check is only `on`: to stop a lead, `system lead-token revoke <p
 
 The default composition digests with the `digest` row, whose Worker reads every source whole. The
 `digest-extractive` row, off, provides the same seam extractive-first: code selects verbatim spans
-of the sources first, the Worker reads only those, and each claim's quote is filled from them
+of the sources first, the Worker reads only those
 ([extractive-first](../design/digests.md#extractive-first)). Both serve the same `digests_*` tools,
-and one runs at a time. Swapping them is a configuration change only.
+and one runs at a time. Swapping is a configuration change only.
 
 1. **Between runs.** A digest pending when you swap is not finished by the other provider: the
    board task waiting on it keeps no digest, recorded with why ("the digest provider no longer
@@ -786,8 +761,8 @@ and one runs at a time. Swapping them is a configuration change only.
    `maxExtracts`, the spans its Worker is given (default 40).
 3. `system check` until it says `ok`, then `system shutdown` and `system start`.
 4. **Check.** `system plugins` shows `@tsuuanmi/system-digest` `candidate` and
-   `@tsuuanmi/system-digest-extractive` `default`, each with the `lifecycle` decision that recorded
-   it; `system health` shows `plugins` and `manifests` ok. A new request's id starts with `dgx-`,
+   `@tsuuanmi/system-digest-extractive` `default`, each with its `lifecycle` decision;
+   `system health` shows `plugins` and `manifests` ok. A new request's id starts with `dgx-`,
    and its brief (`system artifact <brief>`) points at a `digest-extract@1.0` artifact, never at a
    source.
 5. **Compare** before and after, as the [release checklist](../validation/release-checklist.md)
@@ -795,15 +770,13 @@ and one runs at a time. Swapping them is a configuration change only.
    and escalations (`digests_get`), and the tokens the digest Workers' runs recorded on the
    resource ledger (MCP `resources_usage`).
 
-To swap back, reverse the patch (or remove both rows from it) and restart. A provider's requests
-stay in its own table: while it is off, `digests_get` of one of its requests is refused
+To swap back, reverse the patch (or remove both rows) and restart. A provider's requests stay in
+its own table: while it is off, `digests_get` of one of its requests is refused
 (`unknown-request`), and the report counts that digest's attachment but not its claims, and says so
-in its notes; its digest and settling decision stay in the ledger (`system artifact`). Compare the
-period before a swap with the report made before it.
+in its notes; its digest and settling decision stay in the ledger (`system artifact`).
 
 With both rows on, the second provider to register does not start: `system health` shows
-`plugins` down, naming it ("service \"digests\" has been registered"). Turn one of them off and
-restart.
+`plugins` down, naming it ("service \"digests\" has been registered"). Turn one off and restart.
 
 ## The manifest check found a plugin
 
@@ -838,7 +811,7 @@ plugin as unchecked until the finding is cleared.
    recorded twice.
 
 A refused manifest in a row that is off makes `manifests` degraded instead: the plugin does not
-run, but its lifecycle is not recorded until its package ships a valid manifest. The DSH rows the
+run, and its lifecycle is not recorded until its package ships a valid manifest. The DSH rows the
 bundle allows are noted, not found.
 
 ## API and local models
@@ -901,8 +874,8 @@ on this machine ([models](../design/models.md)). Two rows of the profile's
   first make sure the route's `baseURL` is loopback (`127.0.0.1` or `localhost`):
   nothing checks it for you. Then add `local-private` to the egress row's
   `workerClasses['model-local']` (list every class: the setting replaces the
-  default). A server that needs no key still
-  needs a placeholder reference: the OpenAI-compatible protocol sends one.
+  default). A server that needs no key still needs a placeholder reference: the
+  OpenAI-compatible protocol sends one.
 - **Egress:** a remote model receives `public` and `operator-shared` content by
   default (Worker class `model`); a credential in a prompt is always refused.
 - **Cost:** each provider request may be billed. A transiently failed request is
@@ -934,31 +907,27 @@ stopped it ([bounds](../design/models.md#a-call)):
 `system explain <runId>` shows the step's failure; a finished answer records
 its attempts (`attempts` 2 or more: a request failed transiently first).
 
-**A Gemini API call times out.** The Gemini API Worker (a `google` route, its
-economy model) answered in 45 s to 4 min on 2026-10-23, with at most about
-4,000 output tokens, and without a measurable thinking share: on a route that
-sets no `reasoning`, that model already thinks at its lowest level
-(`low`; it offers no `minimal` or `off`). Its time goes to the provider, not
-to the answer's length, so raising the ceiling is the remedy for a slow call;
-lowering `maxTokens` or `reasoning` does not help it. The defaults fit it: a
-5 min silence bound and a 15 min ceiling.
+**A Gemini API call times out.** The Gemini API Worker (a `google` route, its economy model) takes
+45 s to 4 min per call, with at most about 4,000 output tokens and no measurable thinking share:
+on a route that sets no `reasoning`, it already thinks at its lowest level (`low`; no `minimal` or
+`off`). Its time goes to the provider, not the answer's length, so raise the ceiling for a slow
+call; lowering `maxTokens` or `reasoning` does not help. The defaults fit it: a 5 min silence
+bound and a 15 min ceiling.
 
 ## API-first preset
 
 For an organization that cannot accept automated use of consumer websites
 ([ADR-0025](../decisions/adr/0025-api-first-composition.md)):
 
-1. `system init --preset api-first` adds the preset's bundle layer to the
-   profile, right after the system bundle. It turns off the display, browser,
-   provider registry, website drivers, login, accounts, website turns, turn
-   receipts, and both model gateways, turns every agent Worker row (Codex and
-   ACP included) and the software-development profile on, and orders quota `local`, `metered`,
-   `agent-plan`, `subscription-chat`. Your `cordis.patch.yml` is not touched,
-   and a later `system init` keeps the preset.
+1. `system init --preset api-first` adds the preset's bundle layer to the profile, right after the
+   system bundle. It turns off the display, browser, provider registry, website drivers, login,
+   accounts, website turns, turn receipts, and both model gateways; turns every agent Worker row
+   (Codex and ACP included) and the software-development profile on; and orders quota `local`,
+   `metered`, `agent-plan`, `subscription-chat`. Your `cordis.patch.yml` is not touched, and a
+   later `system init` keeps the preset.
 2. Configure model Workers ([above](#api-and-local-models)) and agent Workers
    ([agent Workers](#agent-workers)).
-3. `system start --dump-config` lists the composition: the turned-off rows
-   carry `disabled: true`.
+3. `system start --dump-config` lists the composition: the turned-off rows carry `disabled: true`.
 
 Work that needs a website capability fails at admission with the reason, for
 example `no Worker can take this work: no Worker proves deep-research`; nothing
@@ -967,10 +936,9 @@ is sent anywhere ([templates](../reference/workflow-templates.md#presets)).
 
 ## One provider family
 
-When a second provider cannot serve work teams and
-research fail admission: they need two provider families
-([ADR-0027](../decisions/adr/0027-provider-diversity-in-routing.md)). To run them on one family
-instead ([ADR-0029](../decisions/adr/0029-opt-in-same-family-fallback.md)):
+When a second provider cannot serve, teams and research fail admission: they need two provider
+families ([ADR-0027](../decisions/adr/0027-provider-diversity-in-routing.md)). To run them on one
+family instead ([ADR-0029](../decisions/adr/0029-opt-in-same-family-fallback.md)):
 
 1. Turn the blocked website's driver row off (`provider-gemini-web`), so nothing loads it.
 2. Set `allowSameFamily: true` on the `workflow` row.
@@ -978,23 +946,20 @@ instead ([ADR-0029](../decisions/adr/0029-opt-in-same-family-fallback.md)):
 
 Two team members then share one account, each in its own conversation. The team's answer says
 "same provider family", and each run spends that account's quota for both members. To return to
-two families, turn the row back on and sign the account in; `allowSameFamily` can stay on, since
-a second family is used whenever one is admitted.
+two families, turn the row back on and sign the account in; `allowSameFamily` can stay on, since a
+second family is used whenever one is admitted.
 
 ## Keep a Worker out of teams
 
-To keep a website account (or any Worker) out of brainstorm and review teams while it still
-takes single asks and research, for example while the site is unstable
-([Workers left out of teams](../design/teams.md#workers-left-out-of-teams)):
+To keep a website account (or any Worker) out of brainstorm and review teams while it still takes
+single asks and research ([Workers left out of teams](../design/teams.md#workers-left-out-of-teams)):
 
 1. `system roster` lists every Worker id and, for a Worker on an account, its account's group and
-   id. Pick the Worker ids or accounts to leave out. A Worker id leaves out every other Worker of
-   its account too (a website account's other tiers, an agent account's other roles); an account,
-   written `<group>/<id>`, leaves out every Worker on it; a bare account id does the same when only
-   one group has an account by that id, and is refused when several do (two providers' `default`
+   id. Pick what to leave out. A Worker id leaves out every other Worker of its account too (a
+   website account's other tiers, an agent account's other roles); an account, written
+   `<group>/<id>`, leaves out every Worker on it; a bare account id does the same when only one
+   group has an account by that id, and is refused when several do (two providers' `default`
    accounts, say); a model Worker is left out by its own id.
-2. Add them on the `workflow` row of `cordis.patch.yml` (a targeted patch replaces the row's whole
-   config: keep its other settings):
 
    ```yaml
    - id: workflow
@@ -1011,19 +976,19 @@ takes single asks and research, for example while the site is unstable
 4. Check: start a `system brainstorm "…"`, then `system explain <runId>`: each member's `route`
    line names another Worker, and the route decision gives each Worker left out the reason `left
    out of teams by the operator's teams.excludeWorkers`. An entry that matches no Worker or account
-   listed when a member routes leaves nothing out, and each member's routing records it as a
-   `workflow.team.unmatched-exclusions` event with the entries (`system events --type
-   workflow.team.unmatched-exclusions`): fix the spelling, or remove it.
+   leaves nothing out and is recorded as a `workflow.team.unmatched-exclusions` event with the
+   entries (`system events --type workflow.team.unmatched-exclusions`): fix the spelling, or
+   remove it.
 
 - **What the team runs on instead.** Members still differ by provider family, so another family
-  must be admitted for each member: with a website left out, another provider's website, an API
-  model Worker of the same family as the one left out (a model entry's `family`), or for a review
-  an agent Worker under the review-member profile.
+  must be admitted for each member: another provider's website, an API model Worker of the same
+  family as the one left out (a model entry's `family`), or for a review an agent Worker under the
+  review-member profile.
 - **When your exclusion leaves too few families**, the team fails at its first member, before
   anything is sent, as `config_error`: `team T needs N provider families, one per member; M is
   ready outside the operator's teams.excludeWorkers, which leaves K more out of teams …`.
-  `allowSameFamily` does not run the team on one family instead (that would be a team your exclusion
-  made single-provider): add a Worker of another family, or leave out less.
+  `allowSameFamily` does not run the team on one family instead: add a Worker of another family,
+  or leave out less.
 - **Which one it gets** is routing's order among the Workers admitted: the lowest tier, then the
   quota class in `quotaPreference` order (default `subscription-chat`, `local`, `agent-plan`,
   `metered`), then the least busy, then `priority` ([routing](../design/routing.md#algorithm)). So
@@ -1033,42 +998,41 @@ takes single asks and research, for example while the site is unstable
   reorders every step where a `metered` and an `agent-plan` Worker are both admitted, and the agent
   Worker stays the next choice when the model is not admitted.
 - **An API model Worker as a member.** Its `maxTokens` (default 4096) bounds the whole answer,
-  thinking included. A review member writes its findings after reading the material, so an answer
-  that stops mid-reasoning has no findings JSON and its step is rejected. Raise that catalog entry's
-  `maxTokens` (for example to 16384) before teams use it ([API and local models](#api-and-local-models));
-  a longer answer also takes longer, within `callTimeoutMs`.
-- **Teams in flight** keep the members they formed with: a member already in its team's
-  conversation in that run stays on its Worker, also when you `system continue` the run. A member
-  that would resume a conversation not started for its team in that run on a Worker left out fails
-  as `config_error`, nothing sent. Start the run again to form the team under the option.
+  thinking included. An answer that stops mid-reasoning has no findings JSON and its step is
+  rejected. Raise that catalog entry's `maxTokens` (for example to 16384) before teams use it
+  ([API and local models](#api-and-local-models)); a longer answer takes longer, within
+  `callTimeoutMs`.
+- **Teams in flight** keep the members they formed with, also when you `system continue` the run. A
+  member that would resume a conversation not started for its team in that run on a Worker left
+  out fails as `config_error`, nothing sent. Start the run again to form the team under the option.
 - **Undo:** remove the entries (or the `teams` key), `system check`, restart.
 
 ## A review member fails on a website
 
-A team member's step (`review:m<k>:propose`, `brainstorm:m<k>:propose`, a ballot, or a debate) fails on a website Worker, or
-for want of one. `system explain <runId>` shows the step's decisions, and its error says which
-case it is:
+A team member's step (`review:m<k>:propose`, `brainstorm:m<k>:propose`, a ballot, or a debate)
+fails on a website Worker, or for want of one. `system explain <runId>` shows the step's decisions,
+and its error says which case it is:
 
 - **Over a website's input bound** (`invalid_input`: `no Worker can take this work: … the input
   has N characters; it takes at most M`). A website Worker takes at most what its driver
   declares: the Gemini site 30,000 characters (`maxPromptChars` on the `provider-gemini-web`
-  row). That bound is the site's, not the code's: Gemini drops a longer paste without an error,
-  so raising it only turns the refusal into a lost prompt (`input_dropped`). A member's input is
-  the source it is shown plus about 1,500 characters of instructions. Such a member routes to a
-  Worker of a family no earlier member has that takes it, at the step's tier or the lowest above
-  (an API model Worker, or an agent Worker under the review-member profile); with none, it fails
-  unsent and the message names what to shorten. For a text review, review a smaller part of the
-  text, or lower `repositories.maxSourceChars` on the `workflow` row so a text that long is
-  refused before any member is asked; for a repository, lower that bound or narrow `focus`. Then
-  start the review again: `continue` would compose the same input.
+  row). That bound is the site's: Gemini drops a longer paste without an error, so raising it only
+  turns the refusal into a lost prompt (`input_dropped`). A member's input is the source it is
+  shown plus about 1,500 characters of instructions. Such a member routes to a Worker of a family
+  no earlier member has that takes it, at the step's tier or the lowest above (an API model
+  Worker, or an agent Worker under the review-member profile); with none, it fails unsent and the
+  message names what to shorten. For a text review, review a smaller part, or lower
+  `repositories.maxSourceChars` on the `workflow` row so a text that long is refused before any
+  member is asked; for a repository, lower that bound or narrow `focus`. Then start the review
+  again: `continue` would compose the same input.
 - **A dropped prompt** (`input_dropped`): the site emptied the composer and took nothing. When the
   prompt was near `maxPromptChars`, the site's limit is lower now: lower `maxPromptChars` (a
   targeted patch on the `provider-gemini-web` row, listing its other settings too), restart, then
   `system continue <runId>`.
 - **A stall** (`provider_stalled`: `… no meaningful progress for 300000ms (turns.stallTimeoutMs):
   …`). Nothing the driver reads changed for the stall bound: no answer text, no activity, no start
-  or stop of generation. Read the page as it stood: `system events --type provider.stall` names
-  its outline, and `system evidence <id>` shows it.
+  or stop of generation. `system events --type provider.stall` names the page's outline, and
+  `system evidence <id>` shows it.
   - If the outline shows the answer still thinking or writing (Stop shown), the site was working
     past the bound: raise `stallTimeoutMs` on the `turns` row (below `turnTimeoutMs`, 15 min by
     default), or map the account's tier to a faster mode in the account catalog.
@@ -1079,68 +1043,62 @@ case it is:
     bound ([a provider UI change](playbooks.md#a-provider-ui-change)).
 - **The site's own error** (`overloaded`: `the site answered with its own error instead of an
   answer ("Sorry, something went wrong. Please try your request again."); the prompt was sent, so
-  it is not resent`). The site took the prompt and answered with an error of its own. Nothing may come
-  later to be read: the conversation, reopened, can show an empty new chat, neither the prompt nor
-  the error. The site's own way to retry (its Redo, or trying again as it asks)
+  it is not resent`). The site took the prompt and answered with an error of its own; the
+  conversation, reopened, can show an empty new chat. The site's own way to retry (its Redo)
   sends the prompt again.
   - **A member's first step is resent once, on its own** ([ADR-0062](../decisions/adr/0062-a-team-members-first-step-is-resent-once-after-a-sites-own-error.md)):
-    nothing to do. After the `overloaded` back-off the member's proposal runs again on the same
-    account, in a new conversation, and the team goes on there. `system explain <runId>` shows the
-    `recovery` decision `resend` on the member's `propose` node: why, the failed turn, and the key
-    of the new one; `system events --type workflow.node.resent` lists them. The abandoned
-    conversation is deleted with the member's others when the run is released.
+    nothing to do. After the `overloaded` back-off the proposal runs again on the same account, in
+    a new conversation, and the team goes on there. `system explain <runId>` shows the `recovery`
+    decision `resend` on the member's `propose` node (why, the failed turn, the new turn's key);
+    `system events --type workflow.node.resent` lists them. The abandoned conversation is deleted
+    with the member's others when the run is released.
   - **Anything else fails for you** (`USER_ACTION`): the same step erring a second time (never
     resent twice), a member's ballot or debate (they rely on their conversation), or any other
     step. The `recovery` decision's `resend` candidate says why it was not resent. `system` never
     sends the prompt again on its own (INV-4).
   - Look at what the site kept, sending nothing: `system conversations` names the member's
-    conversation (the failed turn's binding), and `system conversation inspect <account>
-    <binding>` outlines it. To read an answer it shows, open it in the login profile (`system
-    account login <id>`, then Cancel). If it holds a finished answer to the prompt, take it with
-    `system supersede <runId> <nodeId> -` (the answer on stdin).
-  - If it holds nothing, `continue` cannot help a team member: its conversation has nothing to
-    continue, and a member is given a new one only for that one resend of its first step, so its
-    step fails again, unsent (`conversation_lost` when the site sends the page elsewhere). Start
-    the run again. For a one-shot `ask`, `system continue <runId>` sends the prompt again in a new
-    Temporary chat: that resend is your decision.
+    conversation, and `system conversation inspect <account> <binding>` outlines it. To read an
+    answer it shows, open it in the login profile (`system account login <id>`, then Cancel). If it
+    holds a finished answer to the prompt, take it with `system supersede <runId> <nodeId> -` (the
+    answer on stdin).
+  - If it holds nothing, `continue` cannot help a team member: a member is given a new conversation
+    only for that one resend, so its step fails again, unsent (`conversation_lost` when the site
+    sends the page elsewhere). Start the run again. For a one-shot `ask`, `system continue <runId>`
+    sends the prompt again in a new Temporary chat: that resend is your decision.
 - **The page showed neither the account nor a sign-in page** (`ui_drift`: `the app rendered, but
   neither the signed-in account nor a sign-in page showed within 15 s …`, each `(outlined as a
-  ui.drift of auth.account)`). Nothing was sent. The message says what the page showed.
-  `system events --type ui.drift` gives the drift's `url` and `matches` (one entry per candidate:
-  `found` above `shown` means hidden, `found: 0` everywhere means renamed or removed), and `system
-  evidence <outline>` its outline.
+  ui.drift of auth.account)`). Nothing was sent. `system events --type ui.drift` gives the drift's
+  `url` and `matches` (one entry per candidate: `found` above `shown` means hidden, `found: 0`
+  everywhere means renamed or removed), and `system evidence <outline>` its outline.
   - `system account verify <id>` checks the sign-in again, sending nothing. If it signs in, the page
     of that turn showed something else; `continue` runs the step again.
   - A button that is there but hidden is the site's layout or an overlay: look at the page in the
     login profile (`system account login <id>`, then Cancel). A renamed one needs the map changed
     ([a provider UI change](playbooks.md#a-provider-ui-change)).
-  - A terms notice or Google's traffic check is never this: each fails as `challenge`, with its
-    step ([account re-auth](#account-re-auth)).
+  - A terms notice or Google's traffic check is never this: each fails as `challenge`
+    ([account re-auth](#account-re-auth)).
 - **Rejected and not escalated** (`acceptance_rejected`: `…; not escalated: session … stays on its
   Worker model:… (standard), none at tier frontier or above, …`). The member's answer failed its
   contract, and its session, which keeps one Worker for the team's lifetime, has none at the next
-  tier, so escalating could only fail admission. Read the answer
-  ([why a step's answer was rejected](#why-a-steps-answer-was-rejected)). When the reasons say
-  `the answer stopped at its Worker's output bound (N tokens)`, the answer was cut: raise that
-  catalog entry's `maxTokens` on the `models` row ([API and local models](#api-and-local-models);
-  a route's reasoning tokens count toward it), restart, then `system continue <runId>`. Otherwise
-  `continue` runs the step again on the same Worker; to escalate a member of that family, give it
-  a Worker at the next tier (a catalog entry of the same `family` at that tier).
+  tier. Read the answer ([why a step's answer was rejected](#why-a-steps-answer-was-rejected)).
+  When the reasons say `the answer stopped at its Worker's output bound (N tokens)`, the answer was
+  cut: raise that catalog entry's `maxTokens` on the `models` row ([API and local
+  models](#api-and-local-models); a route's reasoning tokens count toward it), restart, then
+  `system continue <runId>`. Otherwise `continue` runs the step again on the same Worker; to
+  escalate a member of that family, give it a Worker at the next tier (a catalog entry of the same
+  `family` at that tier).
 - **`team review needs N provider families, one per member; M is ready`**: fewer families are ready
-  than the team has members (Workers ready or busy that prove the step): see
-  [one provider family](#one-provider-family). With enough of them the message does not say this,
-  and the admission's own reasons are why. `M is ready outside the operator's
-  teams.excludeWorkers, which leaves K more out of teams`: your own exclusion leaves too few, and
-  the team failed before anything was sent, `allowSameFamily` or not
+  than the team has members: see [one provider family](#one-provider-family). `M is ready outside
+  the operator's teams.excludeWorkers, which leaves K more out of teams`: your own exclusion leaves
+  too few, and the team failed before anything was sent, `allowSameFamily` or not
   ([keep a Worker out of teams](#keep-a-worker-out-of-teams)).
 
 ## Pool a provider's accounts
 
 Every provider's accounts are `assigned` by default
 ([ADR-0052](../decisions/adr/0052-accounts-are-assigned-unless-pooling-is-recorded.md)): each
-serves its own work, and a limit on one makes its work wait for the reset instead of moving to
-another account of that provider. Pooling moves unsent work to another account of the provider
-when one is busy or at its limit
+serves its own work, and a limit on one makes its work wait for the reset. Pooling moves unsent
+work to another account of the provider when one is busy or at its limit
 ([ADR-0034](../decisions/adr/0034-unsent-failover-to-a-sibling-account.md)). It is your recorded
 decision
 ([ADR-0055](../decisions/adr/0055-personal-accounts-may-be-pooled-on-the-operators-recorded-acceptance.md)),
@@ -1169,8 +1127,9 @@ on one of two bases, and the record says which:
                busy or at its limit; the operator accepts the risk under the personal-plan terms.
    ```
 
-   For terms that allow it, `terms` names them instead ("<plan> terms, section 3"). `confirmedBy` is who decided, `confirmedAt` when. The rest of the row's
-   configuration stays (a targeted patch replaces the whole config).
+   For terms that allow it, `terms` names them instead ("<plan> terms, section 3"). `confirmedBy`
+   is who decided, `confirmedAt` when. The rest of the row's configuration stays (a targeted patch
+   replaces the whole config).
 2. Restart (`system shutdown`, then start). A pooled provider with no or partial `pooledTerms`
    fails startup with the exact path. Each start records your record as a `gate` decision (rule
    `turns.pooled-terms` or `agent-workers.pooled-terms`: "operator recorded pooling for
@@ -1179,16 +1138,14 @@ on one of two bases, and the record says which:
 
 ## Account re-auth
 
-A turn that fails with `reauth_required` or `challenge` (disposition
-`USER_ACTION`) means the account's saved session no longer works.
+A turn that fails with `reauth_required` or `challenge` (disposition `USER_ACTION`) means the
+account's saved session no longer works.
 
-- **First, re-verify:** `system account verify <id>` opens the site with the
-  saved state, sends nothing, and checks the sign-in. If it still signs in as
-  the saved account, the signed-out mark was false (a page that only looked
-  signed out), and the account is ready again (`account.re-verified` in the
-  event log). Nothing is saved. If it does not sign in, sign in again as
-  below. Never `system account save` from an old login profile to undo a
-  mark: it would replace the newer saved state with older cookies.
+- **First, re-verify:** `system account verify <id>` opens the site with the saved state, sends
+  nothing, and checks the sign-in. If it still signs in as the saved account, the signed-out mark
+  was false and the account is ready again (`account.re-verified` in the event log); nothing is
+  saved. If it does not sign in, sign in again as below. Never `system account save` from an old
+  login profile to undo a mark: it would replace the newer saved state with older cookies.
 
 - **With stored credentials:**
   1. Run `system account relogin <id>`. The TOTP code is computed locally.
@@ -1202,19 +1159,17 @@ A turn that fails with `reauth_required` or `challenge` (disposition
 - Store credentials once with `system account credentials <id>` (JSON on
   stdin). They are encrypted in the vault and never logged.
 
-- **A challenge** (`system health`: the account is `challenge`; event
-  `account.challenged`) is the site's own check, such as Google's unusual-traffic
-  CAPTCHA. Nothing loads the site again until you pass it: wait a while (repeated
-  automated loads deepen it), run `system account login <id>`, solve the check in
-  the login browser, and press Save.
+- **A challenge** (`system health`: the account is `challenge`; event `account.challenged`) is the
+  site's own check, such as Google's unusual-traffic CAPTCHA. Nothing loads the site again until
+  you pass it: wait a while (repeated automated loads deepen it), run
+  `system account login <id>`, solve the check in the login browser, and press Save.
   - A notice of updated terms over the input (Gemini) is handled the same way: `system` never
     acknowledges it. In the login browser, open a new chat, press the notice's own button (not a
     link in it) until the notice is gone, then press Save. Save is refused while it still shows.
-    Gemini titles it "Keep in mind", its button "Got it". It can come back after you
-    acknowledged it, and it can show mid-session, on a
-    page a session keeps or under a turn that failed there: either way the turn fails as
-    `challenge` with this step in its message (`a notice of updated terms ("Keep in mind") covers
-    the input; …`), nothing more is sent, and it is never reported as `ui_drift`.
+    Gemini titles it "Keep in mind", its button "Got it". It can come back, and can show
+    mid-session: either way the turn fails as `challenge` with this step in its message (`a notice
+    of updated terms ("Keep in mind") covers the input; …`), nothing more is sent, and it is never
+    reported as `ui_drift`.
 
 - **A session-bound account** (Gemini and ChatGPT;
   [ADR-0030](../decisions/adr/0030-session-bound-accounts-use-their-login-profile.md)) works in
@@ -1234,10 +1189,9 @@ Then continue the failed run: `system continue <runId>`.
 ## Two accounts sign in as one person
 
 Two catalog entries of one provider whose saved sign-ins are the same person are one account, not
-two (REQ-ACC-7): counting them as two would let a team's members, or a failover, share it. So
-none of them takes work. `system health` shows `accounts` degraded, naming them (`chatgpt-main and
-chatgpt-2 are signed in as the same person`), and their Workers are `unavailable`; a turn already
-routed to one fails `reauth_required` before anything is sent.
+two (REQ-ACC-7), so none of them takes work. `system health` shows `accounts` degraded, naming them
+(`chatgpt-main and chatgpt-2 are signed in as the same person`), and their Workers are
+`unavailable`; a turn already routed to one fails `reauth_required` before anything is sent.
 
 1. Decide which entry keeps that sign-in.
 2. Sign each other entry in as a different person: `system account login <id>` and Save. Or remove
@@ -1298,8 +1252,7 @@ its Workers stop.
 - **The Antigravity CLI** has no verified way to read who is signed in, so
   `system account login antigravity-cli` is refused before anything is taken (`config_error`,
   exit 1). Its hand-named Workers run on; no Worker derived for it takes work until a reader is
-  verified. Free a slot of it with `system account remove antigravity-cli --slot <n>`: its home and
-  sign-in are kept.
+  verified. Free a slot of it with `system account remove antigravity-cli --slot <n>`.
 - **A new runtime version:** the readers are pinned to the versions they were checked on (the
   [Codex](../../packages/plugins/runtime-codex-sdk/README.md) and
   [Claude Code](../../packages/plugins/runtime-claude-agent-sdk/README.md) READMEs list them). On
@@ -1336,8 +1289,8 @@ A run that was already queued when its home changed person fails before anything
 Agent Workers are derived as account × role
 ([design](../design/agent-runtimes.md#workers--account--role)): the `agent-workers` row defines
 roles once and assigns each enrolled account its roles; each Worker is
-`agent:<accountId>/<role>`, never a name you choose. The live install runs this way, and a row that
-still names hand-named `workers` is refused at load. To move a profile that still has them:
+`agent:<accountId>/<role>`. A row that still names hand-named `workers` is refused at load. To
+move a profile that has them:
 
 1. Back up (`system backup`), then enroll slot 1 of each runtime the rows use
    ([enroll an agent account](#enroll-an-agent-account)); each must read `ready`.
@@ -1348,9 +1301,9 @@ still names hand-named `workers` is refused at load. To move a profile that stil
    `--stop antigravity-cli`.
 3. `system drain` (the move is refused while a run of a hand-named Worker is queued or running),
    then `system account migrate --apply` (with the same `--stop`). It records an `enrollment`
-   decision per Worker and one for the cutover, and moves each Worker's agent sessions and runs to its
-   new id. Run again, it changes nothing. If it prints `account_migrate would make an output its
-   schema refuses (a defect), so nothing changed`, report the message.
+   decision per Worker and one for the cutover, and moves each Worker's agent sessions and runs to
+   its new id. Run again, it changes nothing. If it prints `account_migrate would make an output
+   its schema refuses (a defect), so nothing changed`, report the message.
 4. Put the printed row in the profile patch (`~/.dsh/profiles/system/cordis.patch.yml`): it replaces
    the `agent-workers` row's whole config (`workers` gone; `providers`, `roles`, `assignments` in).
    Add any printed `templates` to the `resources` row. Then `system shutdown`, `system start`,
@@ -1359,29 +1312,27 @@ still names hand-named `workers` is refused at load. To move a profile that stil
 **Assign roles later:** a newly enrolled account has no Worker until the row assigns it roles
 (`assignments: [{ account: <id>, roles: [review] }]`). Two accounts of one runtime can serve one
 role at once; a limit on one makes its work wait, never move to the other, unless the runtime is
-[pooled](#pool-a-providers-accounts).
-`maxConcurrentRunsPerAccount` on the runtime's `providers` entry bounds how many of an account's
-runs run at once across its roles (default 1).
+[pooled](#pool-a-providers-accounts). `maxConcurrentRunsPerAccount` on the runtime's `providers`
+entry bounds how many of an account's runs run at once across its roles (default 1).
 
 **Roll back:** `system drain`, then `system account migrate --rollback`: each session and run moved
 goes back to its hand-named Worker, the refusal is lifted, and a `rolled-back` decision is
 recorded. Put the hand-named row back in the patch and restart. Results, usage, and decisions keep
-the ids they were written with. A release downgrade alone, without the rollback, finds the
-hand-named rows' sign-ins where they were (slot 1 is their home), but their moved sessions stay
-under the new ids.
+the ids they were written with. A release downgrade alone, without the rollback, leaves the moved
+sessions under the new ids.
 
 If the daemon refuses the `agent-workers` row at start with "the hand-named agent Workers … were
 migrated", the patch still names `workers`: put the printed row in, or roll back.
+
 ## Read each account's quota
 
 Each ready, assigned agent account whose Workers draw on a pool template has its pool's windows
 read from its runtime's own usage report, without a model turn: once after each of its runs, and
 every `limitReadSeconds` ([ADR-0059](../decisions/adr/0059-quota-readings-from-each-accounts-own-usage-report.md),
-[design](../design/agent-runtimes.md#an-accounts-usage-report)). Two accounts on different plans
-read their own shares; nothing is configured per plan. `system roster` lists each window's state,
-used share, and reset; the Workers tab shows it as `5 h: used 42 % — resets 14:20 (read 14:05)`
-with a small bar, or `5 h: no reading yet: <why>` while its account's usage report could not be
-read.
+[design](../design/agent-runtimes.md#an-accounts-usage-report)). Nothing is configured per plan.
+`system roster` lists each window's state, used share, and reset; the Workers tab shows it as
+`5 h: used 42 % — resets 14:20 (read 14:05)` with a small bar, or `5 h: no reading yet: <why>`
+while its account's usage report could not be read.
 
 1. **Move to accounts × roles first** ([above](#migrate-agent-workers-to-accounts--roles)): the
    periodic read covers derived Workers' accounts only. A hand-named Worker's account is read only
@@ -1405,26 +1356,26 @@ read.
          - { provider: claude-agent-sdk, slots: 2, pool: claude-plan, windows: { five_hour: five-hour }, limitReadSeconds: 600 }
    ```
 
-   Do not declare or map a seven-day window for Claude Code. Its usage report gives no seven-day
-   reading (null server-side), and a spent seven-day quota already shows as an unusable five-hour
-   window. A declared window that is never read is never headroom: every Claude pool stays closed,
-   and dispatch never picks a Claude account.
+   Do not declare or map a seven-day window for Claude Code: its usage report gives no seven-day
+   reading, and a spent seven-day quota already shows as an unusable five-hour window. A declared
+   window that is never read is never headroom: every Claude pool stays closed, and dispatch never
+   picks a Claude account.
 
    The runtimes' window names, which `windows` maps:
 
    | Runtime | Its windows |
    |---|---|
-   | Claude Code | `five_hour`, the only one to map. Its report also names `seven_day`, `seven_day_oauth_apps`, and a weekly window per model family, `seven_day_<family>` (the names its `rate_limit_event` uses too), but gives no seven-day reading; the daemon's log names each window a report gives that `windows` does not map |
+   | Claude Code | `five_hour`, the only one to map. Its report also names `seven_day`, `seven_day_oauth_apps`, and `seven_day_<family>` per model family, but gives no seven-day reading; the daemon's log names each window a report gives that `windows` does not map |
    | Codex | each window by its length in minutes: `300m` (five hours), `10080m` (a week), as the account reports them |
    | Antigravity CLI | each bucket's `id`, as `HOME=<home> agy --print=/usage --output-format json` lists them under `command.data.groups[].buckets[]` |
 
    A window the report gives and `windows` does not map is skipped (logged once), unless it is used
    up: then every window of the pool closes until its reset (fail closed). Map each window that can
-   stop the account's work, or accept that an unmapped one at 100 % holds the account.
+   stop the account's work.
 3. **Choose `limitReadSeconds`** on the provider entry: how often each account is read (default
    600; 60 to 86400; `0` turns the periodic read off and keeps the read after each run). Each read
    starts one runtime process per account (Claude Code, `codex app-server`, or `agy`), no model
-   turn: five accounts at 600 s is thirty short processes an hour, one at a time per runtime.
+   turn, one at a time per runtime.
 4. **Restart** with the patch (`system shutdown`, `system start`): the first reads run a few
    seconds after the start, the longest unread account first.
 5. **Check:** each window shows `used … %` and a `read` time that moves; MCP `resources_pools`
@@ -1436,20 +1387,19 @@ When a window says unknown, or its `read` time stops moving:
   event (Claude Code reports a share only near a limit); the next report fills it.
 - **The report cannot be read.** A window with no reading yet says why in `system roster` (and the
   `/ui` Workers tab): `used unknown (no reading yet: its account's usage report could not be read at
-  <time>: …)`, until a report of that account is read; a window with an older reading keeps it and
-  its `read` time. The daemon's log names it too, once per reason: `the usage report of
-  <accountId> (its periodic read) cannot be read, so nothing is recorded and its windows keep their
-  last readings: …`. A report whose entries changed shape (`… its window <name> is not in the
-  checked shape`) is a reader to fix and pin again, never misread. Most often a runtime version whose report was not checked (`… Claude Code
-  2.1.311 is not verified`): the shares stay unknown until a release pins that version after
-  checking it, never misread. An account on an API key has no plan windows (`… reports no plan
-  limits`): give its pool `unknown: available`, or no pool.
+  <time>: …)`; a window with an older reading keeps it and its `read` time. The daemon's log names it
+  too, once per reason: `the usage report of <accountId> (its periodic read) cannot be read, so
+  nothing is recorded and its windows keep their last readings: …`. A report whose entries changed
+  shape (`… its window <name> is not in the checked shape`) is a reader to fix and pin again. Most
+  often it is a runtime version whose report was not checked (`… Claude Code 2.1.311 is not
+  verified`): the shares stay unknown until a release pins that version. An account on an API key
+  has no plan windows (`… reports no plan limits`): give its pool `unknown: available`, or no pool.
 - **A window stays `limited` though the report reads it open**: a report never opens a window a
-  limit closed before that limit's reset or cooldown; the log says so (`… a report never opens a
-  window a limit closed`). It opens at `until`.
+  limit closed before that limit's reset or cooldown (`… a report never opens a window a limit
+  closed`). It opens at `until`.
 - **The Antigravity CLI** has no identity reader, so its accounts are never `ready` and are not read
   periodically; a hand-named Antigravity Worker's account is read once after a run that hit its
-  quota, for the reset.
+  quota.
 
 ## Backup and restore
 
@@ -1675,13 +1625,12 @@ back when one fails. It is a dry run unless `--apply`.
 
 **Update live on the test profile first.** Run
 `scripts/live-update.sh --stage <commit> --check-with <built checkout of the commit> [--patch …]`, not
-`--apply`: `--stage` implies `--apply`, and before `system` is captured, paused, or stopped (it only
-reads the live patch, when no `--patch` is given), it updates and checks the `system-test` profile with
-the same code and the same patch (`scripts/live-stage.sh`), and updates `system` only when that passes.
-If the stage fails, `system` and its unit are untouched, the output says which step failed, and the
-test daemon's log is `~/.dsh/system-test.log`. The automatic update
-([below](#update-the-live-install-automatically)) stages too. `--apply` alone is only the live steps:
-use it to retry an update the stage already passed.
+`--apply`: `--stage` implies `--apply`, and before `system` is captured, paused, or stopped, it
+updates and checks the `system-test` profile with the same code and patch (`scripts/live-stage.sh`),
+and updates `system` only when that passes. If the stage fails, `system` and its unit are untouched,
+the output says which step failed, and the test daemon's log is `~/.dsh/system-test.log`. The
+[automatic update](#update-the-live-install-automatically) stages too. `--apply` alone is only the
+live steps: use it to retry an update the stage already passed.
 
 - **The test profile** is made by `system init --profile system-test` (the stage runs it) beside
   `system`. It has its own data directory, `~/.dsh/system-test` (store, vault and its key, tokens,
@@ -1689,9 +1638,9 @@ use it to retry an update the stage already passed.
   bundles and patch, with every row that signs in to a website or an agent account turned off
   (`accounts`, `login`, `turns`, `browser`, `display`, the providers, the agent runtimes and
   `agent-workers`), so no account the live profile uses is opened a second time. A patch entry that
-  neither sets a row nor inserts rows stops the stage (update by hand). Workers are the scripted `fake`
-  Worker source ([`workers-fake`](../../packages/plugins/workers-fake/README.md)) and the API model rows
-  the patch carries. Other `system` commands act on it with `--profile system-test`.
+  neither sets a row nor inserts rows stops the stage (update by hand). Workers are the scripted
+  `fake` Worker source ([`workers-fake`](../../packages/plugins/workers-fake/README.md)) and the API
+  model rows the patch carries. Other `system` commands act on it with `--profile system-test`.
 - **The canary** (`scripts/canary.ts`) runs on the staged daemon: health; a board task through
   `algorithm-development` (a `canary-<time>` project, its charter approved, one task, one attempt
   started with `run … task`, ending on the board in review or done); an `ask`; a `research` run; each
@@ -1699,9 +1648,9 @@ use it to retry an update the stage already passed.
   [removability smoke](../engineering/testing.md#removability-matrix) (`pnpm test:removability`) in the
   target's checkout. Under `--removability on` (the default) a failed smoke stops the stage;
   `--removability warn` logs it and goes on.
-- **A mechanism switched on** (a row turned on in the live patch, or a setting changed) is switched on
-  in the test profile first, the canary run, then on live: put it in the candidate patch and update with
-  `--stage … --patch <candidate>`. Nothing is switched on in `system` that the stage has not run.
+- **A mechanism switched on** (a row turned on in the live patch, or a setting changed) goes through
+  the test profile and the canary first: put it in the candidate patch and update with
+  `--stage … --patch <candidate>`.
 
 The live patch is yours. [`examples/live-base.patch.yml`](examples/live-base.patch.yml) shows the
 runtime rows (`runtime-codex-sdk`, `runtime-antigravity-cli`, `agent-workers`,
@@ -1724,31 +1673,31 @@ under the Workers' tools directory ([Codex Workers](#codex-workers)), agy at the
    candidate patch against the target's code (`system check --env-file` on a scratch copy of the
    profile, with the unit's environment file); that the daemon runs under `system.service`; captures
    what the profile answers now, with each Worker's availability from its roster
-   (`system roster --json`); prints `system health`, then what `--apply` would wait for before the stop,
-   and the plan. Fix what it reports until it ends with the plan.
+   (`system roster --json`); prints `system health`, then what `--apply` would wait for before the
+   stop, and the plan. Fix what it reports until it ends with the plan.
 3. **Apply:** the same command with `--apply`, in a shell that outlives a disconnect (`tmux`, or
    `nohup … > ~/system-backups/live-update.out 2>&1 &`): the wait for the steps in flight takes up to
-   `--runs-wait` (5 minutes), and the stop's drain up to `--cut-deadline` (60 s) more; no quiet moment is
-   needed, since each step the stop cuts resumes by itself. The unit starts the daemon with its
-   environment file, never this shell's environment. Notes and the backup go to
-   `~/system-backups/<date>-before-base/` (`-2`, `-3` for a later attempt).
+   `--runs-wait` (5 minutes), and the stop's drain up to `--cut-deadline` (60 s) more; each step the
+   stop cuts resumes by itself. The unit starts the daemon with its environment file, never this
+   shell's environment. Notes and the backup go to `~/system-backups/<date>-before-base/` (`-2`, `-3`
+   for a later attempt).
 
    **Backups are kept within a bound.** Once an update verified (never one that rolled back), the
    script drops that update's `after` snapshot and prunes the older `<date>-before-base*` directories:
-   it keeps the last `--keep` updates (default 3), the newest of each of the last 4 weeks, this update's
-   backup, and any backup an unfinished update refers to (a state file whose phase is not `done`). The
-   backup of a rolled-back or set-aside update is removed. Each removal is logged in
+   it keeps the last `--keep` updates (default 3), the newest of each of the last 4 weeks, this
+   update's backup, and any backup an unfinished update refers to (a state file whose phase is not
+   `done`). The backup of a rolled-back or set-aside update is removed. Each removal is logged in
    `<dir>/live-update.log`. A dry run lists `backup prune: keep …` and `backup prune: would remove …`.
 4. **Read the outcome.**
    - Exit 0, `updated`: the target runs. `system plugins` lists each plugin's lifecycle, and `system
      health` names each agent Worker that cannot take work yet. When the stop cut steps,
      `what the stop cut, and how it resumed:` lists each (also in `<dir>/cut-report.txt`).
-   - Exit 1, `STOP` (nothing was changed) or `rolled back`: the previous commit runs, on its store as it
-     was at the stop. The notes say why. `STOP: steps still run after <n> min` is the wait's bound with
-     `--no-cut`: the unit was not stopped, steps were released, and dispatch was resumed. Run the same
-     command again once those steps are done (or with a longer `--runs-wait`), or without `--no-cut` to
-     cut them. A Worker that took work before and stays unavailable names its reason in the table of the
-     Workers before and after: fix its cause on the host, then update again.
+   - Exit 1, `STOP` (nothing was changed) or `rolled back`: the previous commit runs, on its store as
+     it was at the stop. The notes say why. `STOP: steps still run after <n> min` is the wait's bound
+     with `--no-cut`: the unit was not stopped, steps were released, and dispatch was resumed. Run the
+     same command again once those steps are done (or with a longer `--runs-wait`), or without
+     `--no-cut` to cut them. A Worker that took work before and stays unavailable names its reason in
+     the table of the Workers before and after: fix its cause on the host, then update again.
    - Exit 2, `LOOK FIRST`: the script will not act on what it found, or the rollback failed. It prints
      the checkout, the daemon, and the backup; recover by hand (below).
 
@@ -1757,41 +1706,40 @@ under the Workers' tools directory ([Codex Workers](#codex-workers)), agy at the
 **What the script checks.**
 
 - Before the stop, as in the dry run, and that the daemon is this checkout's `dsh` under `system
-  start`, the main process of `system.service`, which runs in `system-live` on Node 24 with one
-  required environment file naming this DSH home. A daemon started any other way is refused, before
-  anything changes.
-- **No step is cut unsaid, and a cut is cheap.** A run stopped by the host resumes by itself: its agent
-  step ends `host-stopped`, a free retry on its session that spends no attempt
+  start`, the main process of `system.service` (in `system-live`, on Node 24, with one required
+  environment file naming this DSH home). A daemon started any other way is refused before anything
+  changes.
+- **No step is cut unsaid, and a cut is cheap.** A run stopped by the host resumes by itself: its
+  agent step ends `host-stopped`, a free retry on its session that spends no attempt
   ([ADR-0069](../decisions/adr/0069-an-attempt-is-not-spent-on-an-infrastructure-failure.md)), and a
   check the stop cut runs again after the restart. Before the stop, after the capture, the script:
   1. pauses dispatch (`system dispatch pause`, its reason naming the update) unless it is paused
-     already (yours stays, and is never resumed by the script) or off. Its own pause is lifted once the
-     profile runs again, after a rollback, or at the wait's bound. The lead's and your own starts are
-     not paused: hold them yourself while you update;
-  2. **holds steps** (MCP `hold_steps`): each running run finishes the step it is in and starts no next
-     one, so the wait ends at the next step boundary. The script releases the hold on every way out
-     before the stop (the wait's bound, a refusal, Ctrl-C, `kill`); once the daemon has stopped, its
-     next start ends the hold and each held run goes on from its recorded state. A profile whose code is
-     older than the hold (`this profile holds no steps`) holds nothing. Left held by a script killed
-     with `kill -9`: `hold_steps` with `release: true` as the operator, or restart the unit;
+     already (yours stays) or off; it lifts its own pause once the profile runs again, after a
+     rollback, or at the wait's bound. The lead's and your own starts are not paused: hold them
+     yourself;
+  2. **holds steps** (MCP `hold_steps`): each running run finishes its step and starts no next one.
+     The script releases the hold on every way out before the stop; once the daemon has stopped, its
+     next start ends the hold. A profile whose code is older than the hold holds nothing
+     (`this profile holds no steps`). Left held by a script killed with `kill -9`: `hold_steps` with
+     `release: true` as the operator, or restart the unit;
   3. reads what runs every `--runs-every` seconds (30), up to `--runs-wait` minutes (5), until no
-     workflow step runs. The store, opened read-only, is the source: every node in state `RUNNING` of
-     every run in status `running`; the roster (MCP `roster`) adds a step's Worker, task, and start. Its
-     bounds are said, never read as nothing running (only the newest 500 runs read, Workers past the 256
-     listed, no roster at all), and a store that cannot be read counts as running. It says what it waits
-     for at the first look, whenever that changes, and every 5 minutes;
-  4. at the bound, **cuts** (the default, `--cut-running`): it names each step it cuts and writes them
-     to `<dir>/cut.json`, then goes on to the stop. With `--no-cut` it stops instead, exit 1, the unit
+     workflow step runs. The read-only store is the source (every node `RUNNING` of every run
+     `running`); the roster (MCP `roster`) adds a step's Worker, task, and start. Its bounds are said,
+     never read as nothing running (only the newest 500 runs, Workers past the 256 listed, no roster),
+     and a store that cannot be read counts as running. It says what it waits for at the first look,
+     whenever that changes, and every 5 minutes;
+  4. at the bound, **cuts** (the default, `--cut-running`): it names each step it cuts in
+     `<dir>/cut.json`, then goes on to the stop. With `--no-cut` it stops instead, exit 1, the unit
      not stopped and nothing changed (steps released, dispatch resumed).
 
   The automatic update passes no option: it holds, waits up to 5 minutes, and cuts too.
 - The stop. When it cuts, the script stops the daemon itself first, with `system shutdown --deadline
-  <--cut-deadline>` (60 s by default, at most 600): no new run is admitted, the drain waits at most that
-  long, then the daemon is sent SIGTERM and exits, and `system start`, the unit's main process, with it.
-  What still runs then is cut at once:
-  - an agent step is aborted, its session and worktree kept, and its agent run is marked
-    `host_stopped_at`. At the next start the same agent run runs again, never failed: it continues its
-    own native conversation when its runtime can resume one, else its prompt is sent again in the same
+  <--cut-deadline>` (60 s by default, at most 600): no new run is admitted, the drain waits at most
+  that long, then the daemon is sent SIGTERM and exits, and `system start` with it. What still runs
+  is cut at once:
+  - an agent step is aborted, its session and worktree kept, its agent run marked `host_stopped_at`.
+    At the next start the same agent run runs again, never failed: it continues its own native
+    conversation when its runtime can resume one, else its prompt is sent again in the same
     worktree. That is no attempt and asks no one (a `reconciliation` decision of rule
     `agent-workers.resume-cut` and an `agent-workers.run.resumed` event). A step cut more than five
     times, a run whose agent process is still present, and a run no stop marked (a crash) go to the
@@ -1799,25 +1747,24 @@ under the Workers' tools directory ([Codex Workers](#codex-workers)), agy at the
   - a website turn already sent is never resent: the next start reconciles it from the page
     ([provider turns](../design/provider-turns.md), INV-4); one whose outcome the page cannot tell is
     recorded as unknown and fails closed (`reconciliation_failed`);
-  - a run's acceptance check (`tests`, `lint`, `typecheck`) that the stop killed is run again at the
-    next start on the same result tree (a `gate` decision of rule `agent-workers.check-cut-rerun`); the
-    result is then accepted, or sent back, on what the check came to, never held for the operator
-    because it was cut ([the run's required checks](../design/workflow-engine.md#a-runs-required-checks)).
+  - a run's acceptance check (`tests`, `lint`, `typecheck`) the stop killed runs again at the next
+    start on the same result tree (a `gate` decision of rule `agent-workers.check-cut-rerun`); the
+    result is then accepted, or sent back, on what the check came to
+    ([the run's required checks](../design/workflow-engine.md#a-runs-required-checks)).
 
-  With `--no-cut` only, the stop is the unit's: its `ExecStop` is `system shutdown --deadline 600` (the
-  drain). It never kills. A cut whose profile's CLI has no `shutdownHost`, or whose short stop fails
-  with the daemon still running, is refused, nothing stopped, steps released and dispatch resumed.
-- **The report**, when it cut: after the upgrade checks, `what the stop cut, and how it resumed:` reads
-  the store (read-only) and says, for each step of `cut.json`, `resumed` (its agent run went on in its
-  native session, no attempt spent), `restarted` (its runtime cannot resume, so it started again from
-  the same worktree), `free retry` (its step ended `host-stopped`), `not settled yet` (it resumes by
-  itself; follow it with `system explain <run>`), or that its run failed for a reason not the host's,
-  with that reason (the attempt counts: look at it); then each check the stop cut that ran again. Also
-  in `<dir>/cut-report.txt`.
+  With `--no-cut` only, the stop is the unit's `ExecStop` (`system shutdown --deadline 600`); it
+  never kills. A cut whose profile's CLI has no `shutdownHost`, or whose short stop fails with the
+  daemon still running, is refused, nothing stopped, steps released and dispatch resumed.
+- **The report**, when it cut: `what the stop cut, and how it resumed:` reads the store (read-only)
+  and says, for each step of `cut.json`, `resumed` (its agent run went on in its native session, no
+  attempt spent), `restarted` (its runtime cannot resume: started again from the same worktree),
+  `free retry` (its step ended `host-stopped`), `not settled yet` (follow it with `system explain
+  <run>`), or that its run failed for a reason not the host's, with that reason (the attempt counts:
+  look at it); then each check the stop cut that ran again. Also in `<dir>/cut-report.txt`.
 - The backup, taken once the daemon has stopped, so it is the store a rollback returns to: `system
   backup` (the store by `VACUUM INTO`, and the vault; the key stays in `~/.dsh/system`, as in
   [backup and restore](#backup-and-restore)), verified by a restore preview; and the profile's files.
-  Login profiles are not state, so they are not copied.
+  Login profiles are not copied.
 - The build: `pnpm install --frozen-lockfile`, `pnpm build`, and the build stamp
   `packages/cli/lib/build-commit` naming the target ([build stamp](../../packages/cli/README.md)). A
   target whose build writes no stamp is refused: update to it with the script of its own checkout. The
@@ -1827,19 +1774,19 @@ under the Workers' tools directory ([Codex Workers](#codex-workers)), agy at the
   reset first).
 - After the start: `/healthz`, then the Workers. The check reads the roster every 10 s, up to
   `--workers-wait` seconds (600 by default), until every Worker that took work before (`ready` or
-  `busy`) takes work again. One that stays `unavailable` or `quarantined`, or is no longer listed, fails
-  the check with the roster's reason, and the update rolls back. One `resting` at a usage limit is a
-  note, as are the Workers that took no work before and the ones new in the update. Then the
+  `busy`) takes work again. One that stays `unavailable` or `quarantined`, or is no longer listed,
+  fails the check with the roster's reason, and the update rolls back. One `resting` at a usage limit
+  is a note, as are the Workers that took no work before and the ones new in the update. Then the
   [upgrade suite's](../../packages/cli/tests/upgrade/upgrade.e2e.ts) expectations, on the live store:
-  every run explains and answers `result` as before, no migration went backwards, and every step,
-  session, and artifact record of a post-update snapshot validates. No health check is worse than it
+  every run explains and answers `result` as before, no migration went backwards, every step,
+  session, and artifact record of a post-update snapshot validates, no health check is worse than it
   was or gone, `system plugins` names no refused manifest, and `system mcp-headers` prints the client
   token's header. A profile already down before the update (a check other than its Workers) is no
   baseline: the capture refuses it, and nothing stops.
 - A failure after the stop rolls back: the updated daemon stopped, the profile's files and link put
   back, the previous commit checked out, installed, and built, `system restore <dir>/store --yes` once
-  the target has started on the store, and the unit started again. What the target did in its minutes is
-  lost with its store.
+  the target has started on the store, and the unit started again. What the target did in its minutes
+  is lost with its store.
 
 **By hand**, with the unit stopped (`systemctl --user stop system.service`):
 
@@ -1855,12 +1802,13 @@ under the Workers' tools directory ([Codex Workers](#codex-workers)), agy at the
 ## Update the live install automatically
 
 [`scripts/live-auto-update.sh`](../../scripts/live-auto-update.sh) keeps the live install on a branch
-of origin, `--branch <name>`, `main` by default (`--branch dev` follows dev: **Follow dev** below):
-each pass decides whether to start an update, and the update itself is [`live-update.sh`'s](#update-the-live-install-from-e218ae7-to-the-base-release),
-with its backup, upgrade checks, and rollback. A systemd user timer runs a pass every 15 minutes
-([units](#run-as-a-service)). The branch name must be a plain one (letters, digits, `.`, `_`, `-`
-in components joined by `/`, such as `dev` or `release/1`); any other is refused before any git
-command, with exit 2 and the usage. Below, `<branch>` is the branch it follows. One pass:
+of origin, `--branch <name>`, `main` by default (`--branch dev` follows dev: **Follow dev** below).
+Each pass decides whether to start an update; the update itself is
+[`live-update.sh`'s](#update-the-live-install-from-e218ae7-to-the-base-release), with its backup,
+upgrade checks, and rollback. A systemd user timer runs a pass every 15 minutes
+([units](#run-as-a-service)). The branch name must be a plain one (letters, digits, `.`, `_`, `-` in
+components joined by `/`, such as `dev` or `release/1`); any other is refused before any git
+command, exit 2 and the usage. Below, `<branch>` is the branch it follows. One pass:
 
 1. Does nothing while `~/.dsh/system/auto-update.paused` exists, while another pass or a live update
    runs (their locks under `~/system-backups`), or while an update that stopped the daemon is
@@ -1885,17 +1833,16 @@ command, with exit 2 and the usage. Below, `<branch>` is the branch it follows. 
 
 Each pass appends one line to `~/system-backups/auto-update/log`, `<time> origin/<branch> <kind>:
 <detail>`, the kind one of `current`, `wait`, `refused`, `busy`, `paused`, `stopped` (it paused
-itself), or `updated`. The pause file's notes name the branch too. A pass that built and ran the update
-writes its output next to it (`<time>-<sha>.out`); the update's own notes are in its
+itself), or `updated`. The pause file's notes name the branch too. A pass that built and ran the
+update writes its output next to it (`<time>-<sha>.out`); the update's own notes are in its
 `~/system-backups/<date>-before-base*/` directory.
 
 **What it never does.** It never changes the profile's patch (`--patch` is never passed: a target
 that needs a new patch stops at the dry run, and you update to it [by
-hand](#update-the-live-install-from-e218ae7-to-the-base-release)). It never updates to a commit
-that is not a fast-forward of the live one, to a branch other than `--branch`'s, on a red or
-pending CI, or while paused. It never stops
-the daemon but by `systemctl --user stop system.service`, whose `ExecStop` drains, and never kills
-it.
+hand](#update-the-live-install-from-e218ae7-to-the-base-release)). It never updates to a commit that
+is not a fast-forward of the live one, to a branch other than `--branch`'s, on a red or pending CI,
+or while paused. It never stops the daemon but by `systemctl --user stop system.service`, whose
+`ExecStop` drains, and never kills it.
 
 **Enable it** once the daemon runs under `system.service`
 ([once](#run-the-live-daemon-under-systemservice); until then every dry run refuses, and the first
@@ -1906,16 +1853,16 @@ confirm `gh auth status`, write the two units ([Run as a service](#run-as-a-serv
 `loginctl enable-linger`). Run a pass now and read its line: `systemctl --user start
 system-auto-update.service; tail -n 1 ~/system-backups/auto-update/log`.
 
-**Follow dev.** To follow another branch, put `--branch dev` on the service's `ExecStart`, fetch it
+**Follow dev.** Put `--branch dev` on the service's `ExecStart`, fetch it
 (`git -C ~/workspaces/system-live fetch origin dev`), and run a pass: its line names `origin/dev`. The
 live commit must be an ancestor of the branch, or the first pass refuses and pauses itself: update to
 it [by hand](#update-the-live-install-from-e218ae7-to-the-base-release) first. Return to `main` the
 same way, without `--branch`.
 
-The daemon an update restarts is `system.service`'s, with the unit's environment file, whatever
-this timer's environment is. The dry run checks that file against the target's profile (`system
-check --env-file`): a name the target no longer reads stops it there, and a name a row of the target
-forwards that the file does not set is a note in the pass's output.
+The daemon an update restarts is `system.service`'s, with the unit's environment file. The dry run
+checks that file against the target's profile (`system check --env-file`): a name the target no longer
+reads stops it there, and a name a row of the target forwards that the file does not set is a note in
+the pass's output.
 
 **Pause, and resume.** Pause by hand with `echo 'paused by hand' > ~/.dsh/system/auto-update.paused`;
 stop the timer altogether with `systemctl --user disable --now system-auto-update.timer`. A pass
@@ -1926,10 +1873,9 @@ next pass starts again from step 1.
 
 ## Run the live daemon under system.service
 
-Both `live-update.sh` and the automatic update refuse a daemon started by hand, whose environment
-would be whichever shell starts it again. The unit ([Run as a service](#run-as-a-service)) runs it
-with an environment file that declares every variable it reads. To move a hand-started daemon under
-it (`node` is Node 24):
+Both `live-update.sh` and the automatic update refuse a daemon started by hand. The unit
+([Run as a service](#run-as-a-service)) runs it with an environment file that declares every variable
+it reads. To move a hand-started daemon under it (`node` is Node 24):
 
 1. **Write the environment file** from the shell that starts the daemon today (its `PATH` has
    Node 24's bin first, git, Xvfb, bwrap, and for remote login the VNC server and websockify):
@@ -1965,7 +1911,7 @@ it (`node` is Node 24):
    it showed before; and a dry run of `live-update.sh` says `the daemon runs under system.service`.
 
 **Back out**, if the daemon misbehaves under the unit: `systemctl --user disable --now
-system.service` (its `ExecStop` drains), then start it by hand as before, from the old shell: `cd
+system.service` (its `ExecStop` drains), then start it by hand from the old shell: `cd
 ~/workspaces/system-live && nohup node packages/cli/lib/bin.js start >> ~/system-backups/daemon.log
 2>&1 &`. The update scripts refuse that daemon until it runs under the unit again.
 
@@ -1995,19 +1941,19 @@ Rotate a scope's token when it may have leaked
 A project's lead decides on a token of its own, never the operator's
 ([ADR-0076](../decisions/adr/0076-the-lead-is-a-principal-of-its-own-with-a-closed-list-of-rights.md),
 [the lead principal](../design/approvals.md#the-lead-principal)). What it decides is recorded as
-`lead:<project>`, and a closed list of rights is enforced by System.
+`lead:<project>`, and System enforces a closed list of rights.
 
-1. List the project's dev branches in the `approvals` row's configuration (a profile patch replaces the
-   row's whole config, so carry the policies too): `devBranches: { <project>: [dev] }`. `main` and
-   `master` are refused there. Without a branch the lead decides no merge and no acceptance, only
-   commands and dispatch starts. `system check` names a bad entry; a restart applies it.
-2. `system lead-token issue <project>`. The file `lead-<project>.token` sits beside `operator.token`
-   with the same permissions, and is never printed. The lead's scripts read it and send it as the bearer
-   token on `/mcp` (`approvals_decide`, the board tools) and `/ui/api` (`approvals/decide`,
-   `reviews/<task>/decide`), in place of the operator's.
-3. **Rotate** by issuing again: the old token stops working at once. **Revoke** with `system lead-token
-   revoke <project>`: the host refuses the token on its next request, with no restart.
-   `system lead-token list` names the projects that have one.
+1. List the project's dev branches in the `approvals` row's configuration (a profile patch replaces
+   the row's whole config, so carry the policies too): `devBranches: { <project>: [dev] }`. `main`
+   and `master` are refused there. Without a branch the lead decides no merge and no acceptance,
+   only commands and dispatch starts. `system check` names a bad entry; a restart applies it.
+2. `system lead-token issue <project>`. The file `lead-<project>.token` sits beside
+   `operator.token` with the same permissions, and is never printed. The lead's scripts send it as
+   the bearer token on `/mcp` (`approvals_decide`, the board tools) and `/ui/api`
+   (`approvals/decide`, `reviews/<task>/decide`), in place of the operator's.
+3. **Rotate** by issuing again: the old token stops working at once. **Revoke** with
+   `system lead-token revoke <project>`: the host refuses the token on its next request, with no
+   restart. `system lead-token list` names the projects that have one.
 
 What the token is refused (a policy or charter change, `main`, a deploy, an external send, issuing a
 token, every other tool and route) answers `403` with the reason.
@@ -2016,24 +1962,25 @@ token, every other tool and route) answers `403` with the reason.
 
 The operator's decisions live in System as `operator-decision@1.0` records
 ([schema](../../schemas/operator-decision.v1.json), [PROP-0019 section 2.7](../proposals/0019-lead-logic-in-system.md#27-the-decision-log--an-operator-decision-record-rank-4)),
-not in the lead's `decisions.json`. The row is off in the bundle: with it off, System is healthy and the
-lead keeps its file.
+not in the lead's `decisions.json`. The row is off in the bundle: with it off, System is healthy and
+the lead keeps its file.
 
-1. **Turn the row on:** `system plugin on decisions` (no restart; the turn is kept in your profile's
-   patch). `system decisions` is refused while the row is off, saying so.
+1. **Turn the row on:** `system plugin on decisions` (no restart; kept in your profile's patch).
+   `system decisions` is refused while the row is off, saying so.
 2. **Ask:** `system decisions ask "<question>" [--project <id>] [--option <text>]... [--recommend <text>]
-   [--link <text>]...`. The store gives it the studio's next number (`D<n>`), so two sessions never take
-   the same one. No `--project`: a studio-wide decision, which every lead reads.
-3. **Answer:** `system decisions answer D<n> "<the operator's answer>"`. The record keeps the question's
-   number and says `answeredBy: operator`. `system decisions list --state asked` is what waits.
+   [--link <text>]...`. The store gives it the studio's next number (`D<n>`). No `--project`: a
+   studio-wide decision, which every lead reads.
+3. **Answer:** `system decisions answer D<n> "<the operator's answer>"`. The record keeps the
+   question's number and says `answeredBy: operator`. `system decisions list --state asked` is what
+   waits.
 4. **Correct:** an answered record never changes and is never deleted. Ask a new decision with
    `--supersedes D<n>`; `system decisions show D<n>` then lists what supersedes it.
 
 A project's lead, on its own token (MCP `decisions_ask`, `decisions_answer`, `decisions_list`,
-`decisions_show`), asks about its own project and reads its project's and the studio-wide decisions. It
-records an answer only on the operator's word: `source` says where the operator said it, and the record
-says `answeredBy: lead:<project>`, never `operator`. It never answers a studio-wide question or
-another project's, never corrects one, and never imports: those are the operator's.
+`decisions_show`), asks about its own project and reads its project's and the studio-wide decisions.
+It records an answer only on the operator's word: `source` says where the operator said it, and the
+record says `answeredBy: lead:<project>`. It never answers a studio-wide question or another
+project's, never corrects one, and never imports: those are the operator's.
 
 ## A Worker source does not answer
 
@@ -2052,11 +1999,9 @@ its Workers until it answers`.
   probes its runtimes first) reads `describing…`: health says `N available so far; source agents
   describing… (its first describe since it registered has not landed …)`, and `system roster` (and
   the Workers page and Home on `/ui`) says `N Worker(s) so far (source agents still describing its
-  Workers)` and `source agents describing…`. The Workers counted are those heard so far, not
-  every one: wait for the first probe, then read again, and both count every Worker.
-- **Read health again.** A source that was only slow answers in the next read, and health no
-  longer names it. A step refused while it did not answer is run again with `system continue
-  <runId> <nodeId>` or a new run.
+  Workers)`. The count is of the Workers heard so far: wait for the first probe, then read again.
+- **Read health again.** A source that was only slow answers in the next read. A step refused while
+  it did not answer is run again with `system continue <runId> <nodeId>` or a new run.
 - **If it stays,** the daemon's log has the source's own warning. For `agents`, each runtime's
   probe runs in the background and never holds a read once a first one has finished; a Worker
   whose last probe started more than the `agent-workers` row's `probeTtlMs` (5 min) ago reads
@@ -2129,16 +2074,15 @@ An unanswered approval request expires denied, and a run that waits for you wait
 The `notify` row tells you out of band, from what the event log recorded
 ([notifications](../design/notifications.md)): a request opened, a request still open an hour
 before it expires, a board task's review held for you an hour before the hold expires
-(`review.expiring`; unanswered, the task waits for input that only a re-opening revives), a run that failed
-for you (`USER_ACTION`) or was escalated, a step waiting for an account's limit, a pool closed at
-its limit, an agent account quarantined. Each notice says what, which request, task, run, pool, or
-account, and the command to act (`system ui`, `system explain
+(`review.expiring`), a run that failed for you (`USER_ACTION`) or was escalated, a step waiting for
+an account's limit, a pool closed at its limit, an agent account quarantined. Each notice says what
+and which request, task, run, pool, or account, and the command to act (`system ui`, `system explain
 <runId>`, `system continue <runId> <nodeId>`, `system account verify …`). It never carries a
 secret, a prompt, an answer, or a request's summary. The row is off by default.
 
 **On the desktop.** The host runs `notify-send` (libnotify; on Debian or Ubuntu, `sudo apt
 install libnotify-bin`) in the session it runs in, which needs a notification daemon on the
-session bus: a desktop session, or a systemd user service of that session (its
+session bus (a desktop session, or a systemd user service of that session, whose
 `DBUS_SESSION_BUS_ADDRESS` is passed on). Turn the row on in your profile patch and restart:
 
 ```yaml
@@ -2148,8 +2092,8 @@ session bus: a desktop session, or a systemd user service of that session (its
 
 **Through a webhook** (a phone push service, a chat webhook): its URL leaves the machine with every
 notice, so it is opt-in twice. Turn the webhook on in the row, and declare the egress for it in the
-`egress` row (a patch that targets a row replaces its whole config, so list every class, the
-defaults included); `desktop: false` on a host with no desktop session:
+`egress` row (a targeted patch replaces the row's whole config, so list every class, the defaults
+included); `desktop: false` on a host with no desktop session:
 
 ```yaml
 - id: notify
@@ -2201,11 +2145,10 @@ nothing else changes, and the stored URL stays in the vault until you replace it
 
 ## An approval request expired
 
-Every request in the approval queue expires: at its creation plus the shortest `expiresSeconds`
-of the rules that apply to its class, else the policy's `expiry.defaultSeconds` (a day in the
-bundle's studio policy), never more than `expiry.maxSeconds` (14 days). An unanswered request is
-denied, and the work that waited on it never starts
-([approvals](../design/approvals.md#a-request)).
+Every request in the approval queue expires: at its creation plus the shortest `expiresSeconds` of
+the rules that apply to its class, else the policy's `expiry.defaultSeconds` (a day in the bundle's
+studio policy), never more than `expiry.maxSeconds` (14 days). An unanswered request is denied, and
+the work that waited on it never starts ([approvals](../design/approvals.md#a-request)).
 
 What you see:
 
@@ -2228,9 +2171,9 @@ What happened to the waiting work, by the request's subject:
 | a remediation fix, `artifact <plan id> @ git:<HEAD>:<hash>` | the gate closes, the fix never runs, and the run fails as `gate_timeout`. `system continue <runId>` asks again on a new request |
 
 The board moves a task on its own sweep (every `sweepSeconds`, 60), so the new state shows within
-about a minute. It also applies the expiry itself, at the task's `waiting.expiresAt`, when the
-queue did not resolve the request or no longer knows it. A planner's plan gate (`system approve
-<runId>`) is not on this queue; a remediation fix's is ([below](#a-remediation-fix-waits-on-the-queue)).
+about a minute. It also applies the expiry itself, at the task's `waiting.expiresAt`, when the queue
+did not resolve the request or no longer knows it. A planner's plan gate (`system approve <runId>`)
+is not on this queue; a remediation fix's is ([below](#a-remediation-fix-waits-on-the-queue)).
 
 To ask again or plan again:
 
@@ -2238,12 +2181,11 @@ To ask again or plan again:
    <lastDecision>` lists each candidate and its reasons.
 2. **A task:** nothing revives a `rejected` wait (`board_update` refuses it). If the work is still
    wanted, cancel the task (`board_cancel`, through the Lead) and propose it again
-   (`board_propose`): the policy is asked again for the new task. A task that
-   `writes` a subject holds it while it is open, so cancel first, or the proposal is refused
-   (`conflict`). Tasks that depend on the cancelled one are cancelled on the next sweep:
-   propose them again too. After `reconciliation-failed`, look at the run first (`run.runId` of
-   `board_task`, then `system explain <runId>`): its worktree may hold the work
-   ([a run's worktree](#a-runs-worktree)).
+   (`board_propose`): the policy is asked again for the new task. A task that `writes` a subject
+   holds it while it is open, so cancel first, or the proposal is refused (`conflict`). Tasks that
+   depend on the cancelled one are cancelled on the next sweep: propose them again too. After
+   `reconciliation-failed`, look at the run first (`run.runId` of `board_task`, then
+   `system explain <runId>`): its worktree may hold the work ([a run's worktree](#a-runs-worktree)).
 3. **A charter:** found an abandoned project again with `board_charter`, under a new
    `clientRequestId` (the old key returns the project it founded). Make a dropped amendment again
    with the same `projectId` and the next charter version.
@@ -2263,41 +2205,41 @@ state), `board_tasks` (`states`: `waiting-for-input`, `waiting-for-approval`, `r
 `pendingChecks`, or `approvalRequest`), and `lastDecision` is the `board` decision behind the move
 (`system artifact <id>` shows its reasons). The CLI has no board command: ask the Lead, since the
 lead's `board_*` tools are client scope. `/ui` shows the approval queue, the reviews, and the
-projects with their open tasks per state (the **Board** page), not each task.
+projects with their open tasks per state (the **Board** page), not each task. The rules are in
+[board](../design/board.md#what-ends-an-input-wait).
 
 | `waiting.reason` | What it means | What you can do |
 |---|---|---|
 | `approval-needed` (waiting for approval) | the policy asks before an attempt: a new task, the next attempt after a rejected review, or the attempt an answered question continues | decide its request on `/ui` (subject `board-task:<id>:attempt:<n>`, with `:answered:<wait>` after an answer). Approve: the task is ready on the board's next sweep. Deny or expiry: `rejected` |
-| `question` (waiting for input) | a step of the task's run answered with questions it cannot go on without (its run failed as `question`, outcome `blocked`; [a question from a run](../design/workflow-engine.md#a-question-from-a-run)) | answer every one, by index, with `board_update` `answers` (through the Lead): `{"taskId": "task-…", "answers": [{"question": 0, "answer": "Use the v2 API"}]}`, `question` the index from 0 in `waiting.questions`, `answer` 1 to 2000 characters. The attempt that asked continues, its count unchanged, and the step that asked runs again with your answers |
+| `question` (waiting for input) | a step of the task's run answered with questions it cannot go on without (its run failed as `question`, outcome `blocked`; [a question from a run](../design/workflow-engine.md#a-question-from-a-run)) | answer every one, by index, with `board_update` `answers` (through the Lead): `{"taskId": "task-…", "answers": [{"question": 0, "answer": "Use the v2 API"}]}`, `question` the index from 0 in `waiting.questions`, `answer` 1 to 2000 characters. The attempt that asked continues, its count unchanged, and the step runs again with your answers |
 | `rejected` | an approval was denied or expired, or none could be asked (a lost or spent run under a policy that does not ask, or a funding ask past `fundingMaxPercent`) | nothing revives it (see below) |
-| `retries-spent` | every attempt is used (`attempts.count` equals `max`: the proposal's, else the board's `templateAttempts` for its template, else `maxAttempts`, 3; [attempts](../design/board.md#attempts)): a review rejected the last one, a run failed with none left, or an approval to go on had none left to start (an answered question never spends one) | nothing revives it. The last result stays on the task, to read or to take. For a spent budget, see what was spent with MCP `resources_usage` (`taskId`) and propose the work again with larger lines or more attempts |
-| `review-expired` | the review held for you reached its expiry with no accepting decision. A holder's lease that lapsed never ends a review: it only holds it for you (`operator-review`) | re-open it while its run's worktree exists: MCP `board_reopen_review` `{"taskId": "task-…", "reason": "…"}` (your token, or the Lead's for its own project). It is held for you again for the policy's wait, its result unchanged. The work is also on its run's branch ([worktree](#a-runs-worktree)) |
+| `retries-spent` | every attempt is used (`attempts.count` equals `max`: the proposal's, else the board's `templateAttempts` for its template, else `maxAttempts`, 3; [attempts](../design/board.md#attempts)) | nothing revives it. The last result stays on the task, to read or to take. For a spent budget, see what was spent with MCP `resources_usage` (`taskId`) and propose the work again with larger lines or more attempts |
+| `review-expired` | the review held for you reached its expiry with no accepting decision | re-open it while its run's worktree exists: MCP `board_reopen_review` `{"taskId": "task-…", "reason": "…"}` (your token, or the Lead's for its own project). It is held for you again for the policy's wait, its result unchanged. The work is also on its run's branch ([worktree](#a-runs-worktree)) |
 | `operator-review` (in `review`) | the result waits for your acceptance: the checks its class requires have not passed, the policy forbids the class, or, under `board.autoAccept`, a condition of System's own acceptance failed ([let System accept](#let-system-accept-a-branchs-results)) | Accept or Reject on `/ui` ([review](#accept-or-reject-a-review)) until `expiresAt`; then `review-expired`. Home, the Reviews list, `system status`, and the report say when each expires; with the notify row on, `review.expiring` tells you `expiryLeadMinutes` (60) before ([get notified](#get-notified)) |
-| `budget-spent` (waiting for approval) | a line of the task's `budget` is reached: the ledger refused the reservation of the next step of its run (failed as `budget_spent`, outcome `blocked`; the steps that ran before keep their results; [a task's budget](../design/workflow-engine.md#a-tasks-budget)). A `funding` request, which always asks, names the lines it would add (its summary, and `waiting.funding` on `board_task`). On the task's last attempt there is none: the task waits for input (`retries-spent`) | see what was spent with MCP `resources_usage` (`taskId`), and read the request's summary and consequences on `/ui`. Approve: the board adds exactly those lines to the task's `budget`, and the next attempt goes through the gate. Deny or expiry: `rejected`. A request with no lines (the ledger could not count the usage) only lets it go on: propose the work again with larger lines. If the consequences say the resource ledger did not release a step's reservation (its `until` time), a hold that still counts refused it: check `system health` and `resources_pools`, wait past `until`, then approve. An ask past `fundingMaxPercent` (default 100% of the declared lines, over all raises) opens no request: the task waits for input (`rejected`); raise it in the `board` row for later tasks, or propose again |
+| `budget-spent` (waiting for approval) | a line of the task's `budget` is reached: the ledger refused the reservation of the next step (run failed as `budget_spent`, outcome `blocked`; [a task's budget](../design/workflow-engine.md#a-tasks-budget)). A `funding` request, which always asks, names the lines it would add (its summary, and `waiting.funding` on `board_task`). On the last attempt there is none: `retries-spent` | see what was spent with MCP `resources_usage` (`taskId`), and read the request's summary and consequences on `/ui`. Approve: the board adds exactly those lines to the task's `budget`, and the next attempt goes through the gate. Deny or expiry: `rejected`. A request with no lines (the ledger could not count the usage) only lets it go on: propose the work again with larger lines. If the consequences say the resource ledger did not release a step's reservation (its `until` time), check `system health` and `resources_pools`, wait past `until`, then approve. An ask past `fundingMaxPercent` (default 100% of the declared lines, over all raises) opens no request: the task waits for input (`rejected`); raise it in the `board` row for later tasks, or propose again |
 | `reconciliation-failed` (waiting for approval) | the run's holder was lost mid-run and its outcome is not known: a `remediation` request, which always asks | look at the run first (`run.runId`, then `system explain <runId>`). When the engine can report the run's outcome it does, and withdraws the request itself. Approve: another attempt, through the gate; the old run is never started again. Deny or expiry: `rejected` |
 
-**When nothing revives a wait.** Only a question wait takes input. `rejected`, `retries-spent`,
-and `review-expired` end in `cancelled` (`input-expired`) after `inputExpirySeconds` (7 days), or
-sooner by `board_cancel`; a `review-expired` wait can first be re-opened (`board_reopen_review`,
-above). To go on, propose the work as a new task (`board_propose`); cancel the
-old one first when it `writes` a subject, and propose again the tasks that depended on it, which
-are cancelled with it. Every approval wait ends at its request's expiry in `rejected`, and no wait
-ever starts work ([board](../design/board.md#what-ends-an-input-wait)).
+**When nothing revives a wait.** Only a question wait takes input. `rejected`, `retries-spent`, and
+`review-expired` end in `cancelled` (`input-expired`) after `inputExpirySeconds` (7 days), or sooner
+by `board_cancel`; a `review-expired` wait can first be re-opened (`board_reopen_review`, above). To
+go on, propose the work as a new task (`board_propose`); cancel the old one first when it `writes` a
+subject, and propose again the tasks that depended on it, which are cancelled with it. Every
+approval wait ends at its request's expiry in `rejected`, and no wait ever starts work.
 
 ## Accept or reject a review
 
 A board task reaches review when the run that served an attempt submits its result. Under the
 bundle's studio policy a `workspace-write` task stops here for you unless its run passed `tests`
 and `lint` itself: the policy requires them, and the engine reports only the checks it ran itself
-(`schema`, `review`, and the required checks it ran on the result's tree with the commands you
-configured: [let a run pass the required checks](#let-a-run-pass-the-required-checks)), so the
-board holds the review for the operator while one is pending
-([board](../design/board.md#required-checks-bind-at-acceptance)).
-A task of a class that needs no check (`read`) or that the policy asked about before its attempt
-is accepted by the engine's own decision and never shows here. A run whose own check failed is
-rejected by the engine as another attempt, also without you. On a project and branch you listed
-in `board.autoAccept`, System accepts a result itself only when its run's last review approved it
-and its required checks passed on it; every other one stops here, with the reason
+(`schema`, `review`, and the required checks it ran on the result's tree
+([let a run pass the required checks](#let-a-run-pass-the-required-checks))), so the board holds
+the review for the operator while one is pending
+([board](../design/board.md#required-checks-bind-at-acceptance)). A task of a class that needs no
+check (`read`) or that the policy asked about before its attempt is accepted by the engine's own
+decision and never shows here. A run whose own check failed is rejected by the engine as another
+attempt, also without you. On a project and branch you listed in `board.autoAccept`, System accepts
+a result itself only when its run's last review approved it and its required checks passed on it;
+every other one stops here, with the reason
 ([let System accept a branch's results](#let-system-accept-a-branchs-results)).
 
 1. `system ui` prints the link: open it on the host, or over `ssh -L <port>:127.0.0.1:<port>
@@ -2346,11 +2288,11 @@ notify:
   holdsPerHour: 4    # batched messages an hour, at most
 ```
 
-One message per sweep lists every new hold and every expiring one, to the sinks the row already
-has (desktop; the webhook when you enabled it); with `holds` on, the per-task review reminder is
-folded into it. When the holds do not all fit its text, it says how many more wait, and the next
-message names them. Turning it on tells the holds already open. The lead's digest flags the holds
-under the lead inbox's `expiringHours`.
+One message per sweep lists every new hold and every expiring one, to the sinks the row already has
+(desktop; the webhook when you enabled it); with `holds` on, the per-task review reminder is folded
+into it. When the holds do not all fit its text, it says how many more wait, and the next message
+names them. Turning it on tells the holds already open. The lead's digest flags the holds under the
+lead inbox's `expiringHours`.
 
 ## Let System accept a branch's results
 
@@ -2394,8 +2336,7 @@ board:
 
 A new project on a git repository starts from a template by kind
 ([packaging](../design/packaging.md)); today the kind is `software-repository`. Every effect is a
-request for you or a file: nothing applies until you approve it, and the repository is never
-touched.
+request for you or a file: nothing applies until you approve it, and the repository is never touched.
 
 1. **Preview.** With the repository checked out on the branch results should land on:
 
@@ -2433,10 +2374,10 @@ touched.
 
 Auto-accept stays off for the new project until you list it
 ([let System accept a branch's results](#let-system-accept-a-branchs-results)). If filing a request
-fails, the command names what it filed before it, and `requests.json` in the coordination
-directory records it: run the same command again, and it files only the outstanding requests (with
-`--dry-run`, it names them first). Do not remove the coordination directory: the board already
-holds a charter it filed, and a fresh run would refuse the id as in use.
+fails, the command names what it filed before it, and `requests.json` in the coordination directory
+records it: run the same command again, and it files only the outstanding requests (with
+`--dry-run`, it names them first). Do not remove the coordination directory: the board already holds
+a charter it filed, and a fresh run would refuse the id as in use.
 
 ## Pause, resume, or close a project
 
@@ -2445,35 +2386,33 @@ A project's state is yours alone to move: no Lead or Worker pauses, resumes, or 
 **Board** page on `/ui` (`system ui` prints the link), or the operator-scope MCP tools `board_pause`,
 `board_resume`, and `board_close`; a client token is refused (`403` on `/mcp`, `401` on `/ui`).
 
-Each move opens a confirmation of what it does to that project; nothing moves until **Confirm**.
-The page sends the project's revision as it showed it: if the project changed meanwhile, the move is
-refused (`409`) and nothing moves; read the page again and decide again. Each move is recorded as a
-`board` decision (`system artifact <id>`, the project's `lastDecision`).
+Each move opens a confirmation of what it does to that project; nothing moves until **Confirm**. The
+page sends the project's revision as it showed it: if the project changed meanwhile, the move is
+refused (`409`); read the page again and decide again. Each move is recorded as a `board` decision
+(`system artifact <id>`, the project's `lastDecision`).
 
-- **Pause** an `active` project to hold its work: a stop rule that says pause, a budget to
-  rethink, time away. Until you resume it, no task of it is claimed or started (the Lead's `run`
-  with `task` is refused, nothing started) and no proposed task is put to the policy. What already
-  runs goes on to its outcome: a run finishes, its result reaches review, and you still decide
-  reviews held for you. Every wait keeps its expiry, and a request you answer meanwhile still
-  applies, but a task it readies waits unclaimed.
+- **Pause** an `active` project to hold its work (a stop rule says pause, a budget to rethink, time
+  away). Until you resume it, no task of it is claimed or started (the Lead's `run` with `task` is
+  refused) and no proposed task is put to the policy. What already runs goes on to its outcome: a run
+  finishes, its result reaches review, and you still decide reviews held for you. Every wait keeps
+  its expiry, and a request you answer meanwhile still applies, but a task it readies waits unclaimed.
 - **Resume** a `paused` project: on the board's next sweep (a minute) its proposed tasks whose
   dependencies are done go through the gate (ready, or a request in the queue), and the Lead may
   start its ready tasks again.
 - **Close** an `active` or `paused` project for good, `achieved` (its criteria are met) or
   `stopped` (it ends without them). It is refused while a task runs or is in review: let the run
   finish or stop it (`system stop <runId>`), and decide the reviews held for you
-  ([review](#accept-or-reject-a-review)); the confirmation says so when it applies. Otherwise every
-  open task is cancelled (`project-closed`), a claimed one's lease released; then the approval
-  requests its waiting tasks and an amendment were on are withdrawn, and leave the queue. Merge
-  the accepted work you want first ([worktree](#a-runs-worktree)): the close removes no worktree
-  or result, and a closed project takes no task or amendment again. To go on with the work, found
-  a new project (`board_charter`).
+  ([review](#accept-or-reject-a-review)). Otherwise every open task is cancelled (`project-closed`),
+  a claimed one's lease released; then the approval requests its waiting tasks and an amendment were
+  on are withdrawn. Merge the accepted work you want first ([worktree](#a-runs-worktree)): the close
+  removes no worktree or result, and a closed project takes no task or amendment again. To go on
+  with the work, found a new project (`board_charter`).
 
 ## A remediation fix waits on the queue
 
-When an exact-subject review of an agent's change asks for changes with blocking findings, the
-run grows a fix and a re-review, and the fix waits for you: it writes, so it never runs on a
-policy alone ([remediation on the queue](../design/workflow-engine.md#remediation-on-the-approval-queue)).
+When an exact-subject review of an agent's change asks for changes with blocking findings, the run
+grows a fix and a re-review, and the fix waits for you: it writes, so it never runs on a policy
+alone ([remediation on the queue](../design/workflow-engine.md#remediation-on-the-approval-queue)).
 
 Where it shows:
 
@@ -2498,18 +2437,19 @@ To decide:
    `gate_timeout`.
 3. To ask again after a deny or an expiry, `system continue <runId>`: the gate puts the plan to the
    queue on a new request. After `stale_subject`, put the worktree back to the reviewed subject
-   first (the request's `git:<HEAD>:<hash>`); continuing asks on that same subject again. A policy change that withdrew the request closes the gate too
-   (`plan_rejected`, "withdrawn"); continue asks under the policy now.
+   first (the request's `git:<HEAD>:<hash>`); continuing asks on that same subject again. A policy
+   change that withdrew the request closes the gate too (`plan_rejected`, "withdrawn"); continue
+   asks under the policy now.
 
 With no approval queue loaded, the fix waits on the run's plan gate instead: `system approve
 <runId> --plan <plan id>` within `gateTimeoutHours` (24).
 
 ## A Worker's tool call is deferred on an approval
 
-Every tool call of an agent run passes the run's gate. A call the policy asks about is deferred:
-the run stops at it, and the call waits in the queue
-([a Worker's tool calls](../design/approvals.md#a-workers-tool-calls)). This needs an agent Worker
-on a runtime that can ask the gate first (Claude Code; [turn the rows
+Every tool call of an agent run passes the run's gate. A call the policy asks about is deferred: the
+run stops at it, and the call waits in the queue
+([a Worker's tool calls](../design/approvals.md#a-workers-tool-calls)). This needs an agent Worker on
+a runtime that can ask the gate first (Claude Code; [turn the rows
 on](#turn-an-off-row-back-on)), and a policy that asks. Under the bundle's studio policy a Claude
 Code Worker's reads and edits are `read` and `workspace-write`, both `auto`; a `workspace-write`
 run's `Bash` command asks unless the policy lists its exact argv, and the runtime offers no
@@ -2523,8 +2463,8 @@ Where it shows:
 - A run for a board task waits: its step is `BLOCKED` on the request, the run's view says
   `blocked: tool-call` with the request and until when (for a `command` call at most
   `deferredCommandMinutes`, 10 by default, after it was asked; otherwise the request's expiry), and
-  the task stays `running`, its attempt not spent (`system result <runId>` returns at once and says
-  so; `system explain <runId>` shows the step's `recovery` decision `wait`, rule
+  the task stays `running`, its attempt not spent (`system result <runId>` returns at once;
+  `system explain <runId>` shows the step's `recovery` decision `wait`, rule
   `workflow.deferred-call`). It counts against `maxWaitingRuns`, not `maxActiveRuns`.
 - A run outside a board task fails `config_error`: `<worker> stopped at its <tool> call, which
   waits for the operator's approval (approval request apr-…); nothing of that call ran`.
@@ -2552,16 +2492,14 @@ To approve:
      (10; the engine then withdraws the request) denies that call alone: the step runs again in its
      session, told the call was denied and why, and the Worker goes on without it (a `recovery`
      decision `deny`, rule `workflow.deferred-call`, cause `rejected`, `expired`, `withdrawn`,
-     `bound`, or `late`). Nothing of the call runs, then or later in that session, even once you list
-     its command: the gate reads the denial from its own row of the request
-     (`agent_tool_requests.denied_at`). The attempt ends only when the policy now forbids the call's
-     class, or on an approval that is not for exactly that call: the step fails `call_rejected` or
-     `call_expired` (`USER_ACTION`, which notify tells as `run.user-action`), the run's report is an
-     attempt the board counts, and the task goes through the gate for its next attempt (or waits for
-     input, `retries-spent`). Stopping the run, or any other end of the attempt, withdraws every
-     request its Workers left open, so an approval given later runs nothing. To wait for your verdict
-     as long as the request lives, set the workflow's `deferredCommandMinutes` to 0. To let a command
-     run unasked, add its exact argv to the studio policy's commands list
+     `bound`, or `late`). Nothing of the call runs in that session, even once you list its command.
+     The attempt ends only when the policy now forbids the call's class, or on an approval that is not
+     for exactly that call: the step fails `call_rejected` or `call_expired` (`USER_ACTION`, which
+     notify tells as `run.user-action`), the run's report is an attempt the board counts, and the task
+     goes through the gate for its next attempt (or waits for input, `retries-spent`). Stopping the
+     run, or any other end of the attempt, withdraws every request its Workers left open. To wait for
+     your verdict as long as the request lives, set the workflow's `deferredCommandMinutes` to 0. To
+     let a command run unasked, add its exact argv to the studio policy's commands list
      ([change the autonomy policy](#change-the-autonomy-policy)); each Worker that may run commands
      is told the list's lines with every turn's prompt. A run's own tests (`vitest run <its spec
      files>`, `test:related <its files> [-- <options>]`, with a reporter, `--silent`, `--exclude`, or
@@ -2570,13 +2508,13 @@ To approve:
      at the gate. A form no rule names still asks: add it to the rule through a policy change, never
      to a script;
    - a run outside a board task continues by itself: within `approvalPollSeconds` (15 s) of your
-     approval the engine reopens the failed step as a new attempt in its session, with a line
-     saying the call was approved, and the call runs once. It is a `recovery` decision (rule
-     `workflow.approved-call`, `system explain <runId>`) and a `workflow.run.continued` event naming
-     the request; one approval continues the run once. A deny or an expiry continues nothing, and
-     nor does an approval for a run you already continued, stopped, or deleted. To go on without
-     the call, `system continue <runId>` reopens the step yourself (before a verdict it defers again
-     on the same request, queuing nothing new).
+     approval the engine reopens the failed step as a new attempt in its session, with a line saying
+     the call was approved, and the call runs once (a `recovery` decision, rule
+     `workflow.approved-call`, and a `workflow.run.continued` event naming the request); one
+     approval continues the run once. A deny or an expiry continues nothing, and nor does an
+     approval for a run you already continued, stopped, or deleted. To go on without the call,
+     `system continue <runId>` reopens the step yourself (before a verdict it defers again on the
+     same request, queuing nothing new).
 
 A call the policy forbids is not deferred: the agent is told the reason and goes on, and the denial
 is recorded (`agent-workers.tool.denied`, `system explain <decision id>`). With no approval queue
@@ -2586,9 +2524,9 @@ loaded, every call is denied, reads included.
 
 Two ways, both the operator's alone ([a policy change](../design/approvals.md#a-policy-change)):
 **on `/ui`, through a `policy-change` approval**, with no restart, or **by configuration and a
-restart**. No Worker can do either: the proposal routes take the operator's token or scope only,
-and the DSH home is hidden from agents. Once enabled, the queue may propose a change itself from
-your repeated approvals; it still applies only on your approval
+restart**. No Worker can do either: the proposal routes take the operator's token or scope only, and
+the DSH home is hidden from agents. Once enabled, the queue may propose a change itself from your
+repeated approvals; it still applies only on your approval
 ([below](#the-queue-proposes-a-policy-change)).
 
 1. **Read what is in force:** the **Autonomy policy** page on `/ui` (`system ui` prints the link),
@@ -2835,15 +2773,15 @@ that reported no numbers has no record. `system usage` lists runs, not the ledge
 usage the ledger could not count (`not-reported` or `refused`). The same shows as `usage unknown
 (<why>)` on a step in `system usage`, in the report's resources and `Not counted` lines, or as a
 refused `budget` decision whose reason starts `cap of <pool> cannot be held`. Health names the
-latest three runs of each pool, each with its Worker and why in plain words.
+latest three runs of each pool, each with its Worker and why.
 
-The ledger counted no usage record for those runs, or only a lower bound of one (`a lower bound
-counted`), so the tokens and cost the report gives are lower bounds. A cap never counts them as 0
+The ledger counted no usage record for those runs, or only a lower bound (`a lower bound counted`),
+so the tokens and cost reported are lower bounds. A cap never counts them as 0
 (INV-2, [ADR-0065](../decisions/adr/0065-a-cap-fails-closed-on-usage-the-ledger-could-not-count.md)):
 any reservation whose budget lines cap that pool for the run's board task, or its project, is
-refused, for every pool kind, so the task's next step does not start and the task is blocked. Funding
-the task does not help: the cap is refused for what it cannot count, not for what it holds. A pool's
-availability is unaffected: it comes from limit readings, not records.
+refused, for every pool kind, so the task's next step does not start and the task is blocked.
+Funding the task does not help. A pool's availability is unaffected: it comes from limit readings,
+not records.
 
 1. **Read them.** `system events --type usage.unknown`: each entry's `data` names the run
    (`runId`), Worker, pool, account, board task, how it ended, `kind`, and `reason`; the entry's own
@@ -2878,10 +2816,10 @@ availability is unaffected: it comes from limit readings, not records.
 
 The health check clears once the runs fall out of the pool's longest window, or once the ledger
 counts a record of each other than the lower bound its fact names (that one never clears it). A
-cap's refusal does not clear with the window: it lasts until the run is reconciled. A pool with a window of no length (a credit balance) keeps them until the event
-log's retention removes the entries. A fact that could not be recorded at all is only in the
-daemon's log (`the usage of <run> on <Worker> (pool <pool>) is unknown (…), and that could not be
-recorded`).
+cap's refusal does not clear with the window: it lasts until the run is reconciled. A pool with a
+window of no length (a credit balance) keeps them until the event log's retention removes the
+entries. A fact that could not be recorded at all is only in the daemon's log (`the usage of <run>
+on <Worker> (pool <pool>) is unknown (…), and that could not be recorded`).
 
 ## A run's worktree
 
@@ -2893,15 +2831,15 @@ otherwise the Worker is `unavailable` (`system health`), with the reason in the 
 
 - **Where:** `<worktreeRoot>/<repository name>-<12 hex digits>/<workflow run id>`, by default
   `~/.dsh/system/worktrees` (owner-only), on the branch `system/run/<workflow run id>`, cut from the
-  repository's HEAD when the run's first agent run starts (or, for a board task's next attempt, from
-  the work the previous attempt left: [below](#a-tasks-next-attempt-starts-from-the-previous-attempts-work)).
+  repository's HEAD when the run's first agent run starts (for a board task's next attempt, from the
+  work the previous attempt left: [below](#a-tasks-next-attempt-starts-from-the-previous-attempts-work)).
   Every later agent run of that workflow run, reviewers included, uses it; the repository's own
   working tree and branch are written only by a landing you approved
   ([land an accepted result](#land-an-accepted-result)). Find it with
   `ls ~/.dsh/system/worktrees/*/<run id>`, `git -C <repository> worktree list`, or the daemon log
   line `run <id> works in <path> on <branch>`. A task's attempts are separate runs, each with a
   worktree and branch of its own (`run.runId` of `board_task`).
-- **Retention:** while one of its agent runs is queued or running, a worktree is kept. Then, after
+- **Retention:** a worktree is kept while one of its agent runs is queued or running. After
   `worktreeRetentionHours` (168; 0 keeps every worktree), at start and hourly (at most 50 a sweep),
   `system` commits what the worktree holds on its branch (author `system <system@localhost>`,
   message `system: keep the uncommitted work of workflow run <id>`) and removes it, never forced
@@ -2925,41 +2863,41 @@ otherwise the Worker is `unavailable` (`system health`), with the reason in the 
   reason logged once, and the next hourly sweep tries again. Unlock it with `git -C <repository>
   worktree unlock <path>`. One removed by hand is forgotten once git no longer lists it:
   `git -C <repository> worktree prune`.
-- **A `.git` file changed by the agent:** a run whose worktree's `.git` file no longer points to
-  its own directory fails `reconciliation_failed` ("changed the .git file of its worktree …"), and
-  the worktree is left for you; a later run of it fails `config_error`. Do not run git inside it:
-  read the files directly, and use `git -C <repository> worktree list` and the branch from the
+- **A `.git` file changed by the agent:** a run whose worktree's `.git` file no longer points to its
+  own directory fails `reconciliation_failed` ("changed the .git file of its worktree …"), and the
+  worktree is left for you; a later run of it fails `config_error`. Do not run git inside it: read
+  the files directly, and use `git -C <repository> worktree list` and the branch from the
   repository. Once the work is saved, `git -C <repository> worktree remove --force <path>`.
 - **A path that is not the run's:** a path that already exists and is not that run's worktree is
   never taken over (`config_error`). Move it away.
-- **Landed runs go at once:** when a landing ends merged, or finds nothing to land, and the
-  task is done, the source removes the run's worktree right away if it holds nothing uncommitted
-  and no agent run holds it; its branch stays, and a `retention` decision (rule
-  `agent-workers.worktree-release`) records it. A worktree of a task that may be retried is not
-  asked for: the retention above takes it.
-- **Disk:** each worktree is a full checkout, kept a week by default. Set
-  `worktreeRetentionHours` for the worktrees a landing did not remove, or
-  remove the finished ones sooner ([below](#remove-finished-run-worktrees)). The disk floor
-  (`diskFloorGb`, default 10; `system enforce set disk-floor on|warn|off`, starting `warn`) cuts no
-  new worktree while the worktrees' filesystem has less free: dispatch's pass says why for every
-  task, and a start that bypasses dispatch is held, never counted as an attempt (its first step
-  fails `overloaded` with nothing sent, ADR-0069). A retry's carry of the earlier attempt's work is
-  refused `no-room` and waits, bounded by workflow `maxLimitWaitHours` (24 by default); past it, or
-  once the earlier attempt's worktree is gone, the retry starts fresh from HEAD, recorded with why.
-  The earlier work stays on its branch `system/run/<earlier run>` for you to take by hand. In `warn`
-  the refusal is only recorded (a `gate` decision of rule `agent-workers.disk-floor`, at most once
-  every 10 min). `lead_health`'s `Disk` row shows the free space of the worktrees' and the store's
-  filesystems: degraded under 20 % free, failed under the floor. Free room by removing finished
-  worktrees, but not the earlier worktree of a retry that waits to carry it (`system worktrees`
-  lists its run as finished; the task's newest run waits on it), or that retry starts fresh.
+- **Landed runs go at once:** when a landing ends merged, or finds nothing to land, and the task is
+  done, the source removes the run's worktree right away if it holds nothing uncommitted and no
+  agent run holds it; its branch stays, and a `retention` decision (rule
+  `agent-workers.worktree-release`) records it. A worktree of a task that may be retried is left to
+  the retention above.
+- **Disk:** each worktree is a full checkout. Set `worktreeRetentionHours` for the worktrees a
+  landing did not remove, or remove the finished ones sooner ([below](#remove-finished-run-worktrees)).
+  The disk floor (`diskFloorGb`, default 10; `system enforce set disk-floor on|warn|off`, starting
+  `warn`) cuts no new worktree while the worktrees' filesystem has less free: dispatch's pass says
+  why for every task, and a start that bypasses dispatch is held, never counted as an attempt (its
+  first step fails `overloaded` with nothing sent, ADR-0069). A retry's carry of the earlier
+  attempt's work is refused `no-room` and waits, bounded by workflow `maxLimitWaitHours` (24 by
+  default); past it, or once the earlier attempt's worktree is gone, the retry starts fresh from
+  HEAD, recorded with why. The earlier work stays on its branch `system/run/<earlier run>`. In
+  `warn` the refusal is only recorded (a `gate` decision of rule `agent-workers.disk-floor`, at most
+  once every 10 min). `lead_health`'s `Disk` row shows the free space of the worktrees' and the
+  store's filesystems: degraded under 20 % free, failed under the floor. Free room by removing
+  finished worktrees, but not the earlier worktree of a retry that waits to carry it (`system
+  worktrees` lists its run as finished; the task's newest run waits on it), or that retry starts
+  fresh.
 
 ### Remove finished run worktrees
 
 Worktrees and `system/run/*` branches pile up under `~/.dsh/system/worktrees` (one per attempt of a
 task, each a full checkout). The retention removes each `worktreeRetentionHours` after the last agent
-run of the workflow run ended (at start and hourly), whatever became of the attempt; until then each
-stays, so a held review's pending checks can run in it. You can remove the finished ones sooner;
-nothing is ever discarded.
+run of the workflow run ended, whatever became of the attempt; until then each stays, so a held
+review's pending checks can run in it. You can remove the finished ones sooner; nothing is ever
+discarded.
 
 1. **See them:** `system worktrees` lists every one not removed yet, oldest first: its run, its
    state (`in-use` while an agent run of the run is queued or running; `held` while one ended with
@@ -3034,8 +2972,8 @@ has the `workflow.landing` decisions under the run's last step):
 - **The policy forbids `merge`**: refused at once, nothing asked; merge by hand.
 
 The repository's checkout is written only here, by a merge you approved at the exact SHAs shown.
-Never a force, a reset, a branch deletion, or a push. The one branch the system moves other than by a
-commit on top is the run's own `system/run/<runId>`, when a rebase replays it onto the base; its
+Never a force, a reset, a branch deletion, or a push. The one branch the system moves other than by
+a commit on top is the run's own `system/run/<runId>`, when a rebase replays it onto the base; its
 earlier head stays under `refs/system/rebase/<runId>/`.
 
 ## Let System start ready work
@@ -3046,9 +2984,8 @@ one only on your **Approve**
 [ADR-0064](../decisions/adr/0064-system-starts-ready-work-under-the-dispatch-action-class.md)). It is
 on by default (`dispatch.enabled`), and the studio policy asks for `dispatch` (its `default: ask`).
 Where you let it, it starts with no button at all:
-[set dispatch to auto for a project](#set-dispatch-to-auto-for-a-project).
-A Worker is free only when its account's quota is read and has room above your reserve, so it
-chooses none until:
+[set dispatch to auto for a project](#set-dispatch-to-auto-for-a-project). A Worker is free only
+when its account's quota is read and has room above your reserve, so it chooses none until:
 
 1. **Each account's windows are read**: pool templates for the agent runtimes and their window
    names, as in [read each account's quota](#read-each-accounts-quota). A Worker whose account has
@@ -3063,14 +3000,13 @@ chooses none until:
    any rolling hour, `maxPerHourPerProject` (3) in one project. `system check` names a value out of
    its range.
 
-Then, on Home, **Starts awaiting approval** lists each start: the task, its attempt, the Worker, each
-window of its account (`5 h · used 12 % · reserve 20 % · resets 14:20`), and, folded, why that Worker.
-**Approve** starts it at the next pass (within a minute), on that Worker, while the task is
-still ready and the Worker free; past `approvedHoldMinutes` (30) waiting for the Worker, the
-approval is used for nothing and System asks again. **Deny**, or no answer by its expiry, and System
-does not ask again for that attempt: start it from the Board when you want it. A task the board's
-gate asked you about already (its class asks, and you approved the attempt) starts without a second
-button.
+Then, on Home, **Starts awaiting approval** lists each start: the task, its attempt, the Worker,
+each window of its account (`5 h · used 12 % · reserve 20 % · resets 14:20`), and, folded, why that
+Worker. **Approve** starts it at the next pass (within a minute), on that Worker, while the task is
+still ready and the Worker free; past `approvedHoldMinutes` (30) waiting for the Worker, the approval
+is used for nothing and System asks again. **Deny**, or no answer by its expiry, and System does not
+ask again for that attempt: start it from the Board when you want it. A task the board's gate asked
+you about already (its class asks, and you approved the attempt) starts without a second button.
 
 - **Why did it not start my task?** `system dispatch` (or Home's *Why the ready tasks did not start
   at the last look*) gives each ready task's reason at the last pass: a bound reached, the policy, no
@@ -3088,11 +3024,11 @@ button.
 ### Set dispatch to auto for a project
 
 Under `auto`, System starts a chosen ready task's attempt **with no request**: nothing enters the
-queue, and the start is recorded (the `dispatch.select` and `dispatch.choice` decisions, every Worker
-with why, and the policy's `autonomy` decision) and listed on Home under **Started by itself**, one
-line each with its run's state as a chip. Under `notify` it does the same and also tells you (a
-`dispatch.started` notice, when [notifications](#get-notified) are on). Every bound above still
-holds, the hourly ones included, and nothing it starts lands without your `merge` approval.
+queue, and the start is recorded (the `dispatch.select` and `dispatch.choice` decisions, and the
+policy's `autonomy` decision) and listed on Home under **Started by itself**, one line each with its
+run's state as a chip. Under `notify` it does the same and also tells you (a `dispatch.started`
+notice, when [notifications](#get-notified) are on). Every bound above still holds, and nothing it
+starts lands without your `merge` approval.
 
 The effective mode is the strictest of the studio policy and the project's, so `auto` for project
 `p1` only takes two rules, each through [a policy change](#change-the-autonomy-policy):
@@ -3132,9 +3068,9 @@ system/run/<earlier>)`, and `task.carry` on the run's view. It happens when the 
 only after its writing step completed, for a reason that says nothing about the change (the review
 reached its turn limit; a Worker or a session failed, a limit, the budget, a timeout), no review
 judged the change, and the task writes a commit the change is on
-([starting from the previous attempt's work](../design/workflow-engine.md#starting-from-the-previous-attempts-work),
+([design](../design/workflow-engine.md#starting-from-the-previous-attempts-work),
 [ADR-0061](../decisions/adr/0061-a-tasks-next-attempt-starts-from-the-work-its-previous-attempt-left.md)).
-Nothing is asked of you: the board decides and counts the attempt as always.
+Nothing is asked of you.
 
 1. **Read why.** `system explain <runId>` lists, among the run's own decisions, the
    `workflow.task-worktree` ones: the admission decision (`carry`, or `fresh` with the bound that
@@ -3158,26 +3094,24 @@ Nothing is asked of you: the board decides and counts the attempt as always.
 
 A worktree cut for the work and not given it (a crash at that moment) is never run in: its first
 agent run fails `config_error` ("…that work is not in it"); the next carry gives it the work or puts
-it back to its base, and so do the retention and your removal (`system worktrees remove`) before
-they retire it, so nothing of it is committed on its branch. One the source could not put back (its
-`failure` in `system worktrees` says why: not intact, or files its base does not hold, which a
-reading cut short wrote) is yours: read it, then `git -C <repository> worktree remove --force
-<path>`, and close its record with `system worktrees remove --run <runId>`.
+it back to its base, and so do the retention and `system worktrees remove`. One the source could not
+put back (its `failure` in `system worktrees` says why) is yours: read it, then `git -C <repository>
+worktree remove --force <path>`, and close its record with `system worktrees remove --run <runId>`.
 
 ## A run's liveness is unknown
 
-Seen as `system health` showing `liveness degraded` (runs that ended without being known to be gone,
-their session and worktree held), as `liveness` in MCP `status` (the operator's), as a step failed `reconciliation_failed` whose message ends `the operator decides … system free <run>
---agent-gone`, under **Doing now** on the Workers tab and in `system roster` (`Held for …`), and
-in the report's attention section (`Still held: …`).
+Seen as `system health` showing `liveness degraded`, `liveness` in MCP `status`, a step failed
+`reconciliation_failed` whose message ends `the operator decides … system free <run> --agent-gone`,
+**Doing now** on the Workers tab and `system roster` (`Held for …`), and the report's attention
+section (`Still held: …`).
 
 An agent run was running when its holder stopped (a restart, a crash, a lost lease), or you stopped
 it while no process held it, and `system` could not show that its agent is gone: its process was
 never reported (Codex, ACP, and the Antigravity CLI report none), ran on another host, or could not
-be read ([restart and liveness](../design/agent-runtimes.md#restart-and-liveness)). A failed check
-is never death, so the run ended for you to judge, and what it ran in stays held: its session takes
-no input, no run starts in its workflow run's worktree, and the retention sweep keeps that worktree
-(INV-15). Later work starts fresh sessions. Nothing is lost; the agent may still be writing.
+be read ([restart and liveness](../design/agent-runtimes.md#restart-and-liveness)). A failed check is
+never death, so the run ended for you to judge, and what it ran in stays held: its session takes no
+input, no run starts in its workflow run's worktree, and the retention sweep keeps that worktree
+(INV-15). Later work starts fresh sessions. The agent may still be writing.
 
 1. **Read it.** `system explain <arun_…>` (or `system explain <workflow run>`) prints its verdict, how
    many looks it got, each signal (the holder's process and the agent process, with their pids, and
@@ -3217,9 +3151,10 @@ it simply ends; otherwise it ends `aborted` and is held as above.
 A new worktree holds what git tracks, so no dependencies, and a Worker's commands have no network:
 its tests, lint, and typecheck cannot run there until the repository's **setup** has run
 ([a worktree's setup](../design/agent-runtimes.md#a-worktrees-setup),
-[ADR-0058](../decisions/adr/0058-a-run-worktree-is-set-up-offline-before-its-agent-starts.md)). You declare it per repository; `system` runs it in each workflow run's new worktree
-before the agent starts, offline, confined, each command allowed by the autonomy policy. For the
-`system` repository with pnpm (every path absolute: `~` is not expanded):
+[ADR-0058](../decisions/adr/0058-a-run-worktree-is-set-up-offline-before-its-agent-starts.md)). You
+declare it per repository; `system` runs it in each workflow run's new worktree before the agent
+starts, offline, confined, each command allowed by the autonomy policy. For the `system` repository
+with pnpm (every path absolute: `~` is not expanded):
 
 1. **The store.** `corepack pnpm store path` in the repository names it, for example
    `/home/me/.local/share/pnpm/store/v11`. It must hold every package of the lockfile: after the
@@ -3243,11 +3178,11 @@ before the agent starts, offline, confined, each command allowed by the autonomy
              - { path: /home/me/.local/share/pnpm/store/v11, copy: [index.db, index.db-wal], readOnly: [files] }
    ```
 
-   Why each part: `--offline`, since the setup has no network; `--store-dir`, since pnpm otherwise
-   moves to an empty store inside the worktree when it cannot link from the host's; and
-   `--package-import-method=copy`, since the store is read-only and on another mount, and a copy
-   keeps a Worker that writes its worktree from changing the store. Each worktree then holds its
-   own `node_modules` (about 700 MB for `system`), kept as long as the worktree.
+   `--offline`: the setup has no network. `--store-dir`: otherwise pnpm moves to an empty store inside
+   the worktree when it cannot link from the host's. `--package-import-method=copy`: the store is
+   read-only and on another mount, and a copy keeps a Worker that writes its worktree from changing
+   the store. Each worktree then holds its own `node_modules` (about 700 MB for `system`), kept as
+   long as the worktree.
 3. **The policy.** Each setup command is judged as a command, by its exact argv. Under the
    bundle's studio policy it asks the operator. The standing way: list the
    exact line in the studio policy's `commands`
@@ -3277,9 +3212,9 @@ setup and every worktree is set up again before its next run (and asked about ag
 
 The studio policy requires `tests` and `lint` of a `workspace-write` result. A run passes them only
 by running them itself, on the exact tree its result is on, with the commands you configure for the
-repository; a Worker that says it ran them does not count. Then a result whose checks pass and
-whose review approved is accepted without you (its landing still asks you to merge it), and one
-whose check fails goes back as another attempt
+repository; a Worker that says it ran them does not count. A result whose checks pass and whose
+review approved is then accepted without you (its landing still asks you to merge it), and one whose
+check fails goes back as another attempt
 ([a run's required checks](../design/workflow-engine.md#a-runs-required-checks),
 [ADR-0063](../decisions/adr/0063-a-runs-required-checks-run-on-its-exact-result.md)). Without this,
 every such result waits for you in **Reviews** with `tests, lint` pending.
@@ -3311,19 +3246,20 @@ every such result waits for you in **Reviews** with `tests, lint` pending.
    policy newly requires** (a policy change adding it to `requires`) is required of the results
    already held for you too, but their waiting record does not list it, so it is neither run on their
    trees nor offered for a note when you accept: they cannot be accepted until the requirement is
-   removed again. Prefer widening an
-   existing check's command (`lint: corepack pnpm check`) to requiring a new check. A check sees the
-   worktree read-only; `checkScratch` names the git-ignored paths it writes (a cache), each a fresh
-   private directory for it, discarded after it. A check never installs: it runs with pnpm's
-   verify-deps-before-run off (`pnpm_config_verify_deps_before_run=false`; pnpm 11 and later ignore
-   the `npm_config_` name, also set), offline. When a result changes a file `dependencyFiles`
-   names (a workspace package's `package.json`, the lockfile), the setup runs again on the result's
-   tree, offline and confined, before its checks: its commands must be on the policy's `commands`
-   list too, since nothing is asked then
+   removed again. Prefer widening an existing check's command (`lint: corepack pnpm check`) to
+   requiring a new check. A check sees the worktree read-only; `checkScratch` names the git-ignored
+   paths it writes (a cache), each a fresh private directory for it, discarded after it. A check
+   never installs: it runs with pnpm's verify-deps-before-run off
+   (`pnpm_config_verify_deps_before_run=false`; pnpm 11 and later ignore the `npm_config_` name, also
+   set), offline. When a result changes a file `dependencyFiles` names (a workspace package's
+   `package.json`, the lockfile), the setup runs again on the result's tree, offline and confined,
+   before its checks: its commands must be on the policy's `commands` list too, since nothing is
+   asked then
    ([a result that changes its dependencies](../design/workflow-engine.md#a-result-that-changes-its-dependencies)).
    `corepack pnpm test:affected` is told its scope (`SYSTEM_CHECK_SCOPE`): at acceptance it runs the
    tests related to the files the result changed since its worktree was cut (`SYSTEM_CHECK_BASE`),
-   and at the landing, on the rebased or the committed tree, the whole suite, once per landing ([tests scale with the change](../engineering/testing.md#tests-scale-with-the-change)).
+   and at the landing, on the rebased or the committed tree, the whole suite, once per landing
+   ([tests scale with the change](../engineering/testing.md#tests-scale-with-the-change)).
 3. **The policy.** A check runs only when the policy lets its exact argv run unasked: list each
    line in the studio policy's `commands` ([change the autonomy policy](#change-the-autonomy-policy));
    a line already listed for the validation step is enough. A check whose command would ask is not
@@ -3408,22 +3344,21 @@ digest, on your approval ([a lockfile's verification](../design/agent-runtimes.m
    check on that lockfile asks anew.
 4. **off:** nothing of this runs; a result that changes the lockfile is refused as before.
 
-The request is for a command with the network, so the studio policy's `commands` list should not
-hold the verification argv unless you want it to run unasked. A forbidden verification is not run.
-System cannot filter the network of a confined command by host: while it runs, the command has the
-host's network, and what keeps it to the registry is that it runs none of the result's code (scripts
-and pnpmfile off), its environment (`pnpm_config_registry`, and corepack may not download), and the
-check that the result configures no other; your own pnpm configuration in the daemon's home applies
-too. Filter the host's egress if that is not enough. If the offline setup still fails after a
+The request is for a command with the network, so keep the verification argv out of the studio
+policy's `commands` list unless you want it to run unasked. A forbidden verification is not run.
+While it runs, the command has the host's network (System cannot filter a confined command's network
+by host); what keeps it to the registry is that it runs none of the result's code (scripts and
+pnpmfile off), its environment (`pnpm_config_registry`, and corepack may not download), and the check
+that the result configures no other; your own pnpm configuration in the daemon's home applies too.
+Filter the host's egress if that is not enough. If the offline setup still fails after a
 verification, the cause is not the verification, and nothing is asked again.
 
 ## Regenerate generated files on a landing
 
-With several tasks running on one repository at once, an accepted result's merge often conflicts
-only in files the repository generates (`system`: the traceability matrix, the configuration
-reference, the packages list, the plugin manifests), which every change regenerates. Declare them,
-and such a landing makes them again instead of refusing
-([landing a worktree](../design/agent-runtimes.md#landing-a-worktree)). The merge still
+With several tasks running on one repository, an accepted result's merge often conflicts only in
+files the repository generates (`system`: the traceability matrix, the configuration reference, the
+packages list, the plugin manifests). Declare them, and such a landing makes them again instead of
+refusing ([landing a worktree](../design/agent-runtimes.md#landing-a-worktree)). The merge still
 happens only on your approval of its `merge` request.
 
 1. **The setup first.** The commands run in the run's worktree, in the environment the repository's
@@ -3464,16 +3399,15 @@ happens only on your approval of its `merge` request.
    One that would ask is not run, and the landing is refused, nothing put to you for it.
 4. `system check`, then restart.
 
-What a landing then does with a conflict: the repository's merge is aborted, as always, so its
-checkout is as it was. When every conflicted file is one of `paths`, the merge is made again in the
-run's worktree (detached at the approved base, the run's branch merged without a commit), each
-conflicted file taken from either side, and the commands run there. Only when they all exit 0 and
-change no file but the declared ones is the merge committed (one merge commit of the base and the
-run's head, by the system, with the landing's message), and only when the commands, run again on it,
-change nothing (the same tree on a repeat) is your branch fast-forwarded to it, still at the approved
-base and clean. The worktree is put back on its branch either way. `system explain <runId>` shows
-the merge decision naming the regenerated files and the commands, with their autonomy decisions
-among its inputs.
+What a landing then does with a conflict: the repository's merge is aborted, as always. When every
+conflicted file is one of `paths`, the merge is made again in the run's worktree (detached at the
+approved base, the run's branch merged without a commit), each conflicted file taken from either
+side, and the commands run there. Only when they all exit 0 and change no file but the declared ones
+is the merge committed (one merge commit of the base and the run's head, by the system, with the
+landing's message), and only when the commands, run again on it, change nothing is your branch
+fast-forwarded to it, still at the approved base and clean. The worktree is put back on its branch
+either way. `system explain <runId>` shows the merge decision naming the regenerated files and the
+commands, with their autonomy decisions among its inputs.
 
 When it is refused (the card says **Accepted — not merged:**, the reason ending "…and they were not
 regenerated: <why>; the repository is as it was", or naming the files that are not declared):
@@ -3493,11 +3427,11 @@ regenerated: <why>; the repository is as it was", or naming the files that are n
 ## Replay the golden set (workflow eval)
 
 Before a change to how System works on a task is kept (a fix in the author's session, a run without
-`validate:1`, …), replay golden past board tasks under it and under the current process, and
-compare ([workflow eval](../validation/experiments/workflow-eval.md)). Everything runs beside live
-work, never in it: an eval clone of the repository, an eval board project, a budget cap. The
-helper is `node --import tsx scripts/experiments/workflow-eval.ts` (`wfe` below), run from a
-checkout of the `system` repository; it writes under the eval's directory only.
+`validate:1`, …), replay golden past board tasks under it and under the current process, and compare
+([workflow eval](../validation/experiments/workflow-eval.md)). Everything runs beside live work: an
+eval clone of the repository, an eval board project, a budget cap. The helper is `node --import tsx
+scripts/experiments/workflow-eval.ts` (`wfe` below), run from a checkout of the `system`
+repository; it writes under the eval's directory only.
 
 1. **Once: the eval clone and its Workers.** Clone the repository where nothing else works
    (`git clone /home/me/src/system ~/experiments/workflow-eval/repo`), outside `~/.dsh`. In a patch
@@ -3553,14 +3487,13 @@ The [reviewer eval](../validation/experiments/reviewer-eval.md) runs System's ow
 escapes and clean changes. The helper is `node --import tsx scripts/experiments/reviewer-eval.ts`
 (`rev` below), from a checkout of the `system` repository, with the host running.
 
-**When.** `pnpm check` runs `check:reviewer-eval` (`rev gate`). It fails when the reviewer is not
-the one the last recorded run measured. That covers the board reviewer's instructions
-(`REVIEW_PROMPT`), the subject block the engine appends, the parser that reads its assessment, the
-capabilities, tier, and conversation of its `review:1` steps, and the set. The failure names each
-part that changed, and the change is not kept until the eval has run on it and is recorded. The
-Workers and models a deployment routes the review to are configuration, not code: after changing
-the reviewer Workers' rows or their models, run it too. Every recorded run lists the Workers that
-served it, each with its tier (never its model: models are deployment configuration).
+**When.** `pnpm check` runs `check:reviewer-eval` (`rev gate`). It fails when the reviewer is not the
+one the last recorded run measured: the board reviewer's instructions (`REVIEW_PROMPT`), the subject
+block the engine appends, the parser that reads its assessment, the capabilities, tier, and
+conversation of its `review:1` steps, and the set. The failure names each part that changed, and the
+change is not kept until the eval has run on it and is recorded. The Workers and models a deployment
+routes the review to are configuration, not code: after changing the reviewer Workers' rows or their
+models, run it too. Every recorded run lists the Workers that served it, each with its tier.
 
 1. **The set is sound:** `rev check` says `ok`. The defective versions of most escapes sit on run
    branches that never landed on `dev` (`system/run/run_1cf19d48db96256a`,
@@ -3568,26 +3501,25 @@ served it, each with its tier (never its model: models are deployment configurat
    eval reads must have them: run it from your checkout, or fetch those branches into the clone.
    `rev resolve --repo <clone>` shows each case's diff and the size of its review input.
 2. **Run:** `rev run --repo <clone> --out <dir under $TMPDIR> --record`. Each run is a fresh
-   execution with its own id, printed first. Every case's run key is that execution's, so a new run
-   never returns an earlier execution's review. `--execution <id>` resumes one whose cases did not
-   all finish, and a record never names an execution twice. Each case runs on System's reviewer as
-   the board's `review:1` does: MCP `run` of `agent-review` at the board reviewer's tier (its
-   `review` and `local-data` capabilities, so the same reviewer Workers). It is refused when
-   `agent-review` cannot serve that configuration (other capabilities, or a tier it cannot take).
-   A case whose step the host served at another minimum tier is not counted: that host runs another
-   build, so restart it on this one. The reviewer is given the board reviewer's instructions,
-   the task, and the engine's subject block with the change, then `result` until it ends (at most
-   `--minutes`, default 30, a case). Its assessment is read with the engine's own parser. The report
-   gives recall (escapes found, of those run) and the false-important rate (clean changes with an
-   important finding, of those run), per case, with the cases not run and why. `--min-recall` and
-   `--max-false-important` exit 1 below a bar. `rev input <caseId> --repo <clone>` prints what the
-   reviewer is given, and `rev score <dir>` reads findings already written again.
-3. **Record:** with `--record` the run writes `docs/validation/experiments/records/reviewer-eval-gate.json`
-   (the reviewer's fingerprint, the execution, what the run measured, and the Worker, tier, and
-   model that served each case). It does so
-   only when every case ran and the run is no worse than the last recorded one: recall not lower,
-   false-important rate not higher. Commit that file with the change; `pnpm check` passes again.
-   A regression is not recorded: read the case's findings in `--out` before deciding the change.
+   execution with its own id, printed first; every case's run key is that execution's, so a new run
+   never returns an earlier review. `--execution <id>` resumes one whose cases did not all finish,
+   and a record never names an execution twice. Each case runs on System's reviewer as the board's
+   `review:1` does: MCP `run` of `agent-review` at the board reviewer's tier (its `review` and
+   `local-data` capabilities, so the same reviewer Workers). It is refused when `agent-review`
+   cannot serve that configuration. A case whose step the host served at another minimum tier is not
+   counted: that host runs another build, so restart it on this one. The reviewer is given the board
+   reviewer's instructions, the task, and the engine's subject block with the change, then `result`
+   until it ends (at most `--minutes`, default 30, a case). Its assessment is read with the engine's
+   own parser. The report gives recall (escapes found, of those run) and the false-important rate
+   (clean changes with an important finding, of those run), per case, with the cases not run and why.
+   `--min-recall` and `--max-false-important` exit 1 below a bar. `rev input <caseId> --repo <clone>`
+   prints what the reviewer is given, and `rev score <dir>` reads findings already written again.
+3. **Record:** with `--record` the run writes
+   `docs/validation/experiments/records/reviewer-eval-gate.json` (the reviewer's fingerprint, the
+   execution, what the run measured, and the Worker, tier, and model that served each case), only
+   when every case ran and the run is no worse than the last recorded one: recall not lower,
+   false-important rate not higher. Commit that file with the change; `pnpm check` passes again. A
+   regression is not recorded: read the case's findings in `--out` before deciding the change.
 4. **Grow the set** with every escape. When a defect is found after a result landed, or a run's
    defective result is fixed before it lands, add an `escape` case: the change that introduces the
    defect (its commit, or the fix reverted against the fixed tree, narrowed to the defect's paths),
@@ -3607,32 +3539,31 @@ served it, each with its tier (never its model: models are deployment configurat
 ## Auto-accept circuit breaker
 
 Auto-accept ([ADR-0067](../decisions/adr/0067-system-accepts-a-listed-branchs-result-on-its-review-and-checks.md))
-turns itself off for a project and branch when defects found after landing reach the line
-(default 2 in 7 days; `board.autoAccept.breaker: { escapes, days }`). A defect escapes when it is
-found in a result the rule accepted, which only the operator or the lead can say: record it against
-the task whose result held it with MCP `board_escape` (`taskId`, `note`: what escaped, `foundAt`
-when it was found). It is recorded as the caller's: the lead's client token, or the operator's.
-When the line is reached the board records a `board` decision of rule
-`board.auto-accept-breaker` that names every escape it counted, Home says *Auto-accept is off on
-<branch>* in the project's group, and each result that would have been accepted is held for the
-operator, its reason naming the breaker.
+turns itself off for a project and branch when defects found after landing reach the line (default 2
+in 7 days; `board.autoAccept.breaker: { escapes, days }`). A defect escapes when it is found in a
+result the rule accepted, which only the operator or the lead can say: record it against the task
+whose result held it with MCP `board_escape` (`taskId`, `note`: what escaped, `foundAt` when it was
+found), as the caller's (the lead's client token, or the operator's). When the line is reached the
+board records a `board` decision of rule `board.auto-accept-breaker` naming every escape it counted,
+Home says *Auto-accept is off on <branch>* in the project's group, and each result that would have
+been accepted is held for the operator, its reason naming the breaker.
 
 Nothing turns it on but a person: not time, not a sweep. MCP `board_breakers` lists the breakers
-tripped, the escapes each counted, and whether the line holds now. Once the line holds again
-(fewer escapes than the line within the window, counted as of now), the operator or the lead calls
-`board_breaker_reset` (`projectId`, `branch`), which records a decision naming the trip's. Until
-then it is refused, the operator's too.
+tripped, the escapes each counted, and whether the line holds now. Once the line holds again (fewer
+escapes than the line within the window, counted as of now), the operator or the lead calls
+`board_breaker_reset` (`projectId`, `branch`), which records a decision naming the trip's. Until then
+it is refused, the operator's too.
 
-`system metrics` reads the same recorded escapes: its *Escaped defects per 100 landed* is the
-escapes found in the window over the results merged in it, with the count as `figures.escapes` (a
-lower bound: only defects recorded against auto-accepted results count). Read it over the
-breaker's window, `system metrics --days 7`, to see what the breaker counts.
+`system metrics` reads the same recorded escapes: its *Escaped defects per 100 landed* is the escapes
+found in the window over the results merged in it, as `figures.escapes` (a lower bound: only defects
+recorded against auto-accepted results count). Read it over the breaker's window,
+`system metrics --days 7`.
 
 ## Link a defect
 
-When a landed change held a defect and a task fixes it, tell the board, so `system metrics` counts the
-escape ([the defect link](../design/board.md#the-defect-link)). Nothing moves and nothing is decided: it
-is a fact about the fixed task's change.
+When a landed change held a defect and a task fixes it, tell the board, so `system metrics` counts
+the escape ([the defect link](../design/board.md#the-defect-link)). Nothing moves and nothing is
+decided: it is a fact about the fixed task's change.
 
 1. **Find the pair:** the fixing task, the **done** task of the same project whose landed change held the
    defect (`fixes`), and that change's landing commit (`sha`, 7 to 64 hex characters, from the task's
@@ -3669,7 +3600,8 @@ off until you turn it on, and nothing it files starts by itself: the lead or you
 
    `hourUtc` (3), `maxTasksPerRun` (5, at most 20), `maxFiles`, `maxBytes`, `maxFileBytes`,
    `timeoutMinutes`, `actionClass`, `taskTemplate`, and `template` have defaults
-   ([configuration](../reference/configuration.md#workflow)). `system check` names a value out of range.
+   ([configuration](../reference/configuration.md#workflow)). `system check` names a value out of
+   range.
 2. Restart the daemon. The review needs the `scheduled-review` template (the software-development
    profile provides it), the repository's review guides committed at `ref` as
    `docs/review/<area>.REVIEW.md`, one file per area (the only place the review reads them; with none

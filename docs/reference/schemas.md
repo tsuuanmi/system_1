@@ -12,7 +12,8 @@
 | remove, rename, or tighten a field; change meaning | major (`v1 → v2`, new file) | a tested store migration; both majors are readable during migration |
 
 A reader rejects a record whose major version it does not support. It never
-guesses.
+guesses. A record that carries a field added at a later minor than its own `@1.x` is refused, except
+where a section says another version is valid.
 
 ## Validation points
 
@@ -42,382 +43,345 @@ guesses.
   stricter classification than the stored one. A producer can never downgrade.
 
 ### `decision`
+- Exactly one candidate is `selected`, and it equals `outcome.option`. The schema checks that one is
+  selected; the store checks it equals the outcome.
+- Every candidate carries at least one non-blank reason: why a rejected one lost, why the selected one
+  won ([INV-13](../architecture/invariants.md#inv-13-every-decision-is-an-artifact)). The schema allows
+  an empty `reasons` so older decisions stay readable; the store refuses a new decision with a
+  candidate that gives none.
+- `decider.version` changes whenever the policy's behavior changes. `hash` is the hash of the
+  effective policy configuration.
+- When `decider.type` is `model`, `deterministic` must be `false`; reproducibility comes from reuse by
+  input hash.
+- The store clamps `question` (500), each reason (300), and `rationale` (1000) to their bounds on whole
+  characters, ending in `…`, so a long reason never fails its decision.
+- Members are named by opaque identity (session ids), never by provider.
+- A tally's `vote` holds one round. The team's final `vote` holds every round, its `method`, the
+  `dissent`, any `revisions` and `tiebreak`, and a review's `findings`. `threshold` is a strict
+  majority of every member, never of the ballots cast.
+- The decider is `rule` for a tally, a majority, a confirmed blocking finding
+  (`workflow.blocking-finding`), or a tie that timed out (`workflow.tie-timeout`), and `client` or
+  `operator` for a deciding `vote`, by the caller's token scope. Example:
+  [`decision.team-vote.json`](../../schemas/examples/decision.team-vote.json).
 
-- Exactly one candidate is `selected`, and it equals `outcome.option`. The schema
-  checks that only one candidate is selected. The store checks that it equals
-  the outcome.
-- Every candidate carries at least one non-blank reason: a rejected one says why
-  it lost, the selected one why it won
-  ([INV-13](../architecture/invariants.md#inv-13-every-decision-is-an-artifact)).
-  The schema allows an empty `reasons`, so decisions stored before the rule stay
-  readable; the store refuses a new decision with a candidate that gives none.
-- `decider.version` changes whenever the policy's behavior changes. `hash` is the
-  hash of the effective policy configuration.
-- When `decider.type` is `model`, `deterministic` must be `false`, and
-  reproducibility comes from reuse by input hash.
-- Prose can quote model or caller text of any length. The store clamps
-  `question` (500), each reason (300), and `rationale` (1000) to their bounds on
-  whole characters, ending in `…`, so a long reason never fails its decision.
-- `decision@1.1` adds the decision type `vote`, the decider type `client`, and
-  the `vote` object ([teams](../design/teams.md#the-record)). A record with any
-  of them must be `@1.1` and carry `vote`; every other decision stays `@1.0`,
-  so earlier decisions keep their ids.
-- `decision@1.2` adds a review's quote checks ([teams](../design/teams.md#review)):
-  - the method and the round end `blocking-finding` (decider rule
-    `workflow.blocking-finding`);
-  - per finding: its reporters `members`, `kind` (`defect`, `suggestion`),
-    `quote {path, line, text, matched}` (`matched`: the line the quote was found
-    on), `class` (`confirmed`, `needs-verification`, `suggestion`), `why` it
-    is not confirmed, and each member's own `reports` (claim, severity, class; one
-    per member), of which the finding's own fields are the lead one's;
-  - on the vote: the `repository {url, ref?, commit}` read, the number of files
-    `unread`, and, for `blocking-finding`, the deciding findings `blocking`.
+**Versions.** A record that carries a feature below must be at that minor version; every other
+decision keeps its version, so earlier decisions keep their ids.
 
-  A record with any of them must be `@1.2`. A review's votes, its tallies and
-  its final decision, are always `@1.2`; a brainstorm's stay `@1.1`. Example:
+- `@1.1`: the decision type `vote`, the decider type `client`, and the `vote` object
+  ([teams](../design/teams.md#the-record)); a record with any of them carries `vote`.
+- `@1.2`: a review's quote checks ([teams](../design/teams.md#review)). A review's votes, tallies and
+  final decision are always `@1.2`; a brainstorm's stay `@1.1`. The method and the round end
+  `blocking-finding` (decider rule `workflow.blocking-finding`). Per finding: its reporters `members`,
+  `kind` (`defect`, `suggestion`), `quote {path, line, text, matched}` (`matched`: the line the quote
+  was found on), `class` (`confirmed`, `needs-verification`, `suggestion`), `why` it is not confirmed,
+  and each member's own `reports` (claim, severity, class; one per member), of which the finding's own
+  fields are the lead one's. On the vote: the `repository {url, ref?, commit}` read, the number of
+  files `unread`, and, for `blocking-finding`, the deciding findings `blocking`. Example:
   [`decision.review-blocking.json`](../../schemas/examples/decision.review-blocking.json).
-- `decision@1.3` adds the decision type `retention`: a released session's
-  website conversations are deleted on their sites (decider rule
-  `turns.conversation-retention`; `outcome.detail` names the released
-  `sessions` and the `conversations` it made due,
-  [conversation ledger](../design/provider-turns.md#conversation-ledger)). A
-  `retention` decision must be `@1.3`. Example:
+- `@1.3`: the type `retention`: a released session's website conversations are deleted on their sites
+  (decider rule `turns.conversation-retention`; `outcome.detail` names the released `sessions` and the
+  `conversations` it made due,
+  [conversation ledger](../design/provider-turns.md#conversation-ledger)). Example:
   [`decision.retention.json`](../../schemas/examples/decision.retention.json).
-- `decision@1.4` adds four decision types for the Base core. A decision of one of them
-  must be `@1.4`; every other decision keeps its version, so earlier decisions keep their
-  ids.
-  - `autonomy`: the mode the autonomy policy gives one action. Candidates are `auto`, `notify`,
-    `ask`, and `forbid`; the decider is the policy (`policy`, its id and version), and
-    `decider.hash` is the sha256 of the canonical JSON of the effective policy set as loaded (the
-    studio policy, then the project's), so an edit that keeps a version still shows; the outcome
-    is the mode, and `detail` names the action class it was judged as, the effective policies,
-    any `failedChecks`, and why it is `forbidden` whatever a rule says (an argv word with a shell
-    metacharacter). The mode is the mode once the required checks pass: a non-empty
-    `failedChecks` means the result is not yet accepted, and work in progress goes on with them
-    pending ([approvals](../design/approvals.md#a-verdict-is-not-yet-a-permission)).
+- `@1.4`: four types for the Base core.
+  - `autonomy`: the mode the autonomy policy gives one action. Candidates `auto`, `notify`, `ask`,
+    `forbid`; the decider is the policy (`policy`, its id and version), and `decider.hash` is the
+    sha256 of the canonical JSON of the effective policy set as loaded (the studio policy, then the
+    project's), so an edit that keeps a version still shows. The outcome is the mode; `detail` names
+    the action class it was judged as, the effective policies, any `failedChecks`, and why it is
+    `forbidden` whatever a rule says (an argv word with a shell metacharacter). The mode holds once
+    the required checks pass: a non-empty `failedChecks` means the result is not yet accepted, and
+    work in progress goes on with them pending
+    ([approvals](../design/approvals.md#a-verdict-is-not-yet-a-permission)).
   - `approval`: how an approval request was resolved. Options `approved`, `rejected`,
-    `denied:expired` (decider rule `approvals.expiry`), and `withdrawn`. Example:
+    `denied:expired` (decider rule `approvals.expiry`), `withdrawn`. Example:
     [`decision.approval-expired.json`](../../schemas/examples/decision.approval-expired.json).
-  - `board`: a move the board makes on its own (dependencies met, a lease lost, a wait expired,
-    a retry). The outcome is the target state; `detail` names the task or project and the state
-    it left.
-  - `budget`: a reservation before a run. Options `reserved` and `refused`; `detail` names each
-    pool, the amount, and what remained.
-- `decision@1.5` adds the decision type `lifecycle`: the state the plugin host records for one
-  plugin ([plugin host](../design/plugin-host.md#lifecycle-states)). A `lifecycle` decision must be
-  `@1.5`; every other decision keeps its version. Its candidates are the five states, `candidate`,
-  `shadow`, `canary`, `default`, `retired`, each with why; the decider is the rule
-  `plugin-host.composition`, its `hash` the sha256 of the composition as read (each row's id,
-  package, and whether it is mounted, in order). Its input is the plugin's previous lifecycle
-  decision, if any; `detail` names the `plugin`, its `version`, its `rows`, the state it comes
-  `from` (`null` the first time), `renamedFrom` when it took a former name's record, and the
-  `manifestDigest` (the sha256 of the manifest's canonical JSON; not an artifact). Example:
+  - `board`: a move the board makes on its own (dependencies met, a lease lost, a wait expired, a
+    retry). The outcome is the target state; `detail` names the task or project and the state it left.
+  - `budget`: a reservation before a run. Options `reserved`, `refused`; `detail` names each pool, the
+    amount, and what remained.
+- `@1.5`: the type `lifecycle`: the state the plugin host records for one plugin
+  ([plugin host](../design/plugin-host.md#lifecycle-states)). Candidates are the five states
+  `candidate`, `shadow`, `canary`, `default`, `retired`, each with why; the decider is the rule
+  `plugin-host.composition`, its `hash` the sha256 of the composition as read (each row's id, package,
+  and whether it is mounted, in order). Its input is the plugin's previous lifecycle decision, if any;
+  `detail` names the `plugin`, its `version`, its `rows`, the state it comes `from` (`null` the first
+  time), `renamedFrom` when it took a former name's record, and the `manifestDigest` (the sha256 of the
+  manifest's canonical JSON; not an artifact). Example:
   [`decision.lifecycle.json`](../../schemas/examples/decision.lifecycle.json).
-- The plugin host's manifest check (contract 1.1) records a `gate` decision, so it stays
-  `@1.0`: decider rule `plugin-host.manifest-check` version 1, its `hash` the sha256 of what the
-  check read (the rows, each manifest's digest or why there is none, and the packages allowed
-  without one); candidates `pass` and `fail`, `fail` giving each finding's reason (at most 32,
-  the last counting the rest); its input the plugin's previous check decision; `detail` names the
-  `plugin`, its `rows`, its `findings` (each `kind` `no-manifest`, with `manifest` `absent` or
-  `refused`, or `unsatisfied`, with the `seam`, `range`, `provider` when a manifest declares it,
-  and `version`; each with its `reason`), the outcome it comes `from` (`null` the first time), and
-  for a valid manifest its `version` and `manifestDigest` ([plugin host](../design/plugin-host.md#the-manifest-check)).
-  Example: [`decision.manifest-check.json`](../../schemas/examples/decision.manifest-check.json).
-- `decision@1.6` adds the decision type `policy-change`: which autonomy policy set is in force
-  ([approvals](../design/approvals.md#a-policy-change)). A `policy-change` decision must be `@1.6`;
-  every other decision keeps its version. Its two candidates are the old and the new set's
-  hashes, the new one selected; the decider is the rule `approvals.policy-change` (an approved
-  change, its inputs the request's `autonomy` decision, the operator's `approval` artifact, and its
+- The plugin host's manifest check (contract 1.1) records a `gate` decision at `@1.0`: decider rule
+  `plugin-host.manifest-check` version 1, its `hash` the sha256 of what the check read (the rows, each
+  manifest's digest or why there is none, and the packages allowed without one); candidates `pass` and
+  `fail`, `fail` giving each finding's reason (at most 32, the last counting the rest); its input the
+  plugin's previous check decision. `detail` names the `plugin`, its `rows`, its `findings` (each
+  `kind` `no-manifest`, with `manifest` `absent` or `refused`, or `unsatisfied`, with the `seam`,
+  `range`, `provider` when a manifest declares it, and `version`; each with its `reason`), the outcome
+  it comes `from` (`null` the first time), and for a valid manifest its `version` and `manifestDigest`
+  ([plugin host](../design/plugin-host.md#the-manifest-check)). Example:
+  [`decision.manifest-check.json`](../../schemas/examples/decision.manifest-check.json).
+- `@1.6`: the type `policy-change`: which autonomy policy set is in force
+  ([approvals](../design/approvals.md#a-policy-change)). Its two candidates are the old and the new
+  set's hashes, the new one selected. The decider is the rule `approvals.policy-change` (an approved
+  change; inputs the request's `autonomy` decision, the operator's `approval` artifact, and its
   `approval` decision) or `approvals.configuration` (a configuration that names the stored set in
-  `supersedes` replaced it at a start), its `hash` the new set's. `detail` names the `cause`
-  (`approved` or `configuration`), the `changeId`, the `requestId` when approved, `from` and `to`,
-  the `configHash`, and the proposed `policy` by id and version. Example:
-  [`decision.policy-change.json`](../../schemas/examples/decision.policy-change.json). A third
-  decider rule, `approvals.repeated-approvals`, records the queue's own proposal
-  ([approvals](../design/approvals.md#the-queue-proposes-a-policy-change)): the question is which
-  set the queue proposes, the proposed set's hash selected and the set in force kept until the
-  operator approves; its inputs the `autonomy` decision that said ask and the operator's approvals
-  it counted (the newest 100); `detail` names the `cause` (`repeated-approvals`), the `changeId`,
-  the `requestId`, `from` and `to`, the `configHash`, the `policy`, the `shape`
+  `supersedes` replaced it at a start); its `hash` is the new set's. `detail` names the `cause`
+  (`approved` or `configuration`), the `changeId`, the `requestId` when approved, `from` and `to`, the
+  `configHash`, and the proposed `policy` by id and version. Example:
+  [`decision.policy-change.json`](../../schemas/examples/decision.policy-change.json).
+
+  A third decider rule, `approvals.repeated-approvals`, records the queue's own proposal
+  ([approvals](../design/approvals.md#the-queue-proposes-a-policy-change)): the question is which set
+  the queue proposes, the proposed set's hash selected and the set in force kept until the operator
+  approves. Its inputs are the `autonomy` decision that said ask and the operator's approvals it
+  counted (the newest 100). `detail` names the `cause` (`repeated-approvals`), the `changeId`, the
+  `requestId`, `from` and `to`, the `configHash`, the `policy`, the `shape`
   (`{actionClass: command, command}`), the approvals counted (`approved`), the `threshold`, the
   `windowSeconds`, and the counted `requests`. Example:
   [`decision.policy-change-proposed.json`](../../schemas/examples/decision.policy-change-proposed.json).
-- `decision@1.7` adds the feedback loop's two decision types
-  ([ADR-0045](../decisions/adr/0045-feedback-loop-guarantee-seams.md)). A decision of either must be
-  `@1.7`; every other decision keeps its version.
+- `@1.7`: the feedback loop's two types
+  ([ADR-0045](../decisions/adr/0045-feedback-loop-guarantee-seams.md)).
   - `registration`: whether the experiment registry pre-registered or refused one revision of an
-    experiment ([experiments](../design/experiments.md#a-registration)). Candidates `preregistered`
-    and `refused`; the decider is the rule `experiments.registry`, its `hash` the sha256 of the
-    vocabulary the fingerprint was normalized from (`vocabularyHash`). Its inputs are the
-    experiment and hypothesis it recorded, every experiment it matched, and the revision it
-    supersedes; `detail` names the `experimentId`, `revision`, `answer`, `identity`, `fingerprint`,
-    the experiments it `cites`, the predicates it names as `changed`, every match with its
-    `relation` and the predicates that `changed` against it, and `supersedes` (the revision). Example:
+    experiment ([experiments](../design/experiments.md#a-registration)). Candidates `preregistered`,
+    `refused`; the decider is the rule `experiments.registry`, its `hash` the sha256 of the vocabulary
+    the fingerprint was normalized from (`vocabularyHash`). Inputs: the experiment and hypothesis it
+    recorded, every experiment it matched, and the revision it supersedes. `detail` names the
+    `experimentId`, `revision`, `answer`, `identity`, `fingerprint`, the experiments it `cites`, the
+    predicates it names as `changed`, every match with its `relation` and the predicates that
+    `changed` against it, and `supersedes` (the revision). Example:
     [`decision.registration.json`](../../schemas/examples/decision.registration.json).
   - `verdict`: the classification of one evaluation against the thresholds its contract and
     experiment pre-registered ([the verdict rule](../design/evaluations.md#the-verdict-rule)).
-    Candidates `supported`, `refuted`, `inconclusive`, and `invalid`, each with why; the decider is
-    the rule `evaluations.verdict`, its `hash` the sha256 of the experiment's normalized protocol
-    (`protocolHash`). Its inputs are the evaluation, the experiment, and the contract; `detail`
-    names the `experimentId`, `revision`, `evaluationId`, `identity`, `comparison`,
-    `horizonReached`, why it `ended`, each judged metric (its role, the oriented interval, the
-    threshold, and whether it `clears`, is `excluded`, or is `undecided`), each hard constraint and
-    whether it held, the `failedChecks`, and, when the caller gives one, the `netBenefit` bounds.
-    Example: [`decision.verdict.json`](../../schemas/examples/decision.verdict.json).
-- `decision@1.8` adds what agent accounts decide ([PROP-0012](../proposals/0012-agent-accounts.md)).
-  A decision of either kind must be `@1.8`; every other decision keeps its version.
-  - The decision type `enrollment`: what account a slot of an agent runtime holds
+    Candidates `supported`, `refuted`, `inconclusive`, `invalid`, each with why; the decider is the
+    rule `evaluations.verdict`, its `hash` the sha256 of the experiment's normalized protocol
+    (`protocolHash`). Inputs: the evaluation, the experiment, and the contract. `detail` names the
+    `experimentId`, `revision`, `evaluationId`, `identity`, `comparison`, `horizonReached`, why it
+    `ended`, each judged metric (its role, the oriented interval, the threshold, and whether it
+    `clears`, is `excluded`, or is `undecided`), each hard constraint and whether it held, the
+    `failedChecks`, and, when the caller gives one, the `netBenefit` bounds. Example:
+    [`decision.verdict.json`](../../schemas/examples/decision.verdict.json).
+- `@1.8`: what agent accounts decide ([PROP-0012](../proposals/0012-agent-accounts.md)).
+  - The type `enrollment`: what account a slot of an agent runtime holds
     ([ADR-0051](../decisions/adr/0051-agent-accounts-are-enrolled-slots-identified-by-their-login.md)).
-    A slot's first decision has the one candidate `enrolled` (the slot is taken); each later one
-    has `ready`, `signed-out`, `quarantined`, and `removed` (the slot freed), the selected one with
-    why. The decider is the rule `agent-accounts.enrollment`. Its inputs are the slot's previous
-    `enrollment` decision, if any, never the principal; `detail` names the `provider`, the `slot`,
-    its `home`, the record's `revision`, the `accountId` once a principal was read whole (and the
-    `previousAccountId` when an accepted change replaced it), the quarantine `reason` (`changed`,
-    `ambiguous`, `duplicate`, `unverified`), and the `reader` and `runtimeVersion` that read it;
-    `rationale` says why. Recorded from PROP-0012 phase E by the `agents` source
+    A slot's first decision has the one candidate `enrolled` (the slot is taken); each later one has
+    `ready`, `signed-out`, `quarantined`, and `removed` (the slot freed), the selected one with why.
+    The decider is the rule `agent-accounts.enrollment`. Its input is the slot's previous `enrollment`
+    decision, if any, never the principal. `detail` names the `provider`, the `slot`, its `home`, the
+    record's `revision`, the `accountId` once a principal was read whole (and the `previousAccountId`
+    when an accepted change replaced it), the quarantine `reason` (`changed`, `ambiguous`,
+    `duplicate`, `unverified`), and the `reader` and `runtimeVersion` that read it; `rationale` says
+    why. Recorded by the `agents` source
     ([enrollment](../design/agent-runtimes.md#enrollment-and-quarantine)). Example:
     [`decision.enrollment.json`](../../schemas/examples/decision.enrollment.json).
-    From phase F the same type records the move from hand-named agent Workers
+    The same type records the move from hand-named agent Workers
     ([migration](../design/agent-runtimes.md#migration-from-hand-named-rows)), decider the rule
     `agent-workers.migration`: per hand-named Worker, candidates `migrated` and `stopped` (`detail`:
-    `from`, `runtime`, `role`, and when migrated `to` and `accountId`; its input the account's latest
+    `from`, `runtime`, `role`, and when migrated `to` and `accountId`; input: the account's latest
     enrollment decision); then the cutover, candidates `applied` and `kept` (`detail`: each Worker's
-    `from` and `to`, the `roles`, the `assignments`, and how many `sessions` and `runs` moved; its
-    inputs the Workers' decisions); and a rollback, candidates `rolled-back` and `applied`
-    (`detail`: the `cutover` decision, and what moved back; its input the cutover's).
+    `from` and `to`, the `roles`, the `assignments`, and how many `sessions` and `runs` moved; inputs:
+    the Workers' decisions); and a rollback, candidates `rolled-back` and `applied` (`detail`: the
+    `cutover` decision, and what moved back; input: the cutover's).
   - The `recovery` outcome `wait`: a node refused only because assigned accounts that could take it
     are at their limit waits for the earliest of their resets, spending no attempt
-    ([ADR-0052](../decisions/adr/0052-accounts-are-assigned-unless-pooling-is-recorded.md)). Its
-    candidates are `retry`, `failover`, `wait`, and `fail`; `detail` names the `kind`
-    (`quota_exhausted`), the `attempt` (unchanged), `until` (the node's `not_before`), `since` (when
-    the node first waited, kept across waits), and `maxLimitWaitHours`. A recovery decision with any
-    other outcome keeps its version. Example:
-    [`decision.recovery-wait.json`](../../schemas/examples/decision.recovery-wait.json).
-- `decision@1.9` adds the `recovery` outcome `resend`: a read-only team member's first step
-  (`propose`) that a site answered with its own error after the prompt was sent runs once more, in
-  a new conversation of its session ([ADR-0062](../decisions/adr/0062-a-team-members-first-step-is-resent-once-after-a-sites-own-error.md)). Such a decision must be `@1.9`; every other decision keeps its version.
-  Its candidates are `resend`, `retry`, `failover`, and `fail`; the decider is the rule
-  `workflow.recovery` version 2. `detail` names the `kind` and `disposition`, the failed `attempt`,
-  the `sessionId` whose conversation was reset, the failed execution (`failed.execution`, the
-  failed turn), and the new attempt (`next.attempt`, the `key` its execution starts under, the new
-  turn, and `conversation: new`). A site's own error that is not resent fails as before, at its own
-  version, with a candidate `resend` saying why not. Example:
+    ([ADR-0052](../decisions/adr/0052-accounts-are-assigned-unless-pooling-is-recorded.md)).
+    Candidates `retry`, `failover`, `wait`, `fail`; `detail` names the `kind` (`quota_exhausted`), the
+    `attempt` (unchanged), `until` (the node's `not_before`), `since` (when the node first waited,
+    kept across waits), and `maxLimitWaitHours`. A recovery decision with any other outcome keeps its
+    version. Example: [`decision.recovery-wait.json`](../../schemas/examples/decision.recovery-wait.json).
+- `@1.9`: the `recovery` outcome `resend`: a read-only team member's first step (`propose`) that a site
+  answered with its own error after the prompt was sent runs once more, in a new conversation of its
+  session ([ADR-0062](../decisions/adr/0062-a-team-members-first-step-is-resent-once-after-a-sites-own-error.md)).
+  Candidates `resend`, `retry`, `failover`, `fail`; the decider is the rule `workflow.recovery`
+  version 2. `detail` names the `kind` and `disposition`, the failed `attempt`, the `sessionId` whose
+  conversation was reset, the failed execution (`failed.execution`, the failed turn), and the new
+  attempt (`next.attempt`, the `key` its execution starts under, the new turn, and
+  `conversation: new`). A site's own error that is not resent fails as before, at its own version,
+  with a candidate `resend` saying why not. Example:
   [`decision.recovery-resend.json`](../../schemas/examples/decision.recovery-resend.json).
-- `decision@1.10` lets the `client` decider decide more than a vote: a project's lead, on its own token,
-  gives an approval or an acceptance as the decider `{ type: client, id: lead:<project> }`
+- `@1.10`: the `client` decider may decide more than a vote: a project's lead, on its own token, gives
+  an approval or an acceptance as the decider `{ type: client, id: lead:<project> }`
   ([ADR-0076](../decisions/adr/0076-the-lead-is-a-principal-of-its-own-with-a-closed-list-of-rights.md)).
-  Before it a `client` decider carried its vote (a tie's deciding vote still does, at every version from
-  `@1.1`); from it a `client` decider with no vote is valid, and only at `@1.10`. An `approval`
-  decision (and an `autonomy`, `board`, or `budget` one) may be `@1.4` or `@1.10`: the queue records a
-  lead's verdict as `@1.10` and every other as `@1.4`, so earlier decisions keep their ids. The operator's
-  decider on a verdict or an acceptance is version `2` from the lead principal on; a record at version `1`
-  is from before it and is not migrated. Example:
+  A `client` decider with no vote is valid only at `@1.10`; a `client` decider that carries a vote
+  (a tie's deciding vote still does) is valid from `@1.1`. An `approval` decision (and an `autonomy`,
+  `board`, or `budget` one) may be `@1.4` or `@1.10`: the queue records a lead's verdict as `@1.10` and
+  every other as `@1.4`. The operator's decider on a verdict or an acceptance is version `2` from the
+  lead principal on; a record at version `1` is older and is not migrated. Example:
   [`decision.approval-lead.json`](../../schemas/examples/decision.approval-lead.json).
-- The dispatch pass's decisions ([ADR-0064](../decisions/adr/0064-system-starts-ready-work-under-the-dispatch-action-class.md))
-  are existing types at their own versions, their rule ids new values: an `admission` (decider rule
-  `dispatch.select` version 1) whose candidates are the ready tasks a pass looked at, the one it
-  takes selected and every other with why, `detail` naming the `taskId`, `projectId`, `attempt` (the
-  attempts made), and the `order` (`age`); a `route` (rule `dispatch.choice` version 1, its `hash`
-  the sha256 of the quota settings it read) whose candidates are every Worker with its quota keys,
-  why it is not free, or routing's refusal, and the sources that did not answer, at most 255 (the
-  last counting the rest), its inputs the select decision, the stored requirement, and the policy's
-  `autonomy` decision, `detail` naming the `taskId`, `attempt`, `nodeId`, `score`
-  (`quota-score@2`), the `settings`, the request's `version`, the chosen Worker's `account`,
-  `repository`, and `windows`; a `gate` (rule `dispatch.approval`) whose outcome `board-approval`
-  names the board's approved request for the attempt; and a `gate` (decider `operator`,
-  `dispatch.pause`) whose outcome `pause` or `run` is the operator's pause or resume.
-- A tally's `vote` holds one round; the team's final `vote` holds every round,
-  its `method`, the `dissent`, any `revisions` and `tiebreak`, and a review's
-  `findings`. `threshold` is a strict majority of every member, never of the
-  ballots cast.
-- Members are named by opaque identity (their session ids), never by provider.
-- The decider is `rule` for a tally, a majority, a confirmed blocking finding
-  (`workflow.blocking-finding`), or a tie that timed out
-  (`workflow.tie-timeout`), and `client` or `operator` for a deciding `vote`,
-  by the caller's token scope. Example:
-  [`decision.team-vote.json`](../../schemas/examples/decision.team-vote.json).
+- The dispatch pass's decisions
+  ([ADR-0064](../decisions/adr/0064-system-starts-ready-work-under-the-dispatch-action-class.md))
+  are existing types at their own versions, with new rule ids:
+  - `admission` (decider rule `dispatch.select` version 1): candidates are the ready tasks a pass
+    looked at, the one it takes selected and every other with why; `detail` names the `taskId`,
+    `projectId`, `attempt` (the attempts made), and the `order` (`age`).
+  - `route` (rule `dispatch.choice` version 1, its `hash` the sha256 of the quota settings it read):
+    candidates are every Worker with its quota keys, why it is not free, or routing's refusal, and
+    the sources that did not answer, at most 255 (the last counting the rest). Inputs: the select
+    decision, the stored requirement, and the policy's `autonomy` decision. `detail` names the
+    `taskId`, `attempt`, `nodeId`, `score` (`quota-score@2`), the `settings`, the request's `version`,
+    and the chosen Worker's `account`, `repository`, and `windows`.
+  - `gate` (rule `dispatch.approval`): outcome `board-approval` names the board's approved request for
+    the attempt.
+  - `gate` (decider `operator`, `dispatch.pause`): outcome `pause` or `run` is the operator's pause or
+    resume.
 
 ### `work-requirement`
 
-- `tier.source` records who set the tier. When it is `decision`, `tier.decision`
-  references the `tier` decision artifact.
-- `egressPolicy` must come from a trusted envelope (INV-6). A requirement built
-  from model text alone is invalid.
-- `work-requirement@1.1` adds the optional `scope`: the kind of work this is, for capability
-  offers scoped to it ([scoped offers](../design/routing.md#scoped-offers),
-  [ADR-0049](../decisions/adr/0049-read-only-agent-workers-as-review-members.md)). The only value
-  is `review-member`, a step of a review team's member, set by the workflow engine from the
-  admitted spec. A record carrying it below `@1.1` is refused. Example:
-  [`work-requirement.review-member.json`](../../schemas/examples/work-requirement.review-member.json).
-- `work-requirement@1.2` adds the optional `kind`: the kind of work this is, a `workKind` label
-  (`^[a-z][a-z0-9-]{0,31}$`, such as `code` or `docs`), for Workers given `kinds`
-  ([work kinds](../design/routing.md#work-kinds),
+- `tier.source` records who set the tier. When it is `decision`, `tier.decision` references the `tier`
+  decision artifact.
+- `egressPolicy` must come from a trusted envelope (INV-6). A requirement built from model text alone
+  is invalid.
+- `scope` (`@1.1`): the kind of work this is, for capability offers scoped to it
+  ([scoped offers](../design/routing.md#scoped-offers),
+  [ADR-0049](../decisions/adr/0049-read-only-agent-workers-as-review-members.md)). The only value is
+  `review-member`, a step of a review team's member, set by the workflow engine from the admitted spec.
+  Example: [`work-requirement.review-member.json`](../../schemas/examples/work-requirement.review-member.json).
+- `kind` (`@1.2`): a `workKind` label (`^[a-z][a-z0-9-]{0,31}$`, such as `code` or `docs`), for Workers
+  given `kinds` ([work kinds](../design/routing.md#work-kinds),
   [ADR-0057](../decisions/adr/0057-route-work-by-kind.md)). The workflow engine sets it from the
-  admitted spec (the step's `kind`, or its variant's), never from model text (INV-6). A record
-  carrying it below `@1.2` is refused. Example:
+  admitted spec (the step's `kind`, or its variant's), never from model text (INV-6). Example:
   [`work-requirement.kind.json`](../../schemas/examples/work-requirement.kind.json).
-- `work-requirement@1.3` adds the optional `prefers`: 1 to 8 distinct capabilities the work would
-  like and does not need, none of them among its `capabilities`
+- `prefers` (`@1.3`): 1 to 8 distinct capabilities the work would like and does not need, none of them
+  among its `capabilities`
   ([research's second review](../design/routing.md#researchs-second-review),
   [ADR-0074](../decisions/adr/0074-a-research-roles-web-calls-run-under-a-bounded-egress-checked-grant.md)).
-  Routing ranks a Worker that proves all of them first and never refuses one that does not. A
-  record carrying it below `@1.3` is refused.
+  Routing ranks a Worker that proves all of them first and never refuses one that does not.
 
 ### `workflow-node`
 
-- `nodeId` is deterministic. Unrolled loops append an ordinal, for example
-  `review:cycle:2` ([ADR-0012](../decisions/adr/0012-dag-execution-model.md)).
+- `nodeId` is deterministic. Unrolled loops append an ordinal, for example `review:cycle:2`
+  ([ADR-0012](../decisions/adr/0012-dag-execution-model.md)).
 - Every state transition a decision causes updates `lastDecision` to that decision artifact
-  ([INV-13](../architecture/invariants.md#inv-13-every-decision-is-an-artifact)): a refused plan
-  names its `graph-growth` refusal, and a gate that blocks names its `gate` decision (what it
-  waits for, until when). The promotion `WAITING → READY` decides nothing (it follows from its
-  dependencies' completion decisions) and records none.
-- `workflow-node@1.1` adds the state `RETIRED`: a node a re-plan took out of the
-  graph. It stays as history, never runs again, and its `lastDecision` is the
-  `graph-growth` decision that retired it.
-- `workflow-node@1.2` adds `execution.brief`: the brief the execution was started with,
-  recorded before it started ([briefs](../design/workflow-engine.md#briefs)). A node is written
-  as 1.2 once an execution names its brief, retired or not; otherwise as 1.1 when retired, and
-  1.0 before.
+  ([INV-13](../architecture/invariants.md#inv-13-every-decision-is-an-artifact)): a refused plan names
+  its `graph-growth` refusal, and a gate that blocks names its `gate` decision (what it waits for,
+  until when). The promotion `WAITING → READY` decides nothing (it follows from its dependencies'
+  completion decisions) and records none.
+- State `RETIRED` (`@1.1`): a node a re-plan took out of the graph. It stays as history, never runs
+  again, and its `lastDecision` is the `graph-growth` decision that retired it.
+- `execution.brief` (`@1.2`): the brief the execution was started with, recorded before it started
+  ([briefs](../design/workflow-engine.md#briefs)). A node is written as 1.2 once an execution names its
+  brief, retired or not; otherwise as 1.1 when retired, and 1.0 before.
 
 ### `conversation`
 
 - One row of the [conversation ledger](../design/provider-turns.md#conversation-ledger), as
   `system conversations` and MCP `conversation_list` show it.
-- `state`: `live` while its session holds it; `due` once released; `deleted` when the site
-  shows it gone (`reason` says so when it was already gone); `kept` with why (a temporary chat,
-  a feature not yet proven deletable, no deletion on the site, a removed account); `failed`
-  after three attempts, with the last error in `reason`.
+- `state`: `live` while its session holds it; `due` once released; `deleted` when the site shows it
+  gone (`reason` says so when it was already gone); `kept` with why (a temporary chat, a feature not
+  yet proven deletable, no deletion on the site, a removed account); `failed` after three attempts,
+  with the last error in `reason`.
 - `decision` is the `retention` decision that released it. Example:
   [`conversation.deleted.json`](../../schemas/examples/conversation.deleted.json).
 
 ### `provider-turn-receipt`
 
-- It is persisted *before* submission. `previousResponseHash = null` only for a
-  new conversation.
+- It is persisted *before* submission. `previousResponseHash = null` only for a new conversation.
 - `resubmits ≤ 2` is a hard bound. Each reconciliation appends a decision ref.
 
 ### `worker-session`
 
-- `sessionId` never changes for the session's lifetime. `binding.generation`
-  advances on every activation (and on a compaction's rebind), and `binding.nativeHandle` may
-  change with it. The activation's settle presents its generation; a stale one is refused
-  and changes nothing.
-- `mailboxSeq` is the last delivered inbound sequence number. Redelivery after a
-  crash resumes at `mailboxSeq + 1`.
+- `sessionId` never changes for the session's lifetime. `binding.generation` advances on every
+  activation (and on a compaction's rebind), and `binding.nativeHandle` may change with it. The
+  activation's settle presents its generation; a stale one is refused and changes nothing.
+- `mailboxSeq` is the last delivered inbound sequence number. Redelivery after a crash resumes at
+  `mailboxSeq + 1`.
 - `binding.runtime` is metadata, never a routing input: the kind of the runtime that serves the
-  session (`website` for a website Worker, else the agent runtime's kind; a kind the vocabulary
-  does not name is recorded as `local-tool`).
-- `worker-session@1.1` adds the runtime `antigravity-cli`, which `@1.0` recorded as `local-tool`.
-  A writer writes `@1.1` only for that runtime, and `@1.0` otherwise; a `@1.0` record naming it is
-  refused. Example:
+  session (`website` for a website Worker, else the agent runtime's kind; a kind the vocabulary does
+  not name is recorded as `local-tool`). The runtime `antigravity-cli` (`@1.1`) was `local-tool` at
+  `@1.0`: a writer writes `@1.1` only for that runtime, and `@1.0` otherwise; a `@1.0` record naming
+  it is refused. Example:
   [`worker-session.antigravity-member.json`](../../schemas/examples/worker-session.antigravity-member.json).
-- `policy.writes` names the subject the session writes under a board task's authority. Write
-  authority itself is the board's: at most one open task writes a subject
-  ([board](../design/board.md), INV-15); a session never claims it on its own.
+- `policy.writes` names the subject the session writes under a board task's authority. Write authority
+  itself is the board's: at most one open task writes a subject ([board](../design/board.md), INV-15);
+  a session never claims it on its own.
 
 ### `message`
 
 - `messageId` is unique per sender. Receivers deduplicate on `(from, messageId)`.
-- `body` is untrusted data for the receiver, never authority (INV-6).
-  Approvals travel only as `approval` artifacts.
-- The message artifact is at least as strict as its `refs` (they are its inputs), and the
-  receiver's turn carries the strictest classification of the messages it delivers, so the
-  turn's egress check refuses local-private refs to a remote Worker (INV-12).
-- It maps to A2A `Message`: `messageId`, `referenceTaskIds` ≈ `refs`/`inReplyTo`,
-  and `parts` ≈ `body` plus refs.
+- `body` is untrusted data for the receiver, never authority (INV-6). Approvals travel only as
+  `approval` artifacts.
+- The message artifact is at least as strict as its `refs` (they are its inputs), and the receiver's
+  turn carries the strictest classification of the messages it delivers, so the turn's egress check
+  refuses local-private refs to a remote Worker (INV-12).
+- It maps to A2A `Message`: `messageId`, `referenceTaskIds` ≈ `refs`/`inReplyTo`, and `parts` ≈ `body`
+  plus refs.
 
 ### `capability-descriptor`
 
-- `provider` is informational. Routing must not branch on it (INV-11). Only
-  `capabilities` (with each offer's `scope`), `tier`, `quotaClass`, `locality`, `state`,
-  `family`, `maxInputChars`, `load`, `cooldowns`, and `account` are routing inputs.
-- `capability-descriptor@1.1` adds the optional `family`: an opaque provider
-  family the Worker source sets, which routing only compares for inequality
-  ([provider diversity](../design/routing.md#provider-diversity),
-  [ADR-0027](../decisions/adr/0027-provider-diversity-in-routing.md)). A `@1.0`
-  record carrying `family` is refused.
-- `capability-descriptor@1.2` adds the optional `maxInputChars`: the longest input the Worker
-  takes, in characters (code points) of what it is sent; admission refuses longer input
-  ([ADR-0032](../decisions/adr/0032-admission-refuses-input-longer-than-a-worker-takes.md)). A
-  record carrying it below `@1.2` is refused.
-- `capability-descriptor@1.3` adds the optional `load`: the turns `running` in the Worker
-  runtime's `slots`, `queued`, and routed to it but not started (`pending`). Workers that share a
-  runtime (the tiers of one account) report the same numbers. Among equally ranked Workers the
-  least busy is routed to, and the route decision records each one's load
-  ([ADR-0033](../decisions/adr/0033-least-busy-routing.md)). A record carrying it below `@1.3` is
-  refused. It also adds the optional `cooldowns`: capabilities the Worker proves but may not use
-  until `until`, a site's usage limit; work that needs one is not admitted there (admission check
-  `cooldown`, [ADR-0034](../decisions/adr/0034-unsent-failover-to-a-sibling-account.md)).
- 
-- `capability-descriptor@1.4` adds the optional `scope` on a capability offer: the capability is
-  proven only for work whose requirement names that scope (`work-requirement@1.1`), never for
-  other work ([scoped offers](../design/routing.md#scoped-offers),
-  [ADR-0049](../decisions/adr/0049-read-only-agent-workers-as-review-members.md)). The only value
-  is `review-member`. A record carrying it below `@1.4` is refused.
-  Example: [`capability-descriptor.review-member.json`](../../schemas/examples/capability-descriptor.review-member.json).
-- `capability-descriptor@1.5` adds the optional `account`: the account the Worker runs on, as its
-  source sets it ([ADR-0052](../decisions/adr/0052-accounts-are-assigned-unless-pooling-is-recorded.md)).
-  `id` names the account and `group` the accounts it is compared with (a website's provider, an
-  agent runtime); routing compares both for equality only, never names one (INV-11). `mode` is the
-  group's setting, `assigned` or `pooled`. `limitUntil` is when an account whose Worker reads
-  `quota-exhausted` is expected back, when its source knows; a cooldown carries its own `until`.
-  Under `assigned`, a Worker refused only for its limit refuses the group's other accounts the same
-  work (admission check `assignment`), and the earliest reset among those limits is the
-  `AdmissionFailure`'s `limitUntil` ([assigned accounts](../design/routing.md#assigned-accounts)).
-  A record carrying it below `@1.5` is refused. Example:
+- `provider` is informational. Routing must not branch on it (INV-11). Only `capabilities` (with each
+  offer's `scope`), `tier`, `quotaClass`, `locality`, `state`, `family`, `maxInputChars`, `load`,
+  `cooldowns`, and `account` are routing inputs. Fields added after `@1.0` are optional; the version
+  of each is in parentheses.
+- `family` (`@1.1`): an opaque provider family the Worker source sets, which routing only compares for
+  inequality ([provider diversity](../design/routing.md#provider-diversity),
+  [ADR-0027](../decisions/adr/0027-provider-diversity-in-routing.md)).
+- `maxInputChars` (`@1.2`): the longest input the Worker takes, in characters (code points) of what it
+  is sent; admission refuses longer input
+  ([ADR-0032](../decisions/adr/0032-admission-refuses-input-longer-than-a-worker-takes.md)).
+- `load` (`@1.3`): the turns `running` in the Worker runtime's `slots`, `queued`, and routed to it but
+  not started (`pending`). Workers that share a runtime (the tiers of one account) report the same
+  numbers. Among equally ranked Workers the least busy is routed to, and the route decision records
+  each one's load ([ADR-0033](../decisions/adr/0033-least-busy-routing.md)).
+- `cooldowns` (`@1.3`): capabilities the Worker proves but may not use until `until`, a site's usage
+  limit; work that needs one is not admitted there (admission check `cooldown`,
+  [ADR-0034](../decisions/adr/0034-unsent-failover-to-a-sibling-account.md)).
+- `scope` on a capability offer (`@1.4`): the capability is proven only for work whose requirement
+  names that scope (`work-requirement@1.1`), never for other work
+  ([scoped offers](../design/routing.md#scoped-offers),
+  [ADR-0049](../decisions/adr/0049-read-only-agent-workers-as-review-members.md)). The only value is
+  `review-member`. Example:
+  [`capability-descriptor.review-member.json`](../../schemas/examples/capability-descriptor.review-member.json).
+- `account` (`@1.5`): the account the Worker runs on, as its source sets it
+  ([ADR-0052](../decisions/adr/0052-accounts-are-assigned-unless-pooling-is-recorded.md)). `id` names
+  the account and `group` the accounts it is compared with (a website's provider, an agent runtime);
+  routing compares both for equality only, never names one (INV-11). `mode` is the group's setting,
+  `assigned` or `pooled`. `limitUntil` is when an account whose Worker reads `quota-exhausted` is
+  expected back, when its source knows; a cooldown carries its own `until`. Under `assigned`, a Worker
+  refused only for its limit refuses the group's other accounts the same work (admission check
+  `assignment`), and the earliest reset among those limits is the `AdmissionFailure`'s `limitUntil`
+  ([assigned accounts](../design/routing.md#assigned-accounts)). Example:
   [`capability-descriptor.account.json`](../../schemas/examples/capability-descriptor.account.json).
-- `capability-descriptor@1.6` adds the optional `kinds`: the kinds of work the operator gives the
-  Worker (1 to 16 `workKind` labels), as its source sets them from configuration
+- `kinds` (`@1.6`): the kinds of work the operator gives the Worker (1 to 16 `workKind` labels), as its
+  source sets them from configuration
   ([work kinds](../design/routing.md#work-kinds),
   [ADR-0057](../decisions/adr/0057-route-work-by-kind.md)). Such a Worker takes only work whose
-  requirement names one of them (`work-requirement@1.2` `kind`), never work that names none;
-  without `kinds` it takes any work. Routing compares kinds for equality only (admission check
-  `capability`). A record carrying it below `@1.6` is refused. Example:
-  [`capability-descriptor.kinds.json`](../../schemas/examples/capability-descriptor.kinds.json).
-- `capability-descriptor@1.7` adds the optional `description`: what the Worker is for, in the
-  operator's words, from the configuration row that defines it (`description` of an agent-workers
-  `workers[]` or `roles[]` entry, of a `models[]` entry, or of an accounts `accounts[]` entry, which
-  a website Worker carries with its tier). It is for people (the [roster](../design/roster.md))
-  and never a routing input. A record carrying it below `@1.7` is refused. Example:
+  requirement names one of them (`work-requirement@1.2` `kind`), never work that names none; without
+  `kinds` it takes any work. Routing compares kinds for equality only (admission check `capability`).
+  Example: [`capability-descriptor.kinds.json`](../../schemas/examples/capability-descriptor.kinds.json).
+- `description` (`@1.7`): what the Worker is for, in the operator's words, from the configuration row
+  that defines it (`description` of an agent-workers `workers[]` or `roles[]` entry, of a `models[]`
+  entry, or of an accounts `accounts[]` entry, which a website Worker carries with its tier). It is
+  for people (the [roster](../design/roster.md)), never a routing input. Example:
   [`capability-descriptor.description.json`](../../schemas/examples/capability-descriptor.description.json).
-- `capability-descriptor@1.8` adds the optional `title`: the Worker's name for people, plain text
-  on one line of at most 64 characters, as its source gives it: a website provider's own (its
-  driver's `title`, which a provider plugin names), or a model's from the operator's `models[]`
-  entry. The [roster's display name](../design/roster.md#display-names) starts with it; routing
-  never reads it, and no shared code names a vendor in it
-  ([INV-11](../architecture/invariants.md#inv-11-no-tool-lock-in)). A record carrying it below
-  `@1.8` is refused. Example:
+- `title` (`@1.8`): the Worker's name for people, plain text on one line of at most 64 characters, as
+  its source gives it: a website provider's own (its driver's `title`, which a provider plugin names),
+  or a model's from the operator's `models[]` entry. The
+  [roster's display name](../design/roster.md#display-names) starts with it; routing never reads it,
+  and no shared code names a vendor in it
+  ([INV-11](../architecture/invariants.md#inv-11-no-tool-lock-in)). Example:
   [`capability-descriptor.title.json`](../../schemas/examples/capability-descriptor.title.json).
-- `capability-descriptor@1.9` adds the optional `unavailableReason`: why a Worker whose `state` is
-  `unavailable` takes no work, as its source knows it (a failed probe's detail, a workspace that
-  cannot hold a worktree, an account's or pool's gate), plain text on one line of at most 300
-  characters. The [roster](../design/roster.md) shows it as the Worker's reason when its account
-  gives none, so capacity, health, and the Workers page say why; routing never reads it. A record
-  carrying it below `@1.9`, or with another state, is refused. Example:
+- `unavailableReason` (`@1.9`): why a Worker whose `state` is `unavailable` takes no work, as its
+  source knows it (a failed probe's detail, a workspace that cannot hold a worktree, an account's or
+  pool's gate), plain text on one line of at most 300 characters. The [roster](../design/roster.md)
+  shows it as the Worker's reason when its account gives none; routing never reads it. A record with
+  another state is refused. Example:
   [`capability-descriptor.unavailable-reason.json`](../../schemas/examples/capability-descriptor.unavailable-reason.json).
-- `capability-descriptor@1.10` adds the optional `tiers`: every tier one Worker offers, lowest
-  first, each once ([ADR-0073](../decisions/adr/0073-agent-workers-offer-tiers-per-role-with-quota-per-model.md)),
-  for an agent role that declares a model per tier. Each entry names its `tier`, and may carry
-  `pools` (the ledger pools a run at that tier draws on; absent: every pool of its account) and
-  `closed` (its model's limit closes that tier now while the others stay open), with `until` when
-  it is expected back, when known. `tier` stays the lowest offered. Routing serves the Worker at the
-  lowest offered tier within a requirement's bounds that is not closed, and never names a model
+- `tiers` (`@1.10`): every tier one Worker offers, lowest first, each once
+  ([ADR-0073](../decisions/adr/0073-agent-workers-offer-tiers-per-role-with-quota-per-model.md)), for
+  an agent role that declares a model per tier. Each entry names its `tier`, and may carry `pools`
+  (the ledger pools a run at that tier draws on; absent: every pool of its account), `closed` (its
+  model's limit closes that tier now while the others stay open), `until` when it is expected back,
+  when known, and, from `@1.11`, `label` (its model's display label as the live profile gives it; for
+  people only, never a routing input) and `maxTurns` (the turn limit a run at that tier gets). `tier`
+  stays the lowest offered. Routing serves the Worker at the lowest offered tier within a
+  requirement's bounds that is not closed, and never names a model
   ([INV-11](../architecture/invariants.md#inv-11-no-tool-lock-in)); absent, the Worker offers `tier`
-  alone. A record carrying it below `@1.10` is refused. Example:
+  alone. `tiers` is accepted at `@1.10` to `@1.12`. Example:
   [`capability-descriptor.tiers.json`](../../schemas/examples/capability-descriptor.tiers.json).
-- `capability-descriptor@1.11` adds, to each `tiers` entry, the optional `label` (its model's display
-  label as the live profile gives it; for people only, never a routing input) and `maxTurns` (the
-  turn limit a run at that tier gets).
-- `capability-descriptor@1.12` adds the optional `expectedBack` (date-time): when its source expects
-  to know again whether a Worker whose `state` is `unavailable` takes work, because it is
-  unavailable only for a while that passes by itself (an agent runtime's late probe: its next result
-  is due by then); its capabilities are then what it last proved. Routing tells the caller to route
-  the work again then (`AdmissionFailure.retryAt`), and the workflow engine waits, bounded, instead
-  of failing the step ([routing](../design/routing.md#intelligence-tiers)). A record carrying it
-  below `@1.12`, or with another state, is refused; `tiers` is accepted at `@1.10` to `@1.12`.
- 
+- `expectedBack` (`@1.12`, date-time): when its source expects to know again whether a Worker whose
+  `state` is `unavailable` takes work, because it is unavailable only for a while that passes by
+  itself (an agent runtime's late probe: its next result is due by then); its capabilities are then
+  what it last proved. Routing tells the caller to route the work again then
+  (`AdmissionFailure.retryAt`), and the workflow engine waits, bounded, instead of failing the step
+  ([routing](../design/routing.md#intelligence-tiers)). A record with another state is refused.
 
 ### `plan`
 
@@ -438,66 +402,57 @@ guesses.
 
 ### `agent-result`
 
-- Written once per finished agent-runtime run, as the body of a `report`
-  artifact. The prompt is kept by hash only.
-- `nativeHandle` names the agent's own session (for example, a Claude Code
-  session id). The session itself is never mirrored (INV-7).
-- `sandbox` is the policy the run was held to, taken from trusted
-  configuration.
-- `agent-result@1.1` adds `workspace` (from configuration) and `subject`. The
-  subject is the workspace's exact git subject after the run:
-  `{type: git-head, ref: HEAD, version: hash of every change on top}`. A
+- Written once per finished agent-runtime run, as the body of a `report` artifact. The prompt is kept
+  by hash only.
+- `nativeHandle` names the agent's own session (for example, a Claude Code session id). The session
+  itself is never mirrored (INV-7).
+- `sandbox` is the policy the run was held to, taken from trusted configuration.
+- `workspace` (from configuration) and `subject` (since `@1.1`): the subject is the workspace's exact
+  git subject after the run, `{type: git-head, ref: HEAD, version: hash of every change on top}`. A
   review binds to it.
-- `agent-result@1.2` adds `model`, `usage`, and `models`, from the Agent SDK's result
-  message. `usage` is the sum of its per-model `modelUsage`, which covers subagents; the
-  message's own `usage` covers the main loop only and is not used. `model` is the main
-  loop's model. A Worker writes `@1.2` when its runtime reported token usage, and `@1.1`
-  otherwise.
-- Token counts are normalized as in [`usage-record`](#usage-record). The SDK's `modelUsage`
-  uses the same field names with another meaning: its `inputTokens` excludes cached input. So
-  here `inputTokens` is the SDK's `inputTokens` plus its `cacheReadInputTokens` and
-  `cacheCreationInputTokens`.
-- A crashed process writes no result message and so no `agent-result`; its usage is reconciled
-  from the session transcript into a `usage-record`. A record carrying any of the three fields
-  below `@1.2` is refused. Example:
-  [`agent-result.usage.json`](../../schemas/examples/agent-result.usage.json).
-- `agent-result@1.3` adds `profile` and `replay`, written for a review team member's step
+- `model`, `usage`, and `models` (since `@1.2`) come from the Agent SDK's result message. `usage` is
+  the sum of its per-model `modelUsage`, which covers subagents; the message's own `usage` covers the
+  main loop only and is not used. `model` is the main loop's model. A Worker writes `@1.2` when its
+  runtime reported token usage, and `@1.1` otherwise. Token counts are normalized as in
+  [`usage-record`](#usage-record): the SDK's `modelUsage` uses the same field names with another
+  meaning (its `inputTokens` excludes cached input), so here `inputTokens` is the SDK's `inputTokens`
+  plus its `cacheReadInputTokens` and `cacheCreationInputTokens`. A crashed process writes no result
+  message and so no `agent-result`; its usage is reconciled from the session transcript into a
+  `usage-record`. Example: [`agent-result.usage.json`](../../schemas/examples/agent-result.usage.json).
+- `profile` and `replay` (since `@1.3`) are written for a review team member's step
   ([ADR-0049](../decisions/adr/0049-read-only-agent-workers-as-review-members.md)). `profile`
-  `review-member` says the step ran under the review-member profile: its gate denied every tool
-  call, so the answer rests on its prompt alone. `replay` binds an answer to the conversation it
-  continued by replay, on a runtime that keeps none: the earlier runs of its session it was sent, in
-  order (each its message and its answer exactly as they were), their answers (also the artifact's
-  `inputs`), and `promptHash`, the hash of everything the run was sent; the top-level `promptHash`
-  stays the hash of its own message. A record carrying either field below `@1.3` is refused. Example:
+  `review-member` says the step ran under the review-member profile: its gate denied every tool call,
+  so the answer rests on its prompt alone. `replay` binds an answer to the conversation it continued
+  by replay, on a runtime that keeps none: the earlier runs of its session it was sent, in order (each
+  its message and its answer exactly as they were), their answers (also the artifact's `inputs`), and
+  `promptHash`, the hash of everything the run was sent; the top-level `promptHash` stays the hash of
+  its own message. Example:
   [`agent-result.review-member.json`](../../schemas/examples/agent-result.review-member.json).
 
 ### `model-answer`
 
 - Written once per completed model call, as the body of a `report` artifact
-  ([models](../design/models.md)). The prompt is kept by hash only, and the
-  model is named by its catalog id, never by the route's model id.
-- `finish` is `max-tokens` when the answer was cut at `maxTokens`, the bound the
-  call ran under (the smaller of the catalog entry's and the requirement's
-  budget).
-- `usage` is the provider's own token count of the request that answered. The
-  usage report shows it per step; it is not priced.
-- `sends` is how many times the call was sent (2 when a restart sent it once
-  more, a recorded `reconciliation` decision), and `attempts` how many provider
-  requests the last send took, its route re-attempts and the retries of
-  requests the provider said it did not process included. Each request may be
-  billed: at worst `sends × attempts`, six with the defaults when no request is
-  refused as not processed.
-- `model-answer@1.1` raises `attempts`' maximum from 10 to 66, the combined
-  bounds' worst case per send: `(unprocessedRetries + 1) × (maxRetries + 1)`,
-  11 × 6 at their largest valid values. An answer with more than 10 attempts is
-  written as `@1.1`, and one below `@1.1` with more than 10 is refused; an
-  answer with 10 or fewer stays `@1.0`.
+  ([models](../design/models.md)). The prompt is kept by hash only, and the model is named by its
+  catalog id, never by the route's model id.
+- `finish` is `max-tokens` when the answer was cut at `maxTokens`, the bound the call ran under (the
+  smaller of the catalog entry's and the requirement's budget).
+- `usage` is the provider's own token count of the request that answered. The usage report shows it
+  per step; it is not priced.
+- `sends` is how many times the call was sent (2 when a restart sent it once more, a recorded
+  `reconciliation` decision). `attempts` is how many provider requests the last send took, its route
+  re-attempts and the retries of requests the provider said it did not process included. Each request
+  may be billed: at worst `sends × attempts`, six with the defaults when no request is refused as not
+  processed.
+- `attempts` is at most 10 at `@1.0` and at most 66 at `@1.1`, the combined bounds' worst case per
+  send: `(unprocessedRetries + 1) × (maxRetries + 1)`, 11 × 6 at their largest valid values. An
+  answer with more than 10 attempts is written as `@1.1`, and one below `@1.1` with more than 10 is
+  refused; an answer with 10 or fewer stays `@1.0`.
 
 ### `account`
 
-- `account@1.1` adds `features`: the website features a probe proved on the
-  account, and when (REQ-PRV-7). Routing uses only these. A missing or stale
-  probe is refreshed; a feature is never assumed.
+- `features` (since `@1.1`): the website features a probe proved on the account, and when
+  (REQ-PRV-7). Routing uses only these. A missing or stale probe is refreshed; a feature is never
+  assumed.
 
 ### `agent-account`
 
@@ -505,28 +460,27 @@ guesses.
   ([PROP-0012](../proposals/0012-agent-accounts.md),
   [ADR-0051](../decisions/adr/0051-agent-accounts-are-enrolled-slots-identified-by-their-login.md)).
   The slot is a home only: its number never names, orders, or identifies an account.
-- `accountId` is `<provider>:<h>`, `h` the first 16 hex characters of `identity.hmac`, an
-  HMAC-SHA256 over the provider and the principal's canonical parts keyed by a per-install key in
-  the credential vault. The full `hmac` is what is compared; two different full values with one
-  short form make both accounts `ambiguous`. The principal itself never leaves the runtime (INV-8).
-- `status`: `enrolled` (not verified yet), `ready` (signed in as the pinned principal: the only
-  status that admits a Worker), `signed-out` (the runtime's own sign-in check fails), `quarantined`
-  with `quarantine.reason` `changed`, `ambiguous`, `duplicate`, or `unverified` and the
-  `enrollment` decision that set it. A quarantine never clears by itself.
+- `accountId` is `<provider>:<h>`, `h` the first 16 hex characters of `identity.hmac`, an HMAC-SHA256
+  over the provider and the principal's canonical parts keyed by a per-install key in the credential
+  vault. The full `hmac` is what is compared; two different full values with one short form make both
+  accounts `ambiguous`. The principal itself never leaves the runtime (INV-8).
+- `status`: `enrolled` (not verified yet), `ready` (signed in as the pinned principal: the only status
+  that admits a Worker), `signed-out` (the runtime's own sign-in check fails), `quarantined` with
+  `quarantine.reason` `changed`, `ambiguous`, `duplicate`, or `unverified` and the `enrollment`
+  decision that set it. A quarantine never clears by itself.
+- `quarantine.detail` (optional, since `@1.1`): what the reading that quarantined the account found,
+  in one line of at most 300 characters, as its `enrollment` decision's reason says it (for
+  `unverified`, the runtime version found and the ones its reader admits); never a principal. The
+  `agents` source writes a quarantined record at 1.1 with it, and any other at 1.0. Example:
+  [`agent-account.unverified-version.json`](../../schemas/examples/agent-account.unverified-version.json).
 - `hint` is a masked hint for the operator, kept local, never sent to a Worker.
 - `home` of slot 1 is its runtime's own home, adopted where it is; of a later slot,
-  `<accountHomes>/<provider>/<n>`. A `changed` record keeps the pinned `accountId` and `identity`
-  (the account the slot should hold), not the one now read.
-- Written by the `agents` source (PROP-0012 phase E), one per slot taken, `revision` raised on
-  each change; a freed slot's record is deleted, its history kept in its decisions. Examples:
+  `<accountHomes>/<provider>/<n>`. A `changed` record keeps the pinned `accountId` and `identity` (the
+  account the slot should hold), not the one now read.
+- Written by the `agents` source, one per slot taken, `revision` raised on each change; a freed slot's
+  record is deleted, its history kept in its decisions. Examples:
   [`agent-account.ready.json`](../../schemas/examples/agent-account.ready.json),
   [`agent-account.quarantined.json`](../../schemas/examples/agent-account.quarantined.json).
-- `agent-account@1.1` adds the optional `quarantine.detail`: what the reading that quarantined the
-  account found, in one line of at most 300 characters, as its `enrollment` decision's reason says
-  it (for `unverified`, the runtime version found and the ones its reader admits); never a
-  principal. The `agents` source writes a quarantined record at 1.1 with it, and any other at 1.0.
-  A record carrying it below `@1.1` is refused. Example:
-  [`agent-account.unverified-version.json`](../../schemas/examples/agent-account.unverified-version.json).
 
 ### `session-summary`
 
@@ -547,10 +501,8 @@ guesses.
   evidence `source` is a URL.
 - When the step's result changes (superseded, then run again), the new
   artifact `supersedes` the last one.
-- `evidence-table@1.1` adds the optional per-claim `reviews`: which of the
-  run's two literature reviews state the claim (`["A"]`, `["B"]`, or
-  `["A", "B"]`), so a conclusion can say where they agree and differ. A `@1.0`
-  record carrying `reviews` is refused.
+- Per-claim `reviews` (optional, `evidence-table@1.1`): which of the run's two literature reviews state
+  the claim (`["A"]`, `["B"]`, or `["A", "B"]`), so a conclusion can say where they agree and differ.
 
 ### `team-result`
 
@@ -562,9 +514,8 @@ guesses.
   outcome.
 - `winner` is null when the method is `inconclusive`. Example:
   [`team-result.tie.json`](../../schemas/examples/team-result.tie.json).
-- `team-result@1.1` adds the method `blocking-finding`, whose winner is
-  `changes`. Only that method uses `@1.1`; every other result stays `@1.0`.
- 
+- The method `blocking-finding` (winner `changes`) uses `team-result@1.1`; every other result stays
+  `@1.0`.
 
 ### `source-snapshot`
 
@@ -607,18 +558,15 @@ guesses.
 - A local overlay has the same shape, holds only extra candidates, and is
   merged after the shipped candidates. It never replaces the shipped map.
 - `heal` is capped by `sideEffect`: an `irreversible` action never uses `model`.
-- `ui-map@1.1` adds the optional element field `frames` (`main` or `any`).
-- `ui-map@1.2` adds `unverified: true` on an element or action not yet checked on
-  the live site. No irreversible job may depend on one: while a delete flow's
-  entries are unverified, its conversations wait, due, and nothing is clicked
-  ([conversation ledger](../design/provider-turns.md#conversation-ledger)). The
-  live check removes the flag entry by entry.
-  Elements with `frames: any` are searched in every frame and take no `scope`.
- 
-- `ui-map@1.3` adds the action kind `clearText`: it empties a composer (select all,
-  delete) and requires it to read back empty, so an unsent draft a site keeps across
-  page loads is never sent with a prompt.
-- `ui-map@1.4` adds two optional error-rule fields
+- Optional element field `frames` (`main` or `any`; `@1.1`). Elements with `frames: any` are searched
+  in every frame and take no `scope`.
+- `unverified: true` (`@1.2`) on an element or action not yet checked on the live site. No irreversible
+  job may depend on one: while a delete flow's entries are unverified, its conversations wait, due, and
+  nothing is clicked ([conversation ledger](../design/provider-turns.md#conversation-ledger)). The live
+  check removes the flag entry by entry.
+- The action kind `clearText` (`@1.3`): it empties a composer (select all, delete) and requires it to
+  read back empty, so an unsent draft a site keeps across page loads is never sent with a prompt.
+- Two optional error-rule fields (`@1.4`)
   ([ADR-0034](../decisions/adr/0034-unsent-failover-to-a-sibling-account.md)): `feature`, the
   account feature a `quota_exhausted` rule's usage limit applies to (none means the whole
   account), and `on`: `act` (the default) checks the rule before every action, so the turn fails
@@ -638,9 +586,8 @@ guesses.
   or URLs.
 - `depth` counts kept nodes only; `repeat` counts like siblings folded into the
   node. At most 200 nodes; `truncated` says the bound cut it short.
-- `ui-outline@1.1` adds a link's `link`: its target as a kind, never the URL
-  (`external`, another site over http(s); `site`; or `none`). An outline that
-  holds one names `@1.1`; readers accept 1.0 and 1.1.
+- A link's `link` (`@1.1`): its target as a kind, never the URL (`external`, another site over http(s);
+  `site`; or `none`). An outline that holds one names `@1.1`; readers accept 1.0 and 1.1.
 - Example: [ui-outline.composer.json](../../schemas/examples/ui-outline.composer.json).
 
 ### `usage-record`
@@ -707,7 +654,7 @@ guesses.
 ### `quota-draw`
 
 - What one agent run of a derived Worker on a declared pool drew from each window of its account's
-  pool ([quota drawn per run](../design/resources.md#quota-drawn-per-run), PROP-0015 E2): the body
+  pool ([quota drawn per run](../design/resources.md#quota-drawn-per-run)): the body
   of an `evidence` artifact filed under the run's workflow run and step, and the data of the
   `quota.draw` event that names them (the event's `runId` and `nodeId`). The record's `runId` is the
   agent run, as its usage record names it; `kind` is the kind of work it was admitted for
@@ -749,9 +696,11 @@ guesses.
   `tool`, and `actionClass` (and `workerKind`); `deferred` adds `requestId`, the others
   `pendingChecks` when checks are pending (always for `checks-pending`).
 - The data of these four tool events is declared by
-  [`agent-tool-event.v1.json`](../../schemas/agent-tool-event.v1.json) (`agent-tool-event@1.2`; 1.1 adds the reason `use-read-tool`; 1.2 adds the reason `research-role` and the event
-  `agent-workers.tool.web`, a research run's web call judged: the usual `agentRun`, `worker`, `tool`, then `verdict`
-  `auto` or `ask`, `egress`, the call's number, the calls made unasked, the bound, and the `gate` decision, which holds the query or URL, never the query or URL itself), one definition per event type (`$defs/denied`, `deferred`, `notified`, `checks-pending`, `web`).
+  [`agent-tool-event.v1.json`](../../schemas/agent-tool-event.v1.json) (`agent-tool-event@1.2`; the reason `use-read-tool` is 1.1; the reason `research-role` and the event
+  `agent-workers.tool.web` are 1.2: a research run's web call judged, with the usual `agentRun`,
+  `worker`, `tool`, then `verdict` `auto` or `ask`, `egress`, the call's number, the calls made
+  unasked, the bound, and the `gate` decision, which holds the query or URL, never the query or URL
+  itself), one definition per event type (`$defs/denied`, `deferred`, `notified`, `checks-pending`, `web`).
   The data carries no schema tag: a reader names the definition by the entry's type. `reason` is
   an enum of the codes above (a test derives the gate's own list, `DENIAL_REASONS`, and requires each
   in it, so a new code is a minor version of the schema); `explanation` is 1 to 300 characters and
@@ -776,16 +725,15 @@ guesses.
   yet), or the board task id (`review.*`). `id` is `<kind>:<subject>:<event seq>`; an
   `approval.expiring` notice names the `approvals.requested` entry it reminds of, a
   `review.expiring` notice the `board.review.held` entry.
-- `notification@1.1` adds the kind `review.expiring`: a board task's review held for the
-  operator expires within the lead time ([board](../design/board.md#a-review-held-for-the-operator));
-  a notice of it is `@1.1`, every other kind stays `@1.0`, and the kind is refused on `@1.0`.
-  Example: [`notification.review-expiring.json`](../../schemas/examples/notification.review-expiring.json).
-- `notification@1.2` adds the kind `dispatch.started`: System started a ready board task's run by
-  itself where the project's policy gives `dispatch` `notify`
-  ([dispatch](../design/workflow-engine.md#dispatch-starting-ready-work-by-itself), PROP-0014);
-  its `subject` is the run id, its `event` the `workflow.dispatch.notice` entry. A notice of it is
-  `@1.2`, and the kind is refused on `@1.0` and `@1.1`; `review.expiring` is valid on `@1.1` and
-  `@1.2`. Example: [`notification.dispatch-started.json`](../../schemas/examples/notification.dispatch-started.json).
+- The kind `review.expiring` (`@1.1`): a board task's review held for the operator expires within the
+  lead time ([board](../design/board.md#a-review-held-for-the-operator)). A notice of it is `@1.1`,
+  every other kind stays `@1.0`, and the kind is refused on `@1.0`. Example:
+  [`notification.review-expiring.json`](../../schemas/examples/notification.review-expiring.json).
+- The kind `dispatch.started` (`@1.2`): System started a ready board task's run by itself where the
+  project's policy gives `dispatch` `notify`
+  ([dispatch](../design/workflow-engine.md#dispatch-starting-ready-work-by-itself)); its `subject` is
+  the run id, its `event` the `workflow.dispatch.notice` entry. A notice of it is `@1.2`, and the kind
+  is refused on `@1.0` and `@1.1`; `review.expiring` is valid on `@1.1` and `@1.2`. Example: [`notification.dispatch-started.json`](../../schemas/examples/notification.dispatch-started.json).
 - `title`, `text`, and `act` are made by code from ids, classes, kinds, and times the producer's
   event names; a value that is not an id or a word is left out, never quoted. It carries no
   secret, prompt, answer, request summary, consequences, or command a request would run, and no
@@ -796,8 +744,7 @@ guesses.
 
 ### `lead-brief`
 
-- The one read-only page a project's lead session reads at its start and whenever it is lost
-  ([PROP-0019 §3](../proposals/0019-lead-logic-in-system.md#3-system-lead-brief---project-id)): what
+- The one read-only page a project's lead session reads at its start and whenever it is lost: what
   MCP `lead_brief` returns as structured content and `system lead brief --json` prints. Never
   persisted; reading it records only the event `lead.brief-read` (`principal`, `project`).
 - Each part of a section is `{ "value": … }` or `{ "unreadable": "<reason>" }`, and every unreadable
@@ -840,286 +787,275 @@ guesses.
 
 ### `autonomy-policy`
 
-- One rule per action class, `expiry.defaultSeconds ≤ expiry.maxSeconds`, every rule's
-  `expiresSeconds ≤ expiry.maxSeconds`, no rule giving a class that always asks `auto` or
-  `notify`, commands-list entries of non-empty words with no shell metacharacter, and a batch
-  rule whose `maxWaitSeconds` is under the shortest expiry a request it batches can get; a
-  policy that breaks one is refused when loaded. A set holds at most 101 policies: the studio's
-  and 100 projects'.
-- The classes that always ask are the irreversible effects (`external-send`, `deploy`,
-  `delete-data`, `spend`), the investor's decisions (`charter`, `funding`, `policy-change`),
-  `remediation`, `promotion`, and `merge` (a merge always asks the operator, [ADR-0060](../decisions/adr/0060-an-accepted-result-lands-on-the-operators-merge-approval.md)).
-  The schema refuses `auto` and `notify` for them, except `remediation` and `merge`, which it
-  predates: a policy that gives either of them `auto` or `notify` is refused when loaded. `promotion` joined `common@1`'s action classes with the feedback loop
-  ([ADR-0045](../decisions/adr/0045-feedback-loop-guarantee-seams.md)). No record named it
-  before, so the schema refuses it `auto` and `notify` from the start without tightening
-  anything, and the record stays `@1.0`.
-- `dispatch` joined `common@1`'s action classes with PROP-0014's
-  ([ADR-0064](../decisions/adr/0064-system-starts-ready-work-under-the-dispatch-action-class.md)):
-  System starting a ready board task's attempt by itself. It may be any mode (it is not a class
-  that always asks); a policy written before it names no rule for it and takes its `default`, so
-  the record stays `@1.0` and every reader in a decision path knows the value (it is in
-  `ACTION_CLASSES` and the board tools' vocabulary).
-- A project policy constrains only the classes it names. The effective mode of a class is the
-  strictest of the studio's rule and the project's (`auto` < `notify` < `ask` < `forbid`), so a
-  looser project rule has no effect. For a class neither names, it is the stricter of the two
-  `default`s.
-- `auto` and `notify` hold only while every check in `requires` passes; a failed check goes back
-  to the lead as work to fix, never to the operator.
-- A command whose argv equals a line of the `commands` list word for word (the line split on
-  single spaces), with no further arguments, is judged as `workspace-write`; a project's list may
-  only narrow the studio's. Matching is exact, never by prefix. Any other command is the
-  `command` class. When the `command` class is `forbid`, listed commands are forbidden too. An
-  argv word holding a shell metacharacter (`; & | $`, the backquote, `< > ( ) { } [ ] * ? ~`,
-  quotes, backslash, newline, carriage return, tab, NUL) is forbidden, listed or not.
-- `@1.1` adds the optional `riskTiers`, the path map that gives a board task's change its risk tier
+- One rule per action class. Constraints, each refused when the policy loads: `expiry.defaultSeconds ≤
+  expiry.maxSeconds`; every rule's `expiresSeconds ≤ expiry.maxSeconds`; no rule giving a class that
+  always asks `auto` or `notify`; `commands` entries of non-empty words with no shell metacharacter; a
+  batch rule's `maxWaitSeconds` under the shortest expiry a request it batches can get. A set holds at
+  most 101 policies: the studio's and 100 projects'.
+- The classes that always ask are the irreversible effects (`external-send`, `deploy`, `delete-data`,
+  `spend`), the investor's decisions (`charter`, `funding`, `policy-change`), `remediation`,
+  `promotion`, and `merge` (a merge always asks the operator,
+  [ADR-0060](../decisions/adr/0060-an-accepted-result-lands-on-the-operators-merge-approval.md)). The
+  schema refuses `auto` and `notify` for them, except `remediation` and `merge`, which it predates: a
+  policy that gives either of them `auto` or `notify` is refused when loaded. `promotion`
+  ([ADR-0045](../decisions/adr/0045-feedback-loop-guarantee-seams.md)) is refused `auto` and `notify`
+  in the schema; no earlier record named it, so the record stays `@1.0`.
+- `dispatch` ([ADR-0064](../decisions/adr/0064-system-starts-ready-work-under-the-dispatch-action-class.md))
+  is System starting a ready board task's attempt by itself. It may be any mode; a policy that names
+  no rule for it takes its `default`, so the record stays `@1.0` and every reader in a decision path
+  knows the value (it is in `ACTION_CLASSES` and the board tools' vocabulary).
+- A project policy constrains only the classes it names. The effective mode of a class is the strictest
+  of the studio's rule and the project's (`auto` < `notify` < `ask` < `forbid`), so a looser project
+  rule has no effect. For a class neither names, it is the stricter of the two `default`s.
+- `auto` and `notify` hold only while every check in `requires` passes; a failed check goes back to the
+  lead as work to fix, never to the operator.
+- A command whose argv equals a line of the `commands` list word for word (the line split on single
+  spaces), with no further arguments, is judged as `workspace-write`; a project's list may only narrow
+  the studio's. Matching is exact, never by prefix. Any other command is the `command` class. When the
+  `command` class is `forbid`, listed commands are forbidden too. An argv word holding a shell
+  metacharacter (`; & | $`, the backquote, `< > ( ) { } [ ] * ? ~`, quotes, backslash, newline,
+  carriage return, tab, NUL) is forbidden, listed or not.
+- `riskTiers` (optional, `@1.1`) is the path map that gives a board task's change its risk tier
   ([ADR-0071](../decisions/adr/0071-a-changes-risk-tier-comes-from-the-policys-path-map.md),
   [process tiered by risk](../design/workflow-engine.md#process-tiered-by-risk)): its own `version`,
   raised whenever a path's tier changes, and rules of repository-relative patterns, each with a tier
-  (`light`, `normal`, `heavy`) and a `note` saying why. `*` matches within one segment, `**` any
-  number of whole segments, and a pattern ending in `/` is that directory and everything below it;
-  a pattern with a `.` or `..` segment, or `**` inside a segment, is refused when the policy loads. A
-  path's tier is the **highest** of the rules that match it, never the most specific one; a path no
-  rule matches is `heavy`, and so is a part of a change that cannot be read. A change's tier is the
-  highest of its paths' under every applying policy's map (the studio's and the project's: a
-  project's map only makes a path stricter). With no applying map, tiering is off. A map changes
-  only as its policy does, through a `policy-change` approval; `policies/system.json` holds the
-  system repository's, which `pnpm check` (`check:tiers`) keeps whole.
-- `@1.3` adds the optional `webAccess`, a research role's web access grant
+  (`light`, `normal`, `heavy`) and a `note` saying why. `*` matches within one segment, `**` any number
+  of whole segments, and a pattern ending in `/` is that directory and everything below it; a pattern
+  with a `.` or `..` segment, or `**` inside a segment, is refused when the policy loads. A path's tier
+  is the **highest** of the rules that match it, never the most specific one; a path no rule matches is
+  `heavy`, and so is a part of a change that cannot be read. A change's tier is the highest of its
+  paths' under every applying policy's map (the studio's and the project's: a project's map only makes
+  a path stricter). With no applying map, tiering is off. A map changes only as its policy does,
+  through a `policy-change` approval; `policies/system.json` holds the system repository's, which
+  `pnpm check` (`check:tiers`) keeps whole.
+- `webAccess` (optional, `@1.3`) is a research role's web access grant
   ([ADR-0074](../decisions/adr/0074-a-research-roles-web-calls-run-under-a-bounded-egress-checked-grant.md),
-  [a research role's web calls](../design/approvals.md#a-research-roles-web-calls)): its own
-  `version`, raised whenever a grant changes, and at most one rule per `profile` (only `research`),
-  each with `tools` (distinct, `WebSearch` and `WebFetch`), `maxWebCallsPerRun` (1 to 200; the
-  default is 40), `maxClassification` (`public` or `operator-shared`: `local-private` is never
-  granted) and a `note` saying why. A grant moves no effective mode and `external-send` stays `ask`
-  in every rule; the studio's grant is the only one that grants, and a project's only narrows it. A
-  record carrying it below `@1.3` is refused. Like every part of the policy, it changes only
-  through a `policy-change` approval; `policies/system.json` holds the system repository's.
-- `@1.4` adds the optional `commandRules` ([command rules](../design/approvals.md#command-rules),): structured rules a command is matched against, which the policy judges as `workspace-write`.
-  `@1.6` adds an option's `scope` (an option of `kind: path`, such as `--outputFile=`, is judged like
-  a positional path; one with no scope is refused when the policy loads) and a rule's `enforce`
-  (`on`, the default, or `warn`: the rule grants nothing, and the gate records a `gate` decision
-  naming it where it would have allowed the command; a project policy's `warn` copy differs
-  from the studio's rule, so it keeps that rule out of force for the project). A record carrying
-  either below `@1.6` is refused.
-- An approval request expires at its creation plus the shortest `expiresSeconds` of the rules
-  that apply to its class (the studio's and the project's), else the stricter
-  `expiry.defaultSeconds`, never more than the stricter `expiry.maxSeconds`.
-- A `policy-change` is never made by a Worker. While `system` runs, a new policy version takes
-  effect only through the operator's approval of a `policy-change` request (proposed by the
-  operator, or by the queue itself from repeated identical approvals)
-  ([`policy-change`](#policy-change)), so the safety layer never changes itself; at a start, the
-  configured set applies unless an applied change derived from that same configuration is
-  kept in the store. Examples:
+  [a research role's web calls](../design/approvals.md#a-research-roles-web-calls)): its own `version`,
+  raised whenever a grant changes, and at most one rule per `profile` (only `research`), each with
+  `tools` (distinct, `WebSearch` and `WebFetch`), `maxWebCallsPerRun` (1 to 200; default 40),
+  `maxClassification` (`public` or `operator-shared`: `local-private` is never granted) and a `note`
+  saying why. A grant moves no effective mode and `external-send` stays `ask` in every rule; the
+  studio's grant is the only one that grants, and a project's only narrows it.
+- `commandRules` (optional, `@1.4`; [command rules](../design/approvals.md#command-rules)): structured
+  rules a command is matched against, which the policy judges as `workspace-write`. From `@1.6`, an
+  option's `scope` (an option of `kind: path`, such as `--outputFile=`, is judged like a positional
+  path; one with no scope is refused when the policy loads) and a rule's `enforce` (`on`, the default,
+  or `warn`: the rule grants nothing, and the gate records a `gate` decision naming it where it would
+  have allowed the command; a project policy's `warn` copy differs from the studio's rule, so it keeps
+  that rule out of force for the project).
+- An approval request expires at its creation plus the shortest `expiresSeconds` of the rules that
+  apply to its class (the studio's and the project's), else the stricter `expiry.defaultSeconds`, never
+  more than the stricter `expiry.maxSeconds`.
+- A `policy-change` is never made by a Worker. While `system` runs, a new policy version takes effect
+  only through the operator's approval of a `policy-change` request (proposed by the operator, or by
+  the queue itself from repeated identical approvals; [`policy-change`](#policy-change)), so the safety
+  layer never changes itself; at a start, the configured set applies unless an applied change derived
+  from that same configuration is kept in the store. Like every part of the policy, `riskTiers`,
+  `webAccess`, and `commandRules` change only this way. Examples:
   [`autonomy-policy.studio.json`](../../schemas/examples/autonomy-policy.studio.json),
   [`autonomy-policy.project.json`](../../schemas/examples/autonomy-policy.project.json).
 
 ### `approval-request`
 
-- Written only by a core component (`requester.component`), never from model text (INV-6). The
-  summary may quote a Worker's proposal; it carries no authority.
-- `subject`, `action`, `requester`, `policy`, `classification`, and `expiresAt` never change
-  after the request is created, so what the operator was shown is what the verdict binds to. A
-  changed proposal is a new request. `requester` names the work waiting on it (a run, session,
-  project, or task), so the request is withdrawn when that work ends.
-- One request, one exact subject (INV-5). Its subject names a `version`, unless it is an
-  `artifact` subject whose `ref` is a `sha256:` content id; the queue refuses another (the schema
-  cannot say so, as `common@1`'s subject keeps `version` optional). An operator verdict names the
-  subject it saw; if the subject changed since, the verdict is refused and the request is
-  unchanged, so the requester must withdraw it and ask anew.
-- It is queued only on an `ask` the policies loaded now give: `policy` names the `autonomy`
-  decision, which a policy made under the project's policy set as loaded, for the class the
-  action is judged as again when it is queued.
-- An approving verdict writes an `approval@1.x` artifact by `operator` on the same subject,
-  referenced from `resolution.approval`.
+- Written only by a core component (`requester.component`), never from model text (INV-6). The summary
+  may quote a Worker's proposal; it carries no authority.
+- `subject`, `action`, `requester`, `policy`, `classification`, and `expiresAt` never change after the
+  request is created, so what the operator was shown is what the verdict binds to. A changed proposal
+  is a new request. `requester` names the work waiting on it (a run, session, project, or task), so the
+  request is withdrawn when that work ends.
+- One request, one exact subject (INV-5). Its subject names a `version`, unless it is an `artifact`
+  subject whose `ref` is a `sha256:` content id; the queue refuses another (the schema cannot say so, as
+  `common@1`'s subject keeps `version` optional). An operator verdict names the subject it saw; if the
+  subject changed since, the verdict is refused and the request is unchanged, so the requester must
+  withdraw it and ask anew.
+- It is queued only on an `ask` the policies loaded now give: `policy` names the `autonomy` decision,
+  which a policy made under the project's policy set as loaded, for the class the action is judged as
+  again when it is queued.
+- An approving verdict writes an `approval@1.x` artifact by `operator` on the same subject, referenced
+  from `resolution.approval`.
 - Expiry is one transaction: the state becomes `rejected`, `resolution.cause` is `expired`, and an
-  `approval` decision with outcome `denied:expired` is recorded. The waiting work resumes as
-  denied. A request is `withdrawn` (also `rejected`) when the work waiting on it ends first, or
-  when the loaded policies no longer ask for it: its policy is not current at its version, or its
-  class no longer asks (checked at load and on every sweep; the decision's decider is the rule
-  `approvals.policy` and its reason says what changed).
-- `approval-request@1.1` adds the queue's own requests: a `policy-change` the operator proposed,
-  or the queue proposed itself, requested by `approvals` and naming its `policyChangeId`. Such a request must be `@1.1`, of
-  class `policy-change`; every other request stays `@1.0`. Only the queue writes one: `request`
-  refuses the requester `approvals` (`invalid`). Its subject is
+  `approval` decision with outcome `denied:expired` is recorded. The waiting work resumes as denied. A
+  request is `withdrawn` (also `rejected`) when the work waiting on it ends first, or when the loaded
+  policies no longer ask for it: its policy is not current at its version, or its class no longer asks
+  (checked at load and on every sweep; the decision's decider is the rule `approvals.policy` and its
+  reason says what changed).
+- The queue's own requests (`@1.1`): a `policy-change` the operator proposed, or the queue proposed
+  itself, requested by `approvals` and naming its `policyChangeId`. Such a request must be `@1.1`, of
+  class `policy-change`; every other request stays `@1.0`. Only the queue writes one: `request` refuses
+  the requester `approvals` (`invalid`). Its subject is
   `{type: content, ref: autonomy-policy-set, version: <the proposed set's hash>}`.
 - A `dispatch` request (ADR-0064) stays `@1.0`: requester `workflow` with the task and project, its
-  subject `{type: content, ref: dispatch:<taskId>:attempt:<n>, version: quota-score@2:<sha256 of
-  the Worker and the score's inputs>}` (`n`, the attempts the task had made), so an approval binds
-  the task, the attempt, and the Worker; its `refs` name the `dispatch.choice` decision.
-  Examples: [`approval-request.batched.json`](../../schemas/examples/approval-request.batched.json),
+  subject `{type: content, ref: dispatch:<taskId>:attempt:<n>, version: quota-score@2:<sha256 of the
+  Worker and the score's inputs>}` (`n`, the attempts the task had made), so an approval binds the task,
+  the attempt, and the Worker; its `refs` name the `dispatch.choice` decision. Examples:
+  [`approval-request.batched.json`](../../schemas/examples/approval-request.batched.json),
   [`approval-request.expired.json`](../../schemas/examples/approval-request.expired.json),
   [`approval-request.policy-change.json`](../../schemas/examples/approval-request.policy-change.json).
 
 ### `policy-change`
 
-- One change of the autonomy policy set: the operator proposes one `autonomy-policy@1.0` record
-  (a policy of the set at a higher version, or a policy for a project that has none), and the
-  queue keeps the whole set it makes (`policies`: the studio policy, then the project policies
-  by project id), its `hash` (the sha256 of their canonical JSON), the `baseHash` of the set in
-  force when proposed, the `configHash` of the configured set that base derives from, and its
-  `effect`: every effective mode it moves, per project. The proposed set loads under the same
-  rules as a configured one, or nothing is stored.
-- `asked` → `applied` only on the operator's approval of its request, while its base is still
-  the set in force, in the transaction of the verdict, with a `policy-change` decision
-  (`decision@1.6`). `asked` → `declined` when its request is rejected, expires, or is withdrawn
-  (its base no longer in force, or the policy no longer asks). `applied` → `retired` when a
-  configuration names its hash in `supersedes` at a start.
-- The set in force is the latest applied change's while it is not retired and its `configHash`
-  is the configured set's hash, else the configured set
-  ([approvals](../design/approvals.md#the-configuration-and-the-stored-set)).
-  Example: [`policy-change.applied.json`](../../schemas/examples/policy-change.applied.json).
-- `policy-change@1.1` adds the optional `origin`: the queue proposed the change itself
+- One change of the autonomy policy set: the operator proposes one `autonomy-policy@1.0` record (a
+  policy of the set at a higher version, or a policy for a project that has none), and the queue keeps
+  the whole set it makes (`policies`: the studio policy, then the project policies by project id), its
+  `hash` (the sha256 of their canonical JSON), the `baseHash` of the set in force when proposed, the
+  `configHash` of the configured set that base derives from, and its `effect`: every effective mode it
+  moves, per project. The proposed set loads under the same rules as a configured one, or nothing is
+  stored.
+- `asked` → `applied` only on the operator's approval of its request, while its base is still the set
+  in force, in the transaction of the verdict, with a `policy-change` decision (`decision@1.6`).
+  `asked` → `declined` when its request is rejected, expires, or is withdrawn (its base no longer in
+  force, or the policy no longer asks). `applied` → `retired` when a configuration names its hash in
+  `supersedes` at a start.
+- The set in force is the latest applied change's while it is not retired and its `configHash` is the
+  configured set's hash, else the configured set
+  ([approvals](../design/approvals.md#the-configuration-and-the-stored-set)). Example:
+  [`policy-change.applied.json`](../../schemas/examples/policy-change.applied.json).
+- `origin` (optional, `@1.1`): the queue proposed the change itself
   ([approvals](../design/approvals.md#the-queue-proposes-a-policy-change)). It names the rule
-  (`approvals.repeated-approvals`), the `shape` (`{actionClass: command, command}`: the exact argv
-  as the one commands line the change adds), the operator's approvals counted (`approved`), the
+  (`approvals.repeated-approvals`), the `shape` (`{actionClass: command, command}`: the exact argv as
+  the one commands line the change adds), the operator's approvals counted (`approved`), the
   `windowSeconds`, and the `decision` that recorded the proposal. A change with an `origin` must be
-  `@1.1`; the operator's own changes stay `@1.0`. It carries no authority: only the operator's
-  approval of its request applies it. Example:
+  `@1.1`; the operator's own changes stay `@1.0`. It carries no authority: only the operator's approval
+  of its request applies it. Example:
   [`policy-change.queue-proposed.json`](../../schemas/examples/policy-change.queue-proposed.json).
 
 ### `project`
 
 - Its charter is approved by the operator (action class `charter`) on the subject
-  `{type: content, ref: project:<projectId>:charter:<version>, version: sha256 of the canonical
-  charter without approval}`. `board_charter` with an existing `projectId` amends its charter;
-  otherwise it founds a project, with that id or a generated one (derived from its
-  `clientRequestId` when it has one, so a retry after a crash asks about the same subject and
-  adopts that request, also when it was approved meanwhile). A retry under the same key returns
-  the charter version that call asked about. An amendment is held in
-  `proposedCharter` with the next version
-  until approved, and the project keeps its state meanwhile. A first charter that is rejected or
-  expires closes the project as `abandoned` and cancels its open tasks (`project-closed`); a
-  refused or expired amendment is dropped.
-- A milestone is funded (action class `funding`) by an approval on its budget, a funding round.
-  A founding call declares every milestone `planned`, with no `funding`: the charter's approval
-  does not cover a funding round.
+  `{type: content, ref: project:<projectId>:charter:<version>, version: sha256 of the canonical charter
+  without approval}`. `board_charter` with an existing `projectId` amends its charter; otherwise it
+  founds a project, with that id or a generated one (derived from its `clientRequestId` when it has
+  one, so a retry after a crash asks about the same subject and adopts that request, also when it was
+  approved meanwhile). A retry under the same key returns the charter version that call asked about. An
+  amendment is held in `proposedCharter` with the next version until approved, and the project keeps its
+  state meanwhile. A first charter that is rejected or expires closes the project as `abandoned` and
+  cancels its open tasks (`project-closed`); a refused or expired amendment is dropped.
+- A milestone is funded (action class `funding`) by an approval on its budget, a funding round. A
+  founding call declares every milestone `planned`, with no `funding`: the charter's approval does not
+  cover a funding round.
 - Budget use is computed from the usage records of its tasks, never stored on the project.
-- Stop rules are words: the lead or the operator judges them, and the action a rule names is put
-  to the operator through the approval queue.
+- Stop rules are words: the lead or the operator judges them, and the action a rule names is put to the
+  operator through the approval queue.
 - `classification` is a floor for its tasks and briefs. Example:
   [`project.active.json`](../../schemas/examples/project.active.json).
 
 ### `project-requests`
 
-- The ledger `system project new` keeps as `requests.json` in a new project's coordination
-  directory ([packaging](../design/packaging.md)): the charter's `board_charter` request and the
-  one `approvals_policy_propose` request of its creation, each `filed` or not, with the approval
-  request each was answered with. Only the command writes it: created with both unfiled before
-  anything is filed, and rewritten as each request is filed. Each write is validated first.
-- The command run again reads it, validated against its schema tag, before anything is filed: a
-  ledger that does not validate, has no tag, or names a major version this install does not know
-  is refused, and nothing is filed (fail closed). A ledger of another project id, or with every
-  request filed, is an id in use. The requests filed on a retry are the records stored beside it
-  (`charter.json`, `policy-change.json`), the policy the one whose id `policy.id` names.
-- It records requests, never verdicts: whether the operator approved one is the queue's.
-  Example: [`project-requests.partial.json`](../../schemas/examples/project-requests.partial.json).
+- The ledger `system project new` keeps as `requests.json` in a new project's coordination directory
+  ([packaging](../design/packaging.md)): the charter's `board_charter` request and the one
+  `approvals_policy_propose` request of its creation, each `filed` or not, with the approval request
+  each was answered with. Only the command writes it: created with both unfiled before anything is
+  filed, and rewritten as each request is filed. Each write is validated first.
+- The command run again reads it, validated against its schema tag, before anything is filed: a ledger
+  that does not validate, has no tag, or names a major version this install does not know is refused,
+  and nothing is filed (fail closed). A ledger of another project id, or with every request filed, is
+  an id in use. The requests filed on a retry are the records stored beside it (`charter.json`,
+  `policy-change.json`), the policy the one whose id `policy.id` names.
+- It records requests, never verdicts: whether the operator approved one is the queue's. Example:
+  [`project-requests.partial.json`](../../schemas/examples/project-requests.partial.json).
 
 ### `board-task`
 
-- `dependsOn` names tasks of the same project that exist when it is proposed, so it is acyclic. While a task is not terminal, no
-  other task holds write authority over the same `writes` subject (INV-15).
-- `holder` is the lease on resource `board-task:<taskId>`; every write presents its generation
-  as a fence.
+- `dependsOn` names tasks of the same project that exist when it is proposed, so it is acyclic. While a
+  task is not terminal, no other task holds write authority over the same `writes` subject (INV-15).
+- `holder` is the lease on resource `board-task:<taskId>`; every write presents its generation as a
+  fence.
 - `run` is recorded before the run starts. After a restart, a task with a run and no result is
   reconciled and its run is never started again (INV-4); one that cannot be reconciled waits for
   approval with reason `reconciliation-failed`.
-- A rejected review starts another attempt while `attempts.count < attempts.max`, and otherwise
-  waits for input with reason `retries-spent`; `attempts.count` never exceeds `attempts.max`.
-  Every new attempt goes through the autonomy policy again, so an approval request's subject
+- A rejected review starts another attempt while `attempts.count < attempts.max`, and otherwise waits
+  for input with reason `retries-spent`; `attempts.count` never exceeds `attempts.max`. Every new
+  attempt goes through the autonomy policy again, so an approval request's subject
   `board-task:<taskId>:attempt:<n>` (`n`, the attempts already made) covers one attempt only.
-- Only a claimed, running, or reviewed task has a `holder`, and a review the board holds for the
-  operator has none: it has `waiting` instead, with reason `operator-review`, the checks still
-  pending (`pendingChecks`), and the policy's wait for the class as its expiry, after which it
-  waits for input (`review-expired`). Example:
+- Only a claimed, running, or reviewed task has a `holder`. A review the board holds for the operator
+  has none: it has `waiting` instead, with reason `operator-review`, the checks still pending
+  (`pendingChecks`), and the policy's wait for the class as its expiry, after which it waits for input
+  (`review-expired`). Example:
   [`board-task.operator-review.json`](../../schemas/examples/board-task.operator-review.json).
-  A result always names its subject:
-  the worktree's commit, or the result artifact (`{type: artifact}`) for work with no
-  repository, so a task is never stuck in review for want of one. A task that `writes` a subject
-  leaves its result on that subject (the same type and ref, at its new version).
-- Every wait expires and never starts work: an approval wait follows its request, which expiry
-  rejects, and then waits for input with reason `rejected`; an input wait that expires cancels
-  the task (`input-expired`). When the queue has not resolved the request by `waiting.expiresAt`,
-  or no longer knows it, the board applies the expiry itself.
-- `done` needs an `acceptance` decision whose outcome is accepted; the schema checks only that
-  it is named. The board takes one only on the task's exact result: its `outcome.detail` names
-  the `taskId` and the result's exact `subject` (version included), and may report the `checks`
-  it ran (check name → passed); its inputs hold every artifact of the result and its digest. One
-  not made by the operator accepts only when the policy finds none of the class's required checks
-  failed ([board](../design/board.md#required-checks-bind-at-acceptance)); otherwise the board holds the review for the
-  operator. A task in review keeps its holder's lease while verification runs; if the lease
-  lapses with no decision, the review is held for the operator (`operator-review`, the policy's
-  wait), and only that wait's expiry makes the task wait for input (`review-expired`), which
-  expires in turn unless the lead or the operator re-opens it (`board_reopen_review`).
-- A holder lost mid-run is first reconciled by the run's owner: a completed run's result is
-  applied with its `acceptance` decision, as a review's would be, a failed one counts as an
-  attempt, and only an unknown outcome waits for approval to run again (`reconciliation-failed`);
-  an outcome reported later withdraws that request. When the policy's verdict on `remediation`
-  (or, for a spent budget, `funding`) is not `ask`, no request can be opened, and the task waits
-  for input (`rejected`) instead: it is never readied or cancelled on the policy alone.
-- `budget` lines cap what the task's attempts draw together, as the ledger counts them for the
-  task. `board-task@1.1` adds a spent budget's funding
-  ([board](../design/board.md#funding-a-spent-budget)): `waiting.funding`, only on a
-  `budget-spent` wait, holds the lines its `funding` request asks to add, whose subject version is
-  `budget-spent:<sha256 of their canonical JSON>`; `funding` lists each raise an approved request
-  applied (the lines, the operator's `approval`, the board's `decision`, and when), oldest first,
-  at most one per attempt. A record carries either only at `@1.1`; every other record stays
-  `@1.0`. Example:
+- A result always names its subject: the worktree's commit, or the result artifact (`{type: artifact}`)
+  for work with no repository, so a task is never stuck in review for want of one. A task that `writes`
+  a subject leaves its result on that subject (the same type and ref, at its new version).
+- Every wait expires and never starts work: an approval wait follows its request, which expiry rejects,
+  and then waits for input with reason `rejected`; an input wait that expires cancels the task
+  (`input-expired`). When the queue has not resolved the request by `waiting.expiresAt`, or no longer
+  knows it, the board applies the expiry itself.
+- `done` needs an `acceptance` decision whose outcome is accepted; the schema checks only that it is
+  named. The board takes one only on the task's exact result: its `outcome.detail` names the `taskId`
+  and the result's exact `subject` (version included), and may report the `checks` it ran (check name →
+  passed); its inputs hold every artifact of the result and its digest. One not made by the operator
+  accepts only when the policy finds none of the class's required checks failed
+  ([board](../design/board.md#required-checks-bind-at-acceptance)); otherwise the board holds the
+  review for the operator. A task in review keeps its holder's lease while verification runs; if the
+  lease lapses with no decision, the review is held for the operator (`operator-review`, the policy's
+  wait), and only that wait's expiry makes the task wait for input (`review-expired`), which expires in
+  turn unless the lead or the operator re-opens it (`board_reopen_review`).
+- A holder lost mid-run is first reconciled by the run's owner: a completed run's result is applied
+  with its `acceptance` decision, as a review's would be, a failed one counts as an attempt, and only an
+  unknown outcome waits for approval to run again (`reconciliation-failed`); an outcome reported later
+  withdraws that request. When the policy's verdict on `remediation` (or, for a spent budget, `funding`)
+  is not `ask`, no request can be opened, and the task waits for input (`rejected`) instead: it is
+  never readied or cancelled on the policy alone.
+- `budget` lines cap what the task's attempts draw together, as the ledger counts them for the task.
+  A spent budget's funding (`@1.1`; [board](../design/board.md#funding-a-spent-budget)):
+  `waiting.funding`, only on a `budget-spent` wait, holds the lines its `funding` request asks to add,
+  whose subject version is `budget-spent:<sha256 of their canonical JSON>`; `funding` lists each raise
+  an approved request applied (the lines, the operator's `approval`, the board's `decision`, and when),
+  oldest first, at most one per attempt. A record carries either only at `@1.1`. Example:
   [`board-task.funding.json`](../../schemas/examples/board-task.funding.json).
-- `variant` (`board-task@1.5`) is the variant of `template` every run of the task starts with,
-  so its writing step's kind of work routes it (a `docs` or `tests` task to the Workers given that
-  kind); it needs `template`, and a record that carries it is `@1.4` whatever else it carries.
-- `lastDecision` is the decision behind the latest move: a `board` decision for moves the board
-  makes on its own, otherwise the acceptance, approval, route, or reconciliation decision that
-  caused it. Examples: [`board-task.review.json`](../../schemas/examples/board-task.review.json),
+- `variant` (`@1.5`) is the variant of `template` every run of the task starts with, so its writing
+  step's kind of work routes it (a `docs` or `tests` task to the Workers given that kind); it needs
+  `template`, and a record that carries it is `@1.4` whatever else it carries.
+- `lastDecision` is the decision behind the latest move: a `board` decision for moves the board makes on
+  its own, otherwise the acceptance, approval, route, or reconciliation decision that caused it.
+  Examples: [`board-task.review.json`](../../schemas/examples/board-task.review.json),
   [`board-task.waiting-for-approval.json`](../../schemas/examples/board-task.waiting-for-approval.json).
 
 ### `brief`
 
-- The body of an `objective` artifact. Every `artifacts[].ref` is also an input of its envelope,
-  so unknown references are refused and the classification floor applies (INV-12); its
-  `classification` is at least the strictest of them.
-- It carries pointers, never content. A Worker source resolves them when it renders the brief
-  into its prompt at start, and checks egress on what it rendered
+- The body of an `objective` artifact. Every `artifacts[].ref` is also an input of its envelope, so
+  unknown references are refused and the classification floor applies (INV-12); its `classification` is
+  at least the strictest of them.
+- It carries pointers, never content. A Worker source resolves them when it renders the brief into its
+  prompt at start, and checks egress on what it rendered
   ([briefs](../design/workflow-engine.md#briefs)).
-- `brief@1.1` adds `instructions`: what the Worker is told, in order, as its template words it,
-  text and pointers by their index in `artifacts`. Rendered, each pointer is replaced by its
-  artifact's text (the body's `text`, else its canonical JSON) and never expanded again. A brief
-  for a board task, or one without instructions, first states the task and attempt, the goal,
-  the acceptance criteria, and the open questions; pointers the instructions do not place follow,
-  with their role and note. `instructions` before 1.1 is refused.
-- `brief@1.2` adds `ask`: the Worker may answer with questions instead of a result, when it
-  cannot finish without a person's answer. Rendered, the brief says how: the whole answer one
-  JSON object `{"questions": [...]}`, 1 to `maxQuestions` (at most 8) questions of at most 500
-  characters, the bounds of a board task's question wait. Anything else is a result. The workflow
-  engine offers it on every brief of a board task's run
-  ([a question from a run](../design/workflow-engine.md#a-question-from-a-run)); `ask` before
-  1.2 is refused. Example: [`brief.task-attempt.json`](../../schemas/examples/brief.task-attempt.json).
-- `brief@1.2` adds `files`: at most 4 files a Worker source with a workspace of the run's own
-  writes there before the run, each the text of the artifact it points at, at a path of one name
-  under `.system/` (a directory the source makes git ignore). Every `files[].ref` is an input of
-  the envelope too, under the same classification floor. A source with no such workspace writes
-  none and never mentions them; `files` before 1.2 is refused
+- `instructions` (`@1.1`): what the Worker is told, in order, as its template words it, text and
+  pointers by their index in `artifacts`. Rendered, each pointer is replaced by its artifact's text
+  (the body's `text`, else its canonical JSON) and never expanded again. A brief for a board task, or
+  one without instructions, first states the task and attempt, the goal, the acceptance criteria, and
+  the open questions; pointers the instructions do not place follow, with their role and note.
+- `ask` (`@1.2`): the Worker may answer with questions instead of a result, when it cannot finish
+  without a person's answer. Rendered, the brief says how: the whole answer one JSON object
+  `{"questions": [...]}`, 1 to `maxQuestions` (at most 8) questions of at most 500 characters, the
+  bounds of a board task's question wait. Anything else is a result. The workflow engine offers it on
+  every brief of a board task's run ([a question from a run](../design/workflow-engine.md#a-question-from-a-run)).
+  Example: [`brief.task-attempt.json`](../../schemas/examples/brief.task-attempt.json).
+- `files` (`@1.2`): at most 4 files a Worker source with a workspace of the run's own writes there
+  before the run, each the text of the artifact it points at, at a path of one name under `.system/` (a
+  directory the source makes git ignore). Every `files[].ref` is an input of the envelope too, under the
+  same classification floor. A source with no such workspace writes none and never mentions them
   ([TASKS.md in a run's workspace](../design/workflow-engine.md#tasksmd-in-a-runs-workspace)).
-- `brief@1.3` adds an acceptance criterion's optional `check` (`tests`, `typecheck`, `lint`,
-  `schema`, `quote-check`, `review`, `operator`): what checks it, as the board task names it
-  (`board-task` acceptance `check`). Rendered, the criterion says it (`- a1: pnpm test passes
-  (check: tests)`), so a step that measures the change, such as `algorithm-development`'s
-  `develop:1` before its review, knows which criteria are its to run without the caller's input
-  ([workflow templates](workflow-templates.md#algorithm-development)). The workflow engine writes
-  `@1.3` for a board task's run when one of its criteria names a check, `@1.2` otherwise; a `check`
-  before 1.3 is refused. Example: [`brief.task-checks.json`](../../schemas/examples/brief.task-checks.json).
-- `brief@1.6` adds `handbook`: the handbook slice the Worker was given
-  ([handbook](../design/handbook.md#what-a-brief-records)): the 6,000-token bound and its mode
-  (`warn`, `refuse`), what selected the slice (role, class, risk tier and where it came from, how the
-  touched paths were read, and those paths, at most 200), and per layer its version, who rendered it
-  (`engine`, `source`), the ids of the parts it carried, and its estimated tokens (`ceil(UTF-8 bytes /
-  4)`; the source's lessons at what they render to, and a part whose size cannot be read before routing, the gate view always, at its constructed maximum, `atMost`). The workflow engine writes `@1.6` for
-  every step of a board task's run while the slice is on (it holds `tier` and `model` too); `handbook`
-  before 1.6 is refused. Example: [`brief.task-handbook.json`](../../schemas/examples/brief.task-handbook.json).
+- An acceptance criterion's optional `check` (`@1.3`; `tests`, `typecheck`, `lint`, `schema`,
+  `quote-check`, `review`, `operator`): what checks it, as the board task names it (`board-task`
+  acceptance `check`). Rendered, the criterion says it (`- a1: pnpm test passes (check: tests)`), so a
+  step that measures the change, such as `algorithm-development`'s `develop:1` before its review, knows
+  which criteria are its to run without the caller's input
+  ([workflow templates](workflow-templates.md#algorithm-development)). The workflow engine writes `@1.3`
+  for a board task's run when one of its criteria names a check, `@1.2` otherwise. Example:
+  [`brief.task-checks.json`](../../schemas/examples/brief.task-checks.json).
+- `handbook` (`@1.6`): the handbook slice the Worker was given
+  ([handbook](../design/handbook.md#what-a-brief-records)): the 6,000-token bound and its mode (`warn`,
+  `refuse`), what selected the slice (role, class, risk tier and where it came from, how the touched
+  paths were read, and those paths, at most 200), and per layer its version, who rendered it (`engine`,
+  `source`), the ids of the parts it carried, and its estimated tokens (`ceil(UTF-8 bytes / 4)`; the
+  source's lessons at what they render to, and a part whose size cannot be read before routing, the gate
+  view always, at its constructed maximum, `atMost`). The workflow engine writes `@1.6` for every step
+  of a board task's run while the slice is on (it holds `tier` and `model` too). Example:
+  [`brief.task-handbook.json`](../../schemas/examples/brief.task-handbook.json).
+- A brief carrying `instructions`, `ask`, `files`, `check`, or `handbook` below the version noted is
+  refused (see [Versioning](#versioning)).
 - `sandbox` comes from trusted configuration (the Worker source's), never from model text, and
-  `budget.remaining` is computed from the ledger when the brief is written. `resume` names the
-  native session the brief continues, when the Worker keeps one. Examples:
+  `budget.remaining` is computed from the ledger when the brief is written. `resume` names the native
+  session the brief continues, when the Worker keeps one. Examples:
   [`brief.task.json`](../../schemas/examples/brief.task.json),
   [`brief.node.json`](../../schemas/examples/brief.node.json).
 
@@ -1251,10 +1187,7 @@ guesses.
 
 ### MCP tools: `digests_*`
 
-| Tool | Scope | Does |
-|---|---|---|
-| `digests_request` | client | ask for a cited digest of 1 to 64 raw artifacts, by content id; waits up to `waitSeconds` for it to settle |
-| `digests_get` | client | read a request as it stands: `pending`, `written` (with its digest), `not-written`, or `bypassed`, with why |
+Tools: `digests_request`, `digests_get`. Scope and purpose: [mcp-tools](mcp-tools.md).
 
 - Both answer with the request (`$defs/request` of
   [`mcp-digests.v1.json`](../../schemas/mcp-digests.v1.json); 1.1 adds its `escalation`, the
@@ -1286,13 +1219,7 @@ One question put to the operator and, once answered, the answer: the `decisions`
 
 ### MCP tools: `decisions_*`
 
-| Tool | Scope | Does |
-|---|---|---|
-| `decisions_ask` | operator, lead | record a question; the store gives it the studio's next number |
-| `decisions_answer` | operator, lead | record the answer to a question that waits |
-| `decisions_list` | operator, lead | the decisions in number order, a page at a time |
-| `decisions_show` | operator, lead | one decision, with the decisions that supersede it (at most 100) |
-| `decisions_import` | operator | import the lead's `decisions.json`, once |
+Tools: `decisions_ask`, `decisions_answer`, `decisions_list`, `decisions_show`, `decisions_import`. Scope and purpose: [mcp-tools](mcp-tools.md).
 
 - Input and output: [`mcp-decisions.v1.json`](../../schemas/mcp-decisions.v1.json) `$defs/<tool>-input`
   and `<tool>-output` (`mcp-decisions@1.0`). The row is a surface with no seam of its own: these tools
@@ -1314,45 +1241,35 @@ One question put to the operator and, once answered, the answer: the `decisions`
 
 ### MCP tools: agent accounts
 
-| Tool | Scope | Does |
-|---|---|---|
-| `account_enroll` | operator | step `begin`: take the lowest free slot of a runtime (or the slot named; a taken slot, or an `accountId`, is signed in again) and return the runtime's own sign-in command for its home (a runtime with no identity reader takes no free slot: `config_error`, nothing enrolled); step `verify`: read who signed in and record the account (`accept` takes a `changed` slot's new principal as a new account) |
-| `account_remove` | operator | free a slot, by `accountId` or by `provider` and `slot`; its home is kept |
-| `account_agents` | operator | every slot and the account in it, with the Workers that run on its account and the operator's `label` of its account (`@1.2`); each runtime's slots, how many are taken, whether it reads identity and gives a sign-in command, and its `title` (`@1.2`) |
-| `account_migrate` | operator | `@1.1` (a role's `kinds` and `description` `@1.2`): the move from hand-named agent Workers to Workers derived as account × role: `plan` (`workers`: each old Worker's `from`, `runtime`, `role`, new id `to` and `account`, or none when it stops, and why; the new row's `roles`, `assignments`, `providers`; `templates` for the resources row; `blockers`), the new row's whole config (`row`), the `outcome` (`planned`, `applied`, `already-applied`, `rolled-back`, `not-applied`), the `cutover` in force (its decision, when, and the plan applied), and how many sessions and runs were `moved`. `apply` and `rollback` never together |
+Tools: `account_enroll`, `account_remove`, `account_agents`, `account_migrate`. Scope and purpose: [mcp-tools](mcp-tools.md).
 
 - Input and output: [`mcp-agent-accounts.v1.json`](../../schemas/mcp-agent-accounts.v1.json)
-  `$defs/<tool>-input` and `<tool>-output` (`mcp-agent-accounts@1.2`; 1.1 adds `account_migrate`). A slot is named by its
-  `provider` and `slot` or by the `accountId` it holds, never both; `verify` and `remove` name the
-  slot whole, and only `verify` accepts. An `accountId` two slots hold (a duplicate) names neither.
-- `mcp-agent-accounts@1.2` adds, each optional: on a plan's role, `kinds` (1 to 16 `workKind`
-  labels, each once) and `description` (1 to 200 characters), as the planner gives them (rule
-  `agent-workers.migration` version 3: the rows' kinds, and their description when every row of
-  the role gives the same one); in `account_agents`, an account's `label` (the operator's,
-  `assignments[].label`, 1 to 64 characters) and a runtime's `title` (its provider's name for
-  people, 1 to 64 characters). A 1.1 reader refuses a plan whose roles
-  carry `kinds`: that was the defect 1.2 fixes.
-- Each account is an [`agent-account@1.x`](#agent-account) record. The sign-in command's
-  environment names the home and never a session bus; nothing holds a principal or a token (INV-8).
-  A refused input does nothing (`invalid input, nothing done`); a refused call says its kind
-  (`invalid_input`, `config_error`) and changes nothing.
+  `$defs/<tool>-input` and `<tool>-output` (`mcp-agent-accounts@1.2`). A slot is named by its `provider`
+  and `slot` or by the `accountId` it holds, never both; `verify` and `remove` name the slot whole, and
+  only `verify` accepts. An `accountId` two slots hold (a duplicate) names neither.
+- Optional fields of `@1.2`: on a plan's role, `kinds` (1 to 16 `workKind` labels, each once) and
+  `description` (1 to 200 characters), as the planner gives them (rule `agent-workers.migration`
+  version 3: the rows' kinds, and their description when every row of the role gives the same one); in
+  `account_agents`, an account's `label` (the operator's, `assignments[].label`, 1 to 64 characters)
+  and a runtime's `title` (its provider's name for people, 1 to 64 characters). A 1.1 reader refuses a
+  plan whose roles carry `kinds`.
+- Each account is an [`agent-account@1.x`](#agent-account) record. The sign-in command's environment
+  names the home and never a session bus; nothing holds a principal or a token (INV-8). A refused input
+  does nothing (`invalid input, nothing done`); a refused call says its kind (`invalid_input`,
+  `config_error`) and changes nothing.
 - **Output checked before a change commits.** A call that changes anything (a slot taken, a reading
-  recorded, a slot freed, a cutover applied or rolled back) checks the output it would give against
-  its `<tool>-output` before its change commits: an output its schema refuses is a defect,
-  refused as `<tool> would make an output its schema refuses (a defect), so nothing changed`. A
-  call that changes nothing (`account_agents`, a plan) is checked as it returns (`<tool> made an
-  output its schema refuses (a defect)`).
+  recorded, a slot freed, a cutover applied or rolled back) checks the output it would give against its
+  `<tool>-output` before its change commits: an output its schema refuses is a defect, refused as `<tool>
+  would make an output its schema refuses (a defect), so nothing changed`. A call that changes nothing
+  (`account_agents`, a plan) is checked as it returns (`<tool> made an output its schema refuses (a
+  defect)`).
 - Examples: [`mcp-agent-accounts.enroll.json`](../../schemas/examples/mcp-agent-accounts.enroll.json),
   [`mcp-agent-accounts.list.json`](../../schemas/examples/mcp-agent-accounts.list.json),
   [`mcp-agent-accounts.migrate.json`](../../schemas/examples/mcp-agent-accounts.migrate.json).
 
 ### MCP tool: agent runs
 
-| Tool | Scope | Does |
-|---|---|---|
-| `agent_run_free` | operator | free the session and worktree an agent run holds because it ended without being known to be gone, on the operator's word that its agent is gone ([freeing what a run holds](../design/agent-runtimes.md#freeing-what-a-run-holds)) |
-| `agent_worktrees` | operator | 1.1: the workflow runs' worktrees not removed yet, with their state, what they hold, and when the retention removes them ([the operator's removal](../design/agent-runtimes.md#the-operators-removal-of-run-worktrees)) |
-| `agent_worktrees_remove` | operator | 1.1: remove the finished run worktrees now, never discarding a change ([the operator's removal](../design/agent-runtimes.md#the-operators-removal-of-run-worktrees)) |
+Tools: `agent_run_free`, `agent_worktrees`, `agent_worktrees_remove`. Scope and purpose: [mcp-tools](mcp-tools.md).
 
 - Input and output: [`mcp-agent-runs.v1.json`](../../schemas/mcp-agent-runs.v1.json)
   `$defs/agent-run-free-input` and `agent-run-free-output` (`mcp-agent-runs@1.0`). `agentRun` is an
@@ -1364,209 +1281,181 @@ One question put to the operator and, once answered, the answer: the `decisions`
   `freed`, what it held that is free now, in words (empty when `again`); and each worktree of its
   workflow run, `removed` (with the `commit` that kept its changes, if any) or `kept`, and `why`.
 - A refused call (`invalid_input`) changes nothing and records nothing: no such run, a run that holds
-  nothing, a run freed already with no worktree of it left, its liveness still being looked at,
-  another started run of its session or worktree not finished, its lease held, or its holder or
-  agent process present on this host. Example:
-  [`mcp-agent-runs.free.json`](../../schemas/examples/mcp-agent-runs.free.json).
-- `agent_worktrees` (1.1; `$defs/agent-worktrees-input`, `-output`): `limit` 1 to 100 (default
-  100). The output gives `retentionHours` (agent-workers `worktreeRetentionHours`), `total` (every
-  worktree not removed), and at most 100 of them, oldest first: `runId`, `repository`, `path`,
-  `branch`, `createdAt`, `lastActivityAt` (when its workflow run's last agent run ended, else when it
-  was made), `state` (`in-use` while an agent run of its workflow run is queued or running; `held`
-  while one ended without being known to be gone; `finished` otherwise), `changes` (`clean`,
-  `uncommitted`, `gone` from disk, or `not-intact`: its `.git` file or branch is not what it was
-  made with, so git is not run there), `retiresAt` once finished with a retention above 0, and the
-  last retirement's `failure`. Example:
-  [`mcp-agent-runs.worktrees.json`](../../schemas/examples/mcp-agent-runs.worktrees.json).
-- `agent_worktrees_remove` (1.1; `$defs/agent-worktrees-remove-input`, `-output`): `runId` (a
-  workflow run id) narrows it to that run's worktrees; `commitChanges` has a finished worktree's
-  uncommitted changes committed on its branch before it is removed; `note` (at most 1,000
-  characters) is the decision's rationale. The output names the operator's `retention` decision
-  (decider `operator.worktrees`), recorded before any worktree was removed and absent when none
-  could be (then nothing is decided); each worktree looked at (at most 50), `removed` (with the
-  `commit` that kept its changes, if any) or `kept`, and `why`; and `more`, those not looked at. A
-  worktree is removed only while it is `finished` and holds nothing uncommitted, or with
-  `commitChanges`; the branch always stays. Its output is checked on its plan before anything is
-  decided: an output its schema refuses (a defect) decides and removes nothing. Example:
+  nothing, a run freed already with no worktree of it left, its liveness still being looked at, another
+  started run of its session or worktree not finished, its lease held, or its holder or agent process
+  present on this host. Example: [`mcp-agent-runs.free.json`](../../schemas/examples/mcp-agent-runs.free.json).
+- `agent_worktrees` (`$defs/agent-worktrees-input`, `-output`): `limit` 1 to 100 (default 100). The
+  output gives `retentionHours` (agent-workers `worktreeRetentionHours`), `total` (every worktree not
+  removed), and at most 100 of them, oldest first: `runId`, `repository`, `path`, `branch`,
+  `createdAt`, `lastActivityAt` (when its workflow run's last agent run ended, else when it was made),
+  `state` (`in-use` while an agent run of its workflow run is queued or running; `held` while one ended
+  without being known to be gone; `finished` otherwise), `changes` (`clean`, `uncommitted`, `gone` from
+  disk, or `not-intact`: its `.git` file or branch is not what it was made with, so git is not run
+  there), `retiresAt` once finished with a retention above 0, and the last retirement's `failure`.
+  Example: [`mcp-agent-runs.worktrees.json`](../../schemas/examples/mcp-agent-runs.worktrees.json).
+- `agent_worktrees_remove` (`$defs/agent-worktrees-remove-input`, `-output`): `runId` (a workflow run
+  id) narrows it to that run's worktrees; `commitChanges` has a finished worktree's uncommitted changes
+  committed on its branch before it is removed; `note` (at most 1,000 characters) is the decision's
+  rationale. The output names the operator's `retention` decision (decider `operator.worktrees`),
+  recorded before any worktree was removed and absent when none could be (then nothing is decided);
+  each worktree looked at (at most 50), `removed` (with the `commit` that kept its changes, if any) or
+  `kept`, and `why`; and `more`, those not looked at. A worktree is removed only while it is `finished`
+  and holds nothing uncommitted, or with `commitChanges`; the branch always stays. Its output is
+  checked on its plan before anything is decided: an output its schema refuses (a defect) decides and
+  removes nothing. Example:
   [`mcp-agent-runs.worktrees-remove.json`](../../schemas/examples/mcp-agent-runs.worktrees-remove.json).
 
 ### MCP tool: `report`
 
-| Tool | Scope | Does |
-|---|---|---|
-| `report` | client | the baseline report of a period, for one project or every one, from recorded data only; by default the 7 days before now (the weekly investor report) |
+Tools: `report`. Scope and purpose: [mcp-tools](mcp-tools.md).
 
 - Input and output: [`mcp-report.v1.json`](../../schemas/mcp-report.v1.json) `$defs/report-input` and
-  `report-output`. The period is `since` (inclusive) to `until` (exclusive, default the call), or
-  the `days` before `until`; never both `since` and `days`, and at most 366 days.
+  `report-output`. The period is `since` (inclusive) to `until` (exclusive, default the call), or the
+  `days` before `until`; never both `since` and `days`, and at most 366 days.
 - What each figure counts, and from which records, is in [reports](../design/reports.md#what-it-counts).
-  `asOf` is when the board and the queue were read: the `now` counts are as of then. Two calls on
-  the same records and period differ in `asOf` only.
-- `mcp-report` 1.1 adds what a cap counts as 0, each only when there is any: `withoutTokens`,
-  `withoutCost`, `withoutTurns`, and `unknownRuns` per pool and in all, and `usage.unknown`, the
-  runs whose usage the ledger could not count by kind and how many were reconciled
-  ([usage the ledger cannot count](../design/resources.md#usage-the-ledger-cannot-count)). A 1.0
-  report has none of them and stays valid.
-- `mcp-report` 1.2 adds `attention.liveness`, only when there is any: the agent runs whose liveness
-  asked for the operator in the period (`stalled`, `unknown`, `freed`) and `held`, those that ended
-  unknown in the period and were not freed in it (at most 64, `heldOmitted` counting the rest), each
-  by its agent run, Worker, when, and workflow run. They are never counted as interruptions. A 1.1
-  report stays valid.
-- `mcp-report` 1.3 adds `attention.reviewsHeld`, only when there is any: the tasks of the scope in
-  review whose acceptance is held for the operator (`operator-review`) as of `asOf`, the soonest to
-  expire first (at most 64, `reviewsHeldOmitted` counting the rest), each by its task, project,
-  title, `expiresAt`, and the pending checks its wait names. Unanswered by `expiresAt`, a review
-  expires and its task waits for input (`review-expired`). A 1.2 report stays valid.
-- `mcp-report` 1.4 adds `usage.draws`, only when there is any: what the agent runs of the scope
-  recorded in the period drew from their accounts' windows ([`quota-draw`](#quota-draw)), per kind
-  and window (`byKind`) and per kind, template step, and window (`byStep`), each with the clean
-  draws counted, their `median` and `p90` in percentage points (absent with none), and the entries
-  left out by state (`excluded`), at most 256 of each list (`omitted` counting the rest). A 1.3
-  report stays valid.
-- `mcp-report` 1.5 adds `advice`, the dispatch advisor in shadow (PROP-0015 J1). A 1.4 report
+  `asOf` is when the board and the queue were read: the `now` counts are as of then. Two calls on the
+  same records and period differ in `asOf` only.
+- Parts added after 1.0 are optional and appear only when there is something to show; an older report
   stays valid.
-- `mcp-report` 1.6 adds `maturity`: the maturity metrics over the 30 days to the period's end and
-  the reading against the L3 lines, exactly as the [`metrics`](#mcp-tool-metrics) tool gives them
-  (`$defs/metrics-output`); absent when they could not be read, and a note says why. A 1.5 report
-  stays valid.
-- The call's text content is the report rendered for the operator (Markdown); the structured
-  content is the report. A refusal (`unavailable`, `unknown-project`, `invalid`, `overloaded`)
-  reads nothing more and reports nothing. Example:
-  [`mcp-report.week.json`](../../schemas/examples/mcp-report.week.json).
+  - 1.1: what a cap counts as 0: `withoutTokens`, `withoutCost`, `withoutTurns`, and `unknownRuns` per
+    pool and in all, and `usage.unknown`, the runs whose usage the ledger could not count by kind and
+    how many were reconciled
+    ([usage the ledger cannot count](../design/resources.md#usage-the-ledger-cannot-count)).
+  - 1.2: `attention.liveness`: the agent runs whose liveness asked for the operator in the period
+    (`stalled`, `unknown`, `freed`) and `held`, those that ended unknown in the period and were not
+    freed in it (at most 64, `heldOmitted` counting the rest), each by its agent run, Worker, when, and
+    workflow run. They are never counted as interruptions.
+  - 1.3: `attention.reviewsHeld`: the tasks of the scope in review whose acceptance is held for the
+    operator (`operator-review`) as of `asOf`, the soonest to expire first (at most 64,
+    `reviewsHeldOmitted` counting the rest), each by its task, project, title, `expiresAt`, and the
+    pending checks its wait names. Unanswered by `expiresAt`, a review expires and its task waits for
+    input (`review-expired`).
+  - 1.4: `usage.draws`: what the agent runs of the scope recorded in the period drew from their
+    accounts' windows ([`quota-draw`](#quota-draw)), per kind and window (`byKind`) and per kind,
+    template step, and window (`byStep`), each with the clean draws counted, their `median` and `p90`
+    in percentage points (absent with none), and the entries left out by state (`excluded`), at most 256
+    of each list (`omitted` counting the rest).
+  - 1.5: `advice`, the dispatch advisor in shadow.
+  - 1.6: `maturity`: the maturity metrics over the 30 days to the period's end and the reading against
+    the L3 lines, exactly as the [`metrics`](#mcp-tool-metrics) tool gives them
+    (`$defs/metrics-output`); absent when they could not be read, and a note says why.
+- The call's text content is the report rendered for the operator (Markdown); the structured content
+  is the report. A refusal (`unavailable`, `unknown-project`, `invalid`, `overloaded`) reads nothing
+  more and reports nothing. Example: [`mcp-report.week.json`](../../schemas/examples/mcp-report.week.json).
 
 ### MCP tool: `metrics`
 
-| Tool | Scope | Does |
-|---|---|---|
-| `metrics` | client | the maturity metrics of PROP-0016 §1 over a rolling window (default the 30 days before now), for one project or every one, from recorded data only, and the reading against the L3 lines (starting lines); reads only |
+Tools: `metrics`. Scope and purpose: [mcp-tools](mcp-tools.md).
 
 - Input and output (`mcp-report` 1.6): [`mcp-report.v1.json`](../../schemas/mcp-report.v1.json)
   `$defs/metrics-input` (`projectId`, `days` from 1 to 366, `until`) and `metrics-output`.
-- `metrics` lists every metric in the proposal's order, each with `state` `measured` (its `value`,
-  the `sample` it is over and what that counts, other `figures`, and, when the records only bound
-  it, `bound` `lower` or `upper` with the `reason`) or `not-measurable` (the `reason`, and never a
-  value); `sources` names the records it read, and `l3` its line and `status` (`meets`, `misses`,
-  `unproven` for a bound that does not settle it, `not-read`).
+- `metrics` lists every metric in the proposal's order, each with `state` `measured` (its `value`, the
+  `sample` it is over and what that counts, other `figures`, and, when the records only bound it,
+  `bound` `lower` or `upper` with the `reason`) or `not-measurable` (the `reason`, and never a value);
+  `sources` names the records it read, and `l3` its line and `status` (`meets`, `misses`, `unproven`
+  for a bound that does not settle it, `not-read`).
 - `level.l3` is `holds` only when every line is met over at least 30 days and 30 finished tasks;
   otherwise `not-shown`, with each reason. What each metric counts is in
   [maturity metrics](../design/maturity-metrics.md). A refusal is the report's.
 
 ### MCP tool: `roster`
 
-| Tool | Scope | Does |
-|---|---|---|
-| `roster` | client | every Worker in one read model, projected on read: its account and the account's record, role, tier, quota class, availability, the work it serves now, its load, and its account's pools and windows ([roster](../design/roster.md)); and `now`, capacity now ([capacity now](../design/roster.md#capacity-now)) |
+Tools: `roster`. Scope and purpose: [mcp-tools](mcp-tools.md).
 
 - Input and output: [`mcp-roster.v1.json`](../../schemas/mcp-roster.v1.json) `$defs/roster-input`
   (no arguments) and `roster-output`. The record is computed on each call and never stored, so it
   carries no `schema` tag; `asOf` is when it was read, and two calls on the same state differ in
-  `asOf` only.
+  `asOf` only. Readers accept `mcp-roster` 1.0 to 1.9; fields added after 1.0 are marked with their
+  minor.
 - Every fact a source might not give is a *known* value: `{value}`, or `{unknown}` with why (its
-  service is not mounted, its read failed, or it does not say). A reader never takes an `unknown`
-  for an empty list or a default. `role` is `{value: null}` for a Worker that serves no role.
+  service is not mounted, its read failed, or it does not say). A reader never takes an `unknown` for
+  an empty list or a default. `role` is `{value: null}` for a Worker that serves no role.
 - `availability.state` is one of `ready`, `busy` (`running` of `slots`, when the load is known),
   `resting` (`until`, a known time or unknown), `unavailable` (`reason`, known or unknown), and
-  `quarantined` (the account's quarantine `reason`, `since`, and the `enrollment` `decision`); each
-  has a `summary`, its one-line form. What makes each is in [availability](../design/roster.md#availability).
+  `quarantined` (the account's quarantine `reason`, `since`, and the `enrollment` `decision`); each has
+  a `summary`, its one-line form. What makes each is in
+  [availability](../design/roster.md#availability). A Worker its source describes ready, on which the
+  engine runs a step, is `busy` whatever load its source reports, and its `summary` says so. An agent
+  account quarantine's `detail` (`agent-account@1.1`) is on the account record and the `quarantined`
+  availability, and in its summary.
 - `account.record.label` is given to an operator-scope caller only; a client's record has no label.
-- `mcp-roster@1.1` adds, per Worker, `description` (known: the operator's words from its
-  descriptor, `capability-descriptor@1.7`, or `unknown` when none is configured) and `derived` (its
-  provider, role, tier, quota class, and locality as one line, for a reader to show, marked as
-  derived, when there is no description); and, per step of `work`, `since` (known: when its
-  current attempt started, from the event log) and `summary` (the step in one sentence: its task,
-  run, step, and for how long, as of `asOf`).
-- `mcp-roster@1.2` adds, per Worker, `liveness`: present only when the router tells liveness and the
-  Worker has a run that is `stalled`, being looked at (`looking`), or ended without being known to
-  be gone (`unknown`), each with `execution`, `state`, `since`, `runId`, and `summary`; or
-  `unknown` when the read failed or a source could not tell. A 1.1 record stays valid.
-- `mcp-roster@1.3` adds each Worker's `name` for people: `<provider> · <account> · <role or tier>`,
-  its provider's first word capitalised (a model Worker's, its family's), its account's label for
-  an operator-scope caller (a website account's catalog label, an agent account's masked hint),
-  else its account's id (a website account) or slot (an agent account), else the rest of its own
-  id, and its role, else its tier. It is never an id to route by. A Worker its source describes
-  ready, on which the engine runs a step, is `busy` whatever load its source reports, and its
-  `summary` says so.
-- `mcp-roster@1.4` makes `name` the display name, `<runtime> · <account> · <role or tier>
-  [<kinds>]`, made on each read from the runtime's title (else its provider's first word, as in
-  1.3), the account's label for an operator (an agent account's `assignments[].label`, else its
-  masked hint and slot; a website account's catalog label, else its id; for a client the slot or
-  the id, never a label; with no account, the rest of its own id), its role or tier, and its kinds
-  ([display names](../design/roster.md#display-names)); never a routing input, never a key, and
-  still at most 200 characters. It also adds an agent account quarantine's `detail`
-  (`agent-account@1.1`), on the account record and the `quarantined` availability, and in its
-  summary.
-- `mcp-roster@1.5` adds a source read's `describing` (`true`, on a `silent` read only): the source
-  has not described its Workers once since it registered, its first describe (a start's first
-  probe) still running, so its Workers are not known yet, never known to be none. The text then
-  counts the Workers listed as so far and names the source as describing; health reads the same
-  router reads and says the same
+- Per Worker, `description` (1.1): known (the operator's words from its descriptor,
+  `capability-descriptor@1.7`) or `unknown` when none is configured; `derived` (1.1): its provider,
+  role, tier, quota class, and locality as one line, marked as derived, for a reader to show when there
+  is no description.
+- Per Worker, `name` (1.3, display name from 1.4): `<runtime> · <account> · <role or tier> [<kinds>]`,
+  made on each read ([display names](../design/roster.md#display-names)), at most 200 characters,
+  never a routing input or a key. Its parts: the runtime's title, else its provider's first word
+  capitalised (a model Worker's, its family's); the account's label for an operator (an agent
+  account's `assignments[].label`, else its masked hint and slot; a website account's catalog label,
+  else its id), for a client the slot or the id, never a label, and with no account the rest of its own
+  id; its role, else its tier; and its kinds.
+- Per Worker, `liveness` (1.2): present only when the router tells liveness and the Worker has a run
+  that is `stalled`, being looked at (`looking`), or ended without being known to be gone (`unknown`),
+  each with `execution`, `state`, `since`, `runId`, and `summary`; or `unknown` when the read failed or
+  a source could not tell.
+- Per Worker, `teams` (1.6): `{value: {excluded: true, summary}}` when the workflow engine's
+  `teams.excludeWorkers` keeps it out of teams (named itself, by its account, or as another Worker of a
+  named one's account; [Workers left out of teams](../design/teams.md#workers-left-out-of-teams)), read
+  through the engine's `teamExclusion()`; absent when the engine tells none or leaves it in; `unknown`
+  on every Worker when the engine could not tell.
+- Per step of `work`: `since` (1.1, known: when its current attempt started, from the event log);
+  `summary` (1.1: the step in one sentence: its task, run, step, and for how long, as of `asOf`);
+  `startedBy` (1.8): `dispatch` when the dispatch pass started the board task's run by itself
+  ([PROP-0014](../proposals/0014-dispatch-by-quota.md)), `lead` for a start through MCP `run` or `task`
+  or the CLI, `operator` for Start on `/ui`, absent when the engine does not tell (workflow contract
+  below 1.10); the `summary` then ends with `started by itself`.
+- A source read's `describing` (1.5): `true`, on a `silent` read only: the source has not described its
+  Workers once since it registered, its first describe (a start's first probe) still running, so its
+  Workers are not known yet, never known to be none. The text then counts the Workers listed as so far
+  and names the source as describing; health reads the same router reads and says the same
   ([sources that do not answer](../design/routing.md#sources-that-do-not-answer)).
-- `mcp-roster@1.6` adds, per Worker, `teams`: `{value: {excluded: true, summary}}` when the
-  workflow engine's `teams.excludeWorkers` keeps it out of teams (named itself, by its account, or
-  as another Worker of a named one's account; [Workers left out of teams](../design/teams.md#workers-left-out-of-teams)),
-  read through the engine's `teamExclusion()`; absent when the engine tells none or leaves it in;
-  `unknown` on every Worker when the engine could not tell. A 1.5 record stays valid. Readers
-  accept 1.0 to 1.6.
-- `mcp-roster@1.7` adds `now` (`$defs/capacity`), capacity now
-  ([capacity now](../design/roster.md#capacity-now)): one summary made on the server from the
-  roster and the board, which `system capacity` and the Workers page's *Right now* render as it
-  is. `asOf`; `accounts`, each account (`account`, `name`) with its pools' `windows` (`used`,
-  `resets`, `state`), `canWork` (`{value: false}` at a limit or when none of its Workers takes work,
-  `{unknown}` when its quota cannot be read, never read as room), and a one-line `summary`; `free`,
-  the Workers that take work now (ready, the account not at a limit, its quota known), each with
-  `worker`, `name`, `account`, `role`, `kinds`, `tier`, `load`, and `quota` (the window with the
-  least left among those with a current reading: `pool`, `window`, `seconds`, `used`, `left`,
-  `resetsAt`; `null` when no account quota applies), ordered by what would be lost unused per
-  minute (`left` over the minutes to `resetsAt`), the highest first, then the most left, the
-  soonest reset, the id, those with `quota: null` last; `quotaUnknown`, the Workers ready as their
-  source says whose quota cannot be read, with `why` (never counted free, INV-2); `stalled`
-  (`worker`, `name`, `execution`, `runId`, `since`, and `unread` when a Worker's liveness could not
-  be told); `noQuota` (`account`, `name`, `until`, known or unknown); `cannotWork` (`worker`,
-  `name`, `state` `unavailable` or `quarantined`, `reason`); and `ready`, the ready tasks of the
-  active board projects (`projectId`, `taskId`, `title`, `template`), each with `likely`, the Worker
-  a start would most likely go to as the start preview tells it (the first, in the free order, that
-  could take its first step a Worker runs; `{value: null}` when none that takes work now could;
-  `{unknown}` when it names no template, its template is not served, or the steps cannot be read).
-  Each list is `{value: {items, more}}` with at most 16 items, or `{unknown}` with why (the Workers
-  or the board could not be read). Present on every record the roster makes; a 1.6 record, with no
-  `now`, stays valid.
-- `mcp-roster@1.8` adds, per step of `work`, `startedBy`: `dispatch` when the dispatch pass started
-  the board task's run by itself ([PROP-0014](../proposals/0014-dispatch-by-quota.md)), `lead` for
-  a start through MCP `run` or `task` or the CLI, `operator` for Start on `/ui`; absent when the
-  engine does not tell (workflow contract below 1.10). The step's `summary` then ends with
-  `started by itself`. A 1.7 record stays valid.
-- `mcp-roster@1.9` adds, per free Worker of capacity now (`capacityQuota`), `headroom`: what its
-  account's binding window has left above the operator's reserve (from -90 to 100), by the one headroom rule
-  dispatch and routing use ([PROP-0014](../proposals/0014-dispatch-by-quota.md)); the binding window is
-  the one with the least headroom, and its `resetsAt` is absent when its reading names no reset. A 1.8
-  record stays valid.
-- Bounds ([roster bounds](../design/roster.md#bounds)): at most 256 Workers (`unlisted` counts the
-  rest), 32 steps per Worker (`more`), 64 siblings, 64 pools, 16 windows per pool, 64 sources, 64
-  step starts;
-  past a bound with no count, the field is `unknown` with why, never cut silently. `work.unread`
-  says the runs read were cut by their bound (500). In `now`, 16 entries per list (`more`), 16
-  windows per account (else its `windows` are `unknown`), and the ready tasks of at most 32 active
-  projects (`ready.unread` past them).
-- The call's text content is the record rendered for a terminal (what `system roster` prints, its
-  last block *Right now*, what `system capacity` prints); the
-  structured content is the record, validated before it is sent: a record its schema refuses is a
-  defect, and the call is an error. Example:
-  [`mcp-roster.call.json`](../../schemas/examples/mcp-roster.call.json).
+- `now` (1.7, `$defs/capacity`; present on every record): capacity now
+  ([capacity now](../design/roster.md#capacity-now)), one summary made on the server from the roster
+  and the board, which `system capacity` and the Workers page's *Right now* render as it is. Its parts:
+  - `asOf`.
+  - `accounts`: each account (`account`, `name`) with its pools' `windows` (`used`, `resets`, `state`),
+    `canWork` (`{value: false}` at a limit or when none of its Workers takes work, `{unknown}` when its
+    quota cannot be read, never read as room), and a one-line `summary`.
+  - `free`: the Workers that take work now (ready, the account not at a limit, its quota known), each
+    with `worker`, `name`, `account`, `role`, `kinds`, `tier`, `load`, `headroom` (1.9, from -90 to 100: what its account's binding window, the one with the least headroom, has left above the operator's reserve, by the one headroom rule dispatch and routing use, [PROP-0014](../proposals/0014-dispatch-by-quota.md); that window's `resetsAt` is absent when its reading names no reset), and `quota` (the window with the least left among those with a current reading: `pool`, `window`, `seconds`, `used`, `left`, `resetsAt`; `null` when no account quota applies). Order: what would be lost unused per minute
+    (`left` over the minutes to `resetsAt`), the highest first, then the most left, the soonest reset,
+    the id; those with `quota: null` last.
+  - `quotaUnknown`: the Workers ready as their source says whose quota cannot be read, with `why`
+    (never counted free, INV-2).
+  - `stalled`: `worker`, `name`, `execution`, `runId`, `since`, and `unread` when a Worker's liveness
+    could not be told.
+  - `noQuota`: `account`, `name`, `until`, known or unknown.
+  - `cannotWork`: `worker`, `name`, `state` (`unavailable` or `quarantined`), `reason`.
+  - `ready`: the ready tasks of the active board projects (`projectId`, `taskId`, `title`, `template`),
+    each with `likely`, the Worker a start would most likely go to as the start preview tells it (the
+    first, in the free order, that could take its first step a Worker runs; `{value: null}` when none
+    that takes work now could; `{unknown}` when it names no template, its template is not served, or
+    the steps cannot be read).
 
+  Each list is `{value: {items, more}}` with at most 16 items, or `{unknown}` with why (the Workers or
+  the board could not be read).
+- Bounds ([roster bounds](../design/roster.md#bounds)): at most 256 Workers (`unlisted` counts the
+  rest), 32 steps per Worker (`more`), 64 siblings, 64 pools, 16 windows per pool, 64 sources, 64 step
+  starts; past a bound with no count, the field is `unknown` with why, never cut silently.
+  `work.unread` says the runs read were cut by their bound (500). In `now`: 16 entries per list
+  (`more`), 16 windows per account (else its `windows` are `unknown`), and the ready tasks of at most
+  32 active projects (`ready.unread` past them).
+- The call's text content is the record rendered for a terminal (what `system roster` prints, its last
+  block *Right now*, what `system capacity` prints); the structured content is the record, validated
+  before it is sent: a record its schema refuses is a defect, and the call is an error. Example:
+  [`mcp-roster.call.json`](../../schemas/examples/mcp-roster.call.json).
 ### MCP tool: `status`
 
-| Tool | Scope | Does |
-|---|---|---|
-| `status` | client | the host's health, its kernel services and providers; for the operator also each check's detail, the plugins that need a look, and the runs whose liveness needs a look ([mcp-server](../../packages/plugins/mcp-server/README.md)) |
+Tools: `status`. Scope and purpose: [mcp-tools](mcp-tools.md).
 
 - Input and output: [`mcp-status.v1.json`](../../schemas/mcp-status.v1.json) `$defs/status-input`
-  and `status-output`, at 1.0. The reply had no schema before (an MCP tool built before Base);
-  1.0 is its first version, and the shape it fixes is the compact one below.
+  and `status-output`, at 1.0.
 - `health.state` is the worst of every check, listed or not. Unasked, `health.checks` lists only
   the checks that are not `ok`, and `okOmitted` counts the rest (absent when none is left out), so
   the reply does not grow with each check that is ok; `checks: true` lists every check, in the
-  report's order, with no `okOmitted`. `system health` asks for every check. As before, a client
-  sees each listed check's name and state, and the operator also its `detail`.
+  report's order, with no `okOmitted`. `system health` asks for every check. A client sees each listed
+  check's name and state, and the operator also its `detail`.
 - Unasked, `plugins` lists only the plugins that need a look and `pluginsOmitted` counts the rest;
   `plugins: true` lists every one (operator only). `liveness` is the operator's, only when a run
   needs a look or a source cannot tell.
@@ -1599,9 +1488,9 @@ One question put to the operator and, once answered, the answer: the `decisions`
   version and every later minor of its major. At start the plugin host checks each plugin a row
   mounts against it: a range its mounted provider's manifest does not satisfy, or one the host
   cannot read, is a finding ([the manifest check](../design/plugin-host.md#the-manifest-check)).
-- `plugin-manifest@1.1` adds `defines`: the seams whose abstract definition a definition package
-  (a `*-core` package) owns, each at its conformance suite's contract. A manifest that names it
-  must be `@1.1`; every other stays `@1.0`. Example:
+- `defines` (`@1.1`): the seams whose abstract definition a definition package (a `*-core` package)
+  owns, each at its conformance suite's contract. A manifest that names it must be `@1.1`; every other
+  stays `@1.0`. Example:
   [`plugin-manifest.definition.json`](../../schemas/examples/plugin-manifest.definition.json).
 - `_meta` belongs to the host: a declared manifest that carries it is refused. Each lifecycle
   change is recorded as a `lifecycle` decision before the state; Base records the state the
@@ -1614,24 +1503,7 @@ One question put to the operator and, once answered, the answer: the `decisions`
 
 ### MCP tools: `board_*`, `approvals_*`, `resources_*`
 
-| Tool | Scope | Does |
-|---|---|---|
-| `board_projects` | client | list projects with task counts and budget use |
-| `board_charter` | client | found a project or amend its charter; opens a `charter` approval request |
-| `board_brief` | client | one page for a new agent: intent, in progress, waiting, next, what to read first |
-| `board_tasks`, `board_task` | client | list tasks; read one |
-| `board_propose` | client | propose a task, with the attempts it gets (`maxAttempts`, 1.2); the board makes it ready when its dependencies are done and the policy allows |
-| `board_claim` | client | take a ready task's lease; MCP `run` with the task and this claim starts the attempt, and that run submits and accepts its own result |
-| `board_update` | client | report progress and renew the lease, or answer a waiting task's questions |
-| `board_cancel` | client | cancel a task that is not running or in review |
-| `board_pause`, `board_resume` | operator | pause an active project (nothing of it is claimed, started, or gated until it is resumed; running attempts and waits go on), or resume a paused one |
-| `board_close` | operator | close an active or paused project as `achieved` or `stopped`, refused while one of its tasks runs or is in review; its open tasks are cancelled and the requests they and a pending amendment waited on withdrawn |
-| `approvals_list`, `approvals_get` | client | read the queue |
-| `approvals_decide` | operator | verdicts for up to 50 requests, each bound to its exact subject |
-| `approvals_policy` | client | the studio and project policies, the effective mode per action class, and the set in force (`set`: its hash, whether it comes from the configuration or the store, and the projects with a policy) |
-| `approvals_policy_propose` | operator | propose one policy record; the queue asks the operator with a `policy-change` request on the proposed set's hash, and applies it only on approval |
-| `resources_pools` | client | each pool with the latest reading of each window, and whether it is available |
-| `resources_usage` | client | usage records, filtered, with totals over every match |
+Tools: `board_projects`, `board_charter`, `board_brief`, `board_tasks`, `board_task`, `board_propose`, `board_claim`, `board_update`, `board_cancel`, `board_pause`, `board_resume`, `board_close`, `approvals_list`, `approvals_get`, `approvals_decide`, `approvals_policy`, `approvals_policy_propose`, `resources_pools`, `resources_usage`. Scope and purpose: [mcp-tools](mcp-tools.md).
 
 - A page holds at most 100 items; `next` is an opaque cursor.
 - No `board_*` tool starts, submits, accepts, blocks, or reconciles a task: the workflow run that
@@ -1641,22 +1513,18 @@ One question put to the operator and, once answered, the answer: the `decisions`
   ([board](../design/board.md#the-operators-project-moves)): the host serves them to the operator
   token only, and each handler refuses any other caller (`invalid`). Each output names the
   `board` decision that records the move; `board_close` also counts the open tasks it cancelled.
-  `mcp-board` 1.1 adds them.
-- `mcp-board` 1.2 adds `board_propose`'s optional `maxAttempts` (1 to 10): the attempts the task
-  gets, else the board's for its template, else its default
-  ([attempts](../design/board.md#attempts)).
-- `mcp-board` 1.4 adds `board_reopen_review`: the caller, the operator's token or else the
-  lead's for its own project, brings a `review-expired` task back to review, held for the
-  operator for the policy's wait, with a reason. Refused unless the task has its result and its
-  run's worktree is still recorded and on disk. The output names the `board` decision that
-  records it.
-- `mcp-board` 1.5 adds the `defect` link (`board-task@1.2`, ): `board_propose`'s optional
-  `fixes` (a done task and its landing sha), and `board_defect`, which links an existing task to
-  the done task whose landed change held the defect it fixes; a lead links its own project's only.
-- A refused verdict (`unknown-request`, `already-resolved`, `expired`, `subject-changed`, or
-  `failed`: the provider could not apply it, which it logs) leaves its request unchanged; the
-  other verdicts of the call still apply. `mcp-approvals` 1.1 adds `failed`; 1.2 adds
-  `approvals_policy_propose` and `set`.
+- `board_propose`'s optional `maxAttempts` (1 to 10): the attempts the task gets, else the board's for
+  its template, else its default ([attempts](../design/board.md#attempts)).
+- `board_reopen_review`: the caller, the operator's token or else the lead's for its own project, brings
+  a `review-expired` task back to review, held for the operator for the policy's wait, with a reason.
+  Refused unless the task has its result and its run's worktree is still recorded and on disk. The
+  output names the `board` decision that records it.
+- The `defect` link (`board-task@1.2`): `board_propose`'s optional `fixes` (a done task and its landing
+  sha), and `board_defect`, which links an existing task to the done task whose landed change held the
+  defect it fixes; a lead links its own project's only.
+- A refused verdict (`unknown-request`, `already-resolved`, `expired`, `subject-changed`, or `failed`:
+  the provider could not apply it, which it logs) leaves its request unchanged; the other verdicts of
+  the call still apply.
 - Examples: [`mcp-board.claim.json`](../../schemas/examples/mcp-board.claim.json),
   [`mcp-board.charter.json`](../../schemas/examples/mcp-board.charter.json),
   [`mcp-board.close.json`](../../schemas/examples/mcp-board.close.json),

@@ -55,9 +55,9 @@ makes them as that run's owner, so one attempt has one writer
 `board_claim` and hands that claim to the run; no MCP tool makes those moves.
 
 A `board_*` tool that changes the board (`board_charter`, `board_propose`, `board_propose_plan`,
-`board_claim`, `board_update`, `board_cancel`, and the operator's moves) checks the output it would give
-inside the move's store transaction, before it commits. An output its schema refuses (a defect) is
-refused with nothing moved, decided, or withdrawn, and a request the move opened is withdrawn
+`board_claim`, `board_update`, `board_cancel`, and the operator's moves) checks its output inside the move's
+store transaction, before it commits. An output its schema refuses (a defect) is refused with nothing moved,
+decided, or withdrawn, and a request the move opened is withdrawn
 ([INV-2](../architecture/invariants.md#inv-2-fail-closed),
 [INV-14](../architecture/invariants.md#inv-14-every-record-has-a-versioned-schema)).
 
@@ -97,19 +97,19 @@ tools `board_pause`, `board_resume`, and `board_close` are served to the operato
 any other caller. Each records a `board` decision whose candidates say why
 ([INV-13](../architecture/invariants.md#inv-13-every-decision-is-an-artifact)).
 
-- **Pause** (active → paused): until it is resumed, no task of the project is claimed or started (rule 1,
-  also one claimed before the pause), and no proposed task is put to the policy. A running attempt goes on
-  to its outcome, and a next attempt goes through the gate, then waits, unclaimed. Every wait keeps its
-  expiry, and a request answered meanwhile still applies. An amendment may still be asked about.
+- **Pause** (active → paused): until resumed, no task of the project is claimed or started (rule 1, also
+  one claimed before the pause), and no proposed task is put to the policy. A running attempt goes on to its
+  outcome; a next attempt goes through the gate, then waits, unclaimed. Every wait keeps its expiry, and a
+  request answered meanwhile still applies. An amendment may still be asked about.
 - **Resume** (paused → active): the approved charter still holds. The next sweep puts the proposed tasks
-  whose dependencies are done to the policy, and ready tasks may be claimed again. A task already ready is
+  whose dependencies are done to the policy, and ready tasks may be claimed again; a task already ready is
   not asked about again.
 - **Close** (active or paused → closed, as `achieved` or `stopped`): refused while a task runs or is in
   review, since its run's outcome or its acceptance would be lost. Stop the run first (`system stop`: its
   owner reports it failed, and the task waits or is ready again) or decide the review. Otherwise, in one
-  transaction, every open task is cancelled (`project-closed`) and a claimed one's lease released. Once
-  that commits, the requests those tasks and a pending amendment waited on are withdrawn. A closed project
-  takes no task and no amendment.
+  transaction, every open task is cancelled (`project-closed`) and a claimed one's lease released; once that
+  commits, the requests those tasks and a pending amendment waited on are withdrawn. A closed project takes
+  no task and no amendment.
 
 ## Task
 
@@ -160,11 +160,11 @@ interrupted state has an expiry.
 
 ### Where the tables leave room
 
-The store-backed provider settles these cases so that the [fail-closed rules](#fail-closed-rules) hold.
-The suite tests, and the fake provider checks too, the acceptance binding, the required checks, the gate
-per attempt, founding milestones, the written subject, the board's own expiry of a wait, a wait the board
-withdrew itself kept, and a wait put to the policy again after a policy change. The other cases only the
-store-backed provider checks.
+The store-backed provider settles these cases so that the [fail-closed rules](#fail-closed-rules) hold. The
+suite tests, and the fake provider checks too, the acceptance binding, the required checks, the gate per
+attempt, founding milestones, the written subject, the board's own expiry of a wait, a wait the board
+withdrew itself kept, and a wait put to the policy again after a policy change; only the store-backed
+provider checks the rest.
 
 - `start` outside an active project is refused (`invalid-transition`), also for a task claimed before a
   pause (rule 1).
@@ -202,20 +202,20 @@ store-backed provider checks.
   candidates both say why). So `attempts.count` never exceeds `attempts.max`, and a task that can never
   start never sits in `ready`, which does not expire (INV-9).
 - **An answered question spends no attempt.** The answer continues the attempt that asked: `attempts.count`
-  is the same before and after, also on the last attempt, and the policy is still asked for it. A flag
-  beside the record (`board_tasks.continues`, migration 5, read by `Board.continuing`) makes the next
-  `start` the same attempt again (its decision says `continues`). The engine then takes the asking run's
-  steps at its first turn, once its carry settled. Completed steps keep their results, and the asking step
-  resumes its session with the answers. A step bound to the asking run's tree (a writing step, or one that
-  names its worktree or was bound to its subject) is never kept: its result and the reviews, checks, and
-  landing that read the tree would point at the asking run's worktree. The template then runs again from its
-  first such step on the same attempt, in a new session that carries the change and the answers
-  (`workflow.task-continue`). When the asking step is a writing step, its tree (the edits made before it
-  asked) is kept on the asking run's branch and carried; the step resumes once the carry puts that tree in
-  the run's worktree, or once the source refused it as `empty`. Otherwise the run starts again in a new
-  session, and its brief says the edits are gone. The gate after an answer asks on
-  `board-task:<id>:attempt:<n>:answered:<wait>`, so no other gate of the same attempt adopts its approval.
-  Only a step that fails or is rejected spends an attempt.
+  is unchanged, also on the last attempt, and the policy is still asked for it. A flag beside the record
+  (`board_tasks.continues`, migration 5, read by `Board.continuing`) makes the next `start` the same attempt
+  again (its decision says `continues`). The engine then takes the asking run's steps at its first turn,
+  once its carry settled. Completed steps keep their results and the asking step resumes its session with
+  the answers. A step bound to the asking run's tree (a writing step, or one that names its worktree or was
+  bound to its subject) is never kept, since its result and the reviews, checks, and landing that read the
+  tree would point at the asking run's worktree: the template runs again from its first such step on the
+  same attempt, in a new session carrying the change and the answers (`workflow.task-continue`). When the
+  asking step is a writing step, its tree (the edits made before it asked) is kept on the asking run's
+  branch and carried; the step resumes once the carry puts that tree in the run's worktree, or once the
+  source refused it as `empty`. Otherwise the run starts again in a new session, and its brief says the
+  edits are gone. The gate after an answer asks on `board-task:<id>:attempt:<n>:answered:<wait>`, so no
+  other gate of the same attempt adopts its approval. Only a step that fails or is rejected spends an
+  attempt.
 - One amendment waits at a time: another is refused (`invalid-transition`) until it is approved, refused, or
   expired, so a verdict binds the charter it was asked about. An amendment changes the charter only.
 - Answering a question wait records the questions and answers in the `board` decision's detail, which
@@ -250,7 +250,7 @@ store-backed provider checks.
 | review → done | `accept` with an `acceptance` decision whose outcome is `accept` | that decision; `result.acceptance`; under `autoAccept`, a `board` decision of rule `board.auto-accept` naming the acceptance, the review, and the check-run record ([System accepts a listed branch's result](#system-accepts-a-listed-branchs-result)) | a decision of another type, or one not bound to the task's exact result, is refused; one not the operator's needs the required checks passed, and under `autoAccept` the rule's conditions met, else it is held for the operator |
 | review → ready / waiting-for-approval / waiting-for-input | `accept` with a `reject` outcome | while `count < max`, another attempt through the gate: a `board` decision naming that decision and the `autonomy` decision (ready, or `approval-needed` with a new request); else that decision and `retries-spent` | an approval of an earlier attempt never covers this one |
 | waiting-for-approval → ready / waiting-for-approval / waiting-for-input | `sweep`, on the request's resolution (an approval to go on after `budget-spent` or `reconciliation-failed` goes through the gate for the next attempt, a `funding` ask's lines added to the budget first, in the same transaction); at `waiting.expiresAt` (or the request's expiry, if earlier) the board applies the expiry itself when the queue has not resolved the request, the board withdrew it, or the queue no longer knows it | the request's `approval` decision, or the board's own (`board`, cause `expired`), after which a request still open is withdrawn; a raise: `funding` and its `board` decision | rejection and expiry never start work, and raise nothing: the task waits for input (`rejected`) |
-| waiting-for-approval → ready / waiting-for-approval / cancelled (`approval-needed`), or → waiting-for-approval / waiting-for-input (`budget-spent`, `reconciliation-failed`) | `sweep`, on a request the queue withdrew on a policy change (decider rule `approvals.policy`): the wait's gate runs again under the policy loaded now (the class: the task's, `funding`, or `remediation`) | a `board` decision naming the withdrawal and the `autonomy` decision, a reason on every outcome; `approval-needed`: ready on `auto` or `notify` (pending checks recorded), a new request on the same exact subject on `ask` (an open one adopted), `forbidden` on `forbid`; a spent budget or lost run: a new request on `ask`, else a wait for input (`rejected`), the run kept | a move that cannot commit withdraws the new request; the run's owner may still report a lost run |
+| waiting-for-approval → ready / waiting-for-approval / cancelled (`approval-needed`), or → waiting-for-approval / waiting-for-input (`budget-spent`, `reconciliation-failed`) | `sweep`, on a request the queue withdrew on a policy change (decider rule `approvals.policy`): the wait's gate runs again under the policy loaded now (the class: the task's, `funding`, or `remediation`) | a `board` decision naming the withdrawal and the `autonomy` decision, a reason on every outcome; outcomes as in [where the tables leave room](#where-the-tables-leave-room) (ready on `auto` or `notify`, with pending checks recorded) | a move that cannot commit withdraws the new request; the run's owner may still report a lost run |
 | waiting-for-input → ready / waiting-for-approval | `answer`, every question of a `question` wait answered; the same attempt continues through the gate, its count unchanged | a `board` decision with the questions and answers | partial answers, and answers to any other wait, are refused |
 | waiting-for-input → cancelled | `sweep`, its wait expired | a `board` decision (`input-expired`) | — |
 | any not running or in review → cancelled | `cancel` (`operator`, `lead`, `superseded`) | a `board` decision; a pending approval request is withdrawn once the move committed; dependents are cancelled on the next sweep | a running task or one in review is refused |
@@ -288,8 +288,7 @@ computes them from the ledger's count, never from a model ([workflow engine](wor
   may not exceed `fundingMaxPercent` (default 100) of the amount the task declared, which is the line less
   what raises added; nor may a line pass 10^12. It is checked when the task is blocked and again when an
   approval is applied. Each raise follows a spent run, which is an attempt, so a task is raised at most
-  `attempts.max - 1` times. The suite tests an ask past any bound a provider may set; the store-backed
-  provider's tests cover the bound across raises and one lowered before an approval is applied.
+  `attempts.max - 1` times. 
 - **Exact lines.** The board applies only the lines its wait stored, and only on a request whose subject's
   version is their hash, so what the operator approved is what is added.
 - A `budget-spent` block without `funding` asks only to go on, as at 1.1. The engine sends none when the
@@ -297,11 +296,11 @@ computes them from the ledger's count, never from a model ([workflow engine](wor
 - **Reservations not released** (1.3, [ADR-0054](../decisions/adr/0054-a-funding-request-names-the-holds-the-ledger-did-not-release.md)):
   a `budget-spent` block may name `unreleased`, 1 to 8 of the ledger's reservations its holder could not
   release (each a run id and a step of 1 to 200 characters, `run` for a run's one reservation, and an ISO
-  date `expiresAt` when known). A malformed list, or one on another wait, is refused (`invalid`). These
-  reservations still count against the task's budget until they expire, so they may be what refused the
-  step. The request's consequences name each one and say the next attempt may be refused again before then.
-  They change neither the request's subject nor the wait, and nothing is released or raised for them. A
-  request asked again after a policy change does not name them, since the wait does not keep them.
+  date `expiresAt` when known); a malformed list, or one on another wait, is refused (`invalid`). They still
+  count against the task's budget until they expire, so they may be what refused the step. The request's
+  consequences name each and say the next attempt may be refused again before then. They change neither the
+  request's subject nor the wait, and nothing is released or raised for them. A request asked again after a
+  policy change does not name them, since the wait does not keep them.
 - The workflow engine makes no `budget-spent` block on a task's last attempt, since no approval could serve
   it: it reports the run failed (`reconcileRun`), and the task waits for input (`retries-spent`) with nothing
   asked ([funding a spent task](workflow-engine.md#funding-a-spent-task)). A block another holder makes then
@@ -309,24 +308,23 @@ computes them from the ledger's count, never from a model ([workflow engine](wor
 
 ### A digest on a result
 
-`result.digest` is a cited summary of the result's artifacts ([digests](digests.md)). A lead, the operator,
-and the next attempt's or a dependent task's brief read it in place of the raw artifacts. A digest is a
+`result.digest` is a cited summary of the result's artifacts ([digests](digests.md)); a lead, the operator,
+and the next attempt's or a dependent task's brief read it in place of the raw artifacts. It is a
 capability: it never accepts anything, and a result with none is complete. `attachDigest(taskId, digest)`
-(contract 1.1, optional: a provider at 1.0 has none, and its results keep no digest) sets it. The
-[workflow engine](workflow-engine.md#a-digest-of-a-tasks-result) calls it once a digest of a run's result is written.
+(contract 1.1, optional: a provider at 1.0 keeps none) sets it; the
+[workflow engine](workflow-engine.md#a-digest-of-a-tasks-result) calls it once a digest of a run's result is
+written.
 
 - The digest is a stored `digest@1.0` report whose sources are exactly the result's artifacts (`invalid`
-  otherwise), so it binds to that result and no other (INV-5).
-- Once: the same digest again changes nothing, another is refused (`invalid-transition`).
-- Not while the task has no result, and not while the reviewer holds the review (`invalid-transition`): the
-  acceptance being made binds to the whole result, digest included, so a digest attached under it would
-  refuse it. A review held for the operator takes one, and the operator's acceptance then names it among
-  its inputs.
+  otherwise), binding it to that result alone (INV-5).
+- Once: the same digest again changes nothing; another is refused (`invalid-transition`).
+- Not while the task has no result, nor while the reviewer holds the review (`invalid-transition`): the
+  acceptance being made binds to the whole result, digest included. A review held for the operator takes
+  one, and the operator's acceptance names it among its inputs.
 - In any other state with a result (done, or back to ready or waiting after a rejection, until the next
-  attempt's `start` clears the result) it attaches. A done task's acceptance stands on the raw artifacts it named.
+  `start` clears the result) it attaches; a done task's acceptance stands on the raw artifacts it named.
 - No state moves and no `board` decision is made: the digest's own settling decision records it, and the
   record's revision moves on.
-
 ### Required checks bind at acceptance
 
 A policy rule `auto` or `notify` may require checks (`requires`, for example tests and lint for
@@ -355,12 +353,12 @@ readiness decision records the checks still to run (`pendingChecks`). They bind 
 - A `reject` applies with or without checks: a failed check goes back to the lead as another attempt
   ([approvals](approvals.md#the-autonomy-policy)).
 - The workflow engine's acceptance reports, beside `schema` and `review`, the required checks that are
-  commands (`tests`, `typecheck`, `lint`) its run ran on the result's exact tree, by their exit codes
+  commands (`tests`, `typecheck`, `lint`) its run ran on the result's exact tree, by exit code
   ([a run's required checks](workflow-engine.md#a-runs-required-checks)). A check that could not run is not
   reported, so it stays pending here. A task with no write subject gets them too: when they ran on its run's
   git working tree, its result is on that tree (`git-head` at its version), so the acceptance binds to it.
   When a writing step of the run changed the worktree, the result is that tree whatever the run's last step
-  is (a review, a validation), even when no check ran on it. Never the last step's report, which would leave
+  is (a review, a validation), even when no check ran on it; never the last step's report, which would leave
   the change behind with its checks pending.
 - A **writing result** (on a git tree that an agent result among its artifacts names as its run's worktree,
   at that exact version) binds the checks of a lead's or the operator's acceptance to what its run recorded.
@@ -371,7 +369,7 @@ readiness decision records the checks still to run (`pendingChecks`). They bind 
   result's pending checks on the exact tree, once per subject (a check cut short by a host stop is asked
   again on the next sweep), and applies its acceptance again with them: passed, the result is accepted, or
   held again for what still holds it (a heavy result); failed, it goes back as another attempt. A check that
-  cannot run there stays pending. The lead never accepts past a pending check. Only the operator does, on
+  cannot run there stays pending. The lead never accepts past a pending check; only the operator does, on
   `/ui`, by naming each check not run with a note (`outcome.detail.checksNotRun`, check → note, at most 500
   characters, via `POST reviews/<taskId>/decide`). The acceptance then applies on a `board` decision of its
   own (`detail.reason: checks-not-run`).
@@ -385,7 +383,7 @@ readiness decision records the checks still to run (`pendingChecks`). They bind 
   the wait's end it waits for input (`review-expired`). Dependents start only once it is done. A result that is
   not a writing one (a report, or a tree no run's worktree holds) is accepted as above.
 - A review held again with no acceptance (a lapsed lease, a re-opening) counts the checks the run recorded on
-  its exact result, so a check it passed is never shown pending again. The hold's decision names the run's
+  its exact result, so a check it passed is never shown pending again; the hold's decision names the run's
   acceptance among its inputs.
 - A class the policy asks about needs no check here: the operator approved the attempt before it started.
 
@@ -405,29 +403,30 @@ read from the record the decision names, never from its own account:
 | every test ran | `outcome.detail.checkRun.results[].notRun` | no check it reports passed says it did not run some of its tests (its browser tests). "Checks passed, browser tests not run" waits for the lead or the operator |
 | it lands on a listed branch | `outcome.detail.landing.branch` | a branch `autoAccept.branches` names |
 
+
 - Met, the task is accepted (it waits for its landing, and is done once that lands it) on a `board` decision
   of rule `board.auto-accept`, which names the acceptance, the review, the check-run record, and the autonomy
   decision (INV-13). `result.acceptance` is the acceptance it applied. Its landing then asks for the merge as
   any other ([landing an accepted result](workflow-engine.md#landing-an-accepted-result)).
 - Not met, the review is held for the operator as above, with `pendingChecks` the policy's (none when only the
-  rule held it). The hold's `board` decision lists every condition that failed (`outcome.detail.autoAccept`),
+  rule held it). The hold's `board` decision lists every failed condition (`outcome.detail.autoAccept`),
   including a blocking finding left at the review cycle bound. Only the operator's acceptance accepts it then.
 - A rejection, the operator's decision, another project's task, and a result on no working tree go as without
   the setting. The workflow engine's task acceptance names the run's last review and its landing target. That
-  review is the last one of the result's final tree: a first round's review, or a verification gate that re-judged
-  the tree before the fix, is of a tree the fix replaced. When no review is of the final tree, the run's last
-  review is named ([`workflow.task-acceptance`](workflow-engine.md#a-runs-required-checks), version 3).
+  review is the last one of the result's final tree (a first round's review, or a verification gate that
+  re-judged the tree before the fix, is of a tree the fix replaced); when none is of the final tree, the
+  run's last review is named ([`workflow.task-acceptance`](workflow-engine.md#a-runs-required-checks),
+  version 3).
 - **A heavy result** ([ADR-0071](../decisions/adr/0071-a-changes-risk-tier-comes-from-the-policys-path-map.md),
   [process tiered by risk](workflow-engine.md#process-tiered-by-risk)) is never accepted unattended, with or
   without the setting. An accepting decision that is not the operator's and names a risk tier
   (`outcome.detail.risk`, version 4) is held for the operator when the `workflow.risk-tier` decision it names
-  among its inputs says `heavy`, or when it names none (INV-2). One that names no tier is held too when a
-  policy of the task's project carries a path map (`riskTiers`): with tiering on, no tier is read as heavy,
-  never as tiering off. The hold's decision says why (`outcome.detail.heavy`). Only the operator's acceptance
-  accepts it.
+  among its inputs says `heavy`, or names none (INV-2). One that names no tier is held too when a policy of
+  the task's project carries a path map (`riskTiers`): with tiering on, no tier reads as heavy, never as
+  tiering off. The hold's decision says why (`outcome.detail.heavy`). Only the operator's acceptance accepts
+  it.
 - The setting is validated when the board starts: project ids, plain branch names (no patterns), at most 64
   each, no repeats; off unless both lists name one.
-
 A `done` task is terminal here. What happens to its result outside the board is the run owner's: the workflow
 engine lands a result made in a run's worktree, committing it on the run's branch and asking a `merge` request
 of its own on the queue ([landing an accepted result](workflow-engine.md#landing-an-accepted-result)). The board
@@ -454,11 +453,11 @@ before it expires:
 
 A task makes at most `attempts.max` attempts, each a run that serves it (a rejected review included). The
 engine may start an attempt from the work the attempt before it left, when that one failed only after its
-writing step ([starting from the previous attempt's work](workflow-engine.md#starting-from-the-previous-attempts-work)).
-The board decides and counts attempts as always, and reads nothing new. The proposal names the count
-(`maxAttempts`, 1 to 10; MCP `board_propose`). Otherwise the provider's configuration for the task's template
-(`templateAttempts`, by template name), else its `maxAttempts` (3). The lead names more where one attempt tests
-one hypothesis and a few may miss. The count never changes once the task is proposed.
+writing step ([starting from the previous attempt's work](workflow-engine.md#starting-from-the-previous-attempts-work));
+the board decides and counts attempts as always. The proposal names the count (`maxAttempts`, 1 to 10; MCP
+`board_propose`), else the provider's configuration for the task's template (`templateAttempts`, by template
+name), else its `maxAttempts` (3). The lead names more where one attempt tests one hypothesis and a few may
+miss. The count never changes once the task is proposed.
 
 #### An attempt not spent on the infrastructure
 
@@ -473,36 +472,36 @@ reports it failed with `infrastructure`, a kind and a reason ([how the engine te
 | `worker-unavailable` | a step failed only because a Worker it needed became unavailable while the run ran: before anything of it was sent, or after, when its Worker source says that alone ended it |
 
 - **Not counted, within a bound.** While the task has free retries left (`board.maxFreeRetries`, default 3,
-  0 to 10, validated when the board loads; INV-9), `reconcileRun` sets `attempts.count` back by one. The task
-  goes back for the same attempt through the gate (ready, or `approval-needed` on that attempt's subject). The
-  free retries used are kept beside the record (`board_tasks.free_retries`), so the bound holds across restarts
-  and over the task's whole life. The move reads them in its own transaction, so its decision's numbers are
-  exact. A count that changed while the board waited on the approval queue is a `conflict`, and nothing moves.
-- **Recorded.** The move's `board` decision says why it did not count, with the kind and the reason, and names
-  the free retries used and allowed (`outcome.detail.infrastructure`, `outcome.detail.freeRetry`,
-  `counted: false`). A decision's reason is clamped, so it says the outcome first and the owner's reason last;
-  the detail keeps the reason whole.
+  0 to 10, validated when the board loads; INV-9), `reconcileRun` sets `attempts.count` back by one and the
+  task goes back for the same attempt through the gate (ready, or `approval-needed` on that attempt's
+  subject). The free retries used are kept beside the record (`board_tasks.free_retries`), so the bound holds
+  across restarts and over the task's whole life; the move reads them in its own transaction, so its
+  decision's numbers are exact. A count that changed while the board waited on the approval queue is a
+  `conflict`, and nothing moves.
+- **Recorded.** The move's `board` decision says why it did not count, with the kind and the reason, and the
+  free retries used and allowed (`outcome.detail.infrastructure`, `outcome.detail.freeRetry`,
+  `counted: false`). A decision's reason is clamped, so it says the outcome first and the owner's reason
+  last; the detail keeps the reason whole.
 - **Past the bound** the failure counts like any other, and its decision says why (`counted: true`). An
   infrastructure failure that persists still ends the task waiting for input (`retries-spent`), never a loop.
 - **After the sweep found the run lost.** When the policy gives `remediation` no ask, the sweep (or a policy
   change's regate) leaves a lost run's task waiting for input (`rejected`), its run still recorded, and its
-  `board` decision saying so (`outcome.detail.reason` `reconciliation-failed`). `reconcileRun` still takes the
-  run's report from that wait, but only an infrastructure-only failure with a free retry left, which gives the
-  attempt back as above. Any other report to that wait (another outcome, or past the bound) is
-  `invalid-transition`, nothing moves, and the task keeps waiting for a person. A wait the operator's denial made
-  is not such a wait.
-- **The count is not the run's identity.** A run not counted leaves `attempts.count` where it was, so the next
-  run serves the same attempt number. Whoever reads the previous run (as the engine does to
+  `board` decision saying so (`outcome.detail.reason` `reconciliation-failed`). From that wait `reconcileRun`
+  takes only an infrastructure-only failure with a free retry left, which gives the attempt back as above.
+  Any other report (another outcome, or past the bound) is `invalid-transition`, nothing moves, and the task
+  keeps waiting for a person. A wait the operator's denial made is not such a wait.
+- **The count is not the run's identity.** A run not counted leaves `attempts.count` where it was, so the
+  next run serves the same attempt number. Whoever reads the previous run (as the engine does to
   [carry its work](workflow-engine.md#starting-from-the-previous-attempts-work)) finds it by its own record,
   never by the count.
-- A failed run without `infrastructure`, a rejected result, a question, and a spent budget count as before. So
-  does a run the operator stopped, even before anything of it was sent: its owner never reports a stop as the
-  infrastructure's. A malformed `infrastructure` (another kind, a reason that is empty or over 500 characters,
-  any other field) is `invalid`, and nothing moves.
+- A failed run without `infrastructure`, a rejected result, a question, and a spent budget count as before,
+  and so does a run the operator stopped, even before anything of it was sent: its owner never reports a
+  stop as the infrastructure's. A malformed `infrastructure` (another kind, a reason empty or over 500
+  characters, any other field) is `invalid`, and nothing moves.
 
 ### A plan of tasks
 
-> From [PROP-0023](../proposals/0023-worker-roles-and-token-budget.md) change 5 (draft).
+> [PROP-0023](../proposals/0023-worker-roles-and-token-budget.md) change 5.
 
 `board_propose_plan` (`mcp-board` 1.6) proposes a plan's tasks together, such as the answer of a `decompose`
 run. A lead or a planner splits a goal into small tasks, and the board files all of them or none.
@@ -523,14 +522,14 @@ run. A lead or a planner splits a goal into small tasks, and the board files all
 
 ### The defect link
 
-A task may carry `defect: { fixes, sha, at, by }` (`board-task@1.2`, PROP-0016 I4): it fixes a defect of `fixes`,
-a **done** task of the same project, in the change that landed at `sha` (7 to 64 hex characters). It is set when
-the task is filed (`TaskInput.fixes`, MCP `board_propose` `fixes`; `by: filed`), or later, once, by `Board.linkDefect`
-(MCP `board_defect`; `by` the lead, the reviewer with `as: reviewer`, or the operator's token). A task never fixes
-itself. A link to a task that is not done, not of the project, or with a malformed sha is `invalid`. Setting it moves
-no state and makes no decision: it is a fact about the fixed task's change. `system metrics` counts the fixed tasks
-as [escaped defects](maturity-metrics.md#the-metrics), beside the escapes of auto-accepted results and the reverts the
-landings record.
+A task may carry `defect: { fixes, sha, at, by }` (`board-task@1.2`, PROP-0016 I4): it fixes a defect of
+`fixes`, a **done** task of the same project, in the change that landed at `sha` (7 to 64 hex characters). It
+is set when the task is filed (`TaskInput.fixes`, MCP `board_propose` `fixes`; `by: filed`), or later, once,
+by `Board.linkDefect` (MCP `board_defect`; `by` the lead, the reviewer with `as: reviewer`, or the operator's
+token). A task never fixes itself. A link to a task that is not done, not of the project, or with a malformed
+sha is `invalid`. It moves no state and makes no decision: it is a fact about the fixed task's change.
+`system metrics` counts the fixed tasks as [escaped defects](maturity-metrics.md#the-metrics), beside the
+escapes of auto-accepted results and the reverts the landings record.
 
 ## Fail-closed rules
 
@@ -551,15 +550,16 @@ landings record.
 
 ## Conformance
 
-[`board-core/conformance/board.ts`](../../packages/board-core/conformance/board.ts), 31 scenarios at contract 1.5,
-run against the fake provider and the store-backed provider, both over the approvals fake, and against the
+[`board-core/conformance/board.ts`](../../packages/board-core/conformance/board.ts), 31 scenarios at contract
+1.5, run against the fake and the store-backed provider, both over the approvals fake, and against the
 store-backed provider over the store-backed approval queue. Contract 1.0 is unreleased and amended in place
 ([ADR-0039](../decisions/adr/0039-base-guarantee-seam-contract-changes.md)). Each minor adds one optional
 capability: 1.1 `attachDigest`, 1.2 the `funding` of a `budget-spent` block
 ([ADR-0044](../decisions/adr/0044-funding-raises-a-spent-task-budget.md)), 1.3 its `unreleased`
-([ADR-0054](../decisions/adr/0054-a-funding-request-names-the-holds-the-ledger-did-not-release.md)), 1.4 `reopen`
+([ADR-0054](../decisions/adr/0054-a-funding-request-names-the-holds-the-ledger-did-not-release.md)), 1.4
+`reopen`
 ([ADR-0068](../decisions/adr/0068-an-accepted-result-is-rebased-onto-its-target-and-checked-again-before-it-lands.md)),
-and 1.5 a failed run's `infrastructure`
-([ADR-0069](../decisions/adr/0069-an-attempt-is-not-spent-on-an-infrastructure-failure.md)). The last amendment's
-scenario, `board.policy-change-asks-again`, changes the queue's policies in each harness (`changePolicies`: the fake's
+1.5 a failed run's `infrastructure`
+([ADR-0069](../decisions/adr/0069-an-attempt-is-not-spent-on-an-infrastructure-failure.md)). Scenario
+`board.policy-change-asks-again` changes the queue's policies in each harness (`changePolicies`: the fake's
 `reload`, or a restart of the store-backed queue over the same store).
