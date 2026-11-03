@@ -12,7 +12,8 @@ implementation: []
 # Proposal: Capability reuse and measured code deletion
 
 **Draft for operator and local-agent review. Not accepted and not implemented.**
-Read the [2026-11-03 capability reuse audit](../research/capability-reuse-audit-2026-11-03.md)
+Read the [2026-11-03 capability reuse audit](../research/capability-reuse-audit-2026-11-03.md),
+the [targeted source-level plugin architecture audit](../research/plugin-architecture-source-audit-2026-11-03.md),
 and [ADR-0010](../decisions/adr/0010-reuse-before-build.md) before assigning work.
 Existing [Lean Core PROP-0022](0022-lean-core.md) and safety decisions take precedence
 over the experiment plan here.
