@@ -3,14 +3,13 @@
 > Target state. Boundary: [gateways](../architecture/components.md#gateways), plugin family
 > *surface* ([ADR-0036](../decisions/adr/0036-guarantee-core-and-capability-plugins.md)). Proposal:
 > [PROP-0016](../proposals/0016-operating-model.md#1-maturity-model-l0-to-l6) §1, increment I4 part 1
-> (D83: the operator's go-ahead; the L3 lines are starting lines, revisited once 30 days of data exist).
+> (the L3 lines are starting lines, revisited once 30 days of data exist).
 > Payload: [`mcp-report@1.6`](../reference/schemas.md#mcp-tool-metrics) `$defs/metrics-output`.
 >
 > Implemented in [`report`](../../packages/plugins/report/README.md) (`metrics.ts`): MCP `metrics`,
-> `system metrics`, and the weekly report's last section (T236, `bc1b8015`; escaped defects and
-> Worker availability recorded and read, T277b, `6e937cd2`). Differs from target: three metrics are
-> not measurable yet (traced landings, gate coverage, quota idle; below), and a value the records
-> only bound says so. The 30-day evidence period starts 2026-10-27.
+> `system metrics`, and the weekly report's last section. Differs from target: three metrics are not
+> measurable (traced landings, gate coverage, quota idle; below), and a value the records only
+> bound says so.
 
 PROP-0016 judges System's level by what its records show over a rolling 30 days, never by the
 features built. This is the code that reads them. Each metric of §1 is computed from recorded data
@@ -67,16 +66,11 @@ is not told from the operator's. Until those records are gone from the window, t
 bound** (`bound: lower`), and the reason says what it leaves out.
 
 **Only before the window's end.** A run started, a decision made, or a verdict given at or after
-the window's end never counts: a later retry or decision leaves an earlier window's reading as it was.
+the window's end never counts.
 
-**A task not fully attributed.** A finished task with a run whose started entry names no starter
-(recorded before this change), whose start the log no longer holds, or whose decisions were not all
-read, stays in the sample and counts the touches recorded: a lower bound of its own touches, so the
-median over every finished task is still a lower bound of the true median. For unattended
-completion it counts as unattended unless a touch is known, so that share stays an upper bound.
-The figures count such tasks (`unattributed`, `notAttributed`).
-
-This definition is not a contract: it is the reading the metric gives now, and I2 extends it.
+**A task not fully attributed** (no starter named, the start no longer in the log, or decisions not
+all read) stays in the sample and counts the touches recorded: a lower bound. The figures count such
+tasks (`unattributed`, `notAttributed`).
 
 ## The metrics
 
@@ -85,18 +79,18 @@ accepting decision was made in the window, as the report counts one.
 
 | Metric | Value | Sample | Not measurable when |
 |---|---|---|---|
-| Traced landings | — | — | always, for now: a change landed outside System leaves no System record; it needs the repositories' history |
-| Gate coverage | — | — | always, for now: a tool call the gate did not see leaves no record to count against |
+| Traced landings | — | — | always: a change landed outside System leaves no System record; it needs the repositories' history |
+| Gate coverage | — | — | always: a tool call the gate did not see leaves no record to count against |
 | Board coverage | runs started in the window that serve a board task, over all of them (each task has acceptance criteria by its schema) | runs started | no run started; or a project's scope (a run that serves no task belongs to none) |
 | Lead touches per task | the median of touches recorded per finished task (with its p90 and mean, starts, decisions, and the tasks not fully attributed); a lower bound | finished tasks | no task finished, or none fully attributed |
 | Operator decisions per day | the approval verdicts given in the window, the acceptances the operator decided, and the operator's decisions on the runs read, each once, over the window's days; a lower bound, said, when a run's decisions or the latest decisions may not all have been read | those decisions | nothing at all is recorded in the scope |
 | Unattended completion | over every finished task, the share that went from ready to landed (a merged landing before the window's end) with no touch known: no lead touch, no run the operator started, and no operator decision but the merge approval (a verdict on a request of the task or its runs not of class `merge`, an operator acceptance of it or of an attempt, an operator decision on its runs). A task not landed is never unattended; a landed one whose move to ready was not read, or whose touches are not all recorded, counts unless a touch is known, so the share is an upper bound, over every tier (tiers come with I2) | finished tasks | no task finished |
 | Time ready-to-landed | the median and p90, in hours, from a task's first move to `ready` to its result's `merged` landing, for the merges of the window; over every tier. When the latest 1000 moves to ready were all read (`readyReadFrom`), a task created before the first of them may have become ready earlier: its time and the median are a lower bound, which shows a miss but never meets the line | results merged | no result merged, or none has a move to ready read |
 | Stalls per 100 runs | the workflow runs with an agent run that stalled or ended unknown in the window (each once), per 100 runs started in it | runs started | no run started |
-| Escaped defects per 100 landed | the tasks with a defect recorded in the window, each once at the earliest time one was, per 100 results merged in it: a task another task's `defect` link names (`fixes: <taskId>@<landing sha>`, set when the fix task is filed or later by the lead, the reviewer, or the operator), a task whose landing commit a revert landed on the target names (the landing records the `This reverts commit` lines of the commits it merged), and an escape of an auto-accepted result (D93). A lower bound: a defect nobody linked, reverted, or recorded is not counted | results merged | the board records neither links nor escapes; or no result merged in the window |
+| Escaped defects per 100 landed | the tasks with a defect recorded in the window, each once at the earliest time one was, per 100 results merged in it: a task another task's `defect` link names (`fixes: <taskId>@<landing sha>`, set when the fix task is filed or later by the lead, the reviewer, or the operator), a task whose landing commit a revert landed on the target names (the landing records the `This reverts commit` lines of the commits it merged), and an escape of an auto-accepted result. A lower bound: a defect nobody linked, reverted, or recorded is not counted | results merged | the board records neither links nor escapes; or no result merged in the window |
 | Worker availability | of the hours each Worker was observed in the window, the share it could take work. A Worker's state is the one its last event left it in (`roster.worker.unavailable` with a reason, `roster.worker.available`); hours before its first event are not observed. A usage limit (`quota-exhausted`) is no failure of the Worker (PROP-0016 §1): its hours are left out of both sides; a lost login, a quarantine, a stall, or another reason counts as unavailable | Workers | no event recorded, or no hour but at a usage limit |
 | Cost per accepted result | the ledger's tokens (input and output) counted in the window over the results accepted in it, with cost, turns, and the quota the agent runs drew (clean draws, percentage points); and the same by kind of work (`byKind`, each window's quota with the draws left out by state). A usage record's kind is its run's draw's; one no draw names is listed under no kind (not known). Each component is summed over the records that carry it: one no record carries (tokens, cost, turns, a window's points with no clean draw) has no figure, never 0, and the reason says so; one some records lack counts the others, said. The value is a lower bound when records carry no token counts or runs' usage could not be counted | accepted results | none accepted; neither usage nor a draw recorded; or no usage record carries token counts (the quota drawn, cost, and turns recorded stay as figures) |
-| Quota idle while work is ready | — | — | always, for now: an account's headroom is read when a run is routed, not recorded over time |
+| Quota idle while work is ready | — | — | always: an account's headroom is read when a run is routed, not recorded over time |
 
 The three still not measurable (traced landings, gate coverage, quota idle) each name the record they need; adding those records is the rest of I4.
 
@@ -115,7 +109,7 @@ The three still not measurable (traced landings, gate coverage, quota idle) each
 
 ## The L3 reading
 
-Each metric stands against its L3 line (PROP-0016 §1, starting lines, D83): `meets`, `misses`,
+Each metric stands against its L3 line (PROP-0016 §1, starting lines): `meets`, `misses`,
 `unproven` (a bound on the side of the line that does not settle it: a lower bound of lead touches
 that is at most 1, an upper bound of unattended completion that is at least 50 %), or `not-read`
 (no value). "1 working day" is read as 24 hours, and "reported weekly" is met when the cost is
@@ -124,7 +118,7 @@ measured.
 `level.l3` is `holds` only when every line is met, over a window of at least 30 days, on at least
 30 finished tasks. Otherwise it is `not-shown`, with every reason: the window too short, too few
 tasks, the lines missed, those a bound does not show, and those not measurable. With three metrics
-not measurable yet, no reading can show L3: that is the honest reading, not a defect.
+not measurable, no reading can show L3.
 
 ## Where it is shown
 

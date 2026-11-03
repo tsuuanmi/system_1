@@ -11,12 +11,7 @@
 > (wake-on-message, checkpoints, compaction); differs from target: a Worker sends a message only
 > as its reply to a wake, and `session_send` is the operator's or a client's;
 > sessions start `IDLE` at their first admission (no `FORMING`) and are never `CLOSED`; a group
-> lives for its run, not inside one `team` node; the A2A adapter is planned.
->
-> Built since 2026-10-25: a research run does not fail when its session's Worker cannot take a step
-> (T230, `dcc7442a`); review findings go as messages to the author's session (T232, `b5cae5a1`);
-> Workers that share no session work through a task's dossier (T233, `fd3449de`, ADR-0070).
-
+> lives for its run, not inside one `team` node; there is no A2A adapter yet.
 ## Concepts
 
 | Concept | Meaning | Lifetime |
@@ -42,7 +37,7 @@ collaboration identity, and it is chosen through admission once, at formation
 | ACP agent | ACP `sessionId` | `session/resume` (v2) or `session/load` (v1) |
 | An agent runtime that cannot resume (the Antigravity CLI), as a review member only | none | a replay, not a resume: the `agents` source sends the session's earlier turns, exactly as recorded, before each new one, and records them with the answer ([review members](agent-runtimes.md#review-members)) |
 | Model Worker | none | the `models` source replays the session's transcript ([ADR-0031](../decisions/adr/0031-model-worker-sessions-by-replay.md)) |
-| A2A remote agent (planned) | `contextId` (+ current `taskId`) | `SubscribeToTask` / Get Task |
+| A2A remote agent | `contextId` (+ current `taskId`) | `SubscribeToTask` / Get Task |
 
 A Worker can serve a session only if it proves `persistent-conversation`
 ([routing](routing.md#capability-vocabulary)), for that work when its offer is scoped to one kind
@@ -126,9 +121,9 @@ A session stays on its Worker: a template's later step on the run's one
 conversation (`persistent`, `caller`) routes only to the Workers the session's
 source names (`affinity`). When every one of them is refused for a reason no
 wait can change (its input bound, a capability it does not prove, its tier,
-where it runs), the step does not fail for that alone (board T230; live
-2026-10-26, a research run whose session stayed on a website that takes 30,000
-characters, and whose evidence step was 56,350). It runs this once off the
+where it runs), the step does not fail for that alone (for example, a research
+run whose session stayed on a website that takes 30,000 characters, while its
+evidence step was 56,350). It runs this once off the
 session, on any other Worker admission takes, with the rest of its rules
 (provider diversity, an assigned account) kept:
 
@@ -140,21 +135,15 @@ session, on any other Worker admission takes, with the rest of its rules
   runs on the same session (what the conversation held that the step could
   need, as a compaction's `handoff` summary carries a conversation forward).
 
-The session itself does not move: it keeps its Worker and its conversation. A
-later step that runs on it again is handed the results of the steps of its run
-that ran off it, so its conversation lacks nothing it needs. The choice is a
-`route` decision by `workflow.session-move` (`stay`, `sessionless`, `handoff`,
-`fail`, each with why), named by the execution's decisions, beside the
-`workflow.node.session-moved` event. A Worker of the session that is busy, at its
-limit, signed out, or not listed now is a wait, not a move: the step waits or
-fails as before. A team member's session never moves (Model A). A step no
-Worker takes off the session either still fails, its message naming both
-refusals; a handoff that would point at more artifacts than a brief holds does
-not move, and says so. Code: `packages/plugins/workflow/src/session-moves.ts`.
+The session itself does not move: it keeps its Worker and its conversation, and a later step
+that runs on it again is handed the results of the steps that ran off it. The choice is a
+`route` decision by `workflow.session-move` (`stay`, `sessionless`, `handoff`, `fail`, each with
+why). A Worker of the session that is busy, at its limit, or signed out is a wait, not a move. A
+team member's session never moves (Model A). Code: `packages/plugins/workflow/src/session-moves.ts`.
 
 ### A review fix continues its author's session
 
-One task, one author session (board T232; operator 2026-10-26: "when a fix is
+One task, one author session (the operator's rule: "when a fix is
 needed, message it; after a review, message that session directly to update;
 the whole task stays in one session while still getting outside information
 from an independent reviewer"). A review's fix is not routed like any step to a
@@ -196,7 +185,7 @@ runs and its execution, never named by the Worker: an agent Worker's host tools 
 offers them (Claude Code). The engine writes the evidence, and the entry of a step that wrote none (a
 website Worker's answer as it is).
 
-## A2A alignment (for the planned adapter)
+## A2A alignment
 
 | `system` | A2A 1.0 |
 |---|---|

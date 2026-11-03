@@ -10,8 +10,7 @@
 > [`gateway-responses`](../../packages/plugins/gateway-responses/README.md),
 > [`gateway-turns`](../../packages/gateway-turns/README.md), and
 > [`gateway-core`](../../packages/gateway-core/README.md) (the guard); differs from target: see
-> [Target (not built)](#target-not-built). Status audited 2026-10-27: nothing of the gateways
-> changed from T236 to T295 (`gateway-core`'s roster changes are the [roster's](roster.md)).
+> [Target](#target).
 
 The gateways let Claude Code and Codex use website Workers **as their model**. They are plain
 consumer plugins at the edge, not providers of a seam:
@@ -100,35 +99,17 @@ A model name selects the tier: `system-<tier>`, else the plugin's `models` patte
 
 ## Responses gateway (Codex)
 
-An OpenAI Responses-compatible endpoint on the loopback webserver.
+Parked (row off, package frozen) by PROP-0022 change 6; see [docs/proposals/0022-lean-core.md](../proposals/0022-lean-core.md).
 
-- **Routes:** `POST /v1/responses` (SSE or one JSON response) and `GET /v1/models`.
-  `HEAD`, `GET /`, and `GET /healthz` answer 200 without authentication.
-- **Transport:** a WebSocket attempt on `GET /v1/responses` receives HTTP 426, which makes
-  the client fall back to SSE. While a turn runs, `response.in_progress` keeps the client's idle
-  timer from firing.
-- **Authentication:** every other route passes the shared guard: a loopback `Host`, no browser
-  `Origin`, and the model scope's token
-  ([scopes](../../packages/plugins/mcp-server/README.md#scopes)). On plain HTTP on a non-loopback
-  host the route is not registered, so the token never crosses a network in clear text.
-- **Event mapping:** prose becomes output text, and tool requests become `function_call` (or
-  `custom_tool_call` for freeform tools). Status rows are not mapped.
-- **Compaction:** Codex compacts locally for a custom provider. Its summary request continues
-  the bound conversation, and the compacted history, which has no assistant turn, opens a new
-  one.
-- **Retries:** `system codex-env` sets Codex's request and stream retries to zero, because a
-  retried request would send a website turn again.
+An OpenAI Responses-compatible endpoint on the loopback webserver, with the same shared guard
+as the other client endpoints.
 
 ## Anthropic Messages gateway (Claude Code)
 
-An Anthropic Messages-compatible endpoint on the same listener.
+Parked (row off, package frozen) by PROP-0022 change 6; see [docs/proposals/0022-lean-core.md](../proposals/0022-lean-core.md).
 
-- **Routes:** `POST /v1/messages` (SSE or one JSON message), `POST /v1/messages/count_tokens`
-  (an estimate), and `GET /v1/models`. The guard is the same as for Responses.
-- **Client setup:** `system claude-env` prints a command that points Claude Code's base URL at
-  the gateway and reads the model token through a helper.
-- **Event mapping:** prose becomes `text` blocks and tool requests become `tool_use` blocks. A
-  request for thinking is not answered with `thinking` blocks.
+An Anthropic Messages-compatible endpoint on the same listener, with the same shared guard as the
+Responses gateway.
 
 ## Authority
 
@@ -158,7 +139,7 @@ runs, operator controls, accounts, sessions) as native MCP tools to any MCP clie
 Every client pays for the tool list each session, so the list and the most read replies have a
 [token budget](../../packages/plugins/mcp-server/README.md#token-budget) a test enforces.
 
-## Target (not built)
+## Target
 
 The target adds these to the gateways above.
 

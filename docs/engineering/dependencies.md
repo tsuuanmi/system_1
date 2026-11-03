@@ -6,8 +6,7 @@ sits behind a seam ([plugin model](../architecture/plugin-model.md)).
 This file is the canonical list of what `system` reuses, adapts, or builds, on
 which rung of the reuse ladder, and what was compared. Every change that adds a
 runtime dependency or ports code updates this table. Exact versions are in each
-package's `package.json`. **Status** is one of **in use**, **planned**, or
-**dropped**.
+package's `package.json`. **Status** is **in use**, **planned**, or **dropped**.
 
 ## Reused and adapted
 
@@ -20,28 +19,28 @@ package's `package.json`. **Status** is one of **in use**, **planned**, or
 | MCP server | `@modelcontextprotocol/sdk` (stateless Streamable HTTP) on DSH `ctx.webServer`, `zod` for tool schemas | protocol SDK | `mcp-server` | in use | DSH has only an MCP client (review) |
 | Cross-process writer lock | DSH `@deepseek-ai/dsh-atomic-write` `withFileLock` | library (DSH) | `credentials-vault` | in use | its `writeFileAtomic` skips fsync, so `libs` keeps `writeFileDurable` |
 | DSH home path | `@deepseek-ai/dsh-home-paths` `resolveDshHome()` | library (DSH) | `libs` (`dshHome()`) | in use | DSH's own rule (a blank `$DSH_HOME` ignored, a relative one made absolute), so the CLI and the daemon agree on the home |
-| Browser automation | `patchright-core` and a system Chrome, headed; one line patched ([patches](#patches)) | library | `browser-patchright`, `ui-ops` | in use | removes automation leaks ([ADR-0016](../decisions/adr/0016-invisible-headed-browser-and-portable-accounts.md)); `@anweat/dsh-browser` is headless with no IndexedDB (review) |
+| Browser automation | `patchright-core` and a system Chrome, headed; one line patched ([patches](#patches)) | library | `browser-patchright`, `ui-ops` | in use | removes automation leaks ([ADR-0016](../decisions/adr/0016-invisible-headed-browser-and-portable-accounts.md)); `@anweat/dsh-browser` is headless with no IndexedDB |
 | Managed Chrome download | `@puppeteer/browsers`, the build pinned in `chrome.lock.json` | library | `browser-patchright`, `system init` | in use | only when the host has no recent Chrome ([ADR-0020](../decisions/adr/0020-pinned-managed-chrome.md)) |
 | Invisible display | Xvfb from system packages; own manager ported from internet | system tool + port | `display-virtual` | in use | uses `-displayfd` and X auth; `xvfb-run -a` and `@cypress/xvfb` guess display numbers |
 | Agent read confinement | bubblewrap (`bwrap`) from system packages | system tool | `agent-runtime-core`, `agent-runtimes`, `runtime-claude-agent-sdk`, `runtime-codex-sdk`, `runtime-acp`, `runtime-antigravity-cli` | in use | unprivileged, already what Codex's own Linux sandbox and Flatpak use; Codex's permission profiles (schema changes between releases), Landlock through a native addon, and encrypting the state directory compared ([ADR-0024](../decisions/adr/0024-agent-workers-confined-for-reads.md)) |
 | Remote login desktop | `@novnc/novnc`, `ws`; TigerVNC `x0vncserver` or `x11vnc` from system packages | library + system tool | `login` | in use | owner-only VNC unix socket, token, Host and origin checks, no Python; websockify, neko, and Kasm compared ([login](../../packages/plugins/login/README.md)) |
 | TOTP codes | `otpauth` | library | `login` | in use | computed locally, never by a third-party site |
 | UI maps | `yaml` | library | `ui-ops` | in use | maps are data ([ADR-0021](../decisions/adr/0021-ui-operations-as-data.md)) |
-| Desktop notifications | `notify-send` (libnotify) from system packages, run without a shell | system tool | `notify` | in use (its row off) | the freedesktop notification client every desktop ships; `node-notifier` bundles platform binaries and a shell-out of its own, and a D-Bus client library would reimplement what `notify-send` does. Absent, the sink is a no-op health shows ([notifications](../design/notifications.md#sinks)) |
+| Desktop notifications | `notify-send` (libnotify) from system packages, run without a shell | system tool | `notify` | in use (its row off) | the freedesktop client every desktop ships; `node-notifier` bundles platform binaries, and a D-Bus library would reimplement it. Absent, the sink is a no-op ([notifications](../design/notifications.md#sinks)) |
 | Credential scan for egress | `@secretlint/core`, `@secretlint/secretlint-rule-preset-recommend` | library | `egress`, the repository secrets audit (`scripts/check-secrets.ts`, through `egress`'s `scan.ts`) | in use | a thin policy layer over secretlint; gitleaks (Go), detect-secrets (Python), and Presidio need another runtime |
 | Exact git subjects and repository snapshots | the installed `git`, read-only, fixed arguments; 2.37 or later for snapshots (`http.curloptResolve` pins a connection to the checked address) | system tool | `libs` | in use | a review subject, and a review's files at a pinned commit, must match what git sees; isomorphic-git would reimplement it |
 | Claude Code as a Worker | `@anthropic-ai/claude-agent-sdk`, running the operator's `claude` | protocol SDK | `runtime-claude-agent-sdk` | in use | exact tool list, `settingSources: []`, resume; © Anthropic, not open source; a dependency, never vendored ([terms](#claude-agent-sdk-terms)) |
 | Claude Code Workers' confined commands | the Agent SDK's `sandbox` option: Anthropic's sandbox runtime as Claude Code ships it (bubblewrap and a `socat` network proxy on Linux; Apache-2.0) | protocol SDK feature, with `socat` from system packages | `runtime-claude-agent-sdk` | in use | nested in the host's read confinement; no new dependency: `@anthropic-ai/sandbox-runtime` directly would duplicate what the SDK ships ([ADR-0038](../decisions/adr/0038-confined-commands-for-claude-code-workers.md)) |
 | Codex as a Worker | `@openai/codex-sdk`, running the operator's `codex` | protocol SDK | `runtime-codex-sdk` | in use | exact sandbox mode, resume; the run's tool gate through Codex's own PreToolUse hooks (CLI 0.164 behaviour, proven by the probe on each host), no new dependency ([runtime](../../packages/plugins/runtime-codex-sdk/README.md), [ADR-0042](../decisions/adr/0042-codex-workers-ask-the-gate-through-a-hook-bridge.md)) |
 | ACP agents as Workers | `@agentclientprotocol/sdk`, client side over stdio | protocol SDK | `runtime-acp` | in use | client-enforced policy ([runtime](../../packages/plugins/runtime-acp/README.md)) |
-| The Antigravity CLI as a Worker | the operator's installed `agy`, in print mode (`--output-format stream-json`), with one command hook (`hooks.json`) bridged to the run over a unix socket | system tool (CLI) | `runtime-antigravity-cli` | in use (row off by default) | agy publishes no SDK, and `agy --help` shows no ACP or server mode: print mode, stream-json, and the hook contract are its documented interface (agy 1.4.6). Nothing is depended on or vendored; the hook script is a small Node file of our own, shipped with the plugin ([runtime](../../packages/plugins/runtime-antigravity-cli/README.md)) |
+| The Antigravity CLI as a Worker | the operator's installed `agy`, in print mode (`--output-format stream-json`), with one command hook (`hooks.json`) bridged to the run over a unix socket | system tool (CLI) | `runtime-antigravity-cli` | in use (row off by default) | agy publishes no SDK or server mode; print mode, stream-json, and the hook contract are its documented interface. Nothing is depended on or vendored; the hook script is a small Node file of our own ([runtime](../../packages/plugins/runtime-antigravity-cli/README.md)) |
 | Agent child environment | DSH `@deepseek-ai/dsh-subprocess` `scrubbedParentEnv()`, with its peer `@deepseek-ai/dsh-http-proxy` (proxy variables) | library (DSH) | `agent-runtime-core` (`childEnvironment`) | in use | DSH's own scrub of credential-shaped and `DSH_*` names (INV-8); operator variables are forwarded by name on top. Hand-filtering `process.env` would duplicate it |
 | Local exec (shell, fs, sandbox) | DSH `dsh-shell`, `dsh-fs`, `dsh-sandbox`, `dsh-subprocess` | library (DSH) | `ctx.exec` | planned | no seam is mounted |
 | API and local models | DSH `dsh-llm` (`ctx.llm`) and `dsh-llm-pi-ai` (provider routes over `@earendil-works/pi-ai`, whose `pi-telemetry` dependency is contracts only, with no exporter) | library (DSH) | `models` (rows `llm`, `llm-pi-ai`) | in use | the allow-listed DSH rows; they need only `ctx.credentials` and resolve a route's key by reference through the vault. `dsh-llm-retry` is not mounted (it needs the agent loop and session log); `models` bounds its own re-attempts. A minimal own OpenAI-compatible client was the fallback, not needed ([models](../design/models.md)) |
 | Versions and changelogs | Changesets (`@changesets/cli`), one `fixed` group | dev tool | repository root | in use | release-please and semantic-release derive versions from commit messages; Changesets records the bump with the change ([releasing](releasing.md)) |
 | SBOM | `pnpm sbom` (CycloneDX), built into the package manager | dev tool | `scripts/release-artifacts.ts` | in use | `@cyclonedx/cdxgen` and `@cyclonedx/cyclonedx-npm` add a dependency; the package manager already resolves the exact production tree |
 | Build provenance | `actions/attest-build-provenance`, pinned by SHA | CI action | `release` workflow | in use | SLSA provenance stored by GitHub, verified with `gh attestation verify`; no signing key to keep |
-| Statistics reference | SciPy 1.18.1 `scipy.stats.permutation_test` (BSD-3-Clause), with NumPy 2.5.4 on Python 3.14.2, fetched by `uv run --with` into uv's cache | dev tool (reference, run once) | `scripts/statistics/sign-flip-goldens.py`, the fixture of `statistics` | in use | the research run's reference ([research](../research/statistics-tooling-2026-10-23.md)): it generates the golden results the [statistics](../design/statistics.md#golden-tests) tests read; never installed in the workspace, never run by a test or at runtime |
+| Statistics reference | SciPy 1.18.1 `scipy.stats.permutation_test` (BSD-3-Clause), with NumPy 2.5.4 on Python 3.14.2, fetched by `uv run --with` into uv's cache | dev tool (reference, run once) | `scripts/statistics/sign-flip-goldens.py`, the fixture of `statistics` | in use | it generates the golden results the [statistics](../design/statistics.md#golden-tests) tests read; never installed in the workspace, never run by a test or at runtime |
 
 ### Claude Agent SDK terms
 
@@ -52,11 +51,9 @@ operator signs it off.
 - **Pinned:** `@anthropic-ai/claude-agent-sdk` `0.3.296` exactly, in
   `runtime-claude-agent-sdk`'s `package.json` and the lockfile.
 - **Licence:** not an open-source licence. The package's `license` field is
-  `SEE LICENSE IN README.md`; its `LICENSE.md` reads "© Anthropic PBC. All rights
-  reserved. Use is subject to the Legal Agreements outlined here:
-  <https://code.claude.com/docs/en/legal-and-compliance>". Its README adds that the SDK
-  collects feedback (usage data such as code acceptances and rejections, the associated
-  conversation data, and `/bug` reports), under the
+  `SEE LICENSE IN README.md`, and its `LICENSE.md` reserves all rights, subject to Anthropic's legal
+  agreements (<https://code.claude.com/docs/en/legal-and-compliance>). The SDK collects feedback
+  (code acceptances and rejections, the associated conversation data, and `/bug` reports), under the
   [Commercial Terms](https://www.anthropic.com/legal/commercial-terms) and the
   [Privacy Policy](https://www.anthropic.com/legal/privacy).
 - **The legal agreements page** (read 2026-10-23; it can change between releases):
@@ -74,43 +71,26 @@ operator signs it off.
     Anthropic's own flow;
   - "runs Claude Code" may be said in plain text; the Claude Code and Anthropic names and
     logos may not be part of a product's own name or suggest endorsement.
-- **Not vendored:** no file of the SDK is in this repository. It is a registry
-  dependency, installed by the package manager; a release tarball (`pnpm pack` of `lib`
-  and `plugin-manifest.json`) holds only `system`'s compiled code and names the SDK at its
-  exact version, and the SBOM lists it. The SDK's platform builds, which bundle Claude
-  Code, are not installed (`ignoredOptionalDependencies` in `pnpm-workspace.yaml`).
-- **How `system` runs it:** the operator's own installed, unmodified `claude`, for the
-  operator's own runs; the workspace packages are `private`, never published to a
-  registry (a release's tarballs install from the file).
-  Claude Code signs in through its own `/login` in the Workers' home, or with an API key
-  or OAuth token the operator forwards by name (`forwardEnv`) from the daemon's
-  environment to the child; `system` stores no such credential
-  ([runtime](../../packages/plugins/runtime-claude-agent-sdk/README.md)).
-- **For the operator to sign off:** which agreement covers the account the Workers use
-  (Consumer Terms for a Free, Pro, or Max subscription, Commercial Terms for an API key,
-  Team, or Enterprise), and that unattended Workers on a subscription stay within its
-  ordinary, individual use (otherwise an API key); that no one but the operator uses the
-  install, since serving others needs the Commercial Terms and each user's own
-  credentials; that the SDK's feedback collection is acceptable for the runs' content;
-  and that the agreements page still says the above for the release.
-- **Signed off for the pilot** by the operator on 2026-10-24 (D27): the install is the
-  operator's only, its Claude Code Workers run on the operator's own subscriptions, and
-  nothing is resold; unattended Workers count as the operator's own use. Two conditions
-  stand: the agreements page is read again at the release, and the Workers switch to an
-  API key if the install ever serves anyone but the operator. The decision did not
-  name the SDK's feedback collection, so that item is still signed off at the release.
+- **Not vendored:** no file of the SDK is in this repository. It is installed by the package manager;
+  the release SBOM lists it. The SDK's platform builds, which bundle Claude Code, are not installed
+  (`ignoredOptionalDependencies` in `pnpm-workspace.yaml`).
+- **How `system` runs it:** the operator's own installed, unmodified `claude`. The workspace packages
+  are `private` and never published to a registry. Claude Code signs in through its own `/login` in
+  the Workers' home, or with an API key or OAuth token the operator forwards by name (`forwardEnv`);
+  `system` stores no such credential ([runtime](../../packages/plugins/runtime-claude-agent-sdk/README.md)).
+- **Sign-off, each release.** The operator confirms that the account the Workers use is covered
+  (Consumer Terms for a Free, Pro, or Max subscription; Commercial Terms for an API key, Team, or
+  Enterprise), that unattended Workers stay within ordinary individual use, that no one but the
+  operator uses the install, and that the SDK's feedback collection is acceptable for the runs'
+  content.
+- **Conditions.** The agreements page is read again at each release, and the Workers switch to an
+  API key if the install ever serves anyone but the operator.
 
 ### Advisories in production dependencies
 
-The operator's decision of 2026-10-24 (D28) on the two moderate advisories of the
-[dependency audit](../validation/release-checklist.md) of 2026-10-23:
-
-- **`ip-address`** (GHSA-rxp7-6hxx-x8q5, 10.7.3, through `express-rate-limit` of
-  `@modelcontextprotocol/sdk`): overridden to `>=10.7.4`, a patch within the range its
-  dependents ask for. The code path is not one `mcp-server` imports.
-- **`@modelcontextprotocol/client`** (GHSA-6prh-2h8m-c8cw, 2.2.0): not overridden. The
-  `dsh` launcher's `dsh-mcp-client` pins it exactly, and that row is installed but not
-  mounted; it waits for DSH to update its pin, which a DSH bump brings (CON-8).
+The audit's advisories and what is done about each are in [overrides](#overrides), and the ones not
+forced are listed under it. An advisory that a dependent's range does not allow lifting waits for that
+dependent's release.
 
 ## Overrides
 
@@ -126,10 +106,10 @@ dependent's own range excludes the vulnerable versions. The audit gate is
 |---|---|---|---|---|
 | `body-parser` | `^2.4.0` (2.4.0) | [GHSA-27r3-jxmh-p828](https://github.com/advisories/GHSA-27r3-jxmh-p828), high: a denial of service by trailing bytes after a compressed request body, 2.0.0 to 2.3.x | `express` 5.3.0, under `@modelcontextprotocol/sdk` (`mcp-server`, `cli`, the Claude Agent SDK, DSH's `pi-ai` through `@google/genai`) and its `express-rate-limit` | `express` `^2.3.0` |
 | `zod` | `^4.6.6` (4.6.7) | [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5), high: memory exhausted validating an oversized constrained collection, below 4.6.6 | `system`'s own MCP tool schemas, `@modelcontextprotocol/sdk` and its `zod-to-json-schema`, DSH packages, the agent and model SDKs | `^4.1.0` (`system`'s packages), `^4.4.3` (DSH), `^4.2.0`, `^4.0.0`, `^3.25 \|\| ^4.0`, `^3.25.0 \|\| ^4.0.0`, `^3.25.28 \|\| ^4` |
-| `ip-address` | `^10.7.4` (10.7.4) | [GHSA-rxp7-6hxx-x8q5](https://github.com/advisories/GHSA-rxp7-6hxx-x8q5), moderate: a zone identifier matched in quadratic time, up to 10.7.3. Below the gate; lifted by the operator's decision (D28, option 1) | `express-rate-limit` 8.7.1, under `@modelcontextprotocol/sdk` (its OAuth server handlers, which `mcp-server` does not import) | `express-rate-limit` `^10.2.0` |
+| `ip-address` | `^10.7.4` (10.7.4) | [GHSA-rxp7-6hxx-x8q5](https://github.com/advisories/GHSA-rxp7-6hxx-x8q5), moderate: a zone identifier matched in quadratic time, up to 10.7.3. Below the gate | `express-rate-limit` 8.7.1, under `@modelcontextprotocol/sdk` (its OAuth server handlers, which `mcp-server` does not import) | `express-rate-limit` `^10.2.0` |
 | `undici` | `^8.12.2` (8.12.3) | [GHSA-xjj6-f33q-929c](https://github.com/advisories/GHSA-xjj6-f33q-929c), high: a denial of service by an unhandled error on excessive content encodings; with it [GHSA-4qv8-2p9j-2685](https://github.com/advisories/GHSA-4qv8-2p9j-2685) (an EventSource parser's unbounded memory) and [GHSA-f72v-6w45-q472](https://github.com/advisories/GHSA-f72v-6w45-q472) (an integrity check bypassed by a non-lowercase algorithm), moderate; 8.0.0 to 8.12.1 | DSH's `dsh-http-proxy` (`agent-runtime-core`, through `dsh-subprocess` too) and `dsh-web-fetch-http`; `openai`'s optional peer | `^8.10.2` (DSH), `>=5 <9` (`openai`) |
-| `fast-uri` | `^3.1.9` (3.1.9) | moderate: [GHSA-w74x-v6f9-j3xg](https://github.com/advisories/GHSA-w74x-v6f9-j3xg) (a scheme spoofed by percent-encoding) and [GHSA-wjr9-j795-jxcr](https://github.com/advisories/GHSA-wjr9-j795-jxcr) (a host confused by WHATWG canonicalization); low: [GHSA-xhq7-xmqj-769h](https://github.com/advisories/GHSA-xhq7-xmqj-769h), [GHSA-333x-w4r6-6crp](https://github.com/advisories/GHSA-333x-w4r6-6crp); 3.0.0 to 3.1.8. Below the gate; lifted as `ip-address` was (D28, option 1), since `ajv` resolves URIs with it | `ajv` 8.20.0 (`libs`' record and wire schemas, and `ajv` under the MCP SDK) | `ajv` `^3.0.1` |
-| `fflate` | `>=0.8.3` (0.8.3) | moderate: an endless loop on a malformed ZIP64 archive, below 0.8.3 | DSH's office and session-export packages, none of them a mounted row | `^0.8.2` (`dsh-session-log-export`), `0.8.2` exactly (`libreoffice-kit`). Set by an earlier change, before this rule: it forces 0.8.3 onto that exact pin and is an open `>=`. Kept as it was |
+| `fast-uri` | `^3.1.9` (3.1.9) | moderate: [GHSA-w74x-v6f9-j3xg](https://github.com/advisories/GHSA-w74x-v6f9-j3xg) (a scheme spoofed by percent-encoding) and [GHSA-wjr9-j795-jxcr](https://github.com/advisories/GHSA-wjr9-j795-jxcr) (a host confused by WHATWG canonicalization); low: [GHSA-xhq7-xmqj-769h](https://github.com/advisories/GHSA-xhq7-xmqj-769h), [GHSA-333x-w4r6-6crp](https://github.com/advisories/GHSA-333x-w4r6-6crp); 3.0.0 to 3.1.8. Below the gate; lifted because `ajv` resolves URIs with it | `ajv` 8.20.0 (`libs`' record and wire schemas, and `ajv` under the MCP SDK) | `ajv` `^3.0.1` |
+| `fflate` | `>=0.8.3` (0.8.3) | moderate: an endless loop on a malformed ZIP64 archive, below 0.8.3 | DSH's office and session-export packages, none of them a mounted row | `^0.8.2` (`dsh-session-log-export`), `0.8.2` exactly (`libreoffice-kit`). It forces 0.8.3 onto that exact pin, an open `>=` that predates the rule above |
 
 Not forced:
 
@@ -151,7 +131,7 @@ fixes it.
 
 | Package | Patch | Why |
 |---|---|---|
-| `patchright-core` 1.63.0 | [`patchright-core@1.63.0.patch`](../../patches/patchright-core@1.63.0.patch): a new page's request-interception setup, which patchright starts without awaiting (`CRPage`'s constructor), handles a rejection that says the page's session closed; any other rejection still goes unhandled | Its last step sends `Network.setCacheDisabled` on the page's session after the page attached, and when that session closed first (a context closed, the browser lost with its display, right after a page opened) the rejection had no handler. Under the `dsh` launcher an unhandled rejection exits the daemon (its fail-loud handler); in the suite it failed 5 of 13 loaded runs (`browser-patchright`'s lost-display and dispose tests), and those two tests alone 5 of 40 runs beside a suite copy, against none of 40 patched. `browser-patchright` already waits for a page to open before it closes the page's context ([README](../../packages/plugins/browser-patchright/README.md)); that cannot cover a crash or a lost display, and the step may still be running once the page has opened |
+| `patchright-core` 1.63.0 | [`patchright-core@1.63.0.patch`](../../patches/patchright-core@1.63.0.patch): a new page's request-interception setup, which patchright starts without awaiting (`CRPage`'s constructor), handles a rejection that says the page's session closed; any other rejection still goes unhandled | Its last step sends `Network.setCacheDisabled` on the page's session after the page attached. When that session closed first (a context closed, the browser lost with its display, right after a page opened) the rejection had no handler. Under the `dsh` launcher an unhandled rejection exits the daemon. `browser-patchright` already waits for a page to open before it closes the page's context ([README](../../packages/plugins/browser-patchright/README.md)); that cannot cover a crash or a lost display, and the step may still be running once the page has opened |
 
 ## Built, with what was compared
 
@@ -177,9 +157,9 @@ Each of these is built because nothing fits; the comparison is the reason.
 | Worker sessions | `ctx.workerSessions`: sessions, groups, mailboxes, barrier, decision artifacts | `worker-sessions` | in use | DSH `dsh-experimental-agent-team` is experimental and in-process ([ADR-0019](../decisions/adr/0019-explicit-minimal-dsh-core.md)) |
 | Model gateways | `/anthropic` and `/openai` on the `gateway-turns` library | `gateway-anthropic`, `gateway-responses` | in use | claude-code-router, claude-code-proxy, LiteLLM, claudex translate API to API; ours drives web chat through durable, receipted runs ([ADR-0022](../decisions/adr/0022-text-protocol-tool-calls-for-website-models.md)). Nothing was ported from codex-chatgpt-web |
 | Operator web UI | the small `/ui` page | `web-ui` | in use | DSH `dsh-web-app` needs `dsh-base` (ADR-0019); operator decision |
-| Notifications | the `notify` surface plugin: a cursor over the event log, deduplication in the store, a bounded queue, the desktop sink, and a webhook sink on Node's `fetch` behind `ctx.egress` | `notify` | in use (its row off) | DSH's webhook rows are avoided (experimental, [reuse map](../architecture/plugin-model.md#dsh-core-reuse-map)) and none reads `system`'s event log; Apprise (Python, another runtime) and ntfy's client are one sink each, which the webhook reaches as plain HTTP. The rules (one per run per event per 10 min) follow superorchestrator's notifications, read for the pattern only (MIT, nothing ported) |
+| Notifications | the `notify` surface plugin: a cursor over the event log, deduplication in the store, a bounded queue, the desktop sink, and a webhook sink on Node's `fetch` behind `ctx.egress` | `notify` | in use (its row off) | DSH's webhook rows are avoided (experimental, [reuse map](../architecture/plugin-model.md#dsh-core-reuse-map)); Apprise (Python) and ntfy's client are one sink each, which the webhook reaches as plain HTTP. The rules follow superorchestrator's notifications, read for the pattern only (MIT, nothing ported) |
 | CLI | the `system` binary with a stdio MCP shim | `cli` | in use | commander, citty; mcp-remote and supergateway would put the token in client config |
-| Statistics of the evaluation engine | the exact paired sign-flip test and its interval, 2 to 20 cases, golden-tested against SciPy, no dependency, pinned by version in each experiment ([statistics](../design/statistics.md)) | `statistics` | in use (its consumer is the `evaluations` provider, F4) | from the research run ([research](../research/statistics-tooling-2026-10-23.md)): SciPy and statsmodels (BSD-3-Clause) are Python, and a sidecar was not shown worth it, so SciPy is the reference only; GrowthBook `gbstats` (MIT) tests independent samples, with no paired resampling; Optuna and Ax/BoTorch (MIT) optimize rather than infer; PyMC and ArviZ (Apache-2.0) only for a later Bayesian method; MLflow (Apache-2.0) at most a downstream projection of the record; simple-statistics (ISC) awaits a licence-policy decision and is not used |
+| Statistics of the evaluation engine | the exact paired sign-flip test and its interval, 2 to 20 cases, golden-tested against SciPy, no dependency, pinned by version in each experiment ([statistics](../design/statistics.md)) | `statistics` | in use | SciPy and statsmodels (BSD-3-Clause) are Python, so SciPy is the reference only; GrowthBook `gbstats` (MIT) tests independent samples, with no paired resampling; Optuna and Ax/BoTorch (MIT) optimize rather than infer; PyMC and ArviZ (Apache-2.0) only for a later Bayesian method; MLflow (Apache-2.0) at most a downstream projection of the record; simple-statistics (ISC) awaits a licence-policy decision and is not used |
 
 ## Dropped
 

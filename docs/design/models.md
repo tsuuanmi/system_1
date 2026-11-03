@@ -10,9 +10,7 @@
 > [`models`](../../packages/plugins/models/README.md); differs from target: usage is the
 > provider's token counts per step, not priced, and not recorded on the
 > [resource ledger](resources.md). What was verified live is in the
-> [release checklist](../validation/release-checklist.md). Status audited 2026-10-27: nothing of
-> this seam changed from T236 to T295 (an agent Worker's tiers per model are
-> [agent runtimes'](agent-runtimes.md#tiers-per-role), T261).
+> [release checklist](../validation/release-checklist.md).
 
 A **model Worker** is one entry of the operator's model catalog: an API model or a model served
 on this machine. It answers one prompt with text, and runs no tools. It keeps a session by
@@ -28,13 +26,9 @@ and `persistent-conversation`, and can be a team member or carry a run's convers
 | `llm-pi-ai` | DSH `@deepseek-ai/dsh-llm-pi-ai` | provider routes: each key of its `providers` config is a route with an endpoint, a wire protocol, and a credential reference (`apiKeyEnv`) |
 | `models` | `@tsuuanmi/system-models` | `ctx.models` over `ctx.llm`, and the `models` Worker source over `ctx.models` |
 
-The DSH rows need only `ctx.credentials`: no `dsh-base`, telemetry row, vendor default-model row,
-or `attachments` service. `llm-retry` is not mounted: it injects the DSH agent loop and session
-log (`agents`, `sessionProjections`), which `system` never inserts, and it retries only agent-loop
-steps; a direct `ctx.llm.stream()` call is one attempt. The `models` row bounds its own
-re-attempts instead (below).
-
-With an empty catalog the `models` row contributes no Worker.
+The DSH rows need only `ctx.credentials`. `llm-retry` is not mounted: it retries only DSH agent-loop
+steps, so a direct `ctx.llm.stream()` call is one attempt, and the `models` row bounds its own
+re-attempts (below). With an empty catalog the `models` row contributes no Worker.
 
 ## Seam contract
 
@@ -127,7 +121,7 @@ locality is what admits `local-private` work to it
    most `maxRetries` times (default 2), whatever the route policy allows; a refused credential, a
    spent quota, or an invalid request is never re-attempted, whatever the policy. Each request may
    be billed.
-   **A request the provider did not process** (T209) is apart from those: an answer of `503` with
+   **A request the provider did not process** is apart from those: an answer of `503` with
    `UNAVAILABLE` (overloaded) or `429` with `RESOURCE_EXHAUSTED`, as a Gemini API route reports
    them, before any output, both the status and its name said (a bare `503` or `429` is not taken
    as that promise). `ctx.models` does not re-attempt it; it fails it as `transient` (`503`) or
@@ -220,12 +214,9 @@ session, so the source keeps the transcript:
 
 ## The `api-first` preset
 
-[ADR-0025](../decisions/adr/0025-api-first-composition.md): a bundle layer
-(`@tsuuanmi/system-preset-api-first`, shipped in the system bundle's `presets/api-first/`) that
-turns off every row that drives a website and both model gateways, turns on the agent Worker
-rows and the software-development profile (off in the base composition), and sets
-`quotaPreference: [local, metered, agent-plan, subscription-chat]`. `system init --preset
-api-first` adds it to the profile's bundle list after the system bundle; the operator's own
-`cordis.patch.yml` is never rewritten. Templates that need `web-search` or `deep-research` then
-fail admission with `no Worker proves …`
-([templates](../reference/workflow-templates.md#presets)).
+[ADR-0025](../decisions/adr/0025-api-first-composition.md): a bundle layer that turns off every row
+that drives a website and both model gateways, turns on the agent Worker rows and the
+software-development profile, and sets `quotaPreference: [local, metered, agent-plan,
+subscription-chat]`. `system init --preset api-first` adds it to the profile's bundle list; the
+operator's `cordis.patch.yml` is never rewritten. Templates that need `web-search` or
+`deep-research` then fail admission ([templates](../reference/workflow-templates.md#presets)).

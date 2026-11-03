@@ -418,18 +418,18 @@ runs the work the router admitted to them. Callers never reach a source directly
 
 ## Parked
 
-Parked on 2026-11-01 ([PROP-0022](../proposals/0022-lean-core.md#6-park-what-is-not-used-bundle)
-changes 6a and 6b; evidence: [lean-core research](../research/lean-core-2026-11-01.md#5-what-is-used)).
-A parked plugin's row is off in the shipped bundle and its package frozen: no change except a
-security fix, its tests still run. A parked library with no row is only frozen. No code is removed.
+Parked parts are chosen by [PROP-0022](../proposals/0022-lean-core.md#6-park-what-is-not-used-bundle)
+(evidence: [lean-core research](../research/lean-core-2026-11-01.md#5-what-is-used)). A parked plugin's
+row is off in the shipped bundle and its package frozen: no change except a security fix, and its
+tests still run. A parked library with no row is only frozen. No code is removed.
 
 **What turns it back on.** A row: its `disabled` in the bundle, or `system plugin on`
 ([ADR-0078](../decisions/adr/0078-a-plugin-or-a-mechanism-is-turned-off-at-runtime.md)). A part
 with its own key: that key. A template: naming it in a run. A frozen library: nothing to turn on;
 the first change that needs it unfreezes it.
 
-**Deletion.** A separate decided change may delete a parked part after 30 days (from 2026-12-01)
-with no use, read from the event log; this section does not delete anything.
+**Deletion.** A separate decided change may delete a parked part that stays unused for 30 days, read
+from the event log. This section does not delete anything.
 
 | Part | Why (research, section 5) | Turned back on by |
 |---|---|---|

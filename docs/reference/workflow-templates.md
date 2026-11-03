@@ -8,7 +8,9 @@
 
 A template is a list of nodes. Each node names the capabilities a Worker must prove, a minimum
 tier, a conversation mode, and the acceptance contract its result must pass. The engine checks
-every template at load (preflight) and refuses a run whose contracts are not registered.
+every template at load (preflight) and refuses a run whose contracts are not registered. A run of
+a template not in the catalog is refused (`unknown workflow template`); runs started earlier keep
+their resolved spec, so `explain` and `result` still answer for them.
 
 | Field | Meaning |
 |---|---|
@@ -103,7 +105,7 @@ start it with `system research --deep`, MCP `research` with `deep: true`, or `ru
 The two reviews run in parallel, on two provider families
 ([different provider families](../design/workflow-engine.md#different-provider-families)):
 review A (`literature:1`) proves web search; review B (`literature:2`) runs on another family,
-which prefers a Worker that proves web search too (T262, D91: a read-only
+which prefers a Worker that proves web search too (a read-only
 [research role's](../design/agent-runtimes.md#a-research-role) Claude Worker, then one that only
 reasons), so a provider that need not prove a search is gated by its citations. `evidence:1` reads both,
 labelled A and B, and records which review states each claim (`reviews`). `conclusion:1` says
@@ -219,10 +221,9 @@ Worker, in the run's own git worktree when the Workers (or their role) set `work
 | `selfreview:1` (depends on `develop:1`) | `review`, `local-data` | standard | none | temporary (a new session) | `acceptance.answer` |
 | `review:1` (depends on `selfreview:1`, `develop:1`) | `review`, `local-data` | standard | none | temporary | `acceptance.answer` |
 
-**Template version 2** (T267; the profile package's version moves with it). Version 1 ended with a
-`validate:1` step, whose median was 0.4 minutes and which caught nothing the run's required checks at
-acceptance did not. It is gone: the author shows its own checks' output, a fresh session of the author
-reviews the diff, and `review:1` is the final step. A row's `kinds.validate` is still accepted and
+**Template version 2** (the profile package's version moves with it). The `validate:1` step is gone:
+the author shows its own checks' output, a fresh session of the author reviews the diff, and
+`review:1` is the final step. A row's `kinds.validate` is still accepted and
 ignored, so an update never stops a row from loading; remove it.
 
 - **Pipeline** ([ADR-0082](../decisions/adr/0082-the-lean-pipeline-of-algorithm-development.md)).
@@ -234,7 +235,7 @@ ignored, so an update never stops a row from loading; remove it.
   (its spec hash differs between the two), so a change of the key reaches the runs started after it;
   under `lean` the template's playbook version is the package's with `+lean`, which each step's
   brief records (layer 4). Parts 2 and 3 of the lean pipeline (a finding's confirmation, parallel
-  checks and review) are pending (T366, T367).
+  checks and review) are not yet in it.
 - **Kinds of work** ([ADR-0057](../decisions/adr/0057-route-work-by-kind.md)). With no Worker given
   kinds, every step routes as it always did. Once the operator gives Workers kinds
   ([route work by kind](../operations/runbooks.md#route-work-by-kind)), `develop:1` and its fix run
@@ -248,7 +249,7 @@ ignored, so an update never stops a row from loading; remove it.
   failed only after its `develop:1` completed (its review's session broke, say), no review having
   judged that change, this attempt's worktree already holds it, and its brief says so: it builds on
   it ([starting from the previous attempt's work](../design/workflow-engine.md#starting-from-the-previous-attempts-work)).
-- **A change of behaviour is test-first** (T306c, [ADR-0079](../decisions/adr/0079-test-first-is-checked-by-system-red-on-base.md)).
+- **A change of behaviour is test-first** ([ADR-0079](../decisions/adr/0079-test-first-is-checked-by-system-red-on-base.md)).
   The `develop:1` prompt of the code work (not the `docs` and `tests` variants) asks the author to
   write the tests that encode the criteria first, run them and see them fail (a test that cannot
   load for a missing module fails too), then change the code until they pass, and to show both runs
@@ -259,7 +260,7 @@ ignored, so an update never stops a row from loading; remove it.
   files the result adds or changes on the run's base tree, with the result's tests copied over, and
   they must fail there and pass on the result; for a refactor it fails a result that edits or
   deletes an existing test. It sits behind the enforce switch `red-on-base`, which starts in `warn`.
-- **The author verifies before anyone reviews** (T267, T284). `develop:1` ends with the author having
+- **The author verifies before anyone reviews**. `develop:1` ends with the author having
   run the checks the task's criteria name. The System records, for every command the Worker ran, the
   command, its exit code as the runtime reports it (Codex's command items; for Claude Code the tool
   result's error flag, and the `Exit code N` its error text names), and a bounded tail of its output.
@@ -281,7 +282,7 @@ ignored, so an update never stops a row from loading; remove it.
   gate reads what ran, never a check the engine reports: the run's required checks run again
   on the exact result at acceptance
   ([ADR-0063](../decisions/adr/0063-a-runs-required-checks-run-on-its-exact-result.md)).
-- `selfreview:1` is **the author's own review in a fresh context** (T267): a review of the exact
+- `selfreview:1` is **the author's own review in a fresh context**: a review of the exact
   change, on the author's account (the Workers of the account `develop:1` ran on; a writer never
   proves `review`, so it is that account's read-only role), in a session of its own. It never sees
   the author's transcript: its brief is the task's goal and criteria, the exact diff (its requested
@@ -399,15 +400,6 @@ it to a website Worker first; it never needs `local-data`. Its answer ends with 
 the `board_propose_plan` input without `projectId`. Each task is one independently testable
 behaviour with criteria a check names; a task depends on another only when it needs that change,
 so tasks on different files run at once.
-
-## Removed templates
-
-PROP-0004 removed `investigate`, `deep-research`, `develop`, and `panel`, and replaced
-`research-deep` with the `deep` variant of `research`, and the built-in agent `review` with
-`agent-review` (the name `review` now runs the team). A run of `panel` stays readable, but
-`continue` refuses it. A new run of
-a removed template is refused (`unknown workflow template`). Runs started before keep their
-resolved spec and records, so `explain` and `result` still answer for them.
 
 ## Presets
 

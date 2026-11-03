@@ -11,9 +11,7 @@
 > target: the driver steps (open, mode, submit, binding, extract) run inside `ask`; turns are not
 > bound by provider turn id (the receipt binds the conversation and the response boundary); there
 > is no measured composer budget or multipart transfer for [large inputs](#large-inputs), and no
-> attachments. Status audited 2026-10-27: nothing of this mechanism changed from T236 to T295
-> (clean-up T244, `c6341b5b`; a deterministic test, T279c, `059637bf`).
-
+> attachments.
 ## Driver interface
 
 Each website is a `ProviderDriver`. The runtime never branches on provider names
@@ -44,15 +42,11 @@ interface ProviderDriver<Page> {                   // provider-core
 }
 ```
 
-`checkAuth`'s optional `save` (additive, [ADR-0036](../decisions/adr/0036-guarantee-core-and-capability-plugins.md))
-marks the check of the operator's Save in the login profile (`ctx.login.save`), which then reads
-`identity` there. A driver may count as signed in there an account its page names but does not
-show (Gemini's Google Account button while its side panel is collapsed: a Save failed live on
-2026-10-26), since that Save names who it is from the same reading. A turn's check, and a Save's
-verification in a fresh context, pass no options: there the account must show, so a page that
-hides it still fails closed as drift. A driver that takes no options reads every check as a
-turn's. The option is in the contract, not kept inside the driver, because only the caller knows
-which check it makes.
+`checkAuth`'s optional `save` ([ADR-0036](../decisions/adr/0036-guarantee-core-and-capability-plugins.md))
+marks the check of the operator's Save in the login profile. There a driver may count an account
+its page names but does not show (Gemini's Google Account button while its side panel is
+collapsed). A turn's check, and a Save's verification in a fresh context, pass no options, so a
+page that hides the account still fails closed as drift.
 
 `ask` holds the whole turn: open the conversation (new, bound, or Temporary chat), select and
 read back the mode, insert and send the prompt, wait for completion, and read the answer as
@@ -78,29 +72,21 @@ classification.
 ## Conversation modes
 
 The runtime picks the mode from the request and never from the website's
-default. Live observations are in the
-research.
+default.
 
 | Request | Mode | Binding | Why |
 |---|---|---|---|
 | a one-shot `ask` or `research` call with no session | **temporary** (ChatGPT: Temporary chat, `?temporary-chat=true`; Gemini: Temporary chat, shown only by its notice) | none kept after the turn | stays out of the operator's history; no conversation to resume |
 | a turn in a Worker session (`SessionId`), or any long-running or multi-turn work | **persistent** (a normal chat) | the canonical conversation id (ChatGPT `/c/<id>`, Gemini `/app/<id>`), stored in the receipt and the session | later turns, recovery after a crash, and Deep Research return to the same conversation |
 
-- A temporary turn cannot be reopened after its page is gone. Its reconciliation
-  can only conclude WAIT (same page still open), RESUBMIT (no submission
-  evidence), or AMBIGUOUS, never RECOVER.
+- A temporary turn cannot be reopened after its page is gone, so its reconciliation
+  concludes WAIT, RESUBMIT, or AMBIGUOUS, never RECOVER.
 - A persistent conversation is opened by its bound URL. A binding never moves to
   another conversation.
-- **Workspace mode is part of `selectMode`.** Before a new conversation is
-  started, the composer's mode group must show **Chat** selected
-  (`aria-pressed=true`). ChatGPT's **Work** mode spends a different quota (Codex),
-  so it is never used for chat turns. If the mode group is shown and Chat is not
-  selected after one attempt, the turn fails before sending. Temporary chat does
-  not show the group; Chat is selected on the home page before switching to it.
-  The textbox names the tab it sends to, so a composer that names Work fails the
-  turn before sending too, whether the group shows or not.
-  Gemini's agent tab, **Spark**, is refused the same way: where the tabs are
-  shown, the **Chat** tab must be active before sending.
+- **Workspace mode is part of `selectMode`.** ChatGPT's **Work** mode spends a different
+  quota (Codex), so chat turns use **Chat** only (`aria-pressed=true`). If Chat is not
+  selected after one attempt, the turn fails before sending. The same holds when the
+  textbox names Work, and for Gemini's **Spark** tab, where the **Chat** tab must be active.
 
 ## Modes and tiers
 
@@ -125,24 +111,16 @@ research.
   verify, so its turn fails as `ui_drift` and nothing is sent. The receipt
   records the verified model and effort.
 - **Deep research** (the `deep-research` capability) runs only in persistent
-  conversations: Temporary chat does not offer it. Its first reply is an
-  acknowledgement, and the report arrives later in a nested frame. The driver
-  waits for that frame's "Research completed" state (running while "Stop
-  research" shows) and returns the report. If no frame appears, the reply was a
-  clarifying question and is returned as the answer. `research` returns at once,
-  with longer deadlines (default 60 min, stall 30 min).
-- **Gemini's Deep research** is a two-step start. Its first reply is a plan,
-  which already carries Copy, so a plain completion check would take the plan
-  for the answer. The driver clicks **Start research**, which the site records
-  as a user turn of its own, then follows the research card from `processing`
-  to `completed`. It reads the report from the report panel, followed by the
-  sources it used. A reply with no plan is a clarifying question, returned as
-  the answer. A reopened Deep research conversation keeps Deep research chosen,
-  so a plain turn there clears it first and sends nothing if it cannot. The
-  turn's own preset never applies to it. The driver applies only its
-  `researchMode` preset, chosen with the tool on and read back, and skips a
-  thinking level the menu does not show then. Unset, the picker is left as the
-  site has it.
+  conversations. Its first reply is an acknowledgement, and the report arrives later
+  in a nested frame, which the driver waits for and returns. If no frame appears, the
+  reply was a clarifying question and is the answer. `research` returns at once, with
+  longer deadlines (default 60 min, stall 30 min).
+- **Gemini's Deep research** starts in two steps. The first reply is a plan, which
+  already carries Copy, so the driver clicks **Start research** and follows the research
+  card from `processing` to `completed`, then reads the report and its sources. A reply
+  with no plan is a clarifying question. A reopened Deep research conversation keeps the
+  tool chosen, so a plain turn clears it first and sends nothing if it cannot. The driver
+  applies only its `researchMode` preset; the turn's own preset never applies to it.
 
 ## Turn receipt
 
@@ -191,8 +169,7 @@ A site may answer a sent prompt with its own error in place of an answer (Gemini
 try your request again."; read only in a short answer, so an answer about errors is never taken
 for one). The driver reads it on the turn's own page, after the boundary, and fails the turn
 `overloaded` with `siteError` set (`ProviderError.siteError`). The turn runtime never resends it:
-the prompt was sent, and a later look at the conversation can show an empty chat (live
-2026-10-24), which the table above reads as not observed. It records `siteError` on the turn's
+the prompt was sent, and a later look at the conversation can show an empty chat, which the table above reads as not observed. It records `siteError` on the turn's
 error only when its receipt was written, and its Worker execution carries it
 (`WorkerExecution.error.siteError`). Whether the work runs again is the caller's: the workflow
 engine resends a team member's first step once, in a new conversation of its session, and nothing
@@ -222,9 +199,7 @@ Completion is observed with two independent deadlines:
 - **stall deadline:** reset only by *meaningful* transitions, meaning response text
   changed, generation started or stopped, or the work a driver reports before any
   text changed (its `progress`, such as Deep research's growing activity, or a Gemini
-  answer's thinking, which the answer shows and changes before its text: live
-  2026-10-23, a review member's answer on Gemini failed `provider_stalled` at five
-  minutes). A stall's error names the bound that ended it (`turns.stallTimeoutMs`,
+  answer's thinking, which the answer shows and changes before its text). A stall's error names the bound that ended it (`turns.stallTimeoutMs`,
   `turns.researchStallTimeoutMs`) and points at the page's outline (`provider.stall`):
   a site that keeps working with nothing a driver can see change is told from one
   that stopped only there.
@@ -266,28 +241,20 @@ Every website conversation `system` creates is recorded in the turn runtime's le
 the session that owns it, the turn that opened it, its feature and mode, and its state.
 
 - **Recorded at bind time,** inside the turn's fenced transaction, so no binding exists without
-  its row. A compaction that starts a new conversation adds a row; the old one stays live. The
-  ledger outlives the turn records and receipts, which expire on their own clock. When the
-  ledger was introduced, it was filled from the turns that still held a binding; older
-  conversations were never recorded and are not deleted.
+  its row. The ledger outlives the turn records and receipts.
 - **Released with its run.** When a run is deleted or expires, the workflow engine releases
-  the Worker sessions its nodes used that no remaining run uses (the Worker source's `release`,
-  [workers](../../packages/workers-core/src/index.ts)); a persistent session continued by a
-  later run stays. Every release is one `retention` decision, by the rule
-  `turns.conversation-retention` (INV-13), naming the sessions and the conversations it makes
-  due. This is the only clock: only the workflow engine starts Worker work, so every website
-  session belongs to a run, and a conversation lives exactly as long as the runs that use it.
-- **Deleted on its site,** one conversation at a time, under a lease, on the account's
-  scheduler with its page held exclusively, so never beside a turn. The driver opens exactly
-  that conversation (its own path, its turns shown) before anything is clicked, deletes it from
-  its own menu (never a bulk deletion), confirms the dialog, and reopens it to see that it is
-  gone. Its own menu means the button in the conversation's pane (UI map `conversation.pane`),
-  never a history row's, whose rows carry other chats' menus. Before every click the page must
-  still be on the conversation's own path, and while it runs, the page lets no deletion request
-  leave that does not name this conversation (ChatGPT: only `PATCH
-  /backend-api/conversation/<binding>` hiding it; Gemini: an RPC request whose calls name no
-  conversation but this one, from the first click on; a body whose calls cannot be read is refused), so a click that reached another chat's
-  dialog deletes nothing, even in a request that also names this one. "Gone" must hold on two loads in a row.
+  the Worker sessions no remaining run uses. Every release is one `retention` decision, by the
+  rule `turns.conversation-retention` (INV-13), naming the sessions and conversations it makes
+  due. A conversation lives exactly as long as the runs that use it.
+- **Deleted on its site,** one conversation at a time, under a lease, on the account's scheduler
+  with its page held exclusively. The driver opens exactly that conversation, deletes it from
+  its own menu, in the conversation's pane (UI map `conversation.pane`), never a history row's,
+  and never a bulk deletion; it confirms the dialog, then reopens the conversation to see that it
+  is gone. Before every click the page must still be on the conversation's own path, and while
+  it runs, the page lets no deletion request leave that does not name this conversation (ChatGPT:
+  only `PATCH /backend-api/conversation/<binding>` hiding it; Gemini: an RPC request whose calls
+  name no other conversation, and a body whose calls cannot be read is refused). So a click that
+  reached another chat's dialog deletes nothing. "Gone" must hold on two loads in a row.
 - **Never on a guessed flow.** While any of the delete flow's UI map entries is still
   `unverified` (not yet checked on the live site), its conversations wait, due, with the reason
   `unverified-map`, and nothing is clicked. The live check lifts the flag entry by entry.
@@ -302,22 +269,19 @@ the session that owns it, the turn that opened it, its feature and mode, and its
 - **Reconcile before repeat** (INV-4). A deletion that may have happened (a crash between the
   click and the record) is checked on the site first: a conversation already gone is recorded
   as deleted, and nothing is clicked again.
-- **Kept, and why.** A temporary chat leaves the history on its own (the provider keeps it up to
-  30 days on ChatGPT, 72 hours on Gemini) and is never deleted by `system`. A conversation of a
-  feature its driver is not proven to delete (`deletes`; Deep research until a live check) is
-  kept, as is one on a site with no deletion or of a removed account (one the catalog no longer
-  has; an account whose record cannot be read now leaves its conversations due, saying why).
+- **Kept, and why.** A temporary chat is never deleted by `system`; the provider expires it.
+  A conversation of a feature its driver is not proven to delete (`deletes`; Deep research
+  until a live check), or on a site with no deletion, is kept.
 - **Failures** are retried on the next pass; after three attempts the conversation is `failed`,
   and `system health` reports it. A signed-out account leaves its conversations due.
-- **Evidence without the operator's browser:** `system conversation inspect <account> <binding>`
-  opens a recorded conversation, outlines the page and its own menu (structure, never text),
-  closes the menu, and stores the outlines as local-private evidence (`system evidence <id>`).
+- **Evidence:** `system conversation inspect <account> <binding>` outlines the page and its own
+  menu (structure, never text) and stores the outlines as local-private evidence.
 - Deletion on the site does not bind the provider's own retention of the chat.
 
 ## Runtime (MVP slice 1)
 
-`ctx.turns` is the website Worker source: it runs one turn end to end on the website Worker
-the workflow engine admitted. The full path of a turn, from any entry point:
+`ctx.turns` is the website Worker source: it runs one turn end to end on the Worker the workflow
+engine admitted:
 
 ```mermaid
 sequenceDiagram
@@ -376,7 +340,7 @@ research. The wait stays under common MCP client timeouts (at most 55 s).
 
 ## Large inputs
 
-Planned. When a prompt exceeds the measured composer budget, the runtime either fails
+When a prompt exceeds the measured composer budget, the runtime either fails
 before opening a browser turn or, if the capability allows it, sends a multipart
 transfer. Each part carries complete records and must be acknowledged with its
 exact SHA-256 before the next one is sent. Any failure aborts the whole transfer.

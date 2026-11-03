@@ -32,19 +32,19 @@ the operator, and the runs that need a look. A count that could not be read whol
 *(?)* with nothing known.
 Each page opens with its title, and one short sentence of what it is for only where the title does
 not say it (*Control which actions need approval.*); the design rules, the bound on the words of each
-first screen, and the screenshots are in [the web UI at a glance](../design/web-ui.md) (T239). On a
+first screen, and the screenshots are in [the web UI at a glance](../design/web-ui.md). On a
 narrow screen (600 px) no page is wider than the screen: the navigation keeps whole links on one row
 under the name and the refresh line (*policy* for *Autonomy policy* on a phone), the header stays at
 the top, the Board's columns stack, each card the screen's width with its buttons sharing it, and,
 below 600 px, a table is a card per row, each cell named by its column. On the operator's iPhone
-(T240) the page lays itself under the Dynamic Island and the home indicator and keeps clear of both,
+ the page lays itself under the Dynamic Island and the home indicator and keeps clear of both,
 every target is at least 44 by 44 px, every field 16 px (Safari never zooms on focus), a row of
 buttons has a **?** that shows on a tap what each does, and a run's primary action is a bar at the
 bottom of the screen.
 
 ### Shared building blocks and production states
 
-Every page is built from one implementation each (T172): a **status chip**, a word with a colour
+Every page is built from one implementation each: a **status chip**, a word with a colour
 and a symbol of its own shape (● ok, ▲ needs you or waits, ■ failed or blocked, ◆ info, ○ other),
 never the colour alone; a **number with its unit** (*3 tasks*, *1/2 slots*, *2/3 steps*); a
 **relative time** (*12 min ago*, *in 2 h*) with its exact time as its title on hover and after it
@@ -61,7 +61,7 @@ deleted; current failures, blocking reasons, incomplete counts, expiries with wh
 means, irreversible consequences, and failed results stay in sight.
 
 Every button that decides something is labelled by its concept's one wording, the same on every
-page (T191): **Approve** and **Deny** on every approval (a request's card on Home and on the policy
+page: **Approve** and **Deny** on every approval (a request's card on Home and on the policy
 page, a Board card, a start awaiting approval, a run's plan; a batch's **Approve all N** and **Deny
 all N**), **Accept** and **Send back** on every review, **Confirm** and **Cancel** in every
 confirmation (stopping a run, a project's **Pause…**, **Resume…**, and **Close…**, a ready task's
@@ -69,7 +69,7 @@ confirmation (stopping a run, a project's **Pause…**, **Resume…**, and **Clo
 button does is never in its label: it is the button's accessible description (`aria-describedby`)
 and its tooltip, shown on hover and on keyboard focus and hidden by Escape, never text beside it
 (*Approve*: *merges the change*, *Deny*: *keeps the branch only*, *Accept*: *marks it done*, *Send
-back*: *sends it back for another attempt, if it has one left*; T239), one implementation for every
+back*: *sends it back for another attempt, if it has one left*), one implementation for every
 page.
 
 The page shows *Loading…* (`aria-busy`) while a page first loads, and *updated 12 s ago* in the
@@ -82,7 +82,7 @@ their confirmations, which say what they do). **Skip to content** is first in th
 every control shows its focus, nothing moves under `prefers-reduced-motion`, and prose is capped at
 80 characters a line on a full-width page.
 
-**Home** is a dashboard (T239): *Needs your attention*, a tile each (*Approvals · 3*, *Reviews · 2* and
+**Home** is a dashboard: *Needs your attention*, a tile each (*Approvals · 3*, *Reviews · 2* and
 *first expires in 3 h*, *Runs needing attention · 1*), each linking to its section,
 then named one by one under its count, folded under *Names*, at most 5 a group with how many more: each request by what it
 asks, each review by its task and project, each with when it expires, and each run by its task's title
@@ -93,7 +93,7 @@ asks, each review by its task and project, each with when it expires, and each r
 glance (each account's capacity in one line, its 5 h bar beside it: *Claude Code · science: 5 h used 42 %, resets 03:08*, with *resting
 until 02:38 (in 2 h)* first when it rests, or *5 h no reading yet*; then **Right now**, the same
 section the Workers page shows, by the same function from the same roster read, so both name the
-same free, stalled, and no-quota Workers, T160; the counts are the chips at the top, said once).
+same free, stalled, and no-quota Workers; the counts are the chips at the top, said once).
 The reviews are cards, under a line saying how many are held for you and when the first expires,
 in sight within the hour and else folded under *When they expire*, since an unanswered one expires and its task waits for input that nothing
 revives (each [a review card](#what-a-review-shows): one line, the change, the checks, and the
@@ -111,7 +111,7 @@ its template, and its id. No run yet reads *No runs yet · Open Board*.
 Home as seen, one line each with a link, the latest first, at most 5 with **Show all N** for the rest (a part that holds more than it read says *More runs ended than the 50 read here.*, and one that cannot be read says so): the runs that finished or
 failed (a failure led by the same plain-words reason the run page gives, from its kind and
 disposition by one function: *Failed: a solo run — its account must sign in again (it needs you)*;
-the system's own text folded under *What the system said*, T160), the tasks that moved (accepted, merged, waiting for a review, an approval, or
+the system's own text folded under *What the system said*), the tasks that moved (accepted, merged, waiting for a review, an approval, or
 input, cancelled), the requests that expired unanswered (counted as denied), and the Workers that
 started resting, came back, became unavailable, or are available again. **Mark as seen** starts it
 again from now. When and each Worker's status then are kept in this browser only
@@ -133,7 +133,7 @@ window was read, the project), *Expires in 40 min · No response: denied*, and *
 it on* the Worker) and **Deny** (*does not start it, and this attempt is not asked again*, its
 accessible description, here and on the request's card), which are the approval queue's verdicts on the request's exact subject (`POST
 approvals/decide`, INV-5), with a short note in sight under them, *Deny is final for attempt N: it is
-not asked again.* (T197); **Review request** goes to the request's full card in the queue, where it
+not asked again.*; **Review request** goes to the request's full card in the queue, where it
 is described as a start. It also says *Automatic starts off* (`dispatch.enabled: false`, folded) or
 *Automatic starts paused · why · since when* (*How to resume*, `system dispatch resume`, folded), or
 for each project paused on its own *Automatic starts paused in project … · why · since when · resume:
@@ -154,7 +154,7 @@ by itself* chip (the roster's `work[].startedBy`).
 
 ### What waits for you
 
-The one count of what waits for the operator and they can act on (T127), read by every page for
+The one count of what waits for the operator and they can act on, read by every page for
 the window's title and by Home for *Needs your attention*:
 
 - `requests`: the approval requests open for a verdict (`ctx.approvals.list()`). A tool call, a
@@ -214,7 +214,7 @@ its expiry; ids and mechanics folded), the answer (a long one's first lines, the
 and the steps as a timeline in words (done, running, failed, waiting for you, waiting for earlier
 steps), each with its Worker's roster `name`; each step's tier or the tier it needs, its decisions
 (*How it was decided*), and its id under its **Details**; the run's id (**Copy run ID**), template,
-last change, and spec hash under *Technical details* (T239). A running run's
+last change, and spec hash under *Technical details*. A running run's
 page says where it is *Now*, refreshed with the page: each running step on its Worker and for how
 long, the run's last event in words and how long ago (*last event: a tool call ran, 40 s ago*),
 and, when its Worker's source says it stalled (no activity past its own bound,
@@ -223,7 +223,7 @@ A running task's Board card says who runs it in one line, its last event under i
 
 A board task's run is headed by its task's title (*Speed up the image resize*), else its template
 (*solo run*), with its project and its attempt when it carried one below (*Attempt 2 of 3*), from
-`GET projects` (T141). Under **What happened** it says, a line each,
+`GET projects`. Under **What happened** it says, a line each,
 what the run view and its decisions record, each with a **?** for a new word and its mechanics
 folded under *Details*:
 
@@ -260,7 +260,7 @@ A refused action is `400` (a malformed body) or `409` (the engine refused it).
 
 ### A step's timings
 
-`GET runs/<runId>` gives, beside the engine's `run` and `explain` (T256):
+`GET runs/<runId>` gives, beside the engine's `run` and `explain`:
 
 - `timings`: `{value}` or `{unknown}` with why. `value` maps each step's `nodeId` to
   `{startedAt, endedAt?}`. `startedAt` is the step's latest `workflow.node.started` (its current
@@ -282,7 +282,7 @@ Served when `ctx.board` and `ctx.artifacts` are present; without either, both ro
 | Route | Body | Answer |
 |---|---|---|
 | `GET reviews` | — | `{reviews, accepted}`: `accepted`, the latest 20 done tasks whose accepted result is still on its way into the repository (landing `watch`, `commit`, `committed`, `asked`, `merging`), each with `taskId`, `title`, `project`, `run`, and `landing` as the Board's cards give it; `reviews`, every task in review, those held for the operator first, by expiry: `taskId`, `title`, `goal`, `actionClass`, `acceptance`, `attempts`, `project {projectId, title}`, the result's exact `subject`, `artifacts` (and `digest`, `files`), `pendingChecks`, `checks` (below), `run`, `heldFor` (`operator`, or `reviewer` while a run's lease holds it), `since`, `expiresAt`, `lastDecision` |
-| `POST reviews/<taskId>/decide` | `{verdict: accept \| reject, subject, note?, checksNotRun?}` | `{task, decision}`: the task after `ctx.board.accept`, and the `acceptance` decision recorded. `checksNotRun` (operator only, with `accept`; T293): each required command check (`tests`, `typecheck`, `lint`) the operator accepts past, with why it did not run (1 to 500 characters), carried as the decision's `outcome.detail.checksNotRun`; the review card asks for it under the checks not run. A lead's, or a malformed one, is refused (400) |
+| `POST reviews/<taskId>/decide` | `{verdict: accept \| reject, subject, note?, checksNotRun?}` | `{task, decision}`: the task after `ctx.board.accept`, and the `acceptance` decision recorded. `checksNotRun` (operator only, with `accept`): each required command check (`tests`, `typecheck`, `lint`) the operator accepts past, with why it did not run (1 to 500 characters), carried as the decision's `outcome.detail.checksNotRun`; the review card asks for it under the checks not run. A lead's, or a malformed one, is refused (400) |
 
 - `subject` is the exact subject of the result the page showed (INV-5): a result on another
   subject is refused (`409`), and so is a task no longer in review. Nothing is decided then.
@@ -293,7 +293,7 @@ Served when `ctx.board` and `ctx.artifacts` are present; without either, both ro
   accepts a review.
 - A malformed body is `400`, an unknown task `404`. A refusal by the board is `409`, with its
   failure (`invalid`, `invalid-transition`, …).
-- `checks` (T160, [ADR-0063](../decisions/adr/0063-a-runs-required-checks-run-on-its-exact-result.md)):
+- `checks` ([ADR-0063](../decisions/adr/0063-a-runs-required-checks-run-on-its-exact-result.md)):
   `{value, requiredUnknown?}`, each check the policy requires of the task's class (every rule for it
   in the studio's and the project's policies) and each the board holds pending, in the order tests,
   typecheck, lint, schema, quote-check, review, as `{check, state, exitCode?, why?}`, read from the
@@ -329,12 +329,12 @@ Served when `ctx.board` and `ctx.artifacts` are present; without either, both ro
   characters, `truncated` past them;
 - `landing`: where its accepted result stands, as a card gives it (with the committed `head`).
 
-A review card (T186) shows one line (its title, project, and *Expires in 3 h · No response: it
+A review card shows one line (its title, project, and *Expires in 3 h · No response: it
 waits for input*), then as chips the change (*3 files +19 −1*), each required check (*tests: ▲
 Pending*, *lint: ■ Failed · exit code 1*), and each reviewer's verdict (*● Approved · w:standard*,
 *■ Changes requested · …*), then what must stay in sight (a change not read whole, the checks not
 run or failed), then **Accept** (*marks it done*) and **Send back** (*sends it back for another
-attempt, if it has one left*), each described by what it does (T191). Its closed **Details** holds
+attempt, if it has one left*), each described by what it does. Its closed **Details** holds
 what was asked, the action type and task, the run that made the result, the exact result, each
 check with its exit code or why it has none, and the long texts: *What changed* (`3 files changed +19 −1 ·
 on system/run/<id>, against main at <sha>`, then each file folded, its diff in monospace lines
@@ -377,7 +377,7 @@ Served when `ctx.board` is present; without it, every route answers `503`
   · Proposed 0*, with *What needs you* folded, *1 review, 2 merges*; what of it needs the operator,
   *Charter approval needed* or *2 task approvals*, linked to its card, past three folded; and
   **Pause**, **Resume**, **Close**), all under one *Projects (N)* fold below the columns, its
-  summary saying what of them needs you (*▲ 1 charter approval*, T239); above the columns, how many
+  summary saying what of them needs you (*▲ 1 charter approval*); above the columns, how many
   Workers are free and tasks ready (*1 Worker free · 2 tasks ready*), then a column per state:
   *Proposed*, *Ready* (how a ready task starts behind its **?**), *Working* (claimed and running),
   *Review*, *Needs your attention* (input and approval), each empty one a short line (*None*,
@@ -392,7 +392,7 @@ Served when `ctx.board` is present; without it, every route answers `503`
   event. A request a card waits on that the queue lists (a
   task's approval, an accepted result's merge) has that request's own buttons on the card (**Approve**,
   *merges the change*; **Deny**, *keeps the branch only*), sent on the request's exact subject as on Home (INV-5) and
-  reported the same way (T141). A done task's card says where its accepted result is on its way
+  reported the same way. A done task's card says where its accepted result is on its way
   into the repository: *Merge approval needed · into <base>*, with those buttons
   (**Accepted — waiting to merge into <base>: approve**, linked to its `merge` request, when the
   queue cannot be read), also shown under *Needs your attention*; **Accepted and merged into <base> as
@@ -426,7 +426,7 @@ any step runs.
   nothing starts. A refusal by the engine (a paused project, a spent budget, a drained host) is
   `409` with its reason. A start the board did not answer is no refusal (`202`): the page says
   *Not started yet:* with the run linked, that it starts once the board shows it recorded and the
-  task then moves to Working, or is dropped with nothing run, and that nothing more is needed (T127).
+  task then moves to Working, or is dropped with nothing run, and that nothing more is needed.
 - The card's **Start…** opens a confirmation that says what runs: *solo template · attempt 1 of 3
   · 1 step*, each step with a short requirement (*Do solo: standard+ · reason*; a team's size, a kind
   of work, and a step that plans more are said too) and who would likely take it, by display name
@@ -461,10 +461,10 @@ Served when `ctx.approvals` is present; without it, both routes answer `503`
   `subject-changed`, `failed`).
 
 Its count is Home's tile (*Approvals · 3*); the queue says its next expiry only within the hour
-(*Next expiry in 12 min*), or *No approvals needed.* Each request is a card (T186, T239): what is
+(*Next expiry in 12 min*), or *No approvals needed.* Each request is a card: what is
 asked as its title (*Allow a deploy step: …*), an irreversible verdict as its one chip (*Deny cannot
 be undone*), one line of context, when it expires (*Expires in 12 min*); then **Approve** and
-**Deny**, each described by its effect (*activates the project*, T191), and, on a policy change,
+**Deny**, each described by its effect (*activates the project*), and, on a policy change,
 **Show change** beside them, with the diff it shows, never folded. Everything else below is under
 the card's one **Details**, closed by default and kept open through the refresh once opened: for
 which task (else project, else run), what no response does (*No response: denied*), who asked, what
@@ -483,7 +483,7 @@ out, and any other long hash is cut to its first 8 characters, with the exact te
 hash behind **Exact subject**);
 for a board charter or task request without them the page says what the board does with each
 verdict ([board](../design/board.md)), counting the project's proposed and open tasks from
-`GET projects` when the board runs. An accepted result's merge (T141) is asked by *the run of the
+`GET projects` when the board runs. An accepted result's merge is asked by *the run of the
 task "…"* (by its run when the board lists it), is about *the accepted change of "…" · not pushed*,
 says *If you approve: the accepted change of the task "…" is merged as one merge commit. Not
 pushed.* and *If you deny: not merged: the change stays on its branch; the task stays done.*, and
@@ -568,10 +568,10 @@ Served always; each service it reads that is not mounted reads as unknown with w
 | `GET roster` | — | the roster, an `mcp-roster@1.7` `roster-output` record ([record semantics](schemas.md#mcp-tool-roster)), as the operator reads it: account labels included; its `now` is capacity now ([capacity now](../design/roster.md#capacity-now)). A record its schema refuses is a defect: `500` with why |
 
 - Any other method is `405`. The **Workers** tab (`?view=workers`, next to Board) shows the counts
-  as Home's chips (*● 2 free*, and working, resting, unavailable, and quarantined when any; T239);
+  as Home's chips (*● 2 free*, and working, resting, unavailable, and quarantined when any);
   **Right now**, folded there under its heading, the rows that need a look as chips on its summary
   (*▲ 1 quota unknown*), open while someone is stalled or cannot work, and rendered from the roster's `now` as the server made it
-  (the page computes none of it, T152), by name, each said in words and never by colour alone, a
+  (the page computes none of it), by name, each said in words and never by colour alone, a
   count first and, past three names, the rest folded: *Free: 2 —* the Workers that take work now,
   the one whose quota would be lost unused soonest first, each with what is left (*Claude Code ·
   science · develop (90 % of 5 h left, resets 10:10)*), one the operator excludes from teams (D58,
@@ -579,11 +579,11 @@ Served always; each service it reads that is not mounted reads as unknown with w
   how many tasks are ready, linked to the Board; *Quota unknown:* each Worker whose account's quota
   cannot be read, why and that it is not counted free folded under *Why* (only when any); *Stalled:* each Worker with a
   stalled run (linked); *No quota left:* each account resting or at a limit and until when;
-  *Cannot work:* each unavailable or quarantined Worker with why (T141); and *Ready:* each ready
+  *Cannot work:* each unavailable or quarantined Worker with why; and *Ready:* each ready
   task with the Worker its start would likely go to (only when any); a part that could not be read
   is `unknown (why)`, never 0. The tasks ready the page counts are `now`'s when it read every active
   project, else the board's own count. Home's *Workers at a glance* renders this same section by the
-  same function (T160); then the
+  same function; then the
   Workers by account: each account once, a card headed by its name and how many Workers
   (*Claude Code · science · 3 Workers*; its roles, *develop [code], review, review-2*, under its
   details), what stops it (its rest as a chip, *Resting until 02:16 (in 2 h)*; signed out,

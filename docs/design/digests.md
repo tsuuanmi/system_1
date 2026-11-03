@@ -14,8 +14,7 @@
 > ([extractive-first](#extractive-first)), its row off. Differs from target: only a board task's
 > results are digested on their own (a run outside the board is digested on request only); no test
 > output is parsed before the model reads it (the extractive provider selects lines by signal words,
-> it does not parse a runner's output). Status audited 2026-10-27: nothing of this mechanism
-> changed from T236 to T295 (`OutputCheck` made module-private, `283e3481`).
+> it does not parse a runner's output).
 
 A digest is a cited summary of raw artifacts (test logs, agent results, reports), so the lead
 reads a page instead of the raw material, and every claim on that page can be checked. A cheap
@@ -106,7 +105,7 @@ across tiers ([INV-2](../architecture/invariants.md#inv-2-fail-closed)), and the
 standard is a recorded decision on a failed quote check only. An install whose read-only Workers are
 all on the standard tier gives one read-only Worker the economy tier for the digests, as the
 [pilot](../operations/pilot.md) and the [work-kinds example](../operations/examples/work-kinds.patch.yml)
-do (T99 D5), or sets the row's `tier: standard`, the operator's explicit choice, with which a digest
+do, or sets the row's `tier: standard`, the operator's explicit choice, with which a digest
 is written by a standard Worker and never escalated.
 
 Its brief points at each source by content id and never carries their content
@@ -167,42 +166,11 @@ judges the work, and the raw artifacts stay one `artifact` call away.
 
 ## Extractive-first
 
+Parked (row off, package frozen) by PROP-0022 change 6b; see [docs/proposals/0022-lean-core.md](../proposals/0022-lean-core.md).
+
 [`digest-extractive`](../../packages/plugins/digest-extractive/README.md) provides the same seam
-another way: code reads first, and the Worker writes from what code selected. Its row is off; the
-operator swaps it in for `digest` ([replacing the provider](#replacing-the-provider)).
-
-1. **Select.** Before routing, the rule `digest-extractive.select` 1 splits each source's text (the
-   text the quote check reads: its body's `text`, else its canonical JSON) into spans, each
-   non-blank line without its surrounding whitespace, a line longer than a quote may be cut into
-   parts of at most 500 characters, and keeps at most `maxExtracts` (default 40): each source's
-   first span, so no source goes unseen; then failures, risks, decisions, and metrics, each signal
-   taken across the sources in turn; then each source's last span; then results; then the rest,
-   while there is room. It reads at most the first 1,000,000 characters of a source, and says so.
-   The extract is recorded as [`digest-extract@1.0`](../reference/schemas.md#digest-extract), an
-   `evidence` artifact whose envelope inputs are the sources, as strict as the strictest.
-   Deterministic: the same sources give the same artifact, so a restart records nothing new.
-   Sources with nothing to quote ask no Worker: the request is bypassed.
-2. **Write.** The brief points at the extract alone, never at a source. The Worker reads the
-   extract's text, the sources by number and each span with its id (`E1`, `E2`, …), and a short
-   example of the answer instead of the whole `digest@1.0` schema, and cites each claim by a
-   span's id (`"extract": "E3"`).
-3. **Check.** A claim citing a span is given that span's source, quote, and offset from the
-   extract, never from the answer, so its quote is verbatim by construction; one citing a span it
-   was not given cites no source, and the quote check drops it, saying so; one that quotes a source
-   itself is checked as it is. Then the seam's quote check reads the sources, as for any provider;
-   the escalation (with the same extract) and the settling decision are the seam's, and the
-   settling decision's inputs also name the extract.
-
-| | `digest` | `digest-extractive` |
-|---|---|---|
-| The Worker reads | every source, whole, and the `digest@1.0` schema | the extract (at most `maxExtracts` spans) and a short example of the answer |
-| A claim's quote | copied by the Worker, checked against its source | filled from the extract by code, checked against its source |
-| Left out | nothing the Worker was given | the spans the rule did not keep; the extract's header says how many, and the raw artifacts stay one `artifact` call away |
-| Requests, escalation, restart, bounds, failing open, MCP tools | the seam's | the same; its own table, request ids `dgx-…` |
-
-What it trades: the Worker sees only what the rule kept, so a finding in a span left out is not in
-the digest. What it buys: fewer characters sent per digest when the sources are longer than the
-extract, and claims that cannot misquote.
+with code reading first: it selects spans from each source, and the Worker writes from that extract
+alone, so its claims are filled from the extract and cannot misquote. Its row is off.
 
 ## Replacing the provider
 
@@ -226,26 +194,20 @@ after.
   ledger of record, and swapping back finds it again.
 - **Measured, in CI.** The bundle's evolution test
   ([`digest-swap.spec.ts`](../../packages/system-bundle/tests/evolution/digest-swap.spec.ts))
-  composes the bundle's own rows, as shipped and with the operator's patch, names no provider (it
-  mounts the row whose manifest provides `digests`), digests the same five fixtures (a test
-  runner's log of 8,506 characters, a pytest log, a benchmark with its validation report, an
-  attempt's three results, a short validation report) with the same scripted Worker, which answers
-  from the prompt it was given, and reads every figure from the settling and escalation decisions.
-  Its record ([`digest-swap.record.json`](../../packages/system-bundle/tests/evolution/digest-swap.record.json)),
-  before and after:
+  digests five fixtures with the same scripted Worker, before and after the swap, and reads every
+  figure from the settling and escalation decisions. Its record
+  ([`digest-swap.record.json`](../../packages/system-bundle/tests/evolution/digest-swap.record.json))
+  gives:
 
   | Scripted Worker | Written | Claims kept (pass rate) | Escalations | Characters sent to the Worker | Characters it answered |
   |---|---|---|---|---|---|
   | copies quotes verbatim | 5 and 5 | 30 of 30 (1.0) and 30 of 30 (1.0) | 0 and 0 | 31,035 and 16,234 (−48%) | 8,499 and 4,001 |
   | paraphrases on the economy tier | 5 and 5 | 23 of 30 (0.767) and 30 of 30 (1.0) | 0 and 0 | 31,035 and 16,234 | 8,472 and 4,001 |
 
-  Every request sends fewer characters after the swap, the short report's too (3,781 and 1,932):
-  the extract replaces the sources, and a short example of the answer replaces the `digest@1.0`
-  schema. These are characters of a scripted Worker's prompts and answers, not a model's tokens,
-  and the paraphrasing Worker is a stand-in for the failure the escalation exists for; a change in
-  either provider that moves a figure fails the test until the record is regenerated and reviewed.
-  The end-to-end test boots the shipped profile with the same patch through the real launcher: the
-  new provider serves the lead's tools, and the plugin host records the swap and finds nothing.
+  Every request sends fewer characters after the swap. These are characters of a scripted Worker's
+  prompts and answers, not a model's tokens, and a change that moves a figure fails the test until
+  the record is regenerated and reviewed. The end-to-end test boots the shipped profile with the
+  same patch through the real launcher.
 - **Measured live.** The same comparison on the operator's live Worker, in tokens from the
   resource ledger, is a check of the [release checklist](../validation/release-checklist.md).
 
@@ -285,6 +247,6 @@ its own: an operator who set the `digest` row sets the same on `digest-extractiv
 
 [`digest-core/conformance/digests.ts`](../../packages/digest-core/conformance/digests.ts), 13
 scenarios at contract 1.2 (three of them, the escalation, since 1.1; the request's `check` since
-1.2), run against the fake
-provider and against both store-backed providers over real routing with the seam's scripted Worker
-([`conformance/worker.ts`](../../packages/digest-core/conformance/worker.ts)) on each tier.
+1.2), run against the fake provider and against both store-backed providers over real routing with
+the seam's scripted Worker ([`conformance/worker.ts`](../../packages/digest-core/conformance/worker.ts))
+on each tier.

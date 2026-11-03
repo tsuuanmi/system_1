@@ -1,15 +1,13 @@
 # Packaging: a project from a template
 
-> Built in T251 (`4e24a68e`), PROP-0016 I5 part 0; the operator's pages across projects in
-> T253 (`20fe4c45`). Implemented in [`packages/cli`](../../packages/cli/src/project.ts) (`system project new`) with
+> Implemented in [`packages/cli`](../../packages/cli/src/project.ts) (`system project new`) with
 > the templates in [`packages/cli/templates`](../../packages/cli/templates/README.md); differs from
 > target: one kind (`software-repository`) of PROP-0016 §6's three; the attention budget, portfolio
 > scheduling, reporting up, and global ids are later parts of I5.
 
 [PROP-0016](../proposals/0016-operating-model.md) §6 packages what the `system` project was set up
-with by hand into a **template by kind**, so a second project (the operator's D87: the DNA
-repository) starts from a known frame instead of from the lead's memory. Each project has its own
-lead session; only the operator's UI is shared (D88).
+with by hand into a **template by kind**, so a second project starts from a known frame instead of
+from the lead's memory. Each project has its own lead session; only the operator's UI is shared.
 
 ## What a template holds
 
@@ -23,8 +21,8 @@ holds, by [handbook](handbook.md) layer:
 | `template.json` `toolchains` | per toolchain, chosen by the lockfile at the repository's top level (`pnpm-lock.yaml`, `package-lock.json`, `Cargo.lock`, `uv.lock`): the setup command run offline, its views, the checks by kind (`tests`, `lint`), dependency files, check scratch, generated files when known | configuration of `agent-workers` |
 | `template.json` `role` | the writing role `<id>-develop`: `workspace-write`, a worktree per run, the repository its workspace | configuration of `agent-workers` |
 | `template.json` `autoAccept` | off: auto-accept ([ADR-0067](../decisions/adr/0067-system-accepts-a-listed-branchs-result-on-its-review-and-checks.md)) is the operator's to turn on per project | configuration of `board` |
-| `lessons.md` | an empty lessons file with T220's bounds (at most 30 lines of 400 characters, each naming `Check:`) | 5, repository lessons |
-| `LEAD.md` | the lead's onboarding: what to read (the lead's playbook, T252; the charter; the policy; the lessons), a checklist, and what the template could not know | 4, role playbooks (pointer) |
+| `lessons.md` | an empty lessons file (at most 30 lines of 400 characters, each naming `Check:`) | 5, repository lessons |
+| `LEAD.md` | the lead's onboarding: what to read (the lead's playbook, the charter, the policy, the lessons), a checklist, and what the template could not know | 4, role playbooks (pointer) |
 | `decisions.md` | the project's decisions file, its first line the project's start | records |
 
 Values are filled into `{{name}}` placeholders: `id`, `repository`, `repositoryName`,

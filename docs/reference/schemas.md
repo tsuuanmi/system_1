@@ -61,7 +61,7 @@ guesses.
 - `decision@1.1` adds the decision type `vote`, the decider type `client`, and
   the `vote` object ([teams](../design/teams.md#the-record)). A record with any
   of them must be `@1.1` and carry `vote`; every other decision stays `@1.0`,
-  so earlier decisions keep their ids. Readers accept 1.0 through 1.9.
+  so earlier decisions keep their ids.
 - `decision@1.2` adds a review's quote checks ([teams](../design/teams.md#review)):
   - the method and the round end `blocking-finding` (decider rule
     `workflow.blocking-finding`);
@@ -196,8 +196,7 @@ guesses.
     [`decision.recovery-wait.json`](../../schemas/examples/decision.recovery-wait.json).
 - `decision@1.9` adds the `recovery` outcome `resend`: a read-only team member's first step
   (`propose`) that a site answered with its own error after the prompt was sent runs once more, in
-  a new conversation of its session ([ADR-0062](../decisions/adr/0062-a-team-members-first-step-is-resent-once-after-a-sites-own-error.md),
-  operator decision D60). Such a decision must be `@1.9`; every other decision keeps its version.
+  a new conversation of its session ([ADR-0062](../decisions/adr/0062-a-team-members-first-step-is-resent-once-after-a-sites-own-error.md)). Such a decision must be `@1.9`; every other decision keeps its version.
   Its candidates are `resend`, `retry`, `failover`, and `fail`; the decider is the rule
   `workflow.recovery` version 2. `detail` names the `kind` and `disposition`, the failed `attempt`,
   the `sessionId` whose conversation was reset, the failed execution (`failed.execution`, the
@@ -226,7 +225,7 @@ guesses.
   `autonomy` decision, `detail` naming the `taskId`, `attempt`, `nodeId`, `score`
   (`quota-score@2`), the `settings`, the request's `version`, the chosen Worker's `account`,
   `repository`, and `windows`; a `gate` (rule `dispatch.approval`) whose outcome `board-approval`
-  names the board's approved request for the attempt (D62); and a `gate` (decider `operator`,
+  names the board's approved request for the attempt; and a `gate` (decider `operator`,
   `dispatch.pause`) whose outcome `pause` or `run` is the operator's pause or resume.
 - A tally's `vote` holds one round; the team's final `vote` holds every round,
   its `method`, the `dissent`, any `revisions` and `tiebreak`, and a review's
@@ -249,21 +248,21 @@ guesses.
   offers scoped to it ([scoped offers](../design/routing.md#scoped-offers),
   [ADR-0049](../decisions/adr/0049-read-only-agent-workers-as-review-members.md)). The only value
   is `review-member`, a step of a review team's member, set by the workflow engine from the
-  admitted spec. A record carrying it below `@1.1` is refused. Readers accept 1.0 and 1.1. Example:
+  admitted spec. A record carrying it below `@1.1` is refused. Example:
   [`work-requirement.review-member.json`](../../schemas/examples/work-requirement.review-member.json).
 - `work-requirement@1.2` adds the optional `kind`: the kind of work this is, a `workKind` label
   (`^[a-z][a-z0-9-]{0,31}$`, such as `code` or `docs`), for Workers given `kinds`
   ([work kinds](../design/routing.md#work-kinds),
   [ADR-0057](../decisions/adr/0057-route-work-by-kind.md)). The workflow engine sets it from the
   admitted spec (the step's `kind`, or its variant's), never from model text (INV-6). A record
-  carrying it below `@1.2` is refused. Readers accept 1.0 to 1.2. Example:
+  carrying it below `@1.2` is refused. Example:
   [`work-requirement.kind.json`](../../schemas/examples/work-requirement.kind.json).
 - `work-requirement@1.3` adds the optional `prefers`: 1 to 8 distinct capabilities the work would
   like and does not need, none of them among its `capabilities`
   ([research's second review](../design/routing.md#researchs-second-review),
   [ADR-0074](../decisions/adr/0074-a-research-roles-web-calls-run-under-a-bounded-egress-checked-grant.md)).
   Routing ranks a Worker that proves all of them first and never refuses one that does not. A
-  record carrying it below `@1.3` is refused. Readers accept 1.0 to 1.3.
+  record carrying it below `@1.3` is refused.
 
 ### `workflow-node`
 
@@ -280,7 +279,7 @@ guesses.
 - `workflow-node@1.2` adds `execution.brief`: the brief the execution was started with,
   recorded before it started ([briefs](../design/workflow-engine.md#briefs)). A node is written
   as 1.2 once an execution names its brief, retired or not; otherwise as 1.1 when retired, and
-  1.0 before. Readers accept 1.0 to 1.2.
+  1.0 before.
 
 ### `conversation`
 
@@ -312,7 +311,7 @@ guesses.
   does not name is recorded as `local-tool`).
 - `worker-session@1.1` adds the runtime `antigravity-cli`, which `@1.0` recorded as `local-tool`.
   A writer writes `@1.1` only for that runtime, and `@1.0` otherwise; a `@1.0` record naming it is
-  refused. Readers accept 1.0 and 1.1. Example:
+  refused. Example:
   [`worker-session.antigravity-member.json`](../../schemas/examples/worker-session.antigravity-member.json).
 - `policy.writes` names the subject the session writes under a board task's authority. Write
   authority itself is the board's: at most one open task writes a subject
@@ -338,12 +337,11 @@ guesses.
   family the Worker source sets, which routing only compares for inequality
   ([provider diversity](../design/routing.md#provider-diversity),
   [ADR-0027](../decisions/adr/0027-provider-diversity-in-routing.md)). A `@1.0`
-  record carrying `family` is refused. Readers accept 1.0
-  and 1.1.
+  record carrying `family` is refused.
 - `capability-descriptor@1.2` adds the optional `maxInputChars`: the longest input the Worker
   takes, in characters (code points) of what it is sent; admission refuses longer input
   ([ADR-0032](../decisions/adr/0032-admission-refuses-input-longer-than-a-worker-takes.md)). A
-  record carrying it below `@1.2` is refused. Readers accept 1.0 to 1.2.
+  record carrying it below `@1.2` is refused.
 - `capability-descriptor@1.3` adds the optional `load`: the turns `running` in the Worker
   runtime's `slots`, `queued`, and routed to it but not started (`pending`). Workers that share a
   runtime (the tiers of one account) report the same numbers. Among equally ranked Workers the
@@ -352,12 +350,12 @@ guesses.
   refused. It also adds the optional `cooldowns`: capabilities the Worker proves but may not use
   until `until`, a site's usage limit; work that needs one is not admitted there (admission check
   `cooldown`, [ADR-0034](../decisions/adr/0034-unsent-failover-to-a-sibling-account.md)).
-  Readers accept 1.0 to 1.3.
+ 
 - `capability-descriptor@1.4` adds the optional `scope` on a capability offer: the capability is
   proven only for work whose requirement names that scope (`work-requirement@1.1`), never for
   other work ([scoped offers](../design/routing.md#scoped-offers),
   [ADR-0049](../decisions/adr/0049-read-only-agent-workers-as-review-members.md)). The only value
-  is `review-member`. A record carrying it below `@1.4` is refused. Readers accept 1.0 to 1.4.
+  is `review-member`. A record carrying it below `@1.4` is refused.
   Example: [`capability-descriptor.review-member.json`](../../schemas/examples/capability-descriptor.review-member.json).
 - `capability-descriptor@1.5` adds the optional `account`: the account the Worker runs on, as its
   source sets it ([ADR-0052](../decisions/adr/0052-accounts-are-assigned-unless-pooling-is-recorded.md)).
@@ -368,7 +366,7 @@ guesses.
   Under `assigned`, a Worker refused only for its limit refuses the group's other accounts the same
   work (admission check `assignment`), and the earliest reset among those limits is the
   `AdmissionFailure`'s `limitUntil` ([assigned accounts](../design/routing.md#assigned-accounts)).
-  A record carrying it below `@1.5` is refused. Readers accept 1.0 to 1.5. Example:
+  A record carrying it below `@1.5` is refused. Example:
   [`capability-descriptor.account.json`](../../schemas/examples/capability-descriptor.account.json).
 - `capability-descriptor@1.6` adds the optional `kinds`: the kinds of work the operator gives the
   Worker (1 to 16 `workKind` labels), as its source sets them from configuration
@@ -376,14 +374,13 @@ guesses.
   [ADR-0057](../decisions/adr/0057-route-work-by-kind.md)). Such a Worker takes only work whose
   requirement names one of them (`work-requirement@1.2` `kind`), never work that names none;
   without `kinds` it takes any work. Routing compares kinds for equality only (admission check
-  `capability`). A record carrying it below `@1.6` is refused. Readers accept 1.0 to 1.6. Example:
+  `capability`). A record carrying it below `@1.6` is refused. Example:
   [`capability-descriptor.kinds.json`](../../schemas/examples/capability-descriptor.kinds.json).
 - `capability-descriptor@1.7` adds the optional `description`: what the Worker is for, in the
   operator's words, from the configuration row that defines it (`description` of an agent-workers
   `workers[]` or `roles[]` entry, of a `models[]` entry, or of an accounts `accounts[]` entry, which
   a website Worker carries with its tier). It is for people (the [roster](../design/roster.md))
-  and never a routing input. A record carrying it below `@1.7` is refused. Readers accept 1.0 to
-  1.7. Example:
+  and never a routing input. A record carrying it below `@1.7` is refused. Example:
   [`capability-descriptor.description.json`](../../schemas/examples/capability-descriptor.description.json).
 - `capability-descriptor@1.8` adds the optional `title`: the Worker's name for people, plain text
   on one line of at most 64 characters, as its source gives it: a website provider's own (its
@@ -391,14 +388,14 @@ guesses.
   entry. The [roster's display name](../design/roster.md#display-names) starts with it; routing
   never reads it, and no shared code names a vendor in it
   ([INV-11](../architecture/invariants.md#inv-11-no-tool-lock-in)). A record carrying it below
-  `@1.8` is refused. Readers accept 1.0 to 1.8. Example:
+  `@1.8` is refused. Example:
   [`capability-descriptor.title.json`](../../schemas/examples/capability-descriptor.title.json).
 - `capability-descriptor@1.9` adds the optional `unavailableReason`: why a Worker whose `state` is
   `unavailable` takes no work, as its source knows it (a failed probe's detail, a workspace that
   cannot hold a worktree, an account's or pool's gate), plain text on one line of at most 300
   characters. The [roster](../design/roster.md) shows it as the Worker's reason when its account
   gives none, so capacity, health, and the Workers page say why; routing never reads it. A record
-  carrying it below `@1.9`, or with another state, is refused. Readers accept 1.0 to 1.9. Example:
+  carrying it below `@1.9`, or with another state, is refused. Example:
   [`capability-descriptor.unavailable-reason.json`](../../schemas/examples/capability-descriptor.unavailable-reason.json).
 - `capability-descriptor@1.10` adds the optional `tiers`: every tier one Worker offers, lowest
   first, each once ([ADR-0073](../decisions/adr/0073-agent-workers-offer-tiers-per-role-with-quota-per-model.md)),
@@ -408,19 +405,19 @@ guesses.
   it is expected back, when known. `tier` stays the lowest offered. Routing serves the Worker at the
   lowest offered tier within a requirement's bounds that is not closed, and never names a model
   ([INV-11](../architecture/invariants.md#inv-11-no-tool-lock-in)); absent, the Worker offers `tier`
-  alone. A record carrying it below `@1.10` is refused. Readers accept 1.0 to 1.10. Example:
+  alone. A record carrying it below `@1.10` is refused. Example:
   [`capability-descriptor.tiers.json`](../../schemas/examples/capability-descriptor.tiers.json).
 - `capability-descriptor@1.11` adds, to each `tiers` entry, the optional `label` (its model's display
   label as the live profile gives it; for people only, never a routing input) and `maxTurns` (the
-  turn limit a run at that tier gets). Readers accept 1.0 to 1.11.
+  turn limit a run at that tier gets).
 - `capability-descriptor@1.12` adds the optional `expectedBack` (date-time): when its source expects
   to know again whether a Worker whose `state` is `unavailable` takes work, because it is
   unavailable only for a while that passes by itself (an agent runtime's late probe: its next result
   is due by then); its capabilities are then what it last proved. Routing tells the caller to route
   the work again then (`AdmissionFailure.retryAt`), and the workflow engine waits, bounded, instead
-  of failing the step ([routing](../design/routing.md#intelligence-tiers), T282). A record carrying it
+  of failing the step ([routing](../design/routing.md#intelligence-tiers)). A record carrying it
   below `@1.12`, or with another state, is refused; `tiers` is accepted at `@1.10` to `@1.12`.
-  Readers accept 1.0 to 1.12.
+ 
 
 ### `plan`
 
@@ -462,7 +459,7 @@ guesses.
   `cacheCreationInputTokens`.
 - A crashed process writes no result message and so no `agent-result`; its usage is reconciled
   from the session transcript into a `usage-record`. A record carrying any of the three fields
-  below `@1.2` is refused. Readers accept 1.0 to 1.3. Example:
+  below `@1.2` is refused. Example:
   [`agent-result.usage.json`](../../schemas/examples/agent-result.usage.json).
 - `agent-result@1.3` adds `profile` and `replay`, written for a review team member's step
   ([ADR-0049](../decisions/adr/0049-read-only-agent-workers-as-review-members.md)). `profile`
@@ -528,7 +525,7 @@ guesses.
   account found, in one line of at most 300 characters, as its `enrollment` decision's reason says
   it (for `unverified`, the runtime version found and the ones its reader admits); never a
   principal. The `agents` source writes a quarantined record at 1.1 with it, and any other at 1.0.
-  A record carrying it below `@1.1` is refused. Readers accept 1.0 and 1.1. Example:
+  A record carrying it below `@1.1` is refused. Example:
   [`agent-account.unverified-version.json`](../../schemas/examples/agent-account.unverified-version.json).
 
 ### `session-summary`
@@ -553,7 +550,7 @@ guesses.
 - `evidence-table@1.1` adds the optional per-claim `reviews`: which of the
   run's two literature reviews state the claim (`["A"]`, `["B"]`, or
   `["A", "B"]`), so a conclusion can say where they agree and differ. A `@1.0`
-  record carrying `reviews` is refused. Readers accept 1.0 and 1.1.
+  record carrying `reviews` is refused.
 
 ### `team-result`
 
@@ -567,7 +564,7 @@ guesses.
   [`team-result.tie.json`](../../schemas/examples/team-result.tie.json).
 - `team-result@1.1` adds the method `blocking-finding`, whose winner is
   `changes`. Only that method uses `@1.1`; every other result stays `@1.0`.
-  Readers accept 1.0 and 1.1.
+ 
 
 ### `source-snapshot`
 
@@ -617,7 +614,7 @@ guesses.
   ([conversation ledger](../design/provider-turns.md#conversation-ledger)). The
   live check removes the flag entry by entry.
   Elements with `frames: any` are searched in every frame and take no `scope`.
-  Readers accept 1.0 and 1.1.
+ 
 - `ui-map@1.3` adds the action kind `clearText`: it empties a composer (select all,
   delete) and requires it to read back empty, so an unsent draft a site keeps across
   page loads is never sent with a prompt.
@@ -739,28 +736,26 @@ guesses.
   a reader ignores a key it does not know, and treats one an older entry lacks as unrecorded.
 - `agent-workers.tool.denied`: an agent Worker's tool call its gate denied
   ([why a call was denied](../design/approvals.md#why-a-call-was-denied)). `data`: `agentRun`,
-  `worker`, `tool`; since T207 also `reason` (a stable code: `metacharacter`, `empty-word`,
+  `worker`, `tool`; `reason` (a stable code: `metacharacter`, `empty-word`,
   `outside-workspace`, `git-data`, `unclassified-tool`, `unsupported-field`, `invalid-input`,
   `invalid-patch`, `policy-forbid`, `not-listed`, `request-rejected`, `request-expired`,
   `request-withdrawn`, `workflow-denied`, `request-mismatch`, `request-unreadable`, `no-session`,
   `run-stopped`, `review-member`, `no-approvals`, `unknown-checks`, `unknown-mode`, `gate-error`,
-  and since T222 `use-read-tool`; a code is never renamed or reused), `explanation` (the code's fixed plain sentence, at most 300
+  and `use-read-tool`; a code is never renamed or reused), `explanation` (the code's fixed plain sentence, at most 300
   characters, never the call's input), `workerKind` (the Worker's runtime), `actionClass` (once
   the call was classified), `requestId` (a denial on a request), and `decision` (the decision
-  behind it, as on the entry). An entry from before T207 has none of them.
+  behind it, as on the entry). An entry written before these fields existed has none of them.
 - `agent-workers.tool.deferred`, `.notified`, and `.checks-pending` carry `agentRun`, `worker`,
-  `tool`, and `actionClass` (and `workerKind` since T207); `deferred` adds `requestId`, the others
+  `tool`, and `actionClass` (and `workerKind`); `deferred` adds `requestId`, the others
   `pendingChecks` when checks are pending (always for `checks-pending`).
 - The data of these four tool events is declared by
-  [`agent-tool-event.v1.json`](../../schemas/agent-tool-event.v1.json) (`agent-tool-event@1.2`,
-  T211; 1.1 adds the reason `use-read-tool`, T222; 1.2 adds the reason `research-role` and the event
+  [`agent-tool-event.v1.json`](../../schemas/agent-tool-event.v1.json) (`agent-tool-event@1.2`; 1.1 adds the reason `use-read-tool`; 1.2 adds the reason `research-role` and the event
   `agent-workers.tool.web`, a research run's web call judged: the usual `agentRun`, `worker`, `tool`, then `verdict`
-  `auto` or `ask`, `egress`, the call's number, the calls made unasked, the bound, and the `gate` decision, which holds the query or URL, never the query or URL itself, T262), one definition per event type (`$defs/denied`, `deferred`, `notified`, `checks-pending`, `web`).
+  `auto` or `ask`, `egress`, the call's number, the calls made unasked, the bound, and the `gate` decision, which holds the query or URL, never the query or URL itself), one definition per event type (`$defs/denied`, `deferred`, `notified`, `checks-pending`, `web`).
   The data carries no schema tag: a reader names the definition by the entry's type. `reason` is
   an enum of the codes above (a test derives the gate's own list, `DENIAL_REASONS`, and requires each
   in it, so a new code is a minor version of the schema); `explanation` is 1 to 300 characters and
-  only with a `reason`; `workerKind` and `tool` at most 100; no other field. The fields T207 added are
-  optional, so an entry from before T207 stays valid. A reader (`agentToolEventOf`,
+  only with a `reason`; `workerKind` and `tool` at most 100; no other field. These fields are optional, so an entry written before them stays valid. A reader (`agentToolEventOf`,
   `agentToolDenialOf` in `@tsuuanmi/system-libs`; health's `tool-denials` check) validates each
   entry and counts one that is not valid apart, never by reason. Examples:
   [`agent-tool-event.denied.json`](../../schemas/examples/agent-tool-event.denied.json),
@@ -787,7 +782,7 @@ guesses.
   Example: [`notification.review-expiring.json`](../../schemas/examples/notification.review-expiring.json).
 - `notification@1.2` adds the kind `dispatch.started`: System started a ready board task's run by
   itself where the project's policy gives `dispatch` `notify`
-  ([dispatch](../design/workflow-engine.md#dispatch-starting-ready-work-by-itself), PROP-0014 D2);
+  ([dispatch](../design/workflow-engine.md#dispatch-starting-ready-work-by-itself), PROP-0014);
   its `subject` is the run id, its `event` the `workflow.dispatch.notice` entry. A notice of it is
   `@1.2`, and the kind is refused on `@1.0` and `@1.1`; `review.expiring` is valid on `@1.1` and
   `@1.2`. Example: [`notification.dispatch-started.json`](../../schemas/examples/notification.dispatch-started.json).
@@ -853,14 +848,13 @@ guesses.
   and 100 projects'.
 - The classes that always ask are the irreversible effects (`external-send`, `deploy`,
   `delete-data`, `spend`), the investor's decisions (`charter`, `funding`, `policy-change`),
-  `remediation`, `promotion`, and `merge` (a merge always asks the operator, D56,
-  [ADR-0060](../decisions/adr/0060-an-accepted-result-lands-on-the-operators-merge-approval.md)).
+  `remediation`, `promotion`, and `merge` (a merge always asks the operator, [ADR-0060](../decisions/adr/0060-an-accepted-result-lands-on-the-operators-merge-approval.md)).
   The schema refuses `auto` and `notify` for them, except `remediation` and `merge`, which it
   predates: a policy that gives either of them `auto` or `notify` is refused when loaded. `promotion` joined `common@1`'s action classes with the feedback loop
   ([ADR-0045](../decisions/adr/0045-feedback-loop-guarantee-seams.md)). No record named it
   before, so the schema refuses it `auto` and `notify` from the start without tightening
   anything, and the record stays `@1.0`.
-- `dispatch` joined `common@1`'s action classes with PROP-0014's D1
+- `dispatch` joined `common@1`'s action classes with PROP-0014's
   ([ADR-0064](../decisions/adr/0064-system-starts-ready-work-under-the-dispatch-action-class.md)):
   System starting a ready board task's attempt by itself. It may be any mode (it is not a class
   that always asks); a policy written before it names no rule for it and takes its `default`, so
@@ -901,12 +895,11 @@ guesses.
   in every rule; the studio's grant is the only one that grants, and a project's only narrows it. A
   record carrying it below `@1.3` is refused. Like every part of the policy, it changes only
   through a `policy-change` approval; `policies/system.json` holds the system repository's.
-- `@1.4` adds the optional `commandRules` ([command rules](../design/approvals.md#command-rules),
-  T319b): structured rules a command is matched against, which the policy judges as `workspace-write`.
+- `@1.4` adds the optional `commandRules` ([command rules](../design/approvals.md#command-rules),): structured rules a command is matched against, which the policy judges as `workspace-write`.
   `@1.6` adds an option's `scope` (an option of `kind: path`, such as `--outputFile=`, is judged like
   a positional path; one with no scope is refused when the policy loads) and a rule's `enforce`
   (`on`, the default, or `warn`: the rule grants nothing, and the gate records a `gate` decision
-  naming it where it would have allowed the command, T326; a project policy's `warn` copy differs
+  naming it where it would have allowed the command; a project policy's `warn` copy differs
   from the studio's rule, so it keeps that rule out of force for the project). A record carrying
   either below `@1.6` is refused.
 - An approval request expires at its creation plus the shortest `expiresSeconds` of the rules
@@ -1112,7 +1105,7 @@ guesses.
   `schema`, `quote-check`, `review`, `operator`): what checks it, as the board task names it
   (`board-task` acceptance `check`). Rendered, the criterion says it (`- a1: pnpm test passes
   (check: tests)`), so a step that measures the change, such as `algorithm-development`'s
-  `develop:1` before its review (T267), knows which criteria are its to run without the caller's input
+  `develop:1` before its review, knows which criteria are its to run without the caller's input
   ([workflow templates](workflow-templates.md#algorithm-development)). The workflow engine writes
   `@1.3` for a board task's run when one of its criteria names a check, `@1.2` otherwise; a `check`
   before 1.3 is refused. Example: [`brief.task-checks.json`](../../schemas/examples/brief.task-checks.json).
@@ -1162,9 +1155,9 @@ guesses.
   one; `attempt` is the task's attempt it was written in.
 - `author` is the Worker that wrote it (by its step's gated tool, or as the step's own entry the
   engine appended for it), with the run, step, and execution, or the engine (`system`, `workflow`),
-  which writes the System's `evidence` (its checks, acceptance, and landing, and, T284, the commands a
+  which writes the System's `evidence` (its checks, acceptance, and landing, and, the commands a
   writing step's Worker ran with the exit codes its runtime reported). A writing step's Worker may
-  also write `evidence` as optional prose (T267), told from the System's by `author`.
+  also write `evidence` as optional prose, told from the System's by `author`.
 - `refs` link (never copy) what the entry is about: a step's result, a review's assessment, a
   decision; `subject` is the exact subject a review reviewed or a step left; `commits`,
   `finding`, and `inReplyTo` say what a response fixed, in which commit, and which review entry it
@@ -1183,8 +1176,7 @@ guesses.
 ### `review-guides`
 
 - The body of a `report` artifact: the review guides (`docs/review/*.REVIEW.md`) of the areas a
-  change touches, as a review step's brief points at them (role `context`; T267,
-  [the handbook](../design/handbook.md#review-guides-reviewmd)). `guides` names each by file, version,
+  change touches, as a review step's brief points at them (role `context`; [the handbook](../design/handbook.md#review-guides-reviewmd)). `guides` names each by file, version,
   owner, and the hash of its text, so a result traces to the rules it was reviewed by; `left` counts
   the guides no changed path is in the area of; `problems` names a guide that could not be used.
   `text` is what the reviewer reads. Read from the repository the run's worktree was cut from, never
@@ -1198,13 +1190,12 @@ guesses.
   lead's own verdicts, acceptances, other decisions, and starts), `waiting` (reviews held and open
   requests with `brief` and `expiresAt`, as of `asOf`), `failed` (rejected attempts and failed
   daily checks, with the task a daily check filed), `byHand` (commits on the landed branch no
-  landing decision names), and `measures` (D108): `landedBySystem`, `landedByHand`, `leadTouches`,
+  landing decision names), and `measures` : `landedBySystem`, `landedByHand`, `leadTouches`,
   `reruns`, `redDev`, `incidents`. A measure no source could give is `{ unknown }`, never 0 (INV-2).
   A finished day is stored once and read back as it was. Example:
   [`lead-digest.day.json`](../../schemas/examples/lead-digest.day.json). `mcp-report@1.7` adds the
   `lead_digest` and `lead_health` tools' inputs and the health table's output. `mcp-report@1.8`
-  adds the state `failed` to the health table's rows and its state (the disk row under its floor,
-  T345); a 1.7 reader that does not know it must read it as worse than `degraded`.
+  adds the state `failed` to the health table's rows and its state (the disk row under its floor); a 1.7 reader that does not know it must read it as worse than `degraded`.
 
 ### `check-run`
 
@@ -1339,7 +1330,7 @@ One question put to the operator and, once answered, the answer: the `decisions`
   `agent-workers.migration` version 3: the rows' kinds, and their description when every row of
   the role gives the same one); in `account_agents`, an account's `label` (the operator's,
   `assignments[].label`, 1 to 64 characters) and a runtime's `title` (its provider's name for
-  people, 1 to 64 characters). Readers accept 1.0 to 1.2. A 1.1 reader refuses a plan whose roles
+  people, 1 to 64 characters). A 1.1 reader refuses a plan whose roles
   carry `kinds`: that was the defect 1.2 fixes.
 - Each account is an [`agent-account@1.x`](#agent-account) record. The sign-in command's
   environment names the home and never a session bus; nothing holds a principal or a token (INV-8).
@@ -1447,7 +1438,7 @@ One question put to the operator and, once answered, the answer: the `decisions`
 
 | Tool | Scope | Does |
 |---|---|---|
-| `metrics` | client | the maturity metrics of PROP-0016 §1 over a rolling window (default the 30 days before now), for one project or every one, from recorded data only, and the reading against the L3 lines (starting lines, D83); reads only |
+| `metrics` | client | the maturity metrics of PROP-0016 §1 over a rolling window (default the 30 days before now), for one project or every one, from recorded data only, and the reading against the L3 lines (starting lines); reads only |
 
 - Input and output (`mcp-report` 1.6): [`mcp-report.v1.json`](../../schemas/mcp-report.v1.json)
   `$defs/metrics-input` (`projectId`, `days` from 1 to 366, `until`) and `metrics-output`.
@@ -1483,7 +1474,7 @@ One question put to the operator and, once answered, the answer: the `decisions`
   provider, role, tier, quota class, and locality as one line, for a reader to show, marked as
   derived, when there is no description); and, per step of `work`, `since` (known: when its
   current attempt started, from the event log) and `summary` (the step in one sentence: its task,
-  run, step, and for how long, as of `asOf`). Readers accept 1.0 and 1.1.
+  run, step, and for how long, as of `asOf`).
 - `mcp-roster@1.2` adds, per Worker, `liveness`: present only when the router tells liveness and the
   Worker has a run that is `stalled`, being looked at (`looking`), or ended without being known to
   be gone (`unknown`), each with `execution`, `state`, `since`, `runId`, and `summary`; or
@@ -1494,7 +1485,7 @@ One question put to the operator and, once answered, the answer: the `decisions`
   else its account's id (a website account) or slot (an agent account), else the rest of its own
   id, and its role, else its tier. It is never an id to route by. A Worker its source describes
   ready, on which the engine runs a step, is `busy` whatever load its source reports, and its
-  `summary` says so. Readers accept 1.0 to 1.3.
+  `summary` says so.
 - `mcp-roster@1.4` makes `name` the display name, `<runtime> · <account> · <role or tier>
   [<kinds>]`, made on each read from the runtime's title (else its provider's first word, as in
   1.3), the account's label for an operator (an agent account's `assignments[].label`, else its
@@ -1503,14 +1494,13 @@ One question put to the operator and, once answered, the answer: the `decisions`
   ([display names](../design/roster.md#display-names)); never a routing input, never a key, and
   still at most 200 characters. It also adds an agent account quarantine's `detail`
   (`agent-account@1.1`), on the account record and the `quarantined` availability, and in its
-  summary. Readers accept 1.0 to 1.4.
+  summary.
 - `mcp-roster@1.5` adds a source read's `describing` (`true`, on a `silent` read only): the source
   has not described its Workers once since it registered, its first describe (a start's first
   probe) still running, so its Workers are not known yet, never known to be none. The text then
   counts the Workers listed as so far and names the source as describing; health reads the same
   router reads and says the same
-  ([sources that do not answer](../design/routing.md#sources-that-do-not-answer)). Readers accept
-  1.0 to 1.5.
+  ([sources that do not answer](../design/routing.md#sources-that-do-not-answer)).
 - `mcp-roster@1.6` adds, per Worker, `teams`: `{value: {excluded: true, summary}}` when the
   workflow engine's `teams.excludeWorkers` keeps it out of teams (named itself, by its account, or
   as another Worker of a named one's account; [Workers left out of teams](../design/teams.md#workers-left-out-of-teams)),
@@ -1539,17 +1529,17 @@ One question put to the operator and, once answered, the answer: the `decisions`
   `{unknown}` when it names no template, its template is not served, or the steps cannot be read).
   Each list is `{value: {items, more}}` with at most 16 items, or `{unknown}` with why (the Workers
   or the board could not be read). Present on every record the roster makes; a 1.6 record, with no
-  `now`, stays valid. Readers accept 1.0 to 1.7.
+  `now`, stays valid.
 - `mcp-roster@1.8` adds, per step of `work`, `startedBy`: `dispatch` when the dispatch pass started
-  the board task's run by itself ([PROP-0014](../proposals/0014-dispatch-by-quota.md) D2), `lead` for
+  the board task's run by itself ([PROP-0014](../proposals/0014-dispatch-by-quota.md)), `lead` for
   a start through MCP `run` or `task` or the CLI, `operator` for Start on `/ui`; absent when the
   engine does not tell (workflow contract below 1.10). The step's `summary` then ends with
-  `started by itself`. A 1.7 record stays valid. Readers accept 1.0 to 1.8.
+  `started by itself`. A 1.7 record stays valid.
 - `mcp-roster@1.9` adds, per free Worker of capacity now (`capacityQuota`), `headroom`: what its
   account's binding window has left above the operator's reserve (from -90 to 100), by the one headroom rule
-  dispatch and routing use ([PROP-0014](../proposals/0014-dispatch-by-quota.md) D3); the binding window is
+  dispatch and routing use ([PROP-0014](../proposals/0014-dispatch-by-quota.md)); the binding window is
   the one with the least headroom, and its `resetsAt` is absent when its reading names no reset. A 1.8
-  record stays valid. Readers accept 1.0 to 1.9.
+  record stays valid.
 - Bounds ([roster bounds](../design/roster.md#bounds)): at most 256 Workers (`unlisted` counts the
   rest), 32 steps per Worker (`more`), 64 siblings, 64 pools, 16 windows per pool, 64 sources, 64
   step starts;
@@ -1655,12 +1645,12 @@ One question put to the operator and, once answered, the answer: the `decisions`
 - `mcp-board` 1.2 adds `board_propose`'s optional `maxAttempts` (1 to 10): the attempts the task
   gets, else the board's for its template, else its default
   ([attempts](../design/board.md#attempts)).
-- `mcp-board` 1.4 adds `board_reopen_review` (T286): the caller, the operator's token or else the
+- `mcp-board` 1.4 adds `board_reopen_review`: the caller, the operator's token or else the
   lead's for its own project, brings a `review-expired` task back to review, held for the
   operator for the policy's wait, with a reason. Refused unless the task has its result and its
   run's worktree is still recorded and on disk. The output names the `board` decision that
   records it.
-- `mcp-board` 1.5 adds the `defect` link (`board-task@1.2`, T277b): `board_propose`'s optional
+- `mcp-board` 1.5 adds the `defect` link (`board-task@1.2`, ): `board_propose`'s optional
   `fixes` (a done task and its landing sha), and `board_defect`, which links an existing task to
   the done task whose landed change held the defect it fixes; a lead links its own project's only.
 - A refused verdict (`unknown-request`, `already-resolved`, `expired`, `subject-changed`, or

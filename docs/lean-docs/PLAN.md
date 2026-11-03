@@ -13,8 +13,8 @@ set once the inventory is in: what the inventory shows can go, not a fixed numbe
 
 ## What stays, what goes
 
-Measure each document against [purpose](docs/requirements/purpose.md) (P1 to P7) and
-the authority table in [docs/README.md](docs/README.md).
+Measure each document against [purpose](../requirements/purpose.md) (P1 to P7) and
+the authority table in [docs/README.md](../README.md).
 
 | Area | Rule |
 |---|---|
@@ -28,7 +28,7 @@ the authority table in [docs/README.md](docs/README.md).
 | validation | keep the release checklist and traceability (generated); trim the rest |
 | package READMEs | out of scope (a later change) |
 
-Governance changes with this work: AGENTS.md and [governance](docs/governance/README.md)
+Governance changes with this work: AGENTS.md and [governance](../governance/README.md)
 say "a superseded record is deleted; Git keeps its history" in place of "supersede,
 never rewrite" for deletion. An accepted ADR is still never edited in place.
 
@@ -50,7 +50,7 @@ never rewrite" for deletion. An accepted ADR is still never edited in place.
   on every landed change.
 - **One writer per file** (INV-15): a file is in exactly one unit below.
 - **No status words** in design documents; status lives in the roadmap, the ADR
-  index, and package READMEs ([status ownership](docs/README.md#status-ownership)).
+  index, and package READMEs ([status ownership](../README.md#status-ownership)).
 
 ## Phases
 

@@ -1,9 +1,7 @@
 # Research
 
-Research is **non-normative**. It records evidence and the analysis of external
-systems that informed PROP-0001 and later proposals.
-Nothing here changes `system` behavior until it is promoted into requirements,
-decisions, architecture, or design.
+Research is **non-normative**. It records evidence that an open proposal cites. Nothing here
+changes `system` behavior until it is promoted into requirements, decisions, architecture, or design.
 
 | Document | Subject | Analysed revision |
 |---|---|---|
@@ -17,5 +15,4 @@ decisions, architecture, or design.
 | [lean-core-2026-11-01.md](lean-core-2026-11-01.md) | where a task's time, tokens and the operator's attention go (live store, one week), the ledger's double count of resumed sessions, the gate ending a quarter of agent runs, what is used, the SDK and review evidence, the options four System runs chose for PROP-0022 | 2026-11-01 |
 | [token-use-2026-11-02.md](token-use-2026-11-02.md) | where an accepted task's Claude tokens go (live store, one week, each session counted once): cost by step and tier, sessions re-read on every resume, prompt sizes, who does the work, and the System brainstorm on Worker roles for PROP-0023 | 2026-11-02 |
 
-Each analysis ends with **Adopted** and **Not adopted** lists. Once its findings
-are fully promoted, an analysis may be pruned, because git history keeps it.
+Research that no open proposal cites is deleted. Git keeps it.

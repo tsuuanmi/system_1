@@ -16,9 +16,8 @@
 > seam version its providers do not satisfy) is recorded and makes health down, but still runs: the
 > host cannot refuse a row ([ADR-0048](../decisions/adr/0048-the-plugin-host-checks-the-composition-at-start.md));
 > a row the configuration turns on or off is recorded at its next start, and one the operator turns
-> while the host runs ([runtime switches](#runtime-switches), ADR-0078) is recorded at once. Status audited
-> 2026-10-27: nothing of this mechanism changed from T236 to T295 (the canary on a live update,
-> T219, T269, is the [workflow engine's](workflow-engine.md); no lifecycle step is automated).
+> while the host runs ([runtime switches](#runtime-switches), ADR-0078) is recorded at once. No lifecycle step is automated; the canary on a live update is the
+> [workflow engine's](workflow-engine.md).
 
 Every plugin package says what it is in a manifest: the seams it provides and consumes, at which
 contract versions, which core component or plugin family it belongs to, its configuration keys,
@@ -40,9 +39,9 @@ fact in it has one source:
 | `provides` | the services the code registers, each at the contract its provider pins in its own conformance run (`runSuite(<suite>, { contract })` in its tests) |
 | `defines` (`@1.1`) | the abstract definitions a definition package owns, each at its suite's `contract` |
 | `consumes` | the `inject` list, and `ctx.get` and `ctx.inject` for the optional ones, each accepting `^` the version of the seam's provider in this workspace (else its definition's) |
-| `config` | the plugin's `Config` schema, run: each top-level key, `sensitive` when it or a schema within it is marked a secret (`.role('secret')`). No plugin's configuration holds a secret: secrets are kept in the credential vault, and a configuration holds paths and references (INV-8) |
-| `egress` | for a Worker source that checks egress before content leaves (`ctx.egress.check({ workerClass })`: `turns`, `agent-workers`, `models`), the strictest classification the egress plugin's default policy (`WORKER_CLASSES`) lets leave the machine for those Worker classes: `operator-shared`. The drivers and runtimes that carry a source's content to its provider host but check nothing themselves (`provider-chatgpt-web`, `provider-gemini-web`, `runtime-claude-agent-sdk`, `runtime-codex-sdk`, `runtime-acp`, `runtime-antigravity-cli`) declare it in the manifest, at their source's: the code cannot tell which source's content they carry. A plugin that sends no Worker's content off the machine declares none (the browser engine is the drivers' transport; a sign-in sends an account's own credentials to its provider, never through the gate, INV-8) |
-| `renames`, `cacheStable` | the manifest itself: the code cannot tell them. No plugin was renamed, and none is a context plugin, so none declares `cacheStable` |
+| `config` | the plugin's `Config` schema: each top-level key, `sensitive` when marked a secret (`.role('secret')`). Secrets live in the credential vault; a configuration holds paths and references (INV-8) |
+| `egress` | for a Worker source that checks egress before content leaves (`turns`, `agent-workers`, `models`), the strictest classification the default policy lets leave for its Worker class: `operator-shared`. The drivers and runtimes that carry a source's content but check nothing themselves declare it at their source's level. A plugin that sends no Worker's content off the machine declares none |
+| `renames`, `cacheStable` | the manifest itself: the code cannot tell them. No plugin is renamed, and none is a context plugin, so none declares `cacheStable` |
 
 A seam whose conformance suite predates the [conformance runner](../../packages/libs/conformance/runner.ts),
 or that has none (a DSH seam, a service of the dsh launcher), is at contract 1.0.
@@ -65,11 +64,9 @@ the host would (`readManifest`) and names every disagreement:
 - a name, version, description, or license other than `package.json`'s;
 - a configuration key its `Config` does not have, one it has that is not declared, or a `sensitive`
   flag other than its `Config`'s;
-- a Worker source's `egress` other than its egress check gives; a declared `egress` on a plugin
-  outside the Worker family, or at a classification no Worker class may receive by default
-  (`local-private`, INV-12); `cacheStable` on a plugin outside the context family;
-- a system bundle whose `plugin-host` row allows other packages without a manifest than exactly its
-  DSH rows ([the manifest check](#the-manifest-check));
+- a Worker source's `egress`, or a declared `egress` outside the Worker family or at `local-private`
+  (INV-12); `cacheStable` outside the context family;
+- a bundle's `plugin-host` allowance that differs from its DSH rows ([the manifest check](#the-manifest-check));
 - anything else the generator would write differently.
 
 `pnpm version-packages` regenerates them with each release, so a manifest's version is its
@@ -126,23 +123,17 @@ and `pnpm check:manifests` holds that list to the bundle's DSH rows. A patch tha
 replaces its whole config: one that leaves the list out makes each DSH row a finding.
 
 What the check finds in a plugin is a decision (INV-13): `gate` (`decision@1.0`), decider rule
-`plugin-host.manifest-check` version 1, its hash the sha256 of what it read (the rows, each
-manifest's digest or why there is none, and the packages allowed). Its candidates are `pass` and
-`fail`, each with why: `fail` gives each finding's reason. `detail` names the `plugin`, its `rows`,
-its `findings`, the outcome it comes `from` (`null` the first time), and, for a valid manifest, its
-`version` and `manifestDigest`. Its input is the plugin's previous check decision.
+`plugin-host.manifest-check` version 1, its hash the sha256 of what it read. Its candidates are
+`pass` and `fail`, each with why, and its input is the plugin's previous check decision.
 
-**Recorded once** (INV-4). The host keeps each plugin's last check (its findings and decision). A
-start whose findings for a plugin equal its record, reasons and order aside, records nothing; another finding
-is a new `fail`; a finding cleared, by a fix, by the allowance, or because no row mounts the plugin
-any more, is one `pass`. A plugin never found records no check at all.
+**Recorded once** (INV-4). A start whose findings for a plugin equal its last record records
+nothing. A new finding is a new `fail`; a finding cleared, or no row mounting the plugin any more,
+is one `pass`. A plugin never found records no check at all.
 
-**Fail closed, as far as the host can.** The host cannot keep a row from running: DSH starts the
-rows of a group at once, before the store the decision needs exists, and stopping a running row
-from outside rewrites the operator's configuration
+**Fail closed, as far as the host can.** The host cannot keep a row from running
 ([ADR-0048](../decisions/adr/0048-the-plugin-host-checks-the-composition-at-start.md)). So a finding
-makes health `manifests` **down**, naming each finding and what to do: the host cannot vouch for
-what runs. MCP `status` and `system plugins` list each finding under its plugin
+makes health `manifests` **down**, naming each finding and what to do. MCP `status` and
+`system plugins` list each finding under its plugin
 ([runbook](../operations/runbooks.md#the-manifest-check-found-a-plugin)).
 
 ## Lifecycle states
@@ -228,12 +219,8 @@ whose candidates are the modes the mechanism takes.
 ## Conformance
 
 [`plugin-host-core/conformance/plugin-host.ts`](../../packages/plugin-host-core/conformance/plugin-host.ts),
-12 scenarios at contract 1.2 (6 since 1.0; since 1.1: a row with no manifest or a refused one, the
-allowance, an unsatisfied range, a satisfied one, and a finding recorded once; since 1.2: a required
-row refused, and a mode a mechanism does not take refused), run against the fake provider (pinned at
-1.1) and against the store-backed provider reading a stub of the loader over installed package
-directories. A turn itself (quiescence, the patch, the put-back past the bound, a restart) is tested
-on the store-backed provider over a loader whose entries run real plugins
-(`plugin-host/tests/plugin-host.spec.ts`), and on the whole bundle by the removability matrix. The profile end-to-end test boots the shipped composition through the real
-loader, once more with a patch that drops the allowance: each DSH row is found and recorded, health
-is down, and every row still runs.
+12 scenarios at contract 1.2, run against the fake provider and the store-backed provider. A turn
+(quiescence, the patch, the put-back past the bound, a restart) is tested on the store-backed
+provider over real plugins (`plugin-host/tests/plugin-host.spec.ts`). The profile end-to-end test
+also boots the shipped composition once with the allowance dropped: each DSH row is found and
+recorded, health is down, and every row still runs.

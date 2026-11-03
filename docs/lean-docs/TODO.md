@@ -5,6 +5,11 @@ the board (`board_claim`), never here. Each unit owns its files: no file is in t
 
 States: `todo`, `inventory`, `decided`, `rewriting`, `review`, `landed`.
 
+Progress (2026-11-03): inventory by four Haiku subagents; the operator approved the deletion list;
+deletions landed (fbec3bc9); a first rewrite pass by subagents, reviewed by the lead. Docs words:
+584,577 (dev) to 480,771 (-17.8%). A second rewrite pass of the largest design and reference files
+remains.
+
 ## Phase 0
 
 | # | Item | State |

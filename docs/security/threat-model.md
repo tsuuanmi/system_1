@@ -316,7 +316,7 @@
       alias named `echo` or `cat` in `~/.bashrc`, `~/.bash_profile`,
       `~/.profile`, a `BASH_ENV` or `ENV` file, or an exported function
       (`BASH_FUNC_echo%%`) would run instead, on a later call the gate passed as
-      a read (T197, T198). The gate therefore takes a `Bash` call for a read
+      a read. The gate therefore takes a `Bash` call for a read
       only for a runtime that enforces, in the shell that actually runs each
       call, a non-login, non-interactive shell with no startup file and no
       startup variable (`bash --norc --noprofile`, no `BASH_ENV` or `ENV`), a
@@ -343,11 +343,11 @@
       startup file a call can reach, and the next call's `echo` and `cat`,
       plain, login, and interactive, are the real ones. That still does not
       earn `cleanShells`: the shell program itself is the call's to pick;
-    - so a Codex Worker reads without a shell (T200b): every run registers
+    - so a Codex Worker reads without a shell: every run registers
       System's own workspace reads server (`agent-runtime-core`,
       [the workspace reads server](../design/agent-runtimes.md#the-workspace-reads-server)),
       whose tools (`read_file`, `list_dir`, `search`, and the git views of
-      T223 below) the gate classifies
+      below) the gate classifies
       as `read` by their MCP names (`mcp__workspace__…`), only for a run whose
       runtime reports that it gives its agent that server (`workspaceReads`
       evidence; elsewhere every `mcp__workspace__…` tool is denied, so a
@@ -391,7 +391,7 @@
       rests on the runtime's item accounting, not on the probe's turn, which
       calls no MCP tool (a hook that did not run stops the run, after one
       read); and what a read returns reaches the model, as any read does;
-    - so a Worker reads git history without a shell (T223): the same server's
+    - so a Worker reads git history without a shell: the same server's
       `git_log`, `git_show`, `git_diff`, and `git_status`, which the gate
       classifies as `read` only as it does the server's other tools, and only
       when every commit they name is a hex id and every path is inside the
@@ -498,7 +498,7 @@
   Worker may write or `validate`; the release checklist verifies the sandbox
   Claude Code itself starts, live. Each command still passes the tool gate by its
   exact argv, so a shell metacharacter is forbidden and an unlisted command asks
-  the operator. No `Bash` call is a read (T198): Claude Code starts its Bash
+  the operator. No `Bash` call is a read: Claude Code starts its Bash
   tool's shells its own way and runs each command after sourcing a shell
   snapshot kept in its home, so it does not report `cleanShells`, and even the
   fixed inspection commands and the probes that can do nothing are each the

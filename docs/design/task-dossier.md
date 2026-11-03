@@ -4,8 +4,7 @@
 > Shapes: [`task-dossier-entry.v1.json`](../../schemas/task-dossier-entry.v1.json),
 > [`task-dossier.v1.json`](../../schemas/task-dossier.v1.json).
 >
-> Built in T233 (`fd3449de`); ADR-0070 accepted 2026-10-27. Implemented in
-> [`workflow`](../../packages/plugins/workflow/README.md) (`src/dossiers.ts`) and,
+> Implemented in [`workflow`](../../packages/plugins/workflow/README.md) (`src/dossiers.ts`) and,
 > for an agent Worker's own tools, [`agent-workers`](../../packages/plugins/agent-workers/README.md)
 > (`src/dossier.ts`); differs from target: only Claude Code offers host tools today, so an agent
 > Worker on another runtime (Codex, ACP, the Antigravity CLI) holds no dossier tool, its step is
@@ -25,7 +24,7 @@ critics, a human accountable). The dossier is that artifact for a board task.
 | `progress` | the author, after a step; the engine for a step that wrote none | what was done, commits, what remains, small decisions and why |
 | `review` | a reviewer; the engine from a review's assessment | the verdict and findings, bound to the exact subject reviewed; the review's result and assessment linked, not copied |
 | `response` | the author of a fix; the engine for a fix that wrote none | per finding: fixed in which commit, or not and why |
-| `evidence` | the engine (the run's checks and acceptance, the report to the board, the landing, an ended attempt's kept change, where a new attempt's tree came from); and a writing step's Worker (T267) | the System's: what it checked, and (T284) the commands a writing step's Worker ran with the exit codes and output tails its runtime reported, which the System records itself (bounded per step, never dropping the last record that shows a check; a background launch or interrupted command with no exit code) and lists when the step's evidence gate settles, check commands first, in as many entries as the entry's bound needs. The author's (optional prose now): the output of the checks it ran, verbatim; told from the System's by its author, and never a check the engine reports. A gate refusal continues the step's session once; a second fails it ("evidence refused twice") |
+| `evidence` | the engine (the run's checks and acceptance, the report to the board, the landing, an ended attempt's kept change, where a new attempt's tree came from); and a writing step's Worker | the System's: what it checked, and the commands a writing step's Worker ran, with the exit codes and output tails its runtime reported, which the System records itself (bounded per step, never dropping the last record that shows a check; a background launch or interrupted command with no exit code). They are listed when the step's evidence gate settles, check commands first. The author's optional prose is the output of the checks it ran, verbatim, told apart from the System's by its author, and never a check the engine reports. A gate refusal continues the step's session once; a second fails it ("evidence refused twice") |
 
 Every entry is a content-hashed `task-dossier-entry@1.0` artifact. Its `seq` is its place in the
 task's dossier, from 1 with no gap, and `prev` names the entry before it, so the dossier at an entry
@@ -80,19 +79,16 @@ sequenceDiagram
   the report of the run's outcome to the board, and the landing of an accepted result once it is
   committed, asked to merge, and where it ends (merged, returned, refused, rejected, or nothing to
   land; never the steps between) are appended as `evidence`, the decisions and records linked.
-- **Attempts, and where each tree came from** (T271). An attempt that ends without its result being
-  accepted keeps its change as a commit on its run's branch, and its dossier says so once it is
-  settled, as an entry of that attempt: "Attempt N (run …) ended without being accepted; its change
-  is kept as commit <sha> on <branch>, on top of <base>, as the attempt's result", the sha in the
-  entry's `commits`; or that it is not kept, and why. The next attempt's entry says which tree it
-  starts from: "Attempt N+1 (run …) starts from the tree of attempt N (run …): its change is kept as
-  commit <sha> …", the sha in `commits`, and what a move of the base did: replayed on the new tip
-  without conflict, or a conflict (the files named) that left the tree at the change's own base for
-  the Worker to resolve. A fresh start says "starts fresh, not from the tree of attempt N" and why
-  (the task opted out, or the change could not be carried). The carry's decisions are linked
+- **Attempts, and where each tree came from.** An attempt that ends without its result accepted
+  keeps its change as a commit on its run's branch. Its dossier entry says so once it settles,
+  naming the sha in `commits`, or says that the change is not kept, and why. The next attempt's
+  entry says which tree it starts from, and what a move of the base did: replayed on the new tip,
+  or a conflict (the files named) that left the tree at the change's own base for the Worker to
+  resolve. A fresh start says so, and why (the task opted out, or the change could not be carried).
+  The carry's decisions are linked
   ([starting from the previous attempt's work](workflow-engine.md#starting-from-the-previous-attempts-work)).
-- **What a failed check printed (T270).** A Worker cannot open a linked artifact, so a link to the
-  `check-run` record alone told the next attempt that its tests failed, never which. For each
+- **What a failed check printed.** A Worker cannot open a linked artifact, so a link to the
+  `check-run` record alone would say that a test failed, never which. For each
   required check that failed on the result's own subject, one more `evidence` entry follows the
   acceptance's, linking it and the `check-run` record, and carrying in its text what failed: the
   failing tests' names and assertion lines, then the run's summary, as the source that ran the
@@ -120,8 +116,8 @@ sequenceDiagram
 
 ## Where the work moves
 
-- A **continued session** (T232) keeps writing and reading the dossier as any step does.
-- A **step that moves off its session** ([T230](sessions-and-messaging.md#a-step-its-sessions-worker-cannot-take)),
+- A **continued session** keeps writing and reading the dossier as any step does.
+- A **step that moves off its session** ([sessions](sessions-and-messaging.md#a-step-its-sessions-worker-cannot-take)),
   a **fix routed to another Worker**, and a **new attempt** start from the dossier: their briefs hold
   its slice, so the plan, what remains, and the review's findings reach a Worker that never saw the
   conversation.

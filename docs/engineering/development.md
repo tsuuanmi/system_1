@@ -119,11 +119,10 @@ Work flows through two long-lived branches, `dev` and then `main`:
 
 ## Give work to System Workers
 
-A lead can give a change to System itself, as the coordination did on 2026-10-25: a board task
-that one run of [`algorithm-development`](../reference/workflow-templates.md#algorithm-development)
-serves per attempt. The [board](../design/board.md), the
-[workflow engine's board tasks](../design/workflow-engine.md#board-tasks), and
-[approvals](../design/approvals.md) are canonical; this is the path through them.
+A lead can give a change to System itself: a board task that one run of
+[`algorithm-development`](../reference/workflow-templates.md#algorithm-development) serves per attempt.
+The [board](../design/board.md), the [workflow engine's board tasks](../design/workflow-engine.md#board-tasks),
+and [approvals](../design/approvals.md) are canonical; this is the path through them.
 
 1. **Propose** with MCP `board_propose`: the project, a `title`, a `goal`, the `acceptance`
    criteria (name each validation command in one, exactly as the policy lists it, with its
@@ -132,15 +131,13 @@ serves per attempt. The [board](../design/board.md), the
    propose just before running, after merging what the task builds on
    ([pilot](../operations/pilot.md#plan-the-work), [attempts](../design/board.md#attempts)).
 2. **Start an attempt** with MCP `run`: `template: algorithm-development`, `variant: docs` or
-   `tests` for docs or test work (none for code), and `task: { taskId }`, which claims the ready
-   task (CLI: `system run algorithm-development --variant docs --task <taskId> -`). The `input` is
-   the writing step's. Write it in two parts, "Develop step" and "Validation step", each saying
-   it binds only that step, so one step's orders never become another's. `validate:1` reads the
-   criteria from its brief, never the input, so a command not named in a criterion is not run
+   `tests` for docs or test work (none for code), and `task: { taskId }` (CLI: `system run
+   algorithm-development --variant docs --task <taskId> -`). Write the `input` in two parts, "Develop
+   step" and "Validation step", each saying it binds only that step. `validate:1` reads the criteria
+   from its brief, never the input, so a command not named in a criterion is not run
    ([which inputs reach which step](../reference/workflow-templates.md#which-inputs-reach-which-step)).
-   Point the develop step at [CONTRIBUTING](../../CONTRIBUTING.md): a writer takes the next free
-   ADR number, store migration version, and schema version, since runs written beside it take
-   "the next" from the same tree
+   Point the develop step at [CONTRIBUTING](../../CONTRIBUTING.md), so the writer takes the next free
+   ADR number, store migration version, and schema version
    ([what parallel changes collide on](testing.md#what-parallel-changes-collide-on)).
 3. **What a step may run.** Every tool call passes the run's gate
    ([a Worker's tool calls](../design/approvals.md#a-workers-tool-calls)). Edits inside the
@@ -158,9 +155,9 @@ serves per attempt. The [board](../design/board.md), the
    need the worktree's offline setup
    ([ADR-0058](../decisions/adr/0058-a-run-worktree-is-set-up-offline-before-its-agent-starts.md),
    [runbook](../operations/runbooks.md#set-up-a-runs-worktree)).
-4. **Follow it**: `system explain <runId>` gives the task's admission, each step's route and
-   acceptance, the result's subject, and the report to the board; `system events --run <runId>`
-   (or `--type`) reads its events. MCP `board_task` gives the task's state and why it waits.
+4. **Follow it**: `system explain <runId>` gives the task's admission, each step's route and acceptance,
+   and the result's subject; `system events --run <runId>` reads its events; MCP `board_task` gives the
+   task's state and why it waits.
 5. **Answer a question.** A step that cannot finish without a person answers
    `{"questions": [...]}`, and the task waits for input. Answer every question, by index, with
    MCP `board_update` `answers`; the next attempt goes through the gate, its brief pointing at the
