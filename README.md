@@ -31,6 +31,12 @@ it is a plugin.
 4. **Right model, right job.** Cheap models handle low-level work such as triage,
    extraction, summaries, and formatting. Strong models are kept for hard
    reasoning and final synthesis.
+5. **Replaceable Workers.** Work state lives in artifacts, and Workers communicate by
+   artifact id, so any Worker can continue unfinished work.
+6. **Any workflow.** Software development, scientific research, or work outside code:
+   a workflow defines its steps, tiers, and acceptance; the engine runs them all alike.
+7. **The person decides only what matters.** Routine actions inside an approved
+   boundary run without asking.
 
 Full statement: [docs/requirements/purpose.md](docs/requirements/purpose.md).
 

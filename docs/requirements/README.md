@@ -11,7 +11,7 @@ a choice was made (see [decisions](../decisions/README.md)).
 
 | Document | Owns |
 |---|---|
-| [purpose.md](purpose.md) | why `system` exists: the four purposes (P1–P4) that every requirement traces to |
+| [purpose.md](purpose.md) | why `system` exists: the seven purposes (P1–P7) that every requirement traces to |
 | [release-scope.md](release-scope.md) | what MVP, Beta, Base, and production-ready must each deliver, with exit criteria |
 | [SRS.md](SRS.md) | functional requirements, as `REQ-<family>-<n>` ids |
 | [quality-attributes.md](quality-attributes.md) | non-functional qualities (`QA-<n>`) |
