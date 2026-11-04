@@ -21,6 +21,8 @@ The last column gives the state of each check now. Past evidence is in Git's his
 | A local agent review Worker (*only with `profile-software-development` on*) | `system run agent-review "…"` | Verified, as the built-in `review` |
 | Drain, refusal, resume, and shutdown | `system drain`, an `ask` during the drain, `system resume`, `system shutdown` | Verified |
 | Web UI: approve, stop, continue | `system ui` | Verified |
+| Web UI in a browser: no page scrolls sideways at 360 and 402 px, every target at least 44 px, keyboard focus and tooltips, Help's sections and search, Home and the Board by project ([ADR-0084](../decisions/adr/0084-browser-backed-tests-are-release-checks.md)) | `system ui` on a desktop browser and a phone | Not yet verified |
+| A website conversation released by a run is deleted on its site, and only that one: a second conversation of the same account stays ([ADR-0084](../decisions/adr/0084-browser-backed-tests-are-release-checks.md)) | two `system ask --persist` turns, release one session, then read both accounts' history | Not yet verified |
 | Backup while the profile runs, and a verified restore preview | `system backup`, `system restore` | Verified |
 | Restart while a turn runs: reconciled, never resent | start an ask, `system shutdown`, `system start` | Verified |
 | `research`: hypotheses, two reviews on accounts of two providers (one proving Web search), evidence from both, a critique on another provider, conclusions | `system research "…"`; `system explain` shows `literature:2` and `critique:1` on another provider than `literature:1` and `evidence:1` | Verified with one review on one provider; two providers not yet verified |

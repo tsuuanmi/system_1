@@ -283,114 +283,13 @@ each one's bytes with its sha256 as the `ETag`. `pnpm typecheck` and `pnpm lint`
 (`ctx.get`), so the UI works without the queue or the board; for the roster it reads `workers`,
 `accounts`, `agentWorkers`, `resources`, and `eventLog` when present.
 
-**Tests:** [`tests/web-ui.spec.ts`](tests/web-ui.spec.ts): the shell and its
-headers, the guard, the run actions, the queue's routes (listing by batch,
-verdicts bound to the subjects shown, a batch verdict bound to its batch, each
-refusal, `503` without a queue or a board), the roster route (operator only, valid against
-`mcp-roster@1.6`, labels shown, display names, a Worker's runs whose liveness needs a look, unknown without a
-Worker registry), and, with a browser, the runs, the queue (labels by effect, a batch verdict, a
-refused one as an alert), a press a refresh lands on that still counts, a verdict not recorded
-that stays as an alert through refreshes until dismissed, and the Workers tab (counts in the
-operator's words, the Workers by account under its header, each card calm with its unknown,
-derived, and technical facts folded under its details, a reason that blocks work shown, the step
-in one sentence, each pool window's share, reset, and read time or `unknown (why)`, Home's
-capacity line per account, and a run held for want of a verdict with what frees it and a link to
-its run), on a page whose clock stands at a fixed instant in UTC, so each time it shows is named
-exactly whenever the test runs; Home's waiting items by name, each linked to its card; a run's
-*What happened* (continued from the previous attempt's work, a team member's answer retried once,
-its result merged, each mechanism folded; an earlier attempt's error under *Attempt history*, never
-as the step's failure); **Stop run** sent only after its confirmation; and a Worker excluded from
-teams, *Right now* by name, and an engine that cannot tell folded (T141); and the same free,
-stalled, and no-quota names on Home as on the Workers page, a free Worker excluded from teams never
-offered for team work (T160). Its building-block suite
-(T172) checks, on Home, a run's page, Workers, and Help, that every chip has its symbol and word,
-every relative time its exact time on hover and focus, every fold is closed at first, no row
-starts with an id, a count with its unit, and the copy button; a *Loading…* skeleton still under
-reduced motion, and **Skip to content** first in the keyboard order with a visible focus; and a
-stale banner, with when the page was read, while a refresh fails, gone once one succeeds, and a page
-that never loaded said with **Try again**. Its round 8 tests (T186) check that each approval card shows
-one line and **Approve / Deny** only, every fact under its one **Details**, closed at first and
-opened by keyboard; that Tab reaches every button in sight; that *Since you last looked* and *Runs
-needing attention* show 5 rows and a **Show all N** that keeps every row through the refresh; and
-that each page header has one short sentence at most. Its wording suite (T191) checks every
-decision's label (*Approve* / *Deny* on a request's card, a batch, and a run's plan; *Accept* /
-*Send back* on a review; *Confirm* / *Cancel* when stopping a run, pausing or closing a project,
-and starting a task), that each button's accessible description names what it does, and that no
-label still carries its effect.
-[`tests/layout.spec.ts`](tests/layout.spec.ts) (T239): every margin, padding, gap, and font size on
-its scale; light and dark from the system; a script that parses and loads nothing from another
-origin; and, with a browser over the store-backed composition, the Board's first screen at most half
-the words it had before T239 (the numbers before recorded in [`tests/glance.ts`](tests/glance.ts);
-Home, a run, and Workers are bounded in `web-ui.spec.ts`), a heading on every section of every
-page, no page scrolling sideways at 360 px with every button within the screen, and each button's
-tooltip shown on keyboard focus and on hover and hidden by Escape; and, on the operator's iPhone
-16 Pro (T240, 402 and 360 px at 3 device pixels each, touch, and its safe areas emulated), the
-viewport covering the screen, no page scrolling sideways, every target at least 44 by 44 px, every
-field at 16 px, the sticky header below the Dynamic Island, a table below 600 px as cards, and a
-row's tooltips opened by a tap of its **?** and closed by a second tap, a tap outside, or Escape
-(`web-ui.spec.ts` checks a run's primary action in a bar at the bottom of the screen, above the
-home indicator). Without a browser, these tests are reported as not run, with why. With `SYSTEM_UI_SHOTS`, both suites write the screenshots of
-the [design note](../../../docs/design/web-ui.md).
-[`tests/store-backed.ts`](tests/store-backed.ts) boots the UI over the store-backed board,
-approval queue, and engine under the bundle's own default studio policy, for its suites.
-[`tests/policy.spec.ts`](tests/policy.spec.ts): a proposed version asked in the queue on its
-exact hash and applied only on approval, with its `policy-change` decision, a waiting board task
-re-gated by the board's next sweep; a rejection that changes nothing; a restart that keeps the
-applied set, a changed configuration that refuses the queue until it supersedes the stored set; a
-client token refused; proposals the load-time or version rules refuse; a change the queue proposed
-itself, shown with its origin and applied only on the operator's approval; and, with a browser,
-the policy page's diff, a proposal, its queue entry, and its approval, the policy edited as a
-form (each mode, the classes that always ask fixed, commands, expiry, batch, the JSON following,
-the queue's refusal shown), and a queue entry that says
-the queue proposed the change, and why.
-[`tests/portfolio.spec.ts`](tests/portfolio.spec.ts) (T253), with a browser, over the same
-composition with two active projects: Home's groups headed by each project's name with its own
-counts, the more urgent first, its cards in the same groups, each project's Reports; the filter by
-a project's name in the address through a reload and Back, and All projects; the Board's All
-projects as counts only, a project's board by its name and by the switcher, in the address; the
-Workers page naming each running step's project; Home, the Board, and Workers within T239's word
-bound at 1280×800; and no page scrolling sideways, every target at least 44 px, at 402 px.
-[`tests/reviews.spec.ts`](tests/reviews.spec.ts) runs the UI over the same composition: a run's
-change, verdicts, and report served to the operator only (a source that cannot read its own named),
-and, with a browser, a review card led by its chips (the change, each check, the verdict), its
-**Accept** and **Send back** then **Details** reached by Tab, and under them what changed (stat, files folded, show all), the verdict,
-the report, the checks not run in warning, and after Accept where the result stands; a workspace-write task's
-review held for the operator past its run's lease, listed with its pending checks, refused to a
-client token, bound to the subject shown, accepted to done; a send-back as another attempt; a
-review that expires `review-expired`; and each required check with its state from the run's
-acceptance (passed and failed with their exit codes only on a record, not run and why, pending;
-never passed without a record), listed on the card, a failed check the board still holds pending
-warned as failed, never as not run (T160).
-[`tests/help.spec.ts`](tests/help.spec.ts), with a browser: Help in the navigation, its sections
-and links, its answers folded (the lifecycle's states, each troubleshooting symptom), the
-glossary's anchors opened and focused by a link (without a token too), its search, each term's
-definition folded until opened, each **?** named and controlling its note, opened and closed by
-keyboard and linked to Help, and the empty states, one short line each.
-[`tests/live.spec.ts`](tests/live.spec.ts): what happened since a time (runs ended, tasks moved,
-requests expired) for the operator only, the Workers that could likely take a start's step, a
-running run's steps, last event, and a stall; and, with a browser, Home's *Since you last looked*
-until marked as seen, a failed run there led by the run page's plain-words reason with the raw
-text folded (T160), the waiting count in the window's title, the start's likely Workers, and a
-running run's page and Board card.
-[`tests/dispatch.spec.ts`](tests/dispatch.spec.ts): `GET dispatch` for the operator only (the
-settings, an ask with its Worker and windows, the bounds, the last pass); and, with a browser,
-Home's *Starts awaiting approval* naming the start with its Worker and quota line, why that Worker
-folded, starting it on **Approve**, and saying when automatic starts are paused, how to resume
-folded (over a resource ledger the harness adds).
-[`tests/projects.spec.ts`](tests/projects.spec.ts): the projects listed with their open tasks; a
-pause and a close refused to a client token, bound to the revision shown; a paused project whose
-ready task the engine does not run and whose proposed task is not gated, resumed and run to done;
-a close refused while a task is in review, then cancelling the open tasks, releasing a claim, and
-withdrawing the requests a waiting task and a pending amendment were on, in the store-backed queue;
-a ready task's run started for the operator's token only, bound to the revision and template
-shown, refused for a task naming no template; and, with a browser, a ready task started from its
-card after its confirmation (moving to Working) and a task naming no template refused with why;
-every page laid out at 600 px (none wider than the screen, the columns stacked with Needs your
-attention first, whole nav links); each project's state as counts and the filter kept in the address; a
-ready card's likely Worker; an accepted result's merge approved by the button on its card, its
-request on Home in words (T141);
-a charter founded from the queue (what approving and denying do, with the
-project's task counts; the approval recorded and reported with its ids; the project active after
-the board's sweep), a pause and a close each made only after its confirmation, and a Cancel that
-moves nothing. [`tests/web-ui.spec.ts`](tests/web-ui.spec.ts) also checks the projects routes
-answer `503` without a board.
+**Tests** run in process, without a browser: the routes over the store-backed composition
+([`tests/store-backed.ts`](tests/store-backed.ts), the board, approval queue, and engine under the
+bundle's default studio policy), each answered to the operator only where it should be, a client
+token refused, and the page's served files (its scale, light and dark, a script that loads nothing
+from another origin): [`tests/web-ui.spec.ts`](tests/web-ui.spec.ts),
+[`tests/layout.spec.ts`](tests/layout.spec.ts), [`tests/policy.spec.ts`](tests/policy.spec.ts),
+[`tests/reviews.spec.ts`](tests/reviews.spec.ts), [`tests/live.spec.ts`](tests/live.spec.ts),
+[`tests/dispatch.spec.ts`](tests/dispatch.spec.ts), and [`tests/projects.spec.ts`](tests/projects.spec.ts).
+What a page shows in a browser (layout, touch targets, keyboard, the phone's safe areas) is checked
+by hand on the [release checklist](../../../docs/validation/release-checklist.md).

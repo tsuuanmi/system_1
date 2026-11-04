@@ -144,12 +144,11 @@ describe('release artifacts (ADR-0026)', () => {
     expect(() => pnpmCommand({ PATH: join(base, 'none') })).toThrow(`pnpm ${pinned} (packageManager in package.json) is not reachable: run this through it, put it on PATH, or install corepack (pnpm: not found; corepack pnpm: 0.34.0)`)
   })
 
-  it('names one supported Node range in engines, the start-up check, and the CI matrix (ADR-0026, CON-2)', () => {
+  it('names one supported Node range in engines and the start-up check, and runs CI on one Node line inside it (ADR-0026, ADR-0085, CON-2)', () => {
     const engines = (JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { engines: { node: string } }).engines.node
     expect(engines).toBe(SUPPORTED_NODE)
-    const matrix = /^\s*node: \[([^\]]*)\]/m.exec(readFileSync(join(root, '.github', 'workflows', 'ci.yml'), 'utf8'))![1]!.split(',').map((v) => v.trim().replace(/'/g, ''))
+    const ci = /^\s*NODE_VERSION: '([^']+)'/m.exec(readFileSync(join(root, '.github', 'workflows', 'ci.yml'), 'utf8'))![1]!
     const floors = SUPPORTED_NODE.match(/\d+\.\d+\.\d+/g)!
-    expect(matrix).toContain(floors[0]) // the floor itself
-    for (const floor of floors) expect(matrix.some((v) => v.split('.')[0] === floor.split('.')[0]), `a CI entry on Node ${floor.split('.')[0]}`).toBe(true)
+    expect(floors.map((floor) => floor.split('.')[0]), `CI's Node ${ci} is a line the range supports`).toContain(ci.split('.')[0])
   })
 })

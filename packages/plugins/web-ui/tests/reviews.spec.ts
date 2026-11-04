@@ -1,14 +1,11 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { SchemaRegistry } from '@tsuuanmi/system-libs'
 import type { WorkChange } from '@tsuuanmi/system-workers-core'
-import { chromium } from 'patchright-core'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
-import { headlessIt, headlessLaunchOptions } from '../../browser-patchright/tests/support.ts'
 import type { ArtifactRef } from '@tsuuanmi/system-board-core'
 import { activeProject } from '../../workflow/conformance/workflow.ts'
 import { acceptanceOf, checkStates, requiredChecks } from '../src/index.ts'
-import { boot, bundlePolicies, OPERATOR, reviewed } from './store-backed.ts'
-import { decisionsIn } from './wording.ts'
+import { boot, bundlePolicies, reviewed } from './store-backed.ts'
 
 // End to end over the store-backed board, approval queue, and engine, under the bundle's own
 // default studio policy, with the operator's verdicts through the web UI's API. Only Worker
@@ -326,170 +323,6 @@ describe('web UI: what the operator reads before a review verdict (T122)', () =>
     expect(assessments.moreAtLeast).toBeUndefined()
   })
 
-  headlessIt('reads a review that failed once per run and result: the 5-second refresh never reads it again, the operator\'s Read it again does (T128a)', async () => {
-    const booted = await boot()
-    const { ctx } = booted
-    await activeProject(ctx)
-    await reviewed(ctx, 'Keep the rate-limit header')
-    // The review read fails as a whole: the server cannot list the run's verdicts.
-    const artifacts = ctx.artifacts as unknown as { list: (filter?: { kind?: string }) => unknown[] }
-    const list = artifacts.list.bind(artifacts)
-    let reads = 0
-    artifacts.list = (filter) => {
-      if (filter?.kind !== 'assessment') return list(filter)
-      reads++
-      throw new Error('the ledger is busy')
-    }
-    onTestFinished(() => void (artifacts.list = list))
-    const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch(headlessLaunchOptions())
-    onTestFinished(() => browser.close())
-    const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
-    await page.goto(`${origin}/ui/#token=${OPERATOR}`)
-    const card = page.getByRole('region', { name: 'Reviews' }).getByRole('article', { name: 'Keep the rate-limit header' })
-    await expect.poll(() => card.getByText(/What the run changed and what its steps said could not be read/).count(), { timeout: 15_000 }).toBe(1)
-    expect(reads).toBe(1)
-    // Two refreshes later, still read once.
-    await new Promise((resolve) => setTimeout(resolve, 11_000))
-    expect(reads).toBe(1)
-    expect(await card.getByText(/could not be read/).count()).toBe(1)
-    await card.getByRole('button', { name: 'Read it again' }).click()
-    await expect.poll(() => reads, { timeout: 15_000 }).toBe(2)
-  }, 90_000)
-
-  headlessIt('shows a review card with what changed (the stat, each file folded, a long one with show all), the reviewer\'s verdict, the run\'s report, and the checks not run in warning; after Accept, where the result stands on its way in (T122, ADR-0060)', async () => {
-    const booted = await boot()
-    const { ctx } = booted
-    await activeProject(ctx)
-    const { task, run } = await reviewed(ctx, 'Keep the rate-limit header')
-    changes(ctx, run.runId)
-    assessment(ctx, run.runId)
-    const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch(headlessLaunchOptions())
-    onTestFinished(() => browser.close())
-    const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
-    await page.goto(`${origin}/ui/#token=${OPERATOR}`)
-    const card = page.getByRole('region', { name: 'Reviews' }).getByRole('article', { name: 'Keep the rate-limit header' })
-    await expect.poll(() => card.getByText('What changed').count()).toBe(1)
-    // First, as chips (T186): the change in numbers, each required check, and the reviewer's verdict; then two short buttons.
-    expect(await card.locator('.change-stat').innerText()).toBe('3 files +251 −1')
-    expect(await card.getByRole('list', { name: 'Required checks' }).innerText()).toBe('tests: ▲ Pending\nlint: ▲ Pending')
-    expect(await card.getByRole('list', { name: 'Reviewers\' verdicts' }).innerText()).toBe('● Approved · w:standard')
-    expect(await card.locator(':scope > .actions').getByRole('button').allInnerTexts()).toEqual(['Accept', 'Send back'])
-    // Its title, then one line of context (T239): when it expires; its project is its group's heading on Home, so the line
-    // does not say it again (T256), and it is under its Details with what no response does.
-    expect(await card.locator('.line').innerText()).toBe('Keep the rate-limit header')
-    expect(await card.locator('.meta').innerText()).toMatch(/^Expires in .+$/)
-    expect(await page.getByRole('region', { name: 'Project project p1', exact: true }).getByRole('article', { name: 'Keep the rate-limit header' }).count()).toBe(1)
-    expect(await card.locator('details.card-details').textContent()).toContain('project project p1 · task ')
-    expect(await card.locator('details.card-details').textContent()).toContain('No response: it waits for input')
-    // The long texts are under one Details, closed by default: the diff, the findings, the report, why each check is pending.
-    expect(await card.locator('details.card-details').getAttribute('open')).toBeNull()
-    for (const folded of ['The header name is matched case-sensitively', 'reported this, in its own words', 'the run recorded no result of it']) expect(await card.innerText(), folded).not.toContain(folded)
-    // Keyboard: Tab from the card reaches Accept, then Send back, then its Details.
-    await card.focus()
-    const order: string[] = []
-    for (let i = 0; i < 20 && !order.includes('Details'); i++) {
-      await page.keyboard.press('Tab')
-      order.push(await page.evaluate(() => (document.activeElement as HTMLElement | null)?.textContent ?? ''))
-    }
-    expect(order.filter((t) => ['Accept', 'Send back', 'Details'].includes(t))).toEqual(['Accept', 'Send back', 'Details'])
-    await card.getByText('Details', { exact: true }).click()
-    expect(await card.innerText()).toContain('tests: ▲ Pending — the run recorded no result of it')
-    expect(await card.innerText()).toContain('lint: ▲ Pending — the run recorded no result of it')
-    const change = card.getByRole('group', { name: `Change on system/run/${run.runId}` })
-    expect(await change.locator('.stat').innerText()).toBe(`3 files changed +251 −1 · on system/run/${run.runId}, against main at aaaaaaaa…`)
-    // Each file folded: opened, its diff in lines; a long one shows its first 200 lines, then all.
-    expect(await change.innerText()).not.toContain('return { limit, header }')
-    await change.locator('summary', { hasText: 'src/limits.ts' }).click()
-    expect((await change.locator('pre.diff .add').first().innerText()).trimEnd()).toBe('+  return { limit, header }')
-    expect((await change.locator('pre.diff .del').first().innerText()).trimEnd()).toBe('-  return { limit }')
-    await change.locator('summary', { hasText: 'tests/many.spec.ts' }).click()
-    const long = change.locator('li', { hasText: 'tests/many.spec.ts' })
-    expect(await long.innerText()).not.toContain('+line 250')
-    await long.getByRole('button', { name: 'Show all 251 lines' }).click()
-    expect(await long.innerText()).toContain('+line 250')
-    expect(await change.locator('li', { hasText: 'assets/logo.png' }).innerText()).toContain('binary')
-    // The reviewer's verdict and the run's report, next to the verdict buttons; the checks not run in warning.
-    expect(await card.innerText()).toContain('Approved by the review at review:1 (w:standard)')
-    expect(await card.innerText()).toContain('The header name is matched case-sensitively (src/limits.ts)')
-    expect(await card.innerText()).toContain('The run\'s last step, solo, reported this, in its own words:')
-    // Each required check with its state (ADR-0063, T160): the run recorded neither, so neither reads as passed.
-    const required = card.getByRole('list', { name: 'Each required check' })
-    expect(await required.innerText()).toBe('tests: ▲ Pending — the run recorded no result of it\nlint: ▲ Pending — the run recorded no result of it')
-    expect(await card.innerText()).not.toContain('Every check the policy requires passed')
-    const pending = card.locator('p.pending-checks')
-    expect(await pending.innerText()).toMatch(/^Checks not run: tests, lint\. Accepting counts them as passed — run them first\./)
-    const wait = await page.evaluate(() => { const probe = document.createElement('span'); probe.style.color = 'var(--wait)'; document.body.append(probe); const color = getComputedStyle(probe).color; probe.remove(); return color })
-    expect(await pending.evaluate((p) => getComputedStyle(p).color)).toBe(wait)
-    // A review's verdicts are Accept / Send back, what each does their accessible description, said beside them (T191).
-    expect(await decisionsIn(card)).toEqual([
-      { label: 'Accept', description: 'marks it done' },
-      { label: 'Send back', description: 'sends it back for another attempt, if it has one left' }])
-    // Said as each button's tooltip (T239), on hover and on keyboard focus, not as text beside it.
-    expect(await card.locator('.actions').first().innerText()).toMatch(/^Accept\s+Send back$/)
-    await card.getByRole('button', { name: 'Accept', exact: true }).click()
-    await expect.poll(async () => (await ctx.board.task(task.taskId))?.state).toBe('done')
-    // Where the accepted result stands (ADR-0060), as its landing moves: committed on its branch, then its merge asked, linked.
-    const landing = (value: Record<string, unknown>) => ctx.store.db.prepare('UPDATE workflow_tasks SET landing = ? WHERE run_id = ?').run(JSON.stringify({ branch: `system/run/${run.runId}`, at: new Date().toISOString(), ...value }), run.runId)
-    landing({ state: 'committed', head: 'b'.repeat(40), base: { branch: 'main', sha: 'a'.repeat(40) } })
-    const accepted = page.getByRole('region', { name: 'Accepted, on their way in' }).getByRole('article', { name: 'Accepted: Keep the rate-limit header' })
-    await expect.poll(() => accepted.count(), { timeout: 15_000 }).toBe(1)
-    expect(await accepted.innerText()).toContain(`Accepted and committed on system/run/${run.runId} as bbbbbbbb…; its merge request comes next`)
-    landing({ state: 'asked', head: 'b'.repeat(40), base: { branch: 'main', sha: 'a'.repeat(40) }, requestId: 'apr-merge-1' })
-    await expect.poll(() => accepted.innerText(), { timeout: 15_000 }).toContain('Accepted — waiting to merge into main: approve')
-    expect(await accepted.getByRole('link', { name: 'approve', exact: true }).getAttribute('href')).toBe('/ui/?request=apr-merge-1')
-    // The run's page shows the same change and where it stands.
-    await accepted.getByRole('link', { name: 'open its run' }).click()
-    const panel = page.getByRole('region', { name: 'Changes and reviews' })
-    await expect.poll(() => panel.count()).toBe(1)
-    // Where it stands is said once, under What happened, in the run's own words (T141).
-    const happened = page.getByRole('region', { name: 'What happened' })
-    expect(await happened.innerText()).toContain('Accepted — waiting to merge into main: approve')
-    expect(await panel.innerText()).not.toContain('Accepted —')
-    expect(await panel.innerText()).toContain('3 files changed +251 −1')
-    landing({ state: 'merged', head: 'b'.repeat(40), base: { branch: 'main', sha: 'a'.repeat(40) }, commit: 'c'.repeat(40) })
-    await page.goto(`${origin}/ui/`)
-    await expect.poll(() => page.getByRole('heading', { name: 'Reviews' }).count()).toBe(1)
-    expect(await page.getByRole('region', { name: 'Accepted, on their way in' }).count()).toBe(0)
-  }, 90_000)
-
-  headlessIt('says a required check the run recorded as failed, and the board still holds pending, failed — never also not run (T160)', async () => {
-    const booted = await boot()
-    const { ctx } = booted
-    await activeProject(ctx)
-    const { task } = await reviewed(ctx, 'Keep the retry budget')
-    expect(task.waiting?.pendingChecks).toEqual(['tests', 'lint'])
-    // The acceptance the board's hold names first records tests failed with exit code 1; lint it did not record.
-    const store = ctx.artifacts as unknown as { get: (ref: string) => { body?: unknown } | undefined }
-    const get = store.get.bind(store)
-    const hold = get(task.lastDecision!)?.body as { inputs?: string[] }
-    const acceptanceRef = [task.lastDecision!, ...(hold.inputs ?? [])].find((ref) => (get(ref)?.body as { decisionType?: string } | undefined)?.decisionType === 'acceptance')!
-    store.get = (ref) => {
-      const found = get(ref)
-      if (ref !== acceptanceRef || !found) return found
-      const body = found.body as { outcome: { detail?: Record<string, unknown> } }
-      return { ...found, body: { ...body, outcome: { ...body.outcome, detail: { ...body.outcome.detail,
-        checks: { tests: false }, checkRun: { asked: ['tests'], source: 'agents', outcome: 'checked', results: [{ check: 'tests', outcome: 'failed', exitCode: 1 }] } } } } }
-    }
-    onTestFinished(() => void (store.get = get))
-    const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch(headlessLaunchOptions())
-    onTestFinished(() => browser.close())
-    const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
-    await page.goto(`${origin}/ui/#token=${OPERATOR}`)
-    const card = page.getByRole('region', { name: 'Reviews' }).getByRole('article', { name: 'Keep the retry budget' })
-    // Each check a chip first, a failure with its exit code (T186); why one is pending under the card's Details.
-    const required = card.getByRole('list', { name: 'Required checks' })
-    await expect.poll(() => required.count(), { timeout: 15_000 }).toBe(1)
-    expect(await required.innerText()).toBe('tests: ■ Failed · exit code 1\nlint: ▲ Pending')
-    await card.getByText('Details', { exact: true }).click()
-    expect(await card.getByRole('list', { name: 'Each required check' }).innerText()).toBe('tests: ■ Failed · exit code 1\nlint: ▲ Pending — the run recorded no result of it')
-    const pending = card.locator('p.pending-checks')
-    expect(await pending.innerText()).toMatch(/^Checks that failed: tests\. Checks not run: lint\. Accepting counts them as passed — fix the failed ones and run the others first\./)
-    expect(await pending.innerText()).not.toMatch(/not run: [^.]*tests/)
-  }, 90_000)
-
   /** A review held by the auto-accept rule: its acceptance records tests and lint passed, tests without its browser tests (T255). */
   const unrunReview = async (): Promise<Awaited<ReturnType<typeof boot>>> => {
     const booted = await boot()
@@ -523,22 +356,4 @@ describe('web UI: what the operator reads before a review verdict (T122)', () =>
       { check: 'lint', state: 'passed', exitCode: 0 },
     ] })
   })
-
-  headlessIt('says a review whose checks passed without their browser tests: checks passed, browser tests not run, with the check and what did not run (T247, T255)', async () => {
-    const { ctx } = await unrunReview()
-    const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch(headlessLaunchOptions())
-    onTestFinished(() => browser.close())
-    const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
-    await page.goto(`${origin}/ui/#token=${OPERATOR}`)
-    const card = page.getByRole('region', { name: 'Reviews' }).getByRole('article', { name: 'Keep the header test' })
-    const required = card.getByRole('list', { name: 'Required checks' })
-    await expect.poll(() => required.count(), { timeout: 15_000 }).toBe(1)
-    expect(await required.innerText()).toBe('tests: ▲ Passed, browser tests not run · exit code 0\nlint: ● Passed · exit code 0')
-    const unrun = card.locator('p.unrun-tests')
-    expect(await unrun.innerText()).toMatch(/^Checks passed, browser tests not run: tests \(its browser tests \(12 browser tests skipped: no usable Chrome\) did not run\)\. Their pass says nothing of those tests, so the result was not accepted automatically/)
-    expect(await card.locator('p.pending-checks').count()).toBe(0)
-    await card.getByText('Details', { exact: true }).click()
-    expect(await card.getByRole('list', { name: 'Each required check' }).innerText()).toBe('tests: ▲ Passed, browser tests not run · exit code 0 — its browser tests (12 browser tests skipped: no usable Chrome) did not run\nlint: ● Passed · exit code 0')
-  }, 90_000)
 })

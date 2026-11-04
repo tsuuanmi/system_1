@@ -511,7 +511,7 @@ worktreeSetup:
 - **Tests that did not run, as the command reports them:** a line `browser-tests-not-run: <detail>` in the same file says its browser tests were skipped (no usable
   browser in the confinement). The check keeps its outcome (`passed` or `failed`); its answer carries the reason as `notRun`, and the engine adds to the acceptance's
   reasons that the outcome says nothing of those tests, so a review never reads their absence as a pass. The repository's suite writes the line from its reporter and
-  fails the run when it cannot ([testing](../engineering/testing.md#real-browser-tests-in-a-workers-confinement)).
+  fails the run when it cannot ([testing](../engineering/testing.md#real-display-and-browser-tests)).
 - **What counts:** exit 0 is `passed` and any other code `failed`, only when the command said it started and the tree, captured
   again after the command, is still the subject. A tree that changed anyway is an `error` and later checks are not run. A timeout or a signal is an `error`.
 - **Stored per check, reused, never re-run** (INV-4): each check that ran is kept in `agent_check_runs`, keyed by the workflow run, worktree, subject, check,
@@ -565,7 +565,7 @@ worktreeSetup:
   build, bound back read-only and named by `SYSTEM_BROWSERS_DIR`, set with `--setenv` since a child's `DSH_HOME` is scrubbed). Chrome starts without its own
   setuid or user-namespace sandbox (Patchright's `--no-sandbox`), because the confinement isolates it already. `/dev/shm` is a private tmpfs, and the tests give
   Chrome its own XDG directories in the private `/tmp`. Where no Chrome can run, each skipped test names why, and a check reports
-  it ([a run's checks](#a-runs-checks); [testing](../engineering/testing.md#real-browser-tests-in-a-workers-confinement)).
+  it ([a run's checks](#a-runs-checks); [testing](../engineering/testing.md#real-display-and-browser-tests)).
 - **A browser in a Worker's own tool call.** A writing run's commands run inside a second layer, the runtime's command sandbox,
   which the read confinement does not open: Claude Code writes only its `allowWrite` paths, Codex its writable roots.
   `toolSandboxAllowances` (agent-runtime-core) gives that layer what a browser test needs: the managed Chrome

@@ -1,12 +1,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { PoolConfig } from '@tsuuanmi/system-resources-core'
-import { chromium } from 'patchright-core'
-import { describe, expect, it, onTestFinished, vi } from 'vitest'
-import { headlessIt, headlessLaunchOptions } from '../../browser-patchright/tests/support.ts'
+import { describe, expect, it, vi } from 'vitest'
 import { worker } from '../../../workers-core/conformance/workers.ts'
 import { activeProject, readyTask } from '../../workflow/conformance/workflow.ts'
-import { boot, OPERATOR } from './store-backed.ts'
-import { decisionsIn } from './wording.ts'
+import { boot } from './store-backed.ts'
 
 // Home's "Starts awaiting approval" (ADR-0064, PROP-0014 D1) over the store-backed board, approval queue,
 // resource ledger, and engine, under the bundle's own studio policy (dispatch takes its default: ask).
@@ -44,60 +41,4 @@ describe('web UI: the starts System proposes, on Home (ADR-0064)', () => {
     expect((read.value['bounds'] as { hour?: unknown }).hour).toEqual({ used: 0, max: 6 })
     expect((await call('dispatch', {})).status).toBe(405)
   })
-
-  headlessIt('lists each proposed start under Starts awaiting approval with its Worker and quota line, why that Worker folded, starts it on Approve, and says when dispatch is paused', async () => {
-    const { ctx, workers } = await boot({ pools: POOLS })
-    await activeProject(ctx)
-    await freeWorker(ctx, workers, 12)
-    workers.reply = () => 'hold'
-    const task = await readyTask(ctx, 'Write the release notes', { template: 'solo' })
-    await ctx.workflow.sweepDispatch()
-    const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch(headlessLaunchOptions())
-    onTestFinished(() => browser.close())
-    const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
-    await page.goto(`${origin}/ui/#token=${OPERATOR}`)
-    const go = page.getByRole('region', { name: 'Starts awaiting approval' })
-    await expect.poll(() => go.innerText()).toContain('Write the release notes · attempt 1 · Conformance')
-    const said = await go.innerText()
-    expect(said).toMatch(/5 h · used 12 % · reserve 20 % · resets /)
-    expect(said).toMatch(/Expires in .+ · No response: denied/)
-    // Why that Worker, when its quota was read, and its project: folded under the start (T171).
-    expect(said).toContain('Why this Worker?')
-    expect(said).not.toContain('tier standard, agent-plan, known')
-    expect(await go.textContent()).toMatch(/Why this Worker\?tier standard, agent-plan, known/)
-    // The request itself is in the queue too, described as a start: Approve / Deny there and here, each
-    // described by what it does (T191).
-    const card = page.getByRole('region', { name: 'Approval queue' }).getByRole('article').filter({ hasText: 'Write the release notes' })
-    // A Deny is final for the attempt (T197): its accessible description says it is not asked again, here and on the card.
-    const deny = 'does not start it, and this attempt is not asked again'
-    expect(await decisionsIn(card)).toEqual([{ label: 'Approve', description: 'starts it' }, { label: 'Deny', description: deny }])
-    const start = go.getByRole('listitem', { name: 'Start of Write the release notes' })
-    const here = await decisionsIn(start)
-    expect(here.map((d) => d.label)).toEqual(['Approve', 'Deny'])
-    expect(here[0]!.description).toMatch(/^starts it on \S/)
-    expect(here[1]!.description).toBe(deny)
-    // And a short note in sight under the start says so too, naming the attempt.
-    expect(await start.innerText()).toContain('Deny is final for attempt 1: it is not asked again.')
-    expect(await start.locator('.deny-note').isVisible()).toBe(true)
-    await start.getByRole('button', { name: 'Approve', exact: true }).click()
-    await vi.waitFor(async () => expect((await ctx.approvals.list({ states: ['approved'] })).filter((r) => r.action.class === 'dispatch')).toHaveLength(1), { timeout: 15_000 })
-    await ctx.workflow.sweepDispatch()
-    await vi.waitFor(() => expect(workers.started.map((s) => s.worker)).toEqual(['w:max']), { timeout: 15_000 })
-    expect((await ctx.board.task(task.taskId))!.state).toBe('running')
-    // Started by itself (PROP-0014 D2, T256): a row of its table at the bottom of Home, the task, its run's state as a chip,
-    // and the Worker in sight; how it was let start folded into the row.
-    await page.reload()
-    const started = page.getByRole('region', { name: 'Started by itself' })
-    await expect.poll(() => started.innerText()).toContain('Write the release notes')
-    const row = started.getByRole('row', { name: 'Started by itself: Write the release notes' })
-    expect(await row.locator('td').allInnerTexts()).toEqual([expect.stringMatching(/^Write the release notes\s+attempt 1$/), '◆ running', expect.any(String), expect.any(String), expect.stringMatching(/ ago$/)])
-    expect(await row.textContent()).toMatch(/attempt 1 · running · .+ · on your approval · /)
-    ctx.workflow.pauseDispatch('a quiet afternoon')
-    await page.reload()
-    await expect.poll(() => go.innerText()).toMatch(/Automatic starts paused · a quiet afternoon · since /)
-    // How to resume is folded beside it.
-    expect(await go.innerText()).toContain('How to resume')
-    expect(await go.textContent()).toContain('System proposes no start until you resume it: system dispatch resume.')
-  }, 90_000)
 })

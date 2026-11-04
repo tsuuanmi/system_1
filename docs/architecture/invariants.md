@@ -84,7 +84,9 @@ No model, vendor, agent, client, browser engine, or store is reachable except
 through a seam or a public protocol. Routing, teams, workflows, and profiles name
 capabilities, never tools. A second provider must be plausible for every seam,
 and every seam's conformance suite runs against a fake
-([ADR-0008](../decisions/adr/0008-tool-agnostic.md)).
+([ADR-0008](../decisions/adr/0008-tool-agnostic.md)); a seam whose provider needs a
+real browser is checked on the release checklist instead
+([ADR-0084](../decisions/adr/0084-browser-backed-tests-are-release-checks.md)).
 
 ### INV-12 Data egress is explicit
 

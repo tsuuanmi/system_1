@@ -859,7 +859,7 @@ const LAUNCHER = [
 if (!LAUNCHER.includes(`indexOf('${LAUNCHED}')`) || !LAUNCHER.includes(`say('${STARTED}')`)) throw new Error('agent-workers: the check launcher and its constants disagree')
 
 /** Node's arguments that start `argv` through the check {@link LAUNCHER}, as {@link confineIn} runs a check's command. */
-export const launcherArgs = (argv: readonly string[]): string[] => ['-e', LAUNCHER, '--', LAUNCHED, ...argv]
+const launcherArgs = (argv: readonly string[]): string[] => ['-e', LAUNCHER, '--', LAUNCHED, ...argv]
 
 /**
  * The confinement a repository's commands run in, in its worktree `worktree` (its real path): the
@@ -1051,7 +1051,7 @@ export interface Ended {
  * host's, not the check's (./checks.ts); a line `browser-tests-not-run: <detail>`
  * ({@link BROWSER_TESTS_NOT_RUN}) says what of it did not run. Writing either never makes a check pass.
  */
-export const REPORT_PATH = 'SYSTEM_CHECK_REPORT_PATH'
+const REPORT_PATH = 'SYSTEM_CHECK_REPORT_PATH'
 /** The report of a nested bubblewrap refused inside a check's confinement ({@link REPORT_PATH}). */
 export const NESTED_REFUSED = 'nested-confinement-refused'
 /**
@@ -1073,7 +1073,7 @@ const REPORT_BYTES = 4096
  * not reopen a pipe's socket). Being a mount point inside, it cannot be replaced there, only written;
  * the host reads it once the command ended ({@link runBounded}).
  */
-export function reportChannel(dir: string, confinement: Confinement): { path: string; view: { source: string; path: string; writable: true }; confinement: Confinement } {
+function reportChannel(dir: string, confinement: Confinement): { path: string; view: { source: string; path: string; writable: true }; confinement: Confinement } {
   const path = join(dir, 'report')
   closeSync(openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600))
   return { path, view: { source: path, path, writable: true }, confinement: { ...confinement, env: { ...confinement.env, [REPORT_PATH]: path } } }

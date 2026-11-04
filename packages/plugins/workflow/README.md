@@ -1019,9 +1019,7 @@ second execution path (INV-1).
 - **Tests** beyond the suite: one or a few scenarios per behavior that guards an invariant or a
   gate (fail closed, restart reconciliation, exact subject, bounds, recorded decisions, one
   writer), end to end over the store-backed board and approval queue where it matters. The
-  required checks of a run are also tested in
-  [`profile-software-development`'s checks tests](../profile-software-development/tests/checks.spec.ts),
-  and the crash suite kills the dispatch pass after its request and after its run's record
+  crash suite kills the dispatch pass after its request and after its run's record
   ([`dispatch.crash.ts`](../../system-bundle/tests/crash/dispatch.crash.ts)).
 
 ## Source layout
