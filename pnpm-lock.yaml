@@ -838,8 +838,8 @@ importers:
         specifier: 13.0.5
         version: 13.0.5
       '@secretlint/secretlint-rule-preset-recommend':
-        specifier: 13.0.5
-        version: 13.0.5
+        specifier: 13.1.0
+        version: 13.1.0
       '@tsuuanmi/system-ledger-core':
         specifier: workspace:*
         version: link:../../ledger-core
@@ -5676,8 +5676,8 @@ packages:
   '@secretlint/profiler@13.0.5':
     resolution: {integrity: sha512-FAQIuD+sHgBqUl3zf4PN/zPW4aMDo5Ou9z3lMqL7vWSDvujhqwqolyLbdK/FKsmpdE8L87vfiabL2XvWqufZ7Q==}
 
-  '@secretlint/secretlint-rule-preset-recommend@13.0.5':
-    resolution: {integrity: sha512-dxOmTLf1w7I6rQEFPL8Hkdz6dR1FQXF0bzmTahH/Wyezy89TMPLL+8LbZ2YD8trkmYBnS37zUmOsZT6rMVftKQ==}
+  '@secretlint/secretlint-rule-preset-recommend@13.1.0':
+    resolution: {integrity: sha512-dPnplMyjJYpVCJDNTjpUA8c/AfoHbWANJJJWKroK50DGGhAB4Oumzk+XinBMyMMAwgOsjU9CB9lUHXDvObMVCg==}
     engines: {node: '>=22.0.0'}
 
   '@secretlint/types@13.0.5':
@@ -11358,7 +11358,7 @@ snapshots:
 
   '@secretlint/profiler@13.0.5': {}
 
-  '@secretlint/secretlint-rule-preset-recommend@13.0.5': {}
+  '@secretlint/secretlint-rule-preset-recommend@13.1.0': {}
 
   '@secretlint/types@13.0.5': {}
 
