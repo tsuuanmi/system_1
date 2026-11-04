@@ -363,13 +363,15 @@ The rule:
 
 ## CI gates
 
-[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) runs on every pull request, every
-push to `main` or `dev` (every merge; `dev` is where the lead integrates batches and the live install
-follows), nightly on `main`, and on each release tag (the
-[release workflow](releasing.md) calls it), on Node 24.18.1 (the floor), the latest 24, and the
-latest 26, with a real Xvfb, TigerVNC, bubblewrap, and Chrome installed. A pull request runs
-`pnpm check` and its affected [test groups](#test-groups); everything else runs the full gate.
-The job keeps one name on every trigger, so a required check names it whatever ran. Each gate is
+[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) runs the full gate only when work
+is merged: on every push to `dev` (every merge into it; `dev` is where the lead integrates batches
+and the live install follows), on each release tag (the [release workflow](releasing.md) calls
+it), and by hand (`workflow_dispatch`). A commit or a pull request runs none: run `pnpm check` and
+the affected [test groups](#test-groups) locally before merging. It runs on Node 24.18.1 (the
+floor), the latest 24, and the latest 26, with a real Xvfb, TigerVNC, bubblewrap, and Chrome
+installed. `main` takes `dev` only through a pull request, whose head is `dev`'s tip, so the
+checks `main`'s ruleset requires are the ones that ran on `dev`. The job keeps one name on every
+trigger, because the ruleset requires it by name. Each gate is
 a root [`package.json`](../../package.json) script:
 
 1. `pnpm check`:
@@ -425,24 +427,22 @@ a root [`package.json`](../../package.json) script:
    The agent read confinement tests run against the real bubblewrap; locally they
    are skipped, with the reason, when `bwrap` is missing or cannot confine a command
    there, and in CI (`SYSTEM_REQUIRE_BWRAP=1`) such a one fails the run (see
-   [running the suite inside a run's check](#running-the-suite-inside-a-runs-check)). On a
-   pull request, `pnpm test:affected --base origin/<its base branch>` instead, with
-   the same environment.
+   [running the suite inside a run's check](#running-the-suite-inside-a-runs-check)).
 3. `pnpm test:e2e`: build, then every `*.e2e.ts`, one file at a time
    ([`vitest.e2e.config.ts`](../../vitest.e2e.config.ts)): boot the shipped
    profile and the `api-first` preset through `dsh`, and upgrade every seeded
-   store fixture. Not on a pull request.
+   store fixture.
 4. `pnpm test:crash`: build, then every `*.crash.ts`, one file at a time
    ([`vitest.crash.config.ts`](../../vitest.crash.config.ts)): the cases of
-   [crash injection](#conventions-adopted-from-dsh). Not on a pull request.
+   [crash injection](#conventions-adopted-from-dsh).
 
 [`.github/workflows/audit.yml`](../../.github/workflows/audit.yml) runs
 `pnpm audit:deps` (no high or critical advisory in a production dependency) once,
-outside the Node matrix, on the same triggers and daily. It fails closed: a
+outside the Node matrix, on every push to `dev` and daily. It fails closed: a
 registry error fails it like an advisory does, so it is never run with
 `--ignore-registry-errors`. The release checklist adds a full audit.
 [`.github/workflows/codeql.yml`](../../.github/workflows/codeql.yml) runs CodeQL's
-`security-extended` queries on the same triggers and weekly.
+`security-extended` queries on every push to `dev` and weekly.
 [`.github/dependabot.yml`](../../.github/dependabot.yml) proposes npm and Action
 updates weekly, each version once it is a week old, except `@deepseek-ai/*`, whose
 one exact pin moves by hand after the conformance and composition suites pass

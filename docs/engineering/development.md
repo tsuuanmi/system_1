@@ -106,7 +106,7 @@ After changing an MCP tool, regenerate its reference from a running profile:
 Work flows through two long-lived branches, `dev` and then `main`:
 
 - **`dev` integrates.** Workers' branches and the lead's batches merge into
-  `dev`. CI runs the full gate on every push to `dev`, as on `main`
+  `dev`. CI runs the full gate on every push to `dev`, and on nothing before the merge
   ([CI gates](testing.md#ci-gates)).
 - **The live install follows `dev`.** The operator updates it to a `dev` commit
   whose CI passed ([runbook](../operations/runbooks.md#update-the-live-install-from-e218ae7-to-the-base-release)).
