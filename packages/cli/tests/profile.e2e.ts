@@ -22,7 +22,7 @@ let child: ChildProcess | undefined
 // alternative digest provider, which the operator swaps in for `digest` (Base exit criterion 6).
 // The rows the default composition has but turns off, and the DSH rows, whose packages ship no plugin
 // manifest, as the plugin host's configuration in the bundle allows.
-const OFF_ROWS = ['runtime-codex-sdk', 'runtime-acp', 'runtime-antigravity-cli', 'digest-extractive', 'notify', 'profile-software-development', 'gateway-anthropic', 'gateway-responses']
+const OFF_ROWS = ['workers-fake', 'runtime-codex-sdk', 'runtime-acp', 'runtime-antigravity-cli', 'digest-extractive', 'notify', 'decisions', 'profile-software-development', 'gateway-anthropic', 'gateway-responses']
 const DSH_PACKAGES = ['@deepseek-ai/cordis-plugin-timer', '@deepseek-ai/dsh-host-webserver', '@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-llm-pi-ai']
 /** The operator's patch that swaps the digest provider, as the bundle's evolution test applies it to the bundle's rows. */
 const SWAP_PATCH = fileURLToPath(new URL('../../system-bundle/tests/evolution/swap-digests.yml', import.meta.url))
@@ -34,13 +34,30 @@ type Plugin = {
 /** The plugins the first boot recorded, which a restart over an unchanged composition must leave as they are. */
 let firstBoot: Plugin[] = []
 
-const ALLOWED_ROWS = ['timer', 'credentials', 'webserver', 'store', 'event-log', 'leases', 'artifacts', 'plugin-host', 'resources', 'approvals', 'accounts', 'turn-receipts', 'display', 'browser', 'providers', 'provider-chatgpt-web', 'provider-gemini-web', 'login', 'egress', 'workers', 'turns', 'agent-runtimes', 'runtime-claude-agent-sdk', 'agent-workers', 'llm', 'llm-pi-ai', 'models', 'worker-sessions', 'landing-local', 'workflow', 'board', 'digest', 'report', 'profile-scientific-research', 'web-ui', 'mcp-server']
+const ALLOWED_ROWS = ['timer', 'credentials', 'webserver', 'store', 'event-log', 'leases', 'artifacts', 'plugin-host', 'resources', 'approvals', 'accounts', 'turn-receipts', 'display', 'browser', 'providers', 'provider-chatgpt-web', 'provider-gemini-web', 'login', 'egress', 'workers', 'turns', 'agent-runtimes', 'runtime-claude-agent-sdk', 'agent-workers', 'llm', 'llm-pi-ai', 'models', 'worker-sessions', 'landing-local', 'workflow', 'board', 'digest', 'report', 'lead-inbox', 'profile-scientific-research', 'web-ui', 'mcp-server']
 
 async function client2(url: string, token: string): Promise<Client> {
   const client = new Client({ name: 'e2e-2', version: '0' })
   await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { authorization: `Bearer ${token}` } } }) as unknown as Transport)
   return client
 }
+
+/**
+ * `status` once the composition has settled: rows mount after the discovery file is written (a
+ * row that injects the workflow engine waits for it), so a read is polled until `ready` holds or
+ * the bound passes, and the last read is returned either way for the assertions to judge.
+ */
+async function settledStatus(client: Client, args: Record<string, unknown>, ready: (status: Record<string, unknown>) => boolean, timeoutMs = 30_000): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const status = (await client.callTool({ name: 'status', arguments: args })).structuredContent as Record<string, unknown>
+    if (ready(status) || Date.now() > deadline) return status
+    await sleep(500)
+  }
+}
+const checkOf = (status: Record<string, unknown>, name: string): { state: string; detail?: string } | undefined =>
+  (status.health as { checks?: Array<{ name: string; state: string; detail?: string }> } | undefined)?.checks?.find((c) => c.name === name)
+const mountedRows = (status: Record<string, unknown>): string[] => ((status.plugins ?? []) as Plugin[]).filter((p) => p.mounted).flatMap((p) => p.rows)
 
 async function waitFor(path: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -139,7 +156,7 @@ describe('system profile (e2e through dsh)', () => {
     const client = new Client({ name: 'e2e', version: '0' })
     const token = readFileSync(tokenFiles.operator).toString('base64url')
     await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { authorization: `Bearer ${token}` } } }) as unknown as Transport)
-    const status = await client.callTool({ name: 'status', arguments: { plugins: true, checks: true } })
+    const status = { structuredContent: await settledStatus(client, { plugins: true, checks: true }, (s) => ALLOWED_ROWS.every((row) => mountedRows(s).includes(row))) }
     expect(status.structuredContent).toMatchObject({ harness: 'system', store: 'ok', kernel: ['store', 'eventLog', 'leases', 'artifacts', 'credentials'], providers: ['chatgpt-web', 'gemini-web'] })
     // The plugin host read every row from the loader and each package's manifest, and recorded each
     // plugin's lifecycle as a decision: a row on is default, a row off candidate (REQ-HOST-7, INV-13).
@@ -173,9 +190,11 @@ describe('system profile (e2e through dsh)', () => {
     }
     const clientTools = await toolsOf('client')
     expect(clientTools).toEqual([
-      'approvals_get', 'approvals_list', 'approvals_policy', 'ask',
-      'board_brief', 'board_cancel', 'board_charter', 'board_claim', 'board_projects', 'board_propose', 'board_task', 'board_tasks', 'board_update',
-      'brainstorm', 'digests_get', 'digests_request', 'dispatch_status', 'dossier_read', 'explain', 'report', 'research', 'resources_pools', 'resources_usage', 'result', 'review', 'roster', 'run', 'session_inbox', 'session_send', 'status', 'usage', 'vote',
+      'approvals_get', 'approvals_list', 'approvals_policy', 'ask', 'board_breaker_reset', 'board_breakers', 'board_brief', 'board_cancel',
+      'board_charter', 'board_claim', 'board_defect', 'board_escape', 'board_projects', 'board_propose', 'board_propose_plan',
+      'board_reopen_review', 'board_task', 'board_tasks', 'board_update', 'brainstorm', 'digests_get', 'digests_request', 'dispatch_status',
+      'dossier_read', 'explain', 'lead_brief', 'lead_digest', 'lead_health', 'lead_inbox', 'metrics', 'report', 'research',
+      'resources_pools', 'resources_usage', 'result', 'review', 'roster', 'run', 'session_inbox', 'session_send', 'status', 'usage', 'vote',
     ])
     // Digests are on (B6): a request names stored artifacts only, and one that names none is refused with nothing done.
     const digester = await client2(url, tokenOf('client'))
@@ -240,7 +259,7 @@ describe('system profile (e2e through dsh)', () => {
     await waitFor(discoveryPath, 60_000)
     const { url, tokenFiles } = JSON.parse(readFileSync(discoveryPath, 'utf8')) as { url: string; tokenFiles: Record<'operator', string> }
     const client = await client2(url, readFileSync(tokenFiles.operator).toString('base64url'))
-    const status = await client.callTool({ name: 'status', arguments: { plugins: true, checks: true } }).finally(() => client.close())
+    const status = { structuredContent: await settledStatus(client, { plugins: true, checks: true }, (s) => !!checkOf(s, 'workers')?.detail?.includes('agent:reviewer')).finally(() => client.close()) }
     expect(status.structuredContent).toMatchObject({ harness: 'system', store: 'ok' })
     const { checks } = (status.structuredContent as { health: { checks: Array<{ name: string; detail?: string }> } }).health
     expect(checks.find((check) => check.name === 'workers')?.detail).toContain('agent:reviewer (unavailable)')
@@ -263,7 +282,7 @@ describe('system profile (e2e through dsh)', () => {
     const { url, tokenFiles } = JSON.parse(readFileSync(discoveryPath, 'utf8')) as { url: string; tokenFiles: Record<'operator', string> }
     const client = await client2(url, readFileSync(tokenFiles.operator).toString('base64url'))
     try {
-      const { plugins } = (await client.callTool({ name: 'status', arguments: { plugins: true } })).structuredContent as { plugins: Plugin[] }
+      const { plugins } = (await settledStatus(client, { plugins: true }, (s) => mountedRows(s).includes('gateway-anthropic'))) as unknown as { plugins: Plugin[] }
       const before = firstBoot.find((p) => p.rows.includes('gateway-anthropic'))!
       const after = plugins.find((p) => p.rows.includes('gateway-anthropic'))!
       expect([before.lifecycle?.state, after.mounted, after.lifecycle?.state]).toEqual(['candidate', true, 'default'])
@@ -288,7 +307,7 @@ describe('system profile (e2e through dsh)', () => {
     const { url, tokenFiles } = JSON.parse(readFileSync(discoveryPath, 'utf8')) as { url: string; tokenFiles: Record<'operator', string> }
     const client = await client2(url, readFileSync(tokenFiles.operator).toString('base64url'))
     try {
-      const { plugins, health } = (await client.callTool({ name: 'status', arguments: { checks: true } })).structuredContent as { plugins: Plugin[]; health: { state: string; checks: Array<{ name: string; state: string; detail: string }> } }
+      const { plugins, health } = (await settledStatus(client, { plugins: true, checks: true }, (s) => ((s.plugins ?? []) as Plugin[]).some((p) => p.findings))) as unknown as { plugins: Plugin[]; health: { state: string; checks: Array<{ name: string; state: string; detail: string }> } }
       const found = plugins.filter((p) => p.findings)
       expect(found.map((p) => [p.name, p.findings!.map((f) => f.kind)])).toEqual(DSH_PACKAGES.map((name) => [name, ['no-manifest']]))
       expect(health.state).toBe('down')
@@ -318,7 +337,7 @@ describe('system profile (e2e through dsh)', () => {
     const { url, tokenFiles } = JSON.parse(readFileSync(discoveryPath, 'utf8')) as { url: string; tokenFiles: Record<'operator' | 'client', string> }
     const operator = await client2(url, readFileSync(tokenFiles.operator).toString('base64url'))
     try {
-      const { plugins, health } = (await operator.callTool({ name: 'status', arguments: { plugins: true, checks: true } })).structuredContent as { plugins: Plugin[]; health: { checks: Array<{ name: string; state: string }> } }
+      const { plugins, health } = (await settledStatus(operator, { plugins: true, checks: true }, (s) => mountedRows(s).includes('digest-extractive'))) as unknown as { plugins: Plugin[]; health: { checks: Array<{ name: string; state: string }> } }
       const of = (name: string): Plugin => plugins.find((p) => p.name === name)!
       expect([of('@tsuuanmi/system-digest').mounted, of('@tsuuanmi/system-digest').lifecycle?.state]).toEqual([false, 'candidate'])
       expect([of('@tsuuanmi/system-digest-extractive').mounted, of('@tsuuanmi/system-digest-extractive').lifecycle?.state]).toEqual([true, 'default'])
@@ -353,7 +372,7 @@ describe('system profile (e2e through dsh)', () => {
     const { url, tokenFiles } = JSON.parse(readFileSync(discoveryPath, 'utf8')) as { url: string; tokenFiles: Record<'operator', string> }
     const client = await client2(url, readFileSync(tokenFiles.operator).toString('base64url'))
     try {
-      const { health } = (await client.callTool({ name: 'status', arguments: {} })).structuredContent as { health: { checks: Array<{ name: string; state: string; detail: string }> } }
+      const { health } = (await settledStatus(client, { checks: true }, (s) => checkOf(s, 'plugins')?.state === 'down')) as unknown as { health: { checks: Array<{ name: string; state: string; detail: string }> } }
       expect(health.checks.find((c) => c.name === 'plugins')).toMatchObject({ state: 'down', detail: expect.stringMatching(/service "digests" has been registered/) })
     } finally {
       await client.close()

@@ -47,14 +47,22 @@ export const BUDGET = {
      * The operator's `hold_steps` (T257: a live update's wait ends at the next step boundary) adds
      * about 400 B (estimated from its text and two arguments, not yet measured): worth it, since an
      * update that cannot end its wait holds every Worker idle.
+     * Measured again on 2026-11-04 (surface.e2e had not run since 2026-10-26): 84 tools, 62,058 B.
+     * What grew, each a feature the lead or the operator uses: the lead's `lead_brief`, `lead_digest`,
+     * `lead_health`, and `lead_inbox` (T320, PROP-0019), `metrics`, the board's `board_breakers`,
+     * `board_breaker_reset`, `board_escape`, `board_defect`, `board_reopen_review`, and
+     * `board_propose_plan`, the operator's `plugin` and `enforce` (T322, ADR-0078),
+     * `live_update_record`, and the agent accounts' tools. `board_propose_plan` repeats
+     * `board_propose`'s task schema (2.8 KB): the first trim to look at.
      */
-    operator: { measured: 45_614, ceiling: 47_200 },
+    operator: { measured: 62_058, ceiling: 68_300 },
     /**
      * Trimmed from 28,013 B to 26,352 (T108); 61 B for the reviews held, as above (T107); 75 B for `checks` (T115);
      * 134 B for `roster`'s `now` (T152); 318 B for `dispatch_status` and the class `dispatch` (T153); about
-     * 450 B for `dossier_read` (T233, estimated as above).
+     * 450 B for `dossier_read` (T233, estimated as above). Measured again on 2026-11-04: 43 tools,
+     * 40,342 B, grown by the lead's and the board's tools named for `operator` above.
      */
-    client: { measured: 26_940, ceiling: 29_000 },
+    client: { measured: 40_342, ceiling: 44_400 },
   },
   /** One tool's entry in `tools/list` (name, description, schemas, `_meta`): the largest tool's ceiling (`board_charter`). */
   tool: { measured: 4_085, ceiling: 4_500 },
