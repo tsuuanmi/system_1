@@ -9,7 +9,7 @@ Quality attribute: QA-10.
 | unit | pure functions such as the reducer, hashing, and reconcile decisions | no I/O |
 | contract | every seam (store, browser, providers, workers, agent runtimes, …) against its conformance suite | every provider, including fakes, passes the same suite ([plugin rules](../architecture/plugin-model.md#plugin-rules)) |
 | composition | the shipped profile loads through `dsh`, validates all plugin configs, and disposes back to quiescence | catches broken `inject` graphs and leaked effects |
-| driver | provider drivers against fake sites built from the live accessibility tree (each driver's `fixtures/`), in a real headed Chrome | UI drift breaks a fixture test, not production |
+| driver | provider drivers in a real browser: a [release check](../validation/release-checklist.md), not a CI test ([ADR-0084](../decisions/adr/0084-browser-backed-tests-are-release-checks.md)); their fake sites (each driver's `fixtures/`) serve the e2e and crash suites | UI drift is seen live (`ui-drift` health) |
 | crash / restart | kill at every reconcile-before-repeat point; assert WAIT, RECOVER, RESUBMIT, or AMBIGUOUS and no duplicate effects | covers INV-4 |
 | concurrency | competing writers and leases; assert stale-generation commits are rejected | covers the fences in [scheduling-and-leases](../design/scheduling-and-leases.md) |
 | client protocol | the gateways and the MCP server against recorded client requests and a scripted provider | streaming, tool round trip, cancel; the real Codex and Claude Code binaries are on the release checklist |
@@ -157,40 +157,38 @@ scenario of the suite, on the same provider, does not stay.
 
 ## Real display and browser tests
 
-`display-virtual` and `browser-patchright` are tested against a real Xvfb and a real
-headed Chrome, not a mocked engine: invisibility, foreground behavior, and the
-absence of automation leaks are properties of the real browser.
+The unit suite holds no test that needs a real browser or Xvfb, and of those that need real
+bubblewrap only the sandbox's own ([ADR-0084](../decisions/adr/0084-browser-backed-tests-are-release-checks.md)).
+What a website driver, the web UI in a browser, or the browser and login plugins do is checked on
+the [release checklist](../validation/release-checklist.md) and in live use. The e2e and crash
+suites still boot the shipped profile, which mounts the display and browser rows, against the
+providers' fake sites (each driver's `fixtures/`).
 
-- A file of tests that each compose the real stack shares one Xvfb:
-  `fileDisplay()` in
+- The gating stays in
   [`browser-patchright/tests/support.ts`](../../packages/plugins/browser-patchright/tests/support.ts)
-  starts it in `beforeAll` and stops it in `afterAll`, and each test mounts it where it would
-  mount `display-virtual`, as a profile's browsers share one display. Each test still launches
-  its own Chrome. The fake passes the display conformance suite, and `display-virtual` itself is
-  tested on its own real Xvfb.
-- A website driver's tests against its fake site are split by theme, one file each, so they run side
-  by side. Each file launches one Chrome on its own Xvfb through `fakeSite()` in the driver's
-  `tests/site.ts`. A test that expects the driver to give up sets that bound small rather than waiting
-  out the production default.
-- The turn runtime's and the workflow engine's browser specs are split by theme the same way, each
-  file on its own Xvfb through its package's `tests/stack.ts`. Those stacks do not pace page opens
-  (the drivers' `pageGapMs` and the runtime's `providerPageGapMs` are 0). They also set the
-  drivers' answer-stable window (`stableMs`) to 300 ms instead of production's 1.5 s, because the
-  fake sites stream a word every 60 ms and then mark the answer done. The drivers' own specs still
-  cover completion on stable text.
-- They need Xvfb and a modern Chrome. The tests choose Chrome with the
-  product's own `discoverChrome` and launch it with the product's arguments.
-  The order is `CHROME_PATH`, then a system Chrome no older than the engine,
-  then the managed build installed by `system browser install`. As a last
-  resort they use the same pinned build in `~/.cache/system-chrome` (`npx
-  @puppeteer/browsers install chrome@<chrome.lock.json buildId> --path
-  ~/.cache/system-chrome`). No root is needed.
-- The remote-login tests also need `x0vncserver` (on PATH, in `X0VNCSERVER`, or
-  TigerVNC's static build under `~/.cache/system-tigervnc`). CI installs
-  `tigervnc-scraping-server`.
-- Locally they are skipped when either is missing. CI sets
-  `SYSTEM_REQUIRE_BROWSER=1`, so a missing browser **fails** the run instead of
-  skipping silently.
+  for those stacks and for a browser test run by hand: `describe.runIf(canRunBrowser)` for a headed
+  Chrome on Xvfb (`fileDisplay()` shares one per file), `headlessIt(name, fn)` for a headless one.
+  Where no Chrome can run, such a test is skipped with `browser tests did not run: <why>`, and
+  `SYSTEM_REQUIRE_BROWSER=1` makes it fail instead. The reporter
+  ([`scripts/browser-skips.ts`](../../scripts/browser-skips.ts)) prints `!!! BROWSER TESTS DID NOT RUN: …`
+  as the run's last line, and in a run's check appends `browser-tests-not-run: <detail>` to the
+  report file at `SYSTEM_CHECK_REPORT_PATH`, so the review knows the pass does not cover them
+  ([a run's checks](../design/agent-runtimes.md#a-runs-checks)).
+- The tests choose Chrome with the product's own `discoverChrome`: `CHROME_PATH`, then a system
+  Chrome no older than the engine, then the managed build (`system browser install`), then the same
+  pinned build in `~/.cache/system-chrome`.
+- The sandbox's tests (`agent-runtime-core`'s confinement, sockets, shells, and workspace reads, and
+  each agent runtime provider's) run under real bubblewrap: `needsBubblewrap()` skips them, with why,
+  where it cannot confine, and `SYSTEM_REQUIRE_BWRAP=1` (CI) makes them fail instead. A test of a
+  confinement's mask puts the masked path where the child sees it: under a directory the
+  confinement binds back.
+- **vite writes two places in the worktree:** its cache (`node_modules/.vite`) and its bundled
+  configuration (`node_modules/.vite-temp`). A check sees the worktree read-only, so a repository
+  whose checks run vitest names both in `checkScratch`, or vitest fails to start (`EROFS`).
+- **A sandbox's placeholders are not changes.** Inside a Worker's tool sandbox git lists the empty
+  placeholders the sandbox mounts in the worktree (`.bashrc`, `.gitconfig`, `.claude/settings.json`,
+  …) as untracked files. `pnpm test:affected` leaves an empty one out of the changed files
+  (`sandboxPlaceholder`), so it does not run the whole suite for them; one with content counts.
 
 ### A loaded host
 
@@ -205,60 +203,6 @@ absence of automation leaks are properties of the real browser.
   [`provider-core/conformance/time.ts`](../../packages/provider-core/conformance/time.ts). It scales a
   wait only, never an assertion: a bound a test asserts on is the product's own and is not loosened.
   On a shared host at a load of thousands, set it to 3 or more.
-
-### Real-browser tests in a Worker's confinement
-
-The web UI's browser tests run a **headless** Chrome: they need Chrome, not Xvfb, and they run
-inside a Worker's confinement as on the host. What makes that so:
-
-- **Chrome is found there.** `DSH_HOME` is scrubbed inside the confinement, so `findTestChrome` in
-  [`support.ts`](../../packages/plugins/browser-patchright/tests/support.ts) looks for the managed build
-  and the developer cache in the account's own home (the password database's, not `HOME`). The
-  confinement binds `$DSH_HOME/system/browsers` back read-only and names it in `SYSTEM_BROWSERS_DIR`.
-  A Chrome elsewhere under a hidden directory needs `CHROME_PATH` and a `readOnly` entry.
-- **Chrome's own sandbox is off.** Patchright adds `--no-sandbox` unless a launch asks for
-  `chromiumSandbox`, which the headless tests never do: the confinement (its own PID namespace, no
-  network in a check, the host read-only) isolates it, and a nested setuid or user-namespace sandbox
-  is what a confinement may refuse. The product's own launches keep Chrome's sandbox
-  (`IGNORED_DEFAULT_ARGS`).
-- **`/dev/shm` and fonts are there.** `/dev/shm` is hidden as a private tmpfs, which Chrome writes
-  its shared memory to; fontconfig reads `/etc/fonts` and `/usr/share/fonts` on the read-only host.
-  Chrome's profile is a temporary directory in the private `/tmp`.
-- **Chrome writes nothing under `HOME`.** A test launches it with `headlessLaunchOptions()`: its
-  own `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, and `XDG_DATA_HOME` in the temporary directory. Chrome
-  keeps its crash database under `XDG_CONFIG_HOME` (default `~/.config`), not its profile, and where
-  `HOME` is read-only (a check's host, an agent's private home) its crash handler exits
-  (`chrome_crashpad_handler: --database is required`) and takes Chrome with it.
-- **A skip says why, loudly.** A headless browser test is declared with `headlessIt(name, fn)`. Where
-  no Chrome can run it, it is skipped with `browser tests did not run: <why>`, never silently. Whether
-  one can run is decided by doing it: a Chrome is started once, headless, on a blank page. A sandbox
-  that forbids what Chrome needs (an agent's Bash sandbox refuses unix sockets) skips the tests with
-  that reason. `SYSTEM_REQUIRE_BROWSER=1` (CI) makes them fail instead. The reporter
-  ([`scripts/browser-skips.ts`](../../scripts/browser-skips.ts)) prints `!!! BROWSER TESTS DID NOT RUN: …`
-  as the run's last line. In a run's check it also appends `browser-tests-not-run: <detail>` to the
-  report file at `SYSTEM_CHECK_REPORT_PATH`, so the check keeps its outcome and the review knows the
-  pass does not cover those tests ([a run's checks](../design/agent-runtimes.md#a-runs-checks)). A
-  report file that cannot be written fails the run (`!!! THE CHECK WAS NOT TOLD: …`).
-- **vite writes two places in the worktree:** its cache (`node_modules/.vite`) and its bundled
-  configuration (`node_modules/.vite-temp`). A check sees the worktree read-only, so a repository
-  whose checks run vitest names both in `checkScratch`, or vitest fails to start (`EROFS`).
-- [`confined-browser.spec.ts`](../../packages/plugins/web-ui/tests/confined-browser.spec.ts) runs
-  one web UI browser test under a check's own confinement and asserts it passed, not skipped. With
-  every Chrome hidden, it asserts the test was skipped with its reason, reported to the check. That
-  case needs the suite run under pnpm (`npm_execpath`), as CI and a check run it, plus real bubblewrap
-  and a Chrome on the host.
-- **In a Worker's own tool call**, `corepack pnpm exec vitest run <a web-ui browser spec>` runs in the
-  runtime's command sandbox, which makes the managed Chrome readable ([design](../design/agent-runtimes.md#credentials-and-egress)).
-  A run whose tests skipped gets `browser-tests-not-run: <why>` in its report file, result `notRun`,
-  and a review note. [`worker-tool-browser.spec.ts`](../../packages/plugins/web-ui/tests/worker-tool-browser.spec.ts)
-  runs that path end to end, with the model scripted to one Bash call.
-- **A test of a confinement's mask puts the masked path where the child sees it**: under a
-  directory the confinement binds back. The host's `/tmp` is a private tmpfs inside, so a socket
-  under the host's temporary directory that nothing binds back is rightly left unmasked.
-- **A sandbox's placeholders are not changes.** Inside a Worker's tool sandbox git lists the empty
-  placeholders the sandbox mounts in the worktree (`.bashrc`, `.gitconfig`, `.claude/settings.json`,
-  …) as untracked files. `pnpm test:affected` leaves an empty one out of the changed files
-  (`sandboxPlaceholder`), so it does not run the whole suite for them; one with content counts.
 
 ## Test groups
 
@@ -276,9 +220,7 @@ pnpm gen:test-durations $TMPDIR/vitest-report.json
 
 A stale table only costs time: a removed file is ignored, and a new one starts first. A
 file whose tests take about a minute or more together is split by theme, its shared setup in a
-module beside it (the agent Worker source's specs on `agent-workers/tests/stack.ts`, the login
-profile pool's on `browser-patchright/tests/profile-stack.ts`, the
-[browser specs](#real-display-and-browser-tests) on their package's `tests/stack.ts`). Every workspace
+module beside it (the agent Worker source's specs on `agent-workers/tests/stack.ts`). Every workspace
 package's tests, and the repository scripts', belong to one functional group: `kernel`,
 `workflow`, `workers`, `websites`, `surfaces`, and `libs`. [`scripts/test-groups.ts`](../../scripts/test-groups.ts) holds them, and
 `pnpm test:group` with no name lists each with its packages; its own test fails when a package or
@@ -364,15 +306,16 @@ The rule:
 ## CI gates
 
 [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) runs the full gate only when work
-is merged: on every push to `dev` (every merge into it; `dev` is where the lead integrates batches
-and the live install follows), on each release tag (the [release workflow](releasing.md) calls
-it), and by hand (`workflow_dispatch`). A commit or a pull request runs none: run `pnpm check` and
-the affected [test groups](#test-groups) locally before merging. It runs on Node 24.18.1 (the
-floor), the latest 24, and the latest 26, with a real Xvfb, TigerVNC, bubblewrap, and Chrome
-installed. `main` takes `dev` only through a pull request, whose head is `dev`'s tip, so the
-checks `main`'s ruleset requires are the ones that ran on `dev`. The job keeps one name on every
-trigger, because the ruleset requires it by name. Each gate is
-a root [`package.json`](../../package.json) script:
+is merged ([ADR-0085](../decisions/adr/0085-ci-runs-once-per-merge-on-one-node-version.md)): on
+every push to `dev` (every merge into it; `dev` is where the lead integrates batches and the live
+install follows), on each release tag (the [release workflow](releasing.md) calls it), and by hand
+(`workflow_dispatch`). A commit or a pull request runs none: run `pnpm check` and the affected
+[test groups](#test-groups) locally before merging. It runs on the latest Node 24 only, as parallel
+jobs: `check`, the suite in four shards (`pnpm test --shard=<n>/4`, with bubblewrap installed for
+the sandbox's own tests), `e2e`, and `crash injection` (each with Xvfb, TigerVNC, bubblewrap, and
+Chrome). `ci gate` needs them all and is the check `main`'s ruleset requires. `main` takes `dev`
+only through a pull request, whose head is `dev`'s tip, so that check is the one that ran on `dev`.
+Each gate is a root [`package.json`](../../package.json) script:
 
 1. `pnpm check`:
    - `check:docs` ([`scripts/check-docs.ts`](../../scripts/check-docs.ts)):
@@ -420,9 +363,9 @@ a root [`package.json`](../../package.json) script:
      can apply; and the bundle's plugin-host allowance names exactly its DSH rows
      ([plugin host](../design/plugin-host.md#manifests));
    - `lint` (oxlint) and `typecheck` (`tsc --noEmit`).
-2. `pnpm test`, with `SYSTEM_REQUIRE_BROWSER=1` and `SYSTEM_REQUIRE_BWRAP=1`:
+2. `pnpm test --shard=<n>/4`, with `SYSTEM_REQUIRE_BWRAP=1`:
    every `*.spec.ts` in a package's `tests/` and in `scripts/`
-   ([`vitest.config.ts`](../../vitest.config.ts)): unit, contract, driver,
+   ([`vitest.config.ts`](../../vitest.config.ts)): unit, contract,
    concurrency, and architecture tests, and the tests of the repository's scripts.
    The agent read confinement tests run against the real bubblewrap; locally they
    are skipped, with the reason, when `bwrap` is missing or cannot confine a command

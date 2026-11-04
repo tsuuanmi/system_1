@@ -57,7 +57,7 @@ const RPC_REQUEST = /\/_\/BardChatUi\/data\/batchexecute/
  * the bound one. A body that cannot be read as calls (no `f.req`, or one that is not JSON) is
  * refused: calls it cannot see are never taken for none.
  */
-export function namesOnly(body: string, binding: string): boolean {
+function namesOnly(body: string, binding: string): boolean {
   const raw = new URLSearchParams(body).get('f.req')
   if (raw === null) return false
   let calls: unknown
@@ -70,7 +70,7 @@ export function namesOnly(body: string, binding: string): boolean {
   return ids.every((id) => id === binding)
 }
 
-export interface DriverOptions {
+interface DriverOptions {
   /** Site origin (default https://gemini.google.com); tests point it at a local fake. */
   origin?: string
   overlay?: string

@@ -34,7 +34,7 @@ const PAGE_OPEN_MS = 30_000
  * Kept tabs per account (INV-9 bounds every resource): two team members and the research thread,
  * with one to spare. A fifth closes the least recently used.
  */
-export const MAX_KEPT_TABS = 4
+const MAX_KEPT_TABS = 4
 /**
  * A kept tab idle longer than this is not handed back: the turn starts from a fresh page, which
  * loads the conversation and so finds out if the site no longer has it, or has signed it out.
@@ -93,7 +93,7 @@ export interface ProfileUser {
  * space-separated string, so arguments are matched by their space boundaries, not as NUL-separated
  * entries.
  */
-export function profileUsers(dir: string): ProfileUser[] {
+function profileUsers(dir: string): ProfileUser[] {
   if (process.platform !== 'linux') return lockHolder(dir)
   const dirs = [...new Set([dir, resolve(dir)])]
   let entries: string[]

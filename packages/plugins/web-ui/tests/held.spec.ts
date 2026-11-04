@@ -1,10 +1,8 @@
-import { chromium } from 'patchright-core'
-import { describe, expect, it, onTestFinished, vi } from 'vitest'
-import { headlessIt, headlessLaunchOptions } from '../../browser-patchright/tests/support.ts'
+import { describe, expect, it, vi } from 'vitest'
 import { activeProject } from '../../workflow/conformance/workflow.ts'
 import { decideTogether, digestLines, heldOrder, whyHeld, type NotRun, type Send } from '../client/heldbatch.ts'
 import type { ReviewCard } from '../src/api.ts'
-import { boot, OPERATOR, reviewed, type Booted } from './store-backed.ts'
+import { boot, reviewed, type Booted } from './store-backed.ts'
 
 // The results held for the operator, decided together (T336): each its own decision, over the store-backed board and the web UI's real API.
 vi.setConfig({ testTimeout: 120_000 })
@@ -89,37 +87,4 @@ describe('web UI: the results held for the operator, decided together (T336)', (
     expect(await ctx.board.task(b.taskId)).toMatchObject({ state: 'review' })
     expect((await held(call)).map((r) => r.taskId)).toEqual([b.taskId])
   })
-
-  headlessIt('shows a "Held for you" section at the top of Reviews: a row each, select two and accept them together; the decided rows leave at once and Home\'s count follows', async () => {
-    const { ctx, call } = await boot()
-    await activeProject(ctx)
-    await reviewed(ctx, 'Keep the first header')
-    await reviewed(ctx, 'Keep the second header')
-    const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch(headlessLaunchOptions())
-    onTestFinished(() => browser.close())
-    const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } })
-    await page.goto(`${origin}/ui/#token=${OPERATOR}`)
-    const section = page.getByRole('region', { name: 'Held for you' })
-    await expect.poll(() => section.locator('li.held-row').count(), { timeout: 15_000 }).toBe(2)
-    expect(await section.innerText()).toContain('Keep the first header')
-    await section.getByRole('checkbox', { name: 'Select Keep the first header' }).check()
-    await section.getByRole('checkbox', { name: 'Select Keep the second header' }).check()
-    await section.getByLabel('Note for all (optional)').fill('read both')
-    // Their tests and lint are pending: each asks for why they did not run, in its row, and is not sent without it.
-    await section.getByRole('button', { name: 'Accept 2 selected' }).click()
-    await expect.poll(() => section.getByText(/Not sent: say why tests, lint did not run/).count(), { timeout: 15_000 }).toBe(2)
-    expect((await call('reviews')).value.reviews).toHaveLength(2)
-    // The page redraws every 5 seconds, on a loaded host between two steps: fill and press again until they are decided.
-    await expect.poll(async () => {
-      if (((await call('reviews')).value.reviews as unknown[]).length) {
-        for (const input of await section.getByLabel(/Accept with (tests|lint) not run, because/).all()) await input.fill('no browser here')
-        await section.getByRole('button', { name: 'Accept 2 selected' }).click({ timeout: 5_000 })
-      }
-      return (await call('reviews')).value.reviews
-    }, { timeout: 45_000, interval: 2_000 }).toEqual([])
-    await expect.poll(() => section.count(), { timeout: 15_000 }).toBe(0)
-    expect(await page.getByRole('button', { name: 'Accept', exact: true }).count()).toBe(0)
-    expect((await call('waiting')).value.reviews).toEqual({ value: 0 })
-  }, 90_000)
 })

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it, onTestFinished } from 'vitest'
-import { affected, browserPlan, browserSpecs, changedSince, isBrowserSpec, SKIP_BROWSER_TESTS_ENV, skippedBrowserSpecs, specsWithBrowserTests, checkScope, filters, graph, GROUPS, groupOf, packages, related, specFiles, splitArgs } from './test-groups.ts'
+import { affected, browserPlan, browserSpecs, changedSince, isBrowserSpec, SKIP_BROWSER_TESTS_ENV, skippedBrowserSpecs, checkScope, filters, graph, GROUPS, groupOf, packages, related, specFiles, splitArgs } from './test-groups.ts'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const all = packages()
@@ -75,19 +75,19 @@ describe('related tests (T299)', () => {
   }
 
   it('selects a package\'s source change to that package\'s tests and its dependents\' only, with the scripts\' repository checks', () => {
-    const picked = relatedTo('packages/plugins/provider-gemini-web/src/driver.ts').tests
+    const picked = relatedTo('packages/plugins/models/src/index.ts').tests
     expect(picked.length).toBeGreaterThan(0)
     expect(picked.length).toBeLessThan(suite.length)
-    expect(picked.some((t) => pkgOf(t) === 'provider-gemini-web')).toBe(true)
+    expect(picked.some((t) => pkgOf(t) === 'models')).toBe(true)
     for (const spec of picked) {
       const id = pkgOf(spec)
       // Or one that locates a data file of the package (`new URL`): reached all the same, no further.
-      const reads = deps.reads.get(`${id}:test`)?.has('provider-gemini-web') === true
-      expect(id === 'scripts' || id === 'provider-gemini-web' || dependsOn(id, 'provider-gemini-web') || reads, spec).toBe(true)
+      const reads = deps.reads.get(`${id}:test`)?.has('models') === true
+      expect(id === 'scripts' || id === 'models' || dependsOn(id, 'models') || reads, spec).toBe(true)
     }
     // Every test of the package and of each dependent is in: nothing it covers is left out.
     for (const spec of suite) {
-      if (pkgOf(spec) === 'provider-gemini-web' || dependsOn(pkgOf(spec), 'provider-gemini-web')) expect(picked, spec).toContain(spec)
+      if (pkgOf(spec) === 'models' || dependsOn(pkgOf(spec), 'models')) expect(picked, spec).toContain(spec)
     }
     // A package no other depends on selects its own tests, not the kernel's.
     expect(relatedTo('packages/plugins/workflow/src/engine.ts').tests.some((t) => pkgOf(t) === 'store')).toBe(false)
@@ -134,40 +134,12 @@ describe('related tests (T299)', () => {
     expect(changedSince('main', repo)).toContain('package.json')
   })
 
-  it('leaves out the browser specs a change does not touch (T305): a workflow-only change selects none, a provider-chatgpt-web change its own, an edited spec itself', { timeout: 60_000 }, () => {
-    // It reads every spec file of the suite several times: the default 5 s fails on a loaded host (T331's landing).
-    const browser = browserSpecs()
-    expect(browser).toContain('packages/plugins/workflow/tests/team-votes.spec.ts')
-    expect(browser).toContain('packages/plugins/turns/tests/restart.spec.ts')
-    expect(browser).not.toContain('packages/plugins/workflow/tests/review-guides.spec.ts')
-    // A file with plain in-process tests beside its browser ones is no browser spec: those tests still run when reached.
-    for (const mixed of ['packages/plugins/web-ui/tests/policy.spec.ts', 'packages/plugins/web-ui/tests/dispatch.spec.ts', 'packages/ui-ops/tests/engine.spec.ts']) expect(browser, mixed).not.toContain(mixed)
+  it('tells a browser spec, every describe of which needs the browser, from a file with plain tests beside browser ones (T305)', () => {
+    // The repository holds no browser spec today; the rule stays for the repositories System checks.
     expect(isBrowserSpec("describe.runIf(canRunBrowser)('a', () => {})\ndescribe.runIf(canRunBrowser && vnc)('b', () => {})\n")).toBe(true)
     expect(isBrowserSpec("describe('a', () => {})\ndescribe.runIf(canRunBrowser)('b', () => {})\n")).toBe(false)
     expect(isBrowserSpec("describe('a', () => { headlessIt('b', async () => {}) })\n")).toBe(false)
     expect(isBrowserSpec('export {}\n')).toBe(false)
-    // A change to the board reaches web-ui's in-process tests, which share files with its browser ones.
-    expect(relatedTo('packages/plugins/board/src/index.ts').tests).toContain('packages/plugins/web-ui/tests/policy.spec.ts')
-    // A workflow-only change: no whole browser spec is selected, and the browser tests of the mixed files it reaches (web-ui's layout checks) are left out, one test at a time.
-    const workflowOnly = relatedTo('packages/plugins/workflow/src/engine.ts').tests
-    expect(workflowOnly.length).toBeGreaterThan(0)
-    expect(workflowOnly.filter((t) => browser.includes(t))).toEqual([])
-    expect(workflowOnly).toContain('packages/plugins/web-ui/tests/layout.spec.ts')
-    expect(specsWithBrowserTests()).toContain('packages/plugins/web-ui/tests/layout.spec.ts')
-    const workflowPlan = browserPlan(['packages/plugins/workflow/src/engine.ts'], { all })
-    expect(workflowPlan.leaveOut).toBe(true)
-    expect(workflowOnly.filter((t) => specsWithBrowserTests().includes(t) && workflowPlan.touched(t))).toEqual([])
-    // A provider-chatgpt-web change: its browser specs, and every other, run with their browser tests.
-    const chatgpt = relatedTo('packages/plugins/provider-chatgpt-web/src/driver.ts').tests
-    expect(chatgpt).toContain('packages/plugins/provider-chatgpt-web/tests/answers.spec.ts')
-    expect(chatgpt).toContain('packages/plugins/workflow/tests/team-votes.spec.ts')
-    expect(browserPlan(['packages/plugins/provider-chatgpt-web/src/driver.ts'], { all }).leaveOut).toBe(false)
-    // An edited spec runs its own browser tests; the plan keeps it.
-    expect(browserPlan(['packages/plugins/web-ui/tests/layout.spec.ts'], { all }).touched('packages/plugins/web-ui/tests/layout.spec.ts')).toBe(true)
-    expect(relatedTo('packages/plugins/workflow/tests/team-votes.spec.ts').tests).toEqual(['packages/plugins/workflow/tests/team-votes.spec.ts'])
-    // A helper beside the specs keeps them; documentation selects none.
-    expect(relatedTo('packages/plugins/workflow/tests/support.ts').tests).toContain('packages/plugins/workflow/tests/team-votes.spec.ts')
-    expect(relatedTo('docs/engineering/testing.md').tests.filter((t) => browser.includes(t))).toEqual([])
   })
 
   it('leaves out the same at the landing\'s whole suite, given the run\'s starting commit, and runs every one when everything is affected or for the daily run', () => {
