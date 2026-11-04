@@ -4,8 +4,8 @@
 > ([plugin model](../architecture/plugin-model.md#seam-catalog)).
 > Decision: [ADR-0016](../decisions/adr/0016-invisible-headed-browser-and-portable-accounts.md).
 > Requirements: REQ-ACC-1..9. Shape: [`account.v1.json`](../../schemas/account.v1.json).
-> Evidence: how [internet](../research/internet-analysis.md) and
-> [codex-chatgpt-web](../research/codex-chatgpt-web-analysis.md) run their browsers.
+> Evidence: how internet and
+> codex-chatgpt-web run their browsers.
 >
 > Implemented in [`display-virtual`](../../packages/plugins/display-virtual/README.md),
 > [`browser-patchright`](../../packages/plugins/browser-patchright/README.md),
@@ -98,7 +98,7 @@ generic. Everything provider-specific comes from the provider driver
 interface ProviderAccountSupport {          // part of ProviderDriver
   loginUrl: string;
   stateOrigins: string[];                   // origins whose cookies, localStorage, IndexedDB are kept
-  checkAuth(page): Promise<AuthState>;      // signed-in | signed-out (with evidence) | unknown
+  checkAuth(page, { save? }?): Promise<AuthState>;  // signed-in | signed-out (with evidence) | unknown; save: a Save's check
   identity(page): Promise<string>;          // stable identity hint; only its hash is stored
 }
 ```
@@ -113,7 +113,7 @@ interface ProviderAccountSupport {          // part of ProviderDriver
 | Distinct identities | at save time, `identity()` is hashed. Accounts whose hashes match are one person, so none of them takes work: their Workers are `unavailable`, a turn routed to one fails `reauth_required` unsent, and health names them ([runbook](../operations/runbooks.md#two-accounts-sign-in-as-one-person)). REQ-TEAM-4 needs this for independent team members |
 | Write-back | after each turn, and after a sign-in check that finds the account signed in, refreshed state is written only if both the account revision and the scheduler lease generation are current ([scheduling](scheduling-and-leases.md)). A Save or relogin made while the turn ran has a newer revision, so the turn's write-back is skipped and the newer sign-in wins. A session-bound account writes nothing back: its session lives in its profile |
 | Re-auth | only **positive** signed-out evidence (a login URL or login surface) sets `reauth-required`. A challenge or an unknown state never does |
-| Removal | `system account remove <id>` (planned) deletes the record and the login profile after confirmation |
+| Removal | `system account remove <id>` (target) deletes the record and the login profile after confirmation |
 
 ## Login flows
 
@@ -128,8 +128,8 @@ profile, so the operator signs in exactly as usual, including SSO popups and 2FA
 
 | Flow | Platform | How |
 |---|---|---|
-| **remote** | **Linux (MVP)** | **ported from tsuuanmi/internet**: `system account login <id>` opens Chrome on its own X-authenticated Xvfb, with `x0vncserver` or `x11vnc` on an owner-only unix socket and a token-gated **noVNC** page on 127.0.0.1. The operator runs `ssh -L <port>:127.0.0.1:<port> host` and opens the printed URL. The page has Save and Cancel (paste-from-host is not built yet). The session is started on demand and expires after a short TTL |
-| **visible** | desktop (v1.0) | Chrome opens on screen with the account's login profile |
+| **remote** | **Linux** | `system account login <id>` opens Chrome on its own X-authenticated Xvfb, with `x0vncserver` or `x11vnc` on an owner-only unix socket and a token-gated **noVNC** page on 127.0.0.1. The operator runs `ssh -L <port>:127.0.0.1:<port> host` and opens the printed URL. The page has Save and Cancel. The session is started on demand and expires after a short TTL |
+| **visible** | desktop | Chrome opens on screen with the account's login profile |
 
 ### Credential login (`credentials`, opt-in)
 
@@ -180,7 +180,9 @@ flowchart TD
 
 1. Close Chrome gracefully and wait for the profile lock to release.
 2. Reopen the profile headed in the invisible display.
-3. Capture the state for `stateOrigins`, including IndexedDB.
+3. Capture the state for `stateOrigins`, including IndexedDB, and check the sign-in and read
+   `identity()` in the profile (`checkAuth(page, { save: true })`: the
+   [driver interface](provider-turns.md#driver-interface)).
 4. Verify it with `checkAuth` in a **fresh** context built from the captured state.
    A session-bound account skips this step: its sign-in and identity were already
    verified in the profile in step 3, and a copy is not how it works.
@@ -208,36 +210,23 @@ account's profile open, Save reads it in place, in a page of its own.
   - conversation inspection and deletion.
 
   Portable state is neither loaded nor written back.
-  - **Lifecycle.**
-    - The context opens lazily, one launch at a time, with session restore so
-      session-only cookies survive; the restored tabs are blanked.
-    - It closes after `closeAfterMs` idle. A close waits until its Chrome has
-      exited, and stops one that has not within 10 s.
-    - A page close waits at most 5 s for the browser to confirm it. Chrome can
-      acknowledge a close and then drop it, so an operation's end, and so a
-      runtime stop, never wait on the tab. Such a tab closes with its context.
-    - If the browser dies, in-flight operations fail, and a submitted turn
-      reconciles by its receipt.
-  - **Who holds a profile.** A process on this host whose command line names
-    the profile (`/proc` on Linux), never a lock file alone. Only a browser
-    `system` started (it carries `--system-owned-profile`) is ever stopped, for
-    example one a crash left. Any other process blocks the account until it
-    closes, and health shows it (`login-profiles`).
-  - **The operator first.**
-    - A remote login reserves the profile (`reserveProfile`). It is refused while
-      operations run, and it returns only after the idle context's browser has
-      exited.
-    - Until the login ends, operations fail as `overloaded` (backoff).
-    - A second login for the account joins the first.
-    - Saves, and with them automated sign-ins, run one at a time per account.
-  - **Cap.** `maxBrowsers` bounds the login-profile browsers open at once (default
-    none; PROP-0007): a new one first closes the longest-idle browser holding no
-    turn, and waits while every one holds a turn. Health shows the open ones
-    against the cap.
-  - **Pacing.** The opens of the account's pages are spaced by the driver's
-    `pageGapMs`, and the opens across all accounts of one provider by the turn
-    runtime's `providerPageGapMs` (a pace group keyed by the provider; PROP-0007),
-    since they share the host's address; navigations within a page are not.
+  - **Lifecycle.** The context opens lazily, one launch at a time, with session restore so
+    session-only cookies survive. It closes after `closeAfterMs` idle, and a close stops a
+    Chrome that has not exited within 10 s. A page close waits at most 5 s for the browser to
+    confirm it, so an operation's end never waits on the tab. If the browser dies, in-flight
+    operations fail, and a submitted turn reconciles by its receipt.
+  - **Who holds a profile.** A process on this host whose command line names the profile
+    (`/proc` on Linux), never a lock file alone. Only a browser `system` started (it carries
+    `--system-owned-profile`) is ever stopped. Any other process blocks the account, and health
+    shows it (`login-profiles`).
+  - **The operator first.** A remote login reserves the profile (`reserveProfile`), which is
+    refused while operations run. Until the login ends, operations fail as `overloaded`. Saves,
+    and automated sign-ins, run one at a time per account.
+  - **Cap.** `maxBrowsers` bounds the login-profile browsers open at once (default none): a new
+    one first closes the longest-idle browser holding no turn.
+  - **Pacing.** The opens of an account's pages are spaced by the driver's `pageGapMs`, and the
+    opens across all accounts of one provider by `providerPageGapMs`, since they share the host's
+    address.
   - **Kept tabs** (ADR-0030's amendment).
     - A persistent session's page stays open between its turns
       (`openTurn(account, { profile: { keep: sessionId } })`). The next turn gets it back, in

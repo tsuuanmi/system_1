@@ -18,14 +18,17 @@ vi.setConfig({ testTimeout: 60_000 })
 const schemas = new SchemaRegistry()
 
 /** The provider over real routing and leases, a scripted digest Worker, and two raw artifacts. */
-async function boot(drafter: ((refs: { log: ArtifactRef; bench: ArtifactRef }) => Drafter) | undefined, config: Config = {}) {
+async function boot(drafter: ((refs: { log: ArtifactRef; bench: ArtifactRef }) => Drafter) | undefined, config: Config = {}, site?: { maxInputChars?: number }) {
   const dir = mkdtempSync(join(tmpdir(), 'system-digest-'))
   const ctx = new Context()
   const refs = {} as { log: ArtifactRef; bench: ArtifactRef }
   const worker = new DigestWorker(drafter ? (sources, tier) => drafter(refs)(sources, tier) : undefined)
+  // With `site`, a website Worker beside the agent Worker: it proves `reason` only, is remote, and is on website quota.
+  const website = site && new DigestWorker(drafter ? (sources, tier) => drafter(refs)(sources, tier) : undefined, undefined, { id: 'w:site', proves: ['reason'], locality: 'remote', quotaClass: 'subscription-chat', ...site })
   const fibers: Fiber[] = [
     ctx.plugin(Store, { path: join(dir, 'system.db') }), ctx.plugin(Artifacts, {}), ctx.plugin(EventLog, {}), ctx.plugin(Leases, {}), ctx.plugin(WorkerRouter, {}),
     ctx.plugin({ name: 'digest-worker', inject: ['workers', 'artifacts'], apply: (c: Context) => void c.workers.register(worker.source(c)) }),
+    ...(website ? [ctx.plugin({ name: 'digest-website-worker', inject: ['workers', 'artifacts'], apply: (c: Context) => void c.workers.register(website.source(c)) })] : []),
   ]
   await Promise.all(fibers)
   let provider = ctx.plugin(StoreDigests, config)
@@ -42,7 +45,7 @@ async function boot(drafter: ((refs: { log: ArtifactRef; bench: ArtifactRef }) =
     for (const fiber of [...fibers].reverse()) await fiber.dispose()
   })
   return {
-    ctx, worker, ...refs,
+    ctx, worker, website: website!, ...refs,
     /** Stop the provider, run `between` while it is down, and start it again on the same store. */
     restart: async (between?: () => void) => {
       await provider.dispose()
@@ -52,6 +55,11 @@ async function boot(drafter: ((refs: { log: ArtifactRef; bench: ArtifactRef }) =
     },
   }
 }
+
+/** The reasons each recorded routing decision gave about one Worker: one list per decision that names it. */
+const reasonsFor = (ctx: Context, worker: string): string[][] => ctx.artifacts.list({ kind: 'decision', limit: 1000 })
+  .map((a) => ctx.artifacts.get(a.id)!.body as { candidates?: Array<{ option: string; reasons: string[] }> })
+  .flatMap((b) => (b.candidates ?? []).filter((c) => c.option === worker).map((c) => c.reasons))
 
 const until = (check: () => boolean, what: string): Promise<void> => vi.waitFor(() => {
   if (!check()) throw new Error(`timed out waiting for ${what}`)
@@ -76,6 +84,51 @@ describe('ctx.digests on the store', () => {
     expect(run!.prompt).toContain(`<artifact id="${log}">\n${LOG}\n</artifact>`)
     expect(run!.prompt).toContain('valid against this JSON Schema (digest@1.0)')
     expect(ctx.artifacts.get(view.digest!)!.producer).toEqual({ type: 'worker', ref: 'w:digest' })
+  })
+
+  it('asks for `reason` only first, so a website Worker, first in the quota order, writes an operator-shared digest end to end, and the agent Worker is not asked', async () => {
+    const { ctx, worker, website, log, bench } = await boot((r) => () => ({ text: draft(r.log, r.bench) }), {}, {})
+    const view = await ctx.digests.wait((await ctx.digests.request({ sources: [log, bench] })).requestId, 30_000)
+    expect(view).toMatchObject({ state: 'written', worker: 'w:site', claims: { kept: 2, dropped: 0 } })
+    expect(website.started).toHaveLength(1)
+    expect(website.started[0]!.requirement.capabilities).toEqual(['reason'])
+    expect(worker.started).toHaveLength(0)
+    expect(ctx.artifacts.get(view.digest!)!.producer).toEqual({ type: 'worker', ref: 'w:site' })
+  })
+
+  it('runs a digest of a local-private source on the agent Worker: the locality check refuses it to the website Worker', async () => {
+    const { ctx, worker, website, log } = await boot((r) => () => ({ text: draft(r.log, r.bench) }), {}, {})
+    const secret = ctx.artifacts.put({
+      kind: 'report', bodySchema: 'provider-answer@1.0', classification: 'local-private', producer: { type: 'worker', ref: 'w:raw' },
+      body: { schema: 'provider-answer@1.0', provider: 'raw', account: 'raw', turnId: 't-secret', conversation: { mode: 'temporary' }, promptHash: `sha256:${'0'.repeat(64)}`, text: LOG },
+    }).id as ArtifactRef
+    const view = await ctx.digests.wait((await ctx.digests.request({ sources: [log, secret] })).requestId, 30_000)
+    expect(view.state).toBe('written')
+    expect(view.worker).toBe('w:digest')
+    expect(website.started).toHaveLength(0)
+    expect(worker.started).toHaveLength(1)
+    expect(worker.started[0]!.requirement.capabilities).toEqual(['review', 'local-data'])
+    // The website Worker proved what was asked first, and was refused for the data's locality alone.
+    expect(reasonsFor(ctx, 'w:site')).toContainEqual([expect.stringMatching(/local-private data stays on local Workers/)])
+  })
+
+  it('does not admit a digest whose brief is longer than the website Worker takes (ADR-0032): it runs on the agent Worker', async () => {
+    const { ctx, worker, website, log, bench } = await boot((r) => () => ({ text: draft(r.log, r.bench) }), {}, { maxInputChars: 50 })
+    const view = await ctx.digests.wait((await ctx.digests.request({ sources: [log, bench] })).requestId, 30_000)
+    expect(view).toMatchObject({ state: 'written', worker: 'w:digest' })
+    expect(website.started).toHaveLength(0)
+    expect(worker.started).toHaveLength(1)
+    // The website Worker proved what was asked first, and was refused for the brief's length (ADR-0032).
+    expect(reasonsFor(ctx, 'w:site')).toContainEqual([expect.stringMatching(/it takes at most 50/)])
+  })
+
+  it('checks the quotes and escalates once on the website Worker as on any Worker: the standard tier of the website answers the second run', async () => {
+    const { ctx, worker, website, log, bench } = await boot((r) => (_sources, tier) => ({ text: draft(r.log, r.bench, tier === 'economy' ? [{ id: 'C1', kind: 'finding', text: 'x', citation: { artifact: r.log, quote: 'not in the log' } }] : undefined) }), {}, {})
+    const view = await ctx.digests.wait((await ctx.digests.request({ sources: [log, bench] })).requestId, 30_000)
+    expect(view).toMatchObject({ state: 'written', worker: 'w:site:standard', claims: { kept: 2, dropped: 0 } })
+    expect(website.started.map((s) => [s.tier, s.key])).toEqual([['economy', `digests:${view.requestId}`], ['standard', `digests:${view.requestId}:standard`]])
+    expect(worker.started).toHaveLength(0)
+    expect(view.escalation).toBeDefined()
   })
 
   it('asks for a Worker of its tier only: with none, it fails open, naming the admission decision that found none (ADR-0036, INV-11)', async () => {

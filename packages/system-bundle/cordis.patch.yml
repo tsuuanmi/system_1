@@ -23,9 +23,11 @@
       name: '@tsuuanmi/system-artifacts'
     # --- plugin host (core, B7): every row's plugin with the manifest its package declares, and each
     # plugin's lifecycle state, every change a decision. It reads the rows from the DSH loader at start,
-    # records, and automates nothing: a row turned off is recorded `candidate`, never stopped by it.
-    # Its manifest check finds a mounted row with no manifest, or a seam its provider does not
-    # satisfy, and health is down until it is cleared (ADR-0048). ---
+    # records, and automates nothing: a row turned off is recorded `candidate`. Its manifest check
+    # finds a mounted row with no manifest, or a seam its provider does not satisfy, and health is
+    # down until it is cleared (ADR-0048). On the operator's word only (system plugin off|on), it turns
+    # an optional row off or on while it runs and keeps that in the profile's patch; it holds each
+    # mechanism's live enforce mode (system enforce) (ADR-0078). ---
     - id: plugin-host
       name: '@tsuuanmi/system-plugin-host'           # ctx.pluginHost; MCP status lists the plugins
       config:
@@ -35,6 +37,11 @@
         allowWithoutManifest:
           - '@deepseek-ai/cordis-plugin-timer'
           - '@deepseek-ai/dsh-host-webserver'
+          - '@deepseek-ai/dsh-llm'
+          - '@deepseek-ai/dsh-llm-pi-ai'
+        # The DSH rows the operator may turn off at runtime: the model rows are optional
+        # (docs/architecture/plugin-model.md#required-and-optional-rows); timer and webserver are not.
+        optionalWithoutManifest:
           - '@deepseek-ai/dsh-llm'
           - '@deepseek-ai/dsh-llm-pi-ai'
     # --- resource ledger (core, B2): pools are the operator's configuration; none until configured ---
@@ -94,6 +101,11 @@
       name: '@tsuuanmi/system-workers'               # Worker registry, admission, deterministic router
     - id: turns
       name: '@tsuuanmi/system-turns'                 # the website Worker runtime (durable turns)
+    # --- scripted Workers for the system-test profile's canary (T323): off here, on only there. They
+    # answer at once, with no account, network, or model; live work never runs on them. ---
+    - id: workers-fake
+      name: '@tsuuanmi/system-workers-fake'          # the `fake` Worker source
+      disabled: true
     # --- agent runtimes: Claude Code as the first Worker, on by default (PROP-0010 B3). Each run is
     # confined for reads by bubblewrap, and its commands by the SDK's sandbox (ADR-0024, ADR-0038);
     # a host without Claude Code, bubblewrap, or a sign-in still boots, and the probe says why its
@@ -131,6 +143,12 @@
       name: '@tsuuanmi/system-models'                 # ctx.models and the `models` Worker source (no models until configured)
     - id: worker-sessions
       name: '@tsuuanmi/system-worker-sessions'       # sessions, mailboxes, peer messages; MCP session_send/session_inbox
+    # --- the landing seam (PROP-0017 L0): ctx.landing, local. An accepted result is merged into the
+    # repository's checked-out branch by the source that holds its worktree, on the operator's merge
+    # approval; never a force or a push (ADR-0060). Off, nothing is merged: a landing waits at its
+    # merge, saying why, until a provider of ctx.landing is registered (INV-2). ---
+    - id: landing-local
+      name: '@tsuuanmi/system-landing-local'         # ctx.landing over ctx.workers
     - id: workflow
       name: '@tsuuanmi/system-workflow'              # the single engine; MCP ask/research/result/usage/explain
     # --- the board (B4): ctx.board and the board_* MCP tools. It asks for every approval through
@@ -161,6 +179,21 @@
     # is declared. Off by default: the operator turns it on (docs/operations/runbooks.md#get-notified). ---
     - id: notify
       name: '@tsuuanmi/system-notify'                # desktop notifications; webhook opt-in
+      disabled: true
+    # --- the project lead's inbox (D107, surface): from recorded events only, what needs a project's lead
+    # (a result or merge held, a question, spent retries, a landing that gave up, a request outside its
+    # rights or stale, idle quota) and what finished (a live update, a landing and its digest), kept per
+    # project as lead-notice@1.0, read by MCP lead_inbox and `system lead wait`, and pushed to the sinks
+    # the row configures per project (a command's stdin, a line of a file). Reads only; decides nothing. ---
+    - id: lead-inbox
+      name: '@tsuuanmi/system-lead-inbox'            # MCP lead_inbox; system lead wait
+    # --- the operator's decisions (D109, surface): operator-decision@1.0, a question recorded and later
+    # answered, numbered D<n> by the store from one sequence per studio, never deleted; MCP decisions_*,
+    # system decisions. A lead token acts for its own project and reads the studio-wide ones. Off by
+    # default: the lead keeps its decisions.json until the operator turns it on and imports it once
+    # (docs/operations/runbooks.md#record-a-decision). ---
+    - id: decisions
+      name: '@tsuuanmi/system-decisions'             # no seam; MCP decisions_ask/answer/list/show/import (mcp-decisions@1.0)
       disabled: true
     - id: profile-software-development
       name: '@tsuuanmi/system-profile-software-development'  # agent-review, for agent Workers; off until the operator turns it on

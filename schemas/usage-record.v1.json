@@ -6,7 +6,7 @@
   "type": "object",
   "required": ["schema", "requestId", "source", "account", "pool", "observedAt"],
   "properties": {
-    "schema": { "enum": ["usage-record@1.0", "usage-record@1.1"] },
+    "schema": { "enum": ["usage-record@1.0", "usage-record@1.1", "usage-record@1.2"] },
     "requestId": {
       "description": "Deduplication key: the source's own id for the unit counted (an Agent SDK result message's session and uuid, an API response id). The ledger keeps one record per (source, requestId).",
       "type": "string",
@@ -93,10 +93,24 @@
       "enum": ["completed", "failed", "aborted"]
     },
     "partial": {
-      "description": "(1.1, with `runId`) The record is a lower bound of its run, and why, in plain words: the run ended before its runtime's final count (a stop, a timeout, a drain, a deferred call), and its numbers are what the runtime reported while it ran. Counted, never the run's usage: the run stays unknown, and a cap of its scope and pool fails closed, until the ledger counts a record of it in that pool without `partial` (INV-2, ADR-0065). The record says it itself, so no other write is needed for that.",
+      "description": "(1.1, with `runId`) The record is a lower bound of its run, and why, in plain words: the run ended before its runtime's final count (a stop, a timeout, a drain, a deferred call), and its numbers are what the runtime reported while it ran; or the run ran again after the host's stop cut it, and its numbers are only what it used since (T283). Counted, never the run's usage: the run stays unknown, and a cap of its scope and pool fails closed, until the ledger counts a record of it in that pool without `partial` (INV-2, ADR-0065). The record says it itself, so no other write is needed for that.",
       "type": "string",
       "minLength": 1,
       "maxLength": 300
+    },
+    "sessionTotals": {
+      "description": "(1.2, given by a source) The numbers are the running totals of the runtime session this id names, as of this result (a resumed session's result reports the whole session so far), not the run's own spend. The ledger counts the run's own spend: this result minus the session's latest result already in the ledger, less the lower bounds (`partial`) of the session, or of the result's own run, it counted since; the first result of a session from zero, so as it is unless a run of the session ended before it with no result. A record the ledger returns never carries it: its numbers are the run's own. Never with `partial`.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "includesUnrecorded": {
+      "description": "(1.2, set by the ledger) The difference spans a run of the session that ended with no result (a lower bound counted, or no record, as its `usage-unknown` fact says): that run's spend is in this record's numbers.",
+      "const": true
+    },
+    "notDifferenced": {
+      "description": "(1.2, set by the ledger) A counter of the result is below the session's latest result before it (a session that started over), so the difference would be negative: the record holds the full result, never a negative or zero figure.",
+      "const": true
     }
   },
   "anyOf": [
@@ -106,7 +120,17 @@
   "allOf": [
     {
       "if": { "required": ["partial"], "properties": { "partial": true } },
-      "then": { "required": ["runId"], "properties": { "schema": { "const": "usage-record@1.1" }, "runId": true } }
+      "then": { "required": ["runId"], "not": { "required": ["sessionTotals"], "properties": { "sessionTotals": true } }, "properties": { "schema": { "enum": ["usage-record@1.1", "usage-record@1.2"] }, "runId": true } }
+    },
+    {
+      "if": {
+        "anyOf": [
+          { "required": ["sessionTotals"], "properties": { "sessionTotals": true } },
+          { "required": ["includesUnrecorded"], "properties": { "includesUnrecorded": true } },
+          { "required": ["notDifferenced"], "properties": { "notDifferenced": true } }
+        ]
+      },
+      "then": { "properties": { "schema": { "const": "usage-record@1.2" }, "sessionTotals": true, "includesUnrecorded": true, "notDifferenced": true } }
     }
   ],
   "additionalProperties": false

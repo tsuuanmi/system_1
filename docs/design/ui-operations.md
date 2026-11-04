@@ -2,7 +2,7 @@
 
 > Target state. Decision: [ADR-0021](../decisions/adr/0021-ui-operations-as-data.md).
 > Shape: [`ui-map.v1.json`](../../schemas/ui-map.v1.json). Evidence:
-> [research](../research/browser-interaction-and-self-healing.md). Used by the
+> research. Used by the
 > provider drivers on [`ctx.browser`](browser-runtime.md).
 >
 > Implemented in [`ui-ops`](../../packages/ui-ops/README.md), with the heal audit in
@@ -164,35 +164,23 @@ so a stale element can be mapped again without opening the operator's browser:
 - **Region:** the found element's parent on a fallback; an unresolved element's
   scope; otherwise the page body. A page-wide outline (that one, and a stall's)
   folds each element marked `role="navigation"` into one node, without its
-  contents, so a site's sidebar never spends the node budget the content needs
-  (live 2026-10-18, two outlines that ran out inside a sidebar).
-- **Content:** per node, the tag, role, `aria-label` (not on links, whose labels
-  are often content such as chat titles; at most 40 characters), a link's target
-  as a kind, never the URL (`external`, `site`, or `none`; `ui-outline@1.1`), the `aria-*`
-  states, the test id, the names of other `data-*` attributes, the id, up to five
-  classes, whether it is editable, and its visible text length. Never text,
-  input values, or URLs.
-- **Redaction:** any value that holds an email address, or the account's own
-  name or address as its driver reads them from the page, is masked whole as
-  `[redacted]`. An outline carries no identity by construction.
-- **Where and what was found:** the event names the page's path (`url`, never its query, as a
-  stall's does), so a page the site sent elsewhere shows. For an unresolved element it also gives
-  `matches`: per candidate, in the map's order, how many elements it finds where the element is
-  looked for (its scope, or the page), hidden ones too (`found`), and how many of those are
-  visible (`shown`). Counts only. A candidate that finds the element and shows none of it means
-  the page hides the control; none found means it was renamed or removed. The outline alone cannot
-  tell these apart for a control with no text, such as an account button that is a link (live
-  2026-10-24: Gemini's account button was in the outline, the same as on working pages, and still
-  did not resolve).
-- **Bounds:** only nodes that carry one of those marks (wrappers are skipped),
-  like siblings folded into one node with a count, at most 200 nodes and 12
-  levels.
-- **Record:** the provider plugin stores it as a local-private `evidence`
-  artifact, which never leaves the machine
-  ([INV-12](../architecture/invariants.md#inv-12-data-egress-is-explicit)), and
-  the `ui.drift` event names it (`outline`). Each element and kind is reported
-  once per page. An outline that cannot be read is left out; it never fails
-  the turn.
+  contents, so a site's sidebar never spends the node budget the content needs.
+- **Content:** per node, the tag, role, `aria-label` (not on links; at most 40 characters), a link's
+  target as a kind, never the URL (`ui-outline@1.1`), the `aria-*` states, the test id, the names of
+  other `data-*` attributes, the id, up to five classes, editability, and visible text length. Never
+  text, input values, or URLs.
+- **Redaction:** any value holding an email address, or the account's own name or address, is masked
+  whole as `[redacted]`.
+- **Where and what was found:** the event names the page's path (never its query) and, for an
+  unresolved element, `matches`: per candidate, how many elements it finds (`found`) and how many are
+  visible (`shown`). Counts only. A candidate that finds the element and shows none of it means the
+  page hides the control; none found means it was renamed or removed.
+- **Bounds:** at most 200 nodes and 12 levels; wrappers are skipped, and siblings fold into one node
+  with a count.
+- **Record:** a local-private `evidence` artifact, which never leaves the machine
+  ([INV-12](../architecture/invariants.md#inv-12-data-egress-is-explicit)), named by the `ui.drift`
+  event. Each element and kind is reported once per page. An outline that cannot be read is left
+  out; it never fails the turn.
 
 The playbook says how to turn an outline into a map candidate
 ([playbooks](../operations/playbooks.md#a-provider-ui-change)).
@@ -272,8 +260,8 @@ flowchart TD
   end
 ```
 
-The **diagnostic bundle** (planned; saved under the turn's artifacts, classified
-`local-private`) holds:
+The **diagnostic bundle** is saved under the turn's artifacts, classified
+`local-private`, and holds:
 - match counts for every candidate of every operation the procedure used;
 - the scoped ARIA snapshot;
 - the page URL;

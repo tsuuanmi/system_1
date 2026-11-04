@@ -1,5 +1,7 @@
 # @tsuuanmi/system-digest-extractive
 
+> **Parked and frozen (security fixes only)** since 2026-11-01: [components](../../../docs/architecture/components.md#parked).
+
 A second provider of **`ctx.digests`**, extractive-first
 ([digests](../../../docs/design/digests.md#extractive-first); definition
 [`digest-core`](../../digest-core/README.md)): before any Worker writes, code selects verbatim spans
@@ -23,8 +25,9 @@ same MCP tools; it depends on seam definitions only, and fails open.
   first span, then failures, risks, decisions, and metrics, each taken across the sources in turn,
   then each source's last span, then results, then the rest. Deterministic: the same sources give
   the same artifact. Sources with nothing to quote ask no Worker: the request is bypassed.
-- **Its Worker** is whatever `ctx.workers` admits for `review` and `local-data` on the configured
-  `tier` as minimum and maximum (default `economy`), as for `digest`. Its brief (`brief@1.1`)
+- **Its Worker** is whatever `ctx.workers` admits on the configured `tier` as minimum and maximum
+  (default `economy`), as for `digest`: `reason` only first (a website Worker), then, when none is
+  admitted, `review` and `local-data` (a read-only agent Worker). Its brief (`brief@1.1`)
   points at the extract by content id, never at a source; the Worker's source renders the extract's
   text (the sources by number, each span with its id) and checks egress on it (INV-12). The answer
   is described by a short example, not the whole `digest@1.0` schema.

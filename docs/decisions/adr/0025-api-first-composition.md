@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-14
-- **Related:** [PROP-0003](../../proposals/0003-production-readiness.md#m6e-api-first-composition),
+- **Related:** PROP-0003 (removed; in Git history),
   REQ-WRK-8, REQ-WRK-10, REQ-HOST-4, CON-3, [purpose](../../requirements/purpose.md), [models](../../design/models.md),
   [INV-11](../../architecture/invariants.md#inv-11-no-tool-lock-in),
   [INV-12](../../architecture/invariants.md#inv-12-data-egress-is-explicit)

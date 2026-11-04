@@ -6,18 +6,20 @@ import { Context, type Fiber } from '@deepseek-ai/cordis'
 import StoreApprovals from '@tsuuanmi/system-approvals'
 import type { AutonomyPolicy } from '@tsuuanmi/system-approvals-core'
 import Artifacts from '@tsuuanmi/system-artifacts'
-import StoreBoard from '@tsuuanmi/system-board'
+import StoreBoard, { type Config as BoardConfig } from '@tsuuanmi/system-board'
 import type { ArtifactRef, BoardTask } from '@tsuuanmi/system-board-core'
 import Egress from '@tsuuanmi/system-egress'
 import EventLog from '@tsuuanmi/system-event-log'
-import Leases, { LeaseLost } from '@tsuuanmi/system-leases'
+import { LeaseLost } from '@tsuuanmi/system-board-core'
+import Leases from '@tsuuanmi/system-leases'
 import { captureGitSubject, sha256 } from '@tsuuanmi/system-libs'
 import Store from '@tsuuanmi/system-store'
 import WorkerSessions from '@tsuuanmi/system-worker-sessions'
 import WorkerRouter from '@tsuuanmi/system-workers'
 import type { Checked, CheckStep, WorkerExecution } from '@tsuuanmi/system-workers-core'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
-import { activeProject, CONFIG, readyTask, ScriptedWorkers, TEMPLATES } from '../conformance/workflow.ts'
+import { worker } from '../../../workers-core/conformance/workers.ts'
+import { activeProject, CONFIG, importantFinding, readyTask, type Rendered, ScriptedWorkers, TEMPLATES, verifierReply } from '../conformance/workflow.ts'
 import Workflow from '../src/index.ts'
 
 // A run's required checks (T151, ADR-0063): before a written result's acceptance, the engine has the
@@ -31,6 +33,11 @@ const POLICY: AutonomyPolicy = {
   rules: [{ actionClass: 'read', mode: 'auto' }, { actionClass: 'workspace-write', mode: 'auto', requires: ['tests', 'lint'] }, { actionClass: 'merge', mode: 'ask' }],
   default: 'ask', expiry: { defaultSeconds: 3600, maxSeconds: 86400 },
 }
+
+/** The policy of the red-on-base tests (T306c): the studio's, and the new check among the required ones. */
+const REQUIRES_RED: AutonomyPolicy = { ...POLICY, schema: 'autonomy-policy@1.5', rules: POLICY.rules.map((r) => r.actionClass === 'workspace-write' ? { ...r, requires: ['tests', 'lint', 'red-on-base'] } : r) }
+/** The same with a path map (ADR-0071), so that each change has a risk tier. */
+const TIERED: AutonomyPolicy = { ...REQUIRES_RED, riskTiers: { version: 1, rules: [{ tier: 'light', note: 'documents', paths: ['docs/'] }, { tier: 'normal', note: 'sources', paths: ['src/'] }] } }
 
 /** Scripted Workers whose results name a git working tree and the subject it is at, as an agent's do. */
 class TreeWorkers extends ScriptedWorkers {
@@ -59,20 +66,42 @@ type Outcome = 'passed' | 'failed' | 'error'
 class Checker {
   readonly steps: CheckStep[] = []
   outcomes: Record<string, Outcome> = { tests: 'passed', lint: 'passed' }
+  /** What a check's command reported it did not run, by check. */
+  notRun: Record<string, string> = {}
+  /** The failing lines a failed check's answer carries, by check (T270). */
+  failures: Record<string, string[]> = {}
   refuse: Checked | undefined
+  /** How many asks `refuse` answers, when set; every one when unset. */
+  refuseTimes: number | undefined
+  /** The next check runs until its caller's signal stops it (the host's stop cutting it), then throws as a cut check does. */
+  cutNext = false
+  /** The repository's checked-out branch the run's worktree was cut from, as the source tells it (`changes`); none when unset. */
+  base: string | undefined
+  /** The commit the run's worktree forked from, and its HEAD now, as the source tells them; the same commit when unset. */
+  fork: { sha: string; head: string } | undefined
+  /** The run's worktree. */
+  workspace = ''
   private artifacts!: Context['artifacts']
 
   register(ctx: Context): void {
     this.artifacts = ctx.artifacts
     ctx.workers.register({
       name: 'checker', describe: async () => [],
+      changes: async (runId) => this.base === undefined ? undefined : [{
+        repository: '/repo', workspace: this.workspace, branch: `system/run/${runId}`, base: { branch: this.base, sha: this.fork?.sha ?? 'b'.repeat(40) }, head: this.fork?.head ?? 'b'.repeat(40), files: [], more: 0, truncated: false,
+      }],
       start: () => {
         throw new Error('the checker runs no Worker')
       },
       get: () => undefined, wait: () => Promise.reject(new Error('the checker runs no Worker')),
-      check: async (step) => {
+      check: async (step, signal) => {
         this.steps.push(step)
-        if (this.refuse) return this.refuse
+        if (this.cutNext) {
+          this.cutNext = false
+          await new Promise<void>((resolve) => (signal?.aborted ? resolve() : signal?.addEventListener('abort', () => resolve(), { once: true })))
+          throw signal?.reason ?? new Error('stopped')
+        }
+        if (this.refuse && (this.refuseTimes === undefined || this.refuseTimes-- > 0)) return this.refuse
         const results = step.checks.map((check) => {
           const outcome = this.outcomes[check] ?? 'error'
           return { check, outcome, ...(outcome === 'error' ? {} : { exitCode: outcome === 'passed' ? 0 : 1 }), reason: outcome === 'error' ? `no command for the ${check} check is configured` : `exited ${outcome === 'passed' ? 0 : 1}` }
@@ -81,7 +110,11 @@ class Checker {
           kind: 'evidence', bodySchema: 'check-run@1.0', classification: step.classification, producer: { type: 'system', ref: 'checker' }, runId: step.runId,
           body: { schema: 'check-run@1.0', runId: step.runId, repository: step.workspace, workspace: step.workspace, subject: { type: 'git-head', ...step.subject }, setup: sha256('setup'), checks: results },
         }).id
-        return { outcome: 'checked', results, evidence }
+        return { outcome: 'checked', results: results.map((r) => {
+          const notRun = this.notRun[r.check]
+          const failures = r.outcome === 'failed' ? this.failures[r.check] : undefined
+          return { ...r, ...(notRun ? { notRun } : {}), ...(failures ? { failures } : {}) }
+        }), evidence }
       },
     })
   }
@@ -100,14 +133,33 @@ function tree(): string {
 }
 
 const DEVELOP = [{ nodeId: 'develop', objective: 'Develop it', prompt: '{{input}}', capabilities: ['develop'], tier: 'standard' as const, conversation: 'temporary' as const, acceptance: 'acceptance.answer' }]
+/** A change and an exact-subject review of it, as `algorithm-development`'s. */
+const REVIEWED = [DEVELOP[0]!, { ...DEVELOP[0]!, nodeId: 'review', objective: 'Review it', prompt: 'Review: {{input}}', capabilities: ['review'], dependsOn: ['develop'] }]
 
-/** `onTree: false`: the Workers' results are plain reports, on no git working tree. */
-async function boot(checker: Checker | undefined, { onTree = true }: { onTree?: boolean } = {}) {
+/**
+ * `onTree: false`: the Workers' results are plain reports, on no git working tree. `review`: the
+ * reviewer's verdict on the exact subject it is given. `board`: the board's configuration.
+ */
+async function boot(checker: Checker | undefined, { onTree = true, review, board = {}, redOnBase, tiered = false }: { onTree?: boolean; review?: 'approve' | 'changes-requested'; board?: BoardConfig; redOnBase?: 'off' | 'warn' | 'on'; tiered?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'system-workflow-checks-db-'))
   const workspace = tree()
+  if (checker) checker.workspace = workspace
   const ctx = new Context()
   const workers = onTree ? new TreeWorkers(workspace, () => ctx.artifacts) : new ScriptedWorkers()
-  const config = { ...CONFIG, approvalPollSeconds: 1, templates: { ...TEMPLATES, develop: DEVELOP } }
+  if (review) {
+    workers.extra = [worker('w:reviewer', { tier: 'standard', proves: ['review'] })]
+    const answer = workers.reply
+    workers.reply = (request: Rendered) => {
+      // A second reviewer confirms an important finding (ADR-0075).
+      const verified = verifierReply(request.prompt)
+      if (verified) return verified
+      const subject = /^Subject: (\S+)$/m.exec(request.prompt)?.[1]
+      if (!subject) return answer(request)
+      const changes = review === 'changes-requested'
+      return { text: '```json\n' + JSON.stringify({ subject, verdict: review, findings: [changes ? importantFinding('no test for a', 'a.c') : { severity: 'nit', title: 'no test for a', file: 'a.c' }] }) + '\n```' }
+    }
+  }
+  const config = { ...CONFIG, approvalPollSeconds: 1, maxReviewCycles: 1, templates: { ...TEMPLATES, develop: DEVELOP, reviewed: REVIEWED }, ...(redOnBase ? { enforce: { redOnBase } } : {}) }
   const fibers: Fiber[] = [
     ctx.plugin(Store, { path: join(dir, 'system.db') }), ctx.plugin(Artifacts, {}), ctx.plugin(EventLog, {}), ctx.plugin(Leases, {}), ctx.plugin(Egress, {}),
     ctx.plugin(WorkerRouter, {}), ctx.plugin(WorkerSessions, {}),
@@ -115,10 +167,10 @@ async function boot(checker: Checker | undefined, { onTree = true }: { onTree?: 
       c.workers.register(workers.source(c))
       checker?.register(c)
     } }),
-    ctx.plugin(StoreApprovals, { policies: [POLICY], sweepSeconds: 3600 }), ctx.plugin(StoreBoard, { sweepSeconds: 0 }),
+    ctx.plugin(StoreApprovals, { policies: [redOnBase ? (tiered ? TIERED : REQUIRES_RED) : POLICY], sweepSeconds: 3600 }), ctx.plugin(StoreBoard, { sweepSeconds: 0, ...board }),
   ]
   await Promise.all(fibers)
-  const engine = ctx.plugin(Workflow, config)
+  let engine = ctx.plugin(Workflow, config)
   await engine
   onTestFinished(async () => {
     await engine.dispose()
@@ -128,15 +180,24 @@ async function boot(checker: Checker | undefined, { onTree = true }: { onTree?: 
   await activeProject(ctx)
   const { subject } = captureGitSubject(workspace)!
   /** A board task writing the tree (or, `writes: false`, naming no write subject), of `actionClass`, its run started. */
-  const task = async (actionClass: 'workspace-write' | 'read' = 'workspace-write', { writes = true }: { writes?: boolean } = {}): Promise<{ taskId: string; runId: string }> => {
-    const ready = await readyTask(ctx, 'tree', { ...(writes ? { writes: { type: 'git-head' as const, ref: subject.ref } } : {}), actionClass })
-    const run = await ctx.workflow.start({ template: 'solo', input: 'change it', classification: 'public', task: { taskId: ready.taskId } })
+  const task = async (actionClass: 'workspace-write' | 'read' = 'workspace-write', { writes = true, template = 'solo', criteria }: { writes?: boolean; template?: string; criteria?: string } = {}): Promise<{ taskId: string; runId: string }> => {
+    const ready = await readyTask(ctx, 'tree', { ...(writes ? { writes: { type: 'git-head' as const, ref: subject.ref } } : {}), actionClass, ...(criteria ? { acceptance: [{ id: 'a1', statement: criteria }] } : {}) })
+    const run = await ctx.workflow.start({ template, input: 'change it', classification: 'public', task: { taskId: ready.taskId } })
     return { taskId: ready.taskId, runId: run.runId }
   }
-  return { ctx, workspace, subject, task }
+  /** The engine stops (its runs' turns aborted, as at the host's stop) and starts again on the same store. */
+  const restart = async (): Promise<void> => {
+    await engine.dispose()
+    engine = ctx.plugin(Workflow, config)
+    await engine
+  }
+  return { ctx, workspace, subject, task, restart }
 }
 
-/** The task once its run's result reached the board: done, held for the operator, or sent back. */
+/** An accepted writing result: it waits for its landing, never done before that lands it (T293). */
+const LANDING = { state: 'review', waiting: { reason: 'landing' } } as const
+
+/** The task once its run's result reached the board: done, held for the operator, accepted and waiting for its landing, or sent back. */
 const settled = (ctx: Context, taskId: string): Promise<BoardTask> => vi.waitFor(async () => {
   const task = (await ctx.board.task(taskId))!
   if (task.state === 'running' || task.state === 'claimed' || (task.state === 'review' && !task.waiting)) throw new Error(`task ${taskId} is ${task.state}`)
@@ -156,10 +217,11 @@ describe('ctx.workflow runs a written result\'s required checks on its exact tre
     const { ctx, workspace, subject, task } = await boot(checker)
     const { taskId, runId } = await task()
     const done = await settled(ctx, taskId)
-    expect(done).toMatchObject({ state: 'done' })
+    // Accepted, a writing result waits for its landing; it is done only once that lands it (T293).
+    expect(done).toMatchObject(LANDING)
     expect(checker.steps).toEqual([{ runId, workspace, subject: { ref: subject.ref, version: subject.version }, checks: ['tests', 'lint'], classification: 'public' }])
     const acceptance = acceptanceOf(ctx, runId)
-    expect(acceptance).toMatchObject({ decider: { version: '2' }, outcome: { option: 'accept', detail: { checks: { tests: true, lint: true }, checkRun: { source: 'checker', outcome: 'checked', asked: ['tests', 'lint'] } } } })
+    expect(acceptance).toMatchObject({ decider: { version: '4' }, outcome: { option: 'accept', detail: { checks: { tests: true, lint: true }, checkRun: { source: 'checker', outcome: 'checked', asked: ['tests', 'lint'] } } } })
     const evidence = (acceptance.outcome.detail['checkRun'] as { evidence: string }).evidence
     expect(acceptance.inputs).toContain(evidence)
     expect(ctx.artifacts.get(evidence as ArtifactRef)).toMatchObject({ kind: 'evidence', bodySchema: 'check-run@1.0' })
@@ -240,65 +302,63 @@ describe('ctx.workflow runs a written result\'s required checks on its exact tre
     expect(ctx.workflow.get(runId)).toMatchObject({ status: 'completed' })
   })
 
-  it('asks for no check the task\'s class does not require', async () => {
-    const checker = new Checker()
-    const { ctx, task } = await boot(checker)
-    const { taskId, runId } = await task('read')
-    expect(await settled(ctx, taskId)).toMatchObject({ state: 'done' })
-    expect(checker.steps).toEqual([])
-    expect(acceptanceOf(ctx, runId).outcome.detail).not.toHaveProperty('checkRun')
+  describe('the red-on-base check, behind its enforce switch (T306c, ADR-0079, ADR-0078)', () => {
+
+    it('on: a result whose new test fails on its base and passes on the result is accepted', async () => {
+      const checker = new Checker()
+      checker.outcomes = { tests: 'passed', lint: 'passed', 'red-on-base': 'passed' }
+      const { ctx, task } = await boot(checker, { redOnBase: 'on' })
+      const { taskId, runId } = await task()
+      expect(await settled(ctx, taskId)).toMatchObject(LANDING)
+      expect(acceptanceOf(ctx, runId).outcome).toMatchObject({ option: 'accept', detail: { checks: { tests: true, lint: true, 'red-on-base': true } } })
+      // Not a refactor: its check is not told so.
+      expect(checker.steps[0]).not.toHaveProperty('refactor')
+    })
   })
 
   describe('a board task with no write subject (T165: the lead\'s parallel tasks on one repository)', () => {
-    it('runs the checks on the tree its agent result is on and binds the result to that tree: passed, it is accepted without the operator (INV-5)', async () => {
-      const checker = new Checker()
-      const { ctx, workspace, subject, task } = await boot(checker)
-      const { taskId, runId } = await task('workspace-write', { writes: false })
-      const done = await settled(ctx, taskId)
-      expect(done).toMatchObject({ state: 'done', result: { subject: { type: 'git-head', ref: subject.ref, version: subject.version } } })
-      expect(checker.steps).toEqual([{ runId, workspace, subject: { ref: subject.ref, version: subject.version }, checks: ['tests', 'lint'], classification: 'public' }])
-      const acceptance = acceptanceOf(ctx, runId)
-      expect(acceptance.outcome).toMatchObject({ option: 'accept', detail: { subject: { type: 'git-head', ref: subject.ref, version: subject.version }, checks: { tests: true, lint: true }, checkRun: { outcome: 'checked' } } })
-      // The result's artifacts name that exact tree: the agent result on it is among them and the decision's inputs.
-      const onTree = done.result!.artifacts.filter((a) => (ctx.artifacts.get(a)?.body as { subject?: { version?: string } } | undefined)?.subject?.version === subject.version)
-      expect(onTree.length).toBeGreaterThan(0)
-      for (const a of done.result!.artifacts) expect(acceptance.inputs).toContain(a)
-    })
 
-    it('sends one whose lint check failed on its tree back as a rejected attempt', async () => {
+    it('binds to the written tree a run whose writing step left its change in a commit, its worktree clean: changed is against the commit it forked from (T293)', async () => {
       const checker = new Checker()
-      checker.outcomes = { tests: 'passed', lint: 'failed' }
-      const { ctx, task } = await boot(checker)
-      const { taskId, runId } = await task('workspace-write', { writes: false })
-      const back = await settled(ctx, taskId)
-      expect(back.state).toBe('ready')
-      expect(back.attempts.count).toBe(1)
-      const acceptance = acceptanceOf(ctx, runId)
-      expect(acceptance.outcome).toMatchObject({ option: 'reject', detail: { subject: { type: 'git-head' }, checks: { tests: true, lint: false } } })
-      expect(acceptance.candidates.find((c) => c.selected)!.reasons[0]).toMatch(/the run's own lint check failed on git-head/)
-    })
-
-    it('keeps the checks pending, for the operator, when its result is not on a git working tree (INV-2)', async () => {
-      const checker = new Checker()
-      const { ctx, task } = await boot(checker, { onTree: false })
-      const { taskId, runId } = await task('workspace-write', { writes: false })
-      expect(await settled(ctx, taskId)).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: ['tests', 'lint'] } })
-      expect(checker.steps).toEqual([])
-      const acceptance = acceptanceOf(ctx, runId)
-      expect(acceptance.outcome.detail).toMatchObject({ subject: { type: 'artifact' } })
-      expect(acceptance.outcome.detail).not.toHaveProperty('checkRun')
+      checker.base = 'dev'
+      // The source cannot run the checks here: they stay pending, so no check binds the result to the tree.
+      checker.refuse = { outcome: 'refused', cause: 'moved', reason: 'not checked in this test' }
+      const { ctx, workspace, task } = await boot(checker, { review: 'approve' })
+      const git = (...args: string[]): string => execFileSync('git', ['-C', workspace, '-c', 'user.name=t', '-c', 'user.email=t@example.test', ...args], { encoding: 'utf8' }).trim()
+      const fork = git('rev-parse', 'HEAD')
+      git('commit', '-q', '-am', 'the change, committed')
+      checker.fork = { sha: fork, head: git('rev-parse', 'HEAD') }
+      const committed = captureGitSubject(workspace)!.subject
+      const { taskId, runId } = await task('workspace-write', { writes: false, template: 'reviewed' })
+      const held = await settled(ctx, taskId)
+      expect(held).toMatchObject({ state: 'review', result: { subject: { type: 'git-head', ref: committed.ref, version: committed.version } } })
+      expect(acceptanceOf(ctx, runId).outcome.detail).toMatchObject({ subject: { type: 'git-head', ref: committed.ref } })
     })
   })
 
-  it('records a plain run\'s checks as passed or failed on its acceptance, never blocking it', async () => {
-    const checker = new Checker()
-    checker.outcomes = { tests: 'passed', lint: 'failed' }
-    const { ctx } = await boot(checker)
-    const run = ctx.workflow.start({ template: 'develop', input: 'Fix add()', classification: 'public' })
-    expect(await ctx.workflow.wait(run.runId, 30_000)).toMatchObject({ status: 'completed' })
-    expect(acceptanceOf(ctx, run.runId, 'workflow.run-acceptance')).toMatchObject({
-      decider: { version: '2' },
-      outcome: { option: 'accept', detail: { actionClass: 'workspace-write', checks: { tests: true, lint: false }, pendingChecks: ['lint'], checkRun: { outcome: 'checked' } } },
+  describe('the board\'s auto-accept rule (board.autoAccept, D80): the acceptance names the run\'s last review and where its result lands', () => {
+    const AUTO: BoardConfig = { autoAccept: { projects: ['p1'], branches: ['dev'] } }
+
+    it('lands a result whose review approved it and whose checks passed on it, on a listed branch: done without the operator, on the board\'s auto-accept decision', async () => {
+      const checker = new Checker()
+      checker.base = 'dev'
+      const { ctx, subject, task } = await boot(checker, { review: 'approve', board: AUTO })
+      const { taskId, runId } = await task('workspace-write', { template: 'reviewed' })
+      const done = await settled(ctx, taskId)
+      expect(done).toMatchObject(LANDING)
+      const acceptance = acceptanceOf(ctx, runId)
+      const review = acceptance.outcome.detail['review'] as { assessment: string }
+      expect(acceptance.outcome).toMatchObject({
+        option: 'accept',
+        detail: { checks: { review: true, tests: true, lint: true }, review: { node: 'review', verdict: 'approve', blocking: 0, cycle: 1, maxCycles: 1, subject: { ref: subject.ref, version: subject.version } }, landing: { repository: '/repo', branch: 'dev' } },
+      })
+      expect(acceptance.inputs).toContain(review.assessment)
+      const evidence = (acceptance.outcome.detail['checkRun'] as { evidence: string }).evidence
+      expect(ctx.artifacts.get(done.lastDecision!)?.body).toMatchObject({ decider: { id: 'board.auto-accept' }, inputs: expect.arrayContaining([review.assessment, evidence]), outcome: { option: 'landing', detail: { branch: 'dev' } } })
+      expect(done.result?.acceptance).toBeDefined()
+      expect(ctx.artifacts.get(done.result!.acceptance!)?.body).toMatchObject({ decider: { id: 'workflow.task-acceptance' } })
+      // Reported as accepted, and watched for its landing, whose merge asks the operator as before; done once it lands (T293).
+      await vi.waitFor(() => expect(ctx.workflow.get(runId)?.task).toMatchObject({ phase: 'reported', outcome: { status: 'accepted', state: 'review' } }), { timeout: 30_000, interval: 25 })
     })
   })
 })

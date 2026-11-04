@@ -31,6 +31,12 @@ it is a plugin.
 4. **Right model, right job.** Cheap models handle low-level work such as triage,
    extraction, summaries, and formatting. Strong models are kept for hard
    reasoning and final synthesis.
+5. **Replaceable Workers.** Work state lives in artifacts, and Workers communicate by
+   artifact id, so any Worker can continue unfinished work.
+6. **Any workflow.** Software development, scientific research, or work outside code:
+   a workflow defines its steps, tiers, and acceptance; the engine runs them all alike.
+7. **The person decides only what matters.** Routine actions inside an approved
+   boundary run without asking.
 
 Full statement: [docs/requirements/purpose.md](docs/requirements/purpose.md).
 
@@ -51,6 +57,10 @@ Built today:
 - website, agent, and model Workers under platform sandboxes and read confinement;
 - the workflow engine with capability routing, decision artifacts, acceptance contracts, and teams;
 - the resource ledger, board, approval queue, briefs and digests, and plugin host;
+- work run through System itself: ready board tasks started by dispatch (asking, or `auto` where the
+  policy says so), results held for review and accepted on their review and checks, each project's
+  lead on a token of its own with rights System enforces, a scheduled review of landed code, and the
+  maturity metrics (`system metrics`);
 - the MCP server, client protocol gateways, `system` CLI, and `/ui`.
 
 Status and what remains for each milestone are in the [roadmap](docs/proposals/roadmap.md).
@@ -91,7 +101,14 @@ system account login chatgpt-main    # once per account: sign in through noVNC o
 system account probe chatgpt-main    # prove which website features the account offers
 eval "$(system mcp-config claude)"   # Claude Code: MCP server "system" (token via headersHelper)
 system mcp-config codex >> ~/.codex/config.toml   # Codex: runs the stdio shim (system mcp-stdio)
+system health                        # what the host is doing and what to do about it
+system metrics --days 7              # the maturity metrics from recorded data (never a guess)
 ```
+
+For a project's lead (a session that runs the project's board): list the project's dev branches in
+the `approvals` row (`devBranches`), then `system lead-token issue <project>`. The lead decides on
+that token as `lead:<project>`, within a closed list of rights, and `system lead-token revoke
+<project>` ends it ([runbook](docs/operations/runbooks.md#give-a-projects-lead-its-own-token)).
 
 ## What clients get
 
@@ -101,7 +118,7 @@ system mcp-config codex >> ~/.codex/config.toml   # Codex: runs the stdio shim (
   (`session_send`, `session_inbox`), the resource ledger (`resources_pools`,
   `resources_usage`), the board (`board_*`: projects with charters, tasks, claims), the
   approval queue (`approvals_list`, `approvals_get`, `approvals_policy`), digests
-  (`digests_request`, `digests_get`), and the baseline `report`; `run` also serves one
+  (`digests_request`, `digests_get`), the baseline `report`, and `metrics`; `run` also serves one
   attempt of a board task; operator tools for runs (`approve`,
   `stop`, `continue`, `supersede`, `delete`, `drain`, `resume`), verdicts on the queue
   (`approvals_decide`), policy changes asked in it (`approvals_policy_propose`), a project's

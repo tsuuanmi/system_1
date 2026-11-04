@@ -1,13 +1,18 @@
 /** What callers see of runs: views (never the input text), the usage report, and the decision chain. */
-import type { Decision } from '@tsuuanmi/system-artifacts'
+import type { Decision } from '@tsuuanmi/system-ledger-core'
 import { type ContentId, drawFigures, QUOTA_DRAW_EVENT, type QuotaDraw, quotaDrawOf, USAGE_UNKNOWN_EVENT, type UsageUnknownKind, usageUnknownOf } from '@tsuuanmi/system-libs'
 import type { ArtifactRef } from '@tsuuanmi/system-workers-core'
 import { waitsOnCall } from './continuations.ts'
 import type { Engine } from './engine.ts'
-import type { ResolvedNode } from './spec.ts'
+import { handbookOf } from './handbook.ts'
+import { queueView } from './landing-queue.ts'
+import { blocks, bySeverity, countOf, type ResolvedNode } from './spec.ts'
 import { isSameFamily, waitingUntil } from './recovery.ts'
+import { latestAssessment } from './review.ts'
+import { riskOf } from './risk.ts'
+import { singleFamilyHeader } from './single-family.ts'
 import { tieOf, type TeamRound } from './teams.ts'
-import type { ExplainedDecision, Explanation, NodeRecord, NodeView, RunRow, RunView, UsageDraws, UsageFilter, UsageRunView, WorkflowError } from './types.ts'
+import { type ExplainedDecision, type ExplainedReview, type Explanation, MAX_WEB_CALLS_SHOWN, type NodeRecord, type NodeRow, type NodeView, type RunRow, type RunView, type StalledCheck, type UsageDraws, type UsageFilter, type UsageRunView, type WebCall, type WebCalls, type WorkflowError } from './types.ts'
 
 export function view(e: Engine, run: RunRow): RunView {
   const rows = e.nodeRows(run.run_id)
@@ -18,7 +23,7 @@ export function view(e: Engine, run: RunRow): RunView {
       nodeId: n.node_id, state: n.state, minTier: spec.tier, attempt: n.attempt,
       ...(n.execution_id ? { executionId: n.execution_id } : {}), ...(n.source ? { source: n.source } : {}), ...(n.worker ? { worker: n.worker } : {}),
       ...(n.served_tier ? { tier: n.served_tier } : {}), ...(n.quota_class ? { quotaClass: n.quota_class } : {}),
-      ...(record.outputReceipt ? { result: record.outputReceipt.result, ...usageOf(e, record.outputReceipt.result) } : {}),
+      ...(record.outputReceipt ? { result: record.outputReceipt.result, ...usageOf(e, record.outputReceipt.result), ...modelOf(e, record.outputReceipt.result) } : {}),
       ...(record.execution?.brief ? { brief: record.execution.brief } : {}),
       ...(waitingUntil(n) ? { waitingUntil: n.not_before! } : {}),
       ...(n.error && n.state !== 'COMPLETED' ? { error: JSON.parse(n.error) as WorkflowError } : {}),
@@ -27,7 +32,7 @@ export function view(e: Engine, run: RunRow): RunView {
   return {
     runId: run.run_id, template: run.template, status: run.status, specHash: run.spec_hash as ContentId,
     ...(run.session_id ? { sessionId: run.session_id } : {}),
-    ...(run.result ? { result: run.result as ArtifactRef, answer: sameFamilyNote(e, rows) + e.resultText(run.result as ArtifactRef) } : {}),
+    ...(run.result ? { result: run.result as ArtifactRef, answer: singleFamilyHeader(e, rows) + sameFamilyNote(e, rows) + e.resultText(run.result as ArtifactRef) } : {}),
     nodes,
     ...blockedOf(e, run.run_id),
     ...(run.error ? { error: JSON.parse(run.error) as WorkflowError } : {}),
@@ -49,6 +54,18 @@ function taskOf(e: Engine, runId: string): Pick<RunView, 'task'> {
 function sameFamilyNote(e: Engine, rows: ReturnType<Engine['nodeRows']>): string {
   const same = rows.filter((n) => !(JSON.parse(n.spec) as ResolvedNode).team && (n.decisions ? (JSON.parse(n.decisions) as ArtifactRef[]) : []).some((d) => isSameFamily(e, d)))
   return same.length ? `Same provider family (allowSameFamily): ${same.map((n) => n.node_id).join(', ')} ran on the family of the steps ${same.length > 1 ? 'they' : 'it'} should differ from; no other provider judged ${same.length > 1 ? 'them' : 'it'}.\n\n` : ''
+}
+
+/**
+ * The model a tiered Worker's result ran on (ADR-0073): `agent-result@1.4` names the model its
+ * configuration gives it at its tier (`configuredModel`), else the one its runtime answered with.
+ * Only a result that names its tier says it: a one-tier Worker's is shown as before.
+ */
+function modelOf(e: Engine, result: ArtifactRef): Pick<NodeView, 'model'> {
+  const body = e.ctx.artifacts.get(result)?.body as { tier?: unknown; configuredModel?: unknown; model?: unknown } | undefined
+  if (typeof body?.tier !== 'string') return {}
+  const model = typeof body.configuredModel === 'string' ? body.configuredModel : typeof body.model === 'string' ? body.model : undefined
+  return model ? { model: model.slice(0, 200) } : {}
 }
 
 /** The token usage a result reports (`model-answer`), for the usage report. */
@@ -165,9 +182,21 @@ export function explain(e: Engine, runId: string): Explanation | undefined {
   // A run dispatch started: why it started and on what come first (ADR-0064).
   const chosen = (e.tasks.dispatchOf(runId)?.decisions ?? []).map((id) => decision(e, id)).filter((d): d is ExplainedDecision => !!d)
   const own = [...chosen, ...runDecisions(e, runId)]
+  const stalled = run.status === 'running' ? stalledChecks(e, runId) : []
+  // Its risk tier and why (ADR-0071), when its project's policy has a path map.
+  const risk = riskOf(e, runId)
+  // Its research Workers' web calls (T262), from the web access rule's decisions filed under it.
+  const web = webCallsOf(e, runId)
+  // Where its accepted result stands in its target's landing queue (PROP-0016 I3).
+  const taskRow = e.tasks.row(runId)
+  const landing = taskRow ? queueView(e, taskRow) : undefined
   return {
     runId, template: run.template, status: run.status, specHash: run.spec_hash as ContentId,
     ...(own.length ? { decisions: own } : {}),
+    ...(risk ? { risk } : {}),
+    ...(stalled.length ? { stalledChecks: stalled } : {}),
+    ...(web ? { webCalls: web } : {}),
+    ...(landing ? { landing } : {}),
     nodes: e.nodeRows(runId).map((node) => {
       const record = JSON.parse(node.record) as NodeRecord
       const kept = node.decisions ? (JSON.parse(node.decisions) as ArtifactRef[]) : []
@@ -179,13 +208,106 @@ export function explain(e: Engine, runId: string): Explanation | undefined {
       const latest = [...kept, ...(last && !kept.includes(last) ? [last] : [])]
       const earlier = e.ctx.artifacts.list({ kind: 'decision', runId, nodeId: node.node_id, limit: 1000 }).map((a) => a.id as ArtifactRef).filter((id) => !latest.includes(id))
       const ids = [...earlier, ...latest]
+      // The handbook slice its latest brief recorded, with what its Worker source rendered (docs/design/handbook.md#what-a-brief-records).
+      const handbook = handbookOf(e, record.execution?.brief, runId, node.execution_id)
       return {
         nodeId: node.node_id, state: node.state,
         ...(node.execution_id ? { executionId: node.execution_id } : {}), ...(node.worker ? { worker: node.worker } : {}), ...(node.quota_class ? { quotaClass: node.quota_class } : {}),
+        // A tiered Worker's step says the tier it ran at and the model it ran on (ADR-0073).
+        ...(() => {
+          const model = record.outputReceipt ? modelOf(e, record.outputReceipt.result) : {}
+          return model.model && node.served_tier ? { tier: node.served_tier, model: model.model } : {}
+        })(),
         decisions: ids.filter((id): id is ArtifactRef => !!id).map((id) => decision(e, id)).filter((d): d is ExplainedDecision => !!d),
+        ...(handbook ? { handbook } : {}),
+        ...(() => {
+          const review = explainedReview(e, node)
+          return review ? { review } : {}
+        })(),
       }
     }),
   }
+}
+
+/** A review step's latest assessment for `explain` (ADR-0075): summary first, findings by severity with their votes. */
+function explainedReview(e: Engine, node: NodeRow): ExplainedReview | undefined {
+  const latest = latestAssessment(e, node)
+  if (!latest) return undefined
+  const findings = latest.body.findings ?? []
+  return {
+    assessment: latest.ref, verdict: latest.body.verdict ?? '', summary: latest.body.summary ?? countOf(findings),
+    findings: bySeverity(findings).map((f) => ({
+      ...(f.id ? { id: f.id } : {}), severity: f.severity, title: f.title, ...(f.file ? { place: `${f.file}${f.line ? `:${f.line}` : ''}` } : {}),
+      ...(f.class ? { class: f.class } : {}), blocks: blocks(f), ...(f.verification ? { vote: f.verification.vote, reason: f.verification.reason } : {}), ...(f.repeated ? { repeated: f.repeated } : {}),
+    })),
+  }
+}
+
+/** The event a Worker source tells a check's stall by (agent-workers `CHECK_EVENT`, T235): `stalled`, `resumed`, `ended`. */
+export const CHECK_EVENT = 'agent-workers.check'
+/** The check events of a run explain reads at most, the latest first (INV-9). */
+const CHECK_EVENTS_READ = 200
+
+/**
+ * The run's checks stalled now (T235): per check, its latest `agent-workers.check` event, when that
+ * says `stalled` and its check's deadline has not passed (past it the check no longer runs: a restart
+ * that cut it never tells its `ended`). An entry that is not one is skipped; a log that cannot be read
+ * shows none, logged.
+ */
+function stalledChecks(e: Engine, runId: string): StalledCheck[] {
+  let entries: Array<{ at: string; data?: unknown }>
+  try {
+    entries = e.ctx.eventLog.query({ type: CHECK_EVENT, runId, order: 'desc', limit: CHECK_EVENTS_READ })
+  } catch (error) {
+    e.ctx.logger.warn(`workflow: the check events of run ${runId} could not be read: ${(error as Error).message}`)
+    return []
+  }
+  const seen = new Set<string>()
+  const stalled: StalledCheck[] = []
+  const now = Date.now()
+  for (const entry of entries) {
+    const d = entry.data as { check?: unknown; command?: unknown; state?: unknown; quietSince?: unknown; stallSeconds?: unknown; deadline?: unknown } | undefined
+    if (typeof d?.check !== 'string' || seen.has(d.check)) continue
+    seen.add(d.check)
+    if (d.state !== 'stalled' || (typeof d.deadline === 'string' && Date.parse(d.deadline) <= now)) continue
+    stalled.push({
+      check: d.check, command: typeof d.command === 'string' ? d.command : '', since: entry.at,
+      quietSince: typeof d.quietSince === 'string' ? d.quietSince : entry.at, stallSeconds: typeof d.stallSeconds === 'number' ? d.stallSeconds : 0,
+    })
+  }
+  return stalled.reverse()
+}
+
+/** The rule whose decisions are a research Worker's web calls (agent-workers `WEB_RULE`, T262). */
+export const WEB_ACCESS_RULE = 'agent-workers.web-access'
+/** The gate decisions of a run read at most for its web calls (INV-9). */
+const WEB_DECISIONS_READ = 1000
+
+/**
+ * A run's web calls (T262): the `gate` decisions of rule {@link WEB_ACCESS_RULE} filed under it, oldest
+ * first, each read from its outcome (tool, query or URL, verdict, egress outcome, why), counted whole
+ * and listed at most {@link MAX_WEB_CALLS_SHOWN}. A decision that does not read as one is skipped.
+ * Undefined when there are none.
+ */
+function webCallsOf(e: Engine, runId: string): WebCalls | undefined {
+  const found = e.ctx.artifacts.list({ kind: 'decision', decisionType: 'gate', runId, limit: WEB_DECISIONS_READ })
+    .filter((a) => (a.body as Decision | undefined)?.decider.id === WEB_ACCESS_RULE)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+  const calls: WebCall[] = []
+  for (const a of found) {
+    const body = a.body as Decision
+    const d = body.outcome.detail as { tool?: unknown; target?: unknown; egress?: unknown; reason?: unknown; nodeId?: unknown } | undefined
+    const verdict = body.outcome.option
+    if ((verdict !== 'auto' && verdict !== 'ask' && verdict !== 'deny') || typeof d?.tool !== 'string' || typeof d.target !== 'string') continue
+    const egress = d.egress === 'allow' || d.egress === 'deny' ? d.egress : 'not-checked'
+    calls.push({
+      at: a.createdAt, ...(typeof d.nodeId === 'string' ? { nodeId: d.nodeId } : a.nodeId ? { nodeId: a.nodeId } : {}), tool: d.tool, target: d.target, verdict, egress,
+      ...(typeof d.reason === 'string' ? { reason: d.reason } : {}), decision: a.id as ArtifactRef,
+    })
+  }
+  if (!calls.length) return undefined
+  const count = (verdict: WebCall['verdict']): number => calls.filter((c) => c.verdict === verdict).length
+  return { count: calls.length, auto: count('auto'), asked: count('ask'), denied: count('deny'), calls: calls.slice(0, MAX_WEB_CALLS_SHOWN) }
 }
 
 /** The decision types the engine records for a run as a whole, under no step. */

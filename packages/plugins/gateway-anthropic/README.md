@@ -1,5 +1,7 @@
 # @tsuuanmi/system-gateway-anthropic
 
+> **Parked and frozen (security fixes only)** since 2026-11-01: [components](../../../docs/architecture/components.md#parked).
+
 The **Anthropic Messages gateway**, on the DSH webserver under `/anthropic`
 (loopback only). Claude Code points its base URL here and uses website Workers
 as its model ([gateways](../../../docs/design/gateways.md),
@@ -28,7 +30,9 @@ never printed, exported, or written to Claude Code's settings.
     `system-frontier`.
 - **Tiers:** a model name maps to a tier.
   - `system-<tier>` names the tier directly.
-  - Otherwise the `models` patterns apply (default: `haiku` → `economy`).
+  - Otherwise the `models` patterns apply: the operator's, in the live profile (a model-name
+    pattern → a tier, such as `"<economy model family>": economy`); none by default, since model
+    names are configuration only (ADR-0073).
   - Anything else gets `standard`.
 - **Runs:** each request is an `ask` run on the workflow engine. It is routed,
   egress-checked at the configured `classification`, receipted, and

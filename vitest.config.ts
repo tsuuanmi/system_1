@@ -1,8 +1,10 @@
-import { availableParallelism } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
 import { BaseSequencer, type TestSpecification } from 'vitest/node'
+import { scaled } from './packages/provider-core/conformance/time.ts'
+import { BrowserSkips } from './scripts/browser-skips.ts'
 import { durationKey, order, readDurations } from './scripts/test-durations.ts'
+import { testWorkers } from './scripts/test-workers.ts'
 
 const src = (path: string): string => fileURLToPath(new URL(path, import.meta.url))
 
@@ -56,11 +58,16 @@ export default defineConfig({
       '@tsuuanmi/system-worker-sessions': src('./packages/plugins/worker-sessions/src/index.ts'),
       '@tsuuanmi/system-workflow': src('./packages/plugins/workflow/src/index.ts'),
       '@tsuuanmi/system-workers-core': src('./packages/workers-core/src/index.ts'),
+      '@tsuuanmi/system-ledger-core': src('./packages/ledger-core/src/index.ts'),
       '@tsuuanmi/system-approvals-core': src('./packages/approvals-core/src/index.ts'),
       '@tsuuanmi/system-approvals': src('./packages/plugins/approvals/src/index.ts'),
       '@tsuuanmi/system-digest-core': src('./packages/digest-core/src/index.ts'),
+      '@tsuuanmi/system-decision-core': src('./packages/decision-core/src/index.ts'),
+      '@tsuuanmi/system-landing-core': src('./packages/landing-core/src/index.ts'),
+      '@tsuuanmi/system-landing-local': src('./packages/plugins/landing-local/src/index.ts'),
       '@tsuuanmi/system-digest': src('./packages/plugins/digest/src/index.ts'),
       '@tsuuanmi/system-digest-extractive': src('./packages/plugins/digest-extractive/src/index.ts'),
+      '@tsuuanmi/system-workers-fake': src('./packages/plugins/workers-fake/src/index.ts'),
       '@tsuuanmi/system-report': src('./packages/plugins/report/src/index.ts'),
       '@tsuuanmi/system-resources-core': src('./packages/resources-core/src/index.ts'),
       '@tsuuanmi/system-resources': src('./packages/plugins/resources/src/index.ts'),
@@ -73,24 +80,29 @@ export default defineConfig({
       '@tsuuanmi/system-provider-core': src('./packages/provider-core/src/index.ts'),
       '@tsuuanmi/system-plugin-host-core': src('./packages/plugin-host-core/src/index.ts'),
       '@tsuuanmi/system-plugin-host': src('./packages/plugins/plugin-host/src/index.ts'),
-      '@tsuuanmi/system-experiments-core': src('./packages/experiments-core/src/index.ts'),
-      '@tsuuanmi/system-evaluations-core': src('./packages/evaluations-core/src/index.ts'),
-      '@tsuuanmi/system-statistics': src('./packages/statistics/src/index.ts'),
+      '@tsuuanmi/system-decisions': src('./packages/plugins/decisions/src/index.ts'),
+      '@tsuuanmi/system-lead-inbox':src('./packages/plugins/lead-inbox/src/index.ts'),
+      '@tsuuanmi/system-notify': src('./packages/plugins/notify/src/index.ts'),
     },
   },
   test: {
-    // The M0 spike is not part of the suite: its probe runs by hand (spikes/m0-dsh-core/README.md).
     include: ['scripts/**/*.spec.ts', 'packages/**/tests/**/*.spec.ts'],
     // One temporary parent per run, removed at its end (and a killed run's, at the next start).
     globalSetup: ['./scripts/test-tmp.ts'],
+    // Browser tests skipped where no browser can run are counted and said at the end, and to a check (T247).
+    reporters: ['default', new BrowserSkips()],
     // Setup starts real displays and browsers: on a loaded 4-vCPU CI runner that can pass the
-    // 10 s default, which fails a whole suite before any of its tests runs.
-    hookTimeout: 60_000,
+    // 10 s default, which fails a whole suite before any of its tests runs. Scaled by
+    // SYSTEM_TEST_TIME_FACTOR (T348), as the Xvfb and Chrome start-up bounds those hooks wait on are.
+    hookTimeout: scaled(60_000),
     // At most 32 files at once (vitest's own default is one per CPU but one). On a 256-CPU host that
     // was 255: every file, its imports served by the one main process, its stores and processes at
     // once, and in-process tests of 1 to 2 s passed their 5 s bound (two copies of the suite: 9
     // failures, none capped, in the same 3.6 minutes). A 4-vCPU runner keeps its 3.
-    maxWorkers: Math.max(1, Math.min(32, availableParallelism() - 1)),
+    // An acceptance check (agent-workers, T292) sets SYSTEM_CHECK_MAX_WORKERS and a writing step its own
+    // test runs' SYSTEM_TEST_MAX_WORKERS (T348): a share of the host's cores, so that the runs the host
+    // runs at once, each with that many workers, fit its cores (scripts/test-workers.ts).
+    maxWorkers: testWorkers(),
     // Longest first by scripts/test-durations.json (`pnpm gen:test-durations`), cache or none.
     sequence: { sequencer: DurationSequencer },
   },

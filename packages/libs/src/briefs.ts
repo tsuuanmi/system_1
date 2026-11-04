@@ -23,8 +23,41 @@ export interface BriefFile { path: string; ref: ContentId; note?: string }
 /** What checks an acceptance criterion (`board-task@1.x`): a kind of check a policy rule can require, or the operator. */
 export type BriefCheck = 'tests' | 'typecheck' | 'lint' | 'schema' | 'quote-check' | 'review' | 'operator'
 
+/** A handbook layer (docs/design/handbook.md#the-five-layers): 1 constitution, 2 organisation policy, 3 project charter, 4 role playbook, 5 repository lessons. */
+export type HandbookLayer = 1 | 2 | 3 | 4 | 5
+/** A role a handbook slice is selected for. */
+export type HandbookRole = 'develop' | 'review' | 'validate' | 'research' | 'lead'
+
+/**
+ * `brief@1.6` `handbook`: the handbook slice the Worker was given (docs/design/handbook.md#what-a-brief-records):
+ * the bound and its mode, what selected the slice, and per layer the version, who rendered it, the
+ * ids of the parts it carried, and its size in estimated tokens (`ceil(UTF-8 bytes / 4)`; the
+ * source's half at its constructed maximum).
+ */
+export interface BriefHandbook {
+  bound: { tokens: number; mode: 'warn' | 'refuse' }
+  /** The slice's estimated tokens in all, both halves. */
+  tokens: number
+  selection: {
+    role: HandbookRole
+    class?: string
+    tier: 'light' | 'normal' | 'heavy' | 'off'
+    /** The `workflow.risk-tier` decision the tier is from, `map` (the step's own reading of the path map), `unknown` (heavy: unread), or `off`. */
+    tierFrom: string
+    paths: 'subject' | 'previous-attempt' | 'declared' | 'unknown'
+    /** The touched paths, when they were read (at most 200): the Worker source selects its lessons by them too. */
+    touched?: string[]
+  }
+  /** `atMost`: the source's half, counted at its constructed maximum; what it rendered, it records itself. */
+  layers: Array<{ layer: HandbookLayer; version: string; renderedBy: 'engine' | 'source'; parts: string[]; tokens: number; sha256?: string; atMost?: boolean }>
+}
+
 export interface Brief {
-  schema: 'brief@1.0' | 'brief@1.1' | 'brief@1.2' | 'brief@1.3'
+  schema: 'brief@1.0' | 'brief@1.1' | 'brief@1.2' | 'brief@1.3' | 'brief@1.4' | 'brief@1.5' | 'brief@1.6'
+  /** `@1.4`: the tier routing served the run at, when its Worker offers several (ADR-0073); from the route decision. */
+  tier?: 'economy' | 'standard' | 'frontier'
+  /** `@1.5`, with `tier`: the model its Worker's source configuration runs at that tier (ADR-0073); configuration, shown only. */
+  model?: string
   projectId?: string
   taskId?: string
   attempt?: number
@@ -43,6 +76,8 @@ export interface Brief {
   budget: { remaining: BriefBudgetLine[]; deadline?: string }
   sandbox: BriefSandbox
   resume?: { nativeHandle: string; fork?: boolean }
+  /** `@1.6`: the handbook slice the Worker was given, each layer's version and size ({@link BriefHandbook}). */
+  handbook?: BriefHandbook
   classification: BriefClassification
 }
 
@@ -138,7 +173,7 @@ function frame(brief: Brief, options: RenderOptions): string {
   }
   if (brief.ask) {
     lines.push(`If you cannot finish without an answer from a person, answer with only this JSON object and nothing else: {"questions": ["..."]}, `
-      + `with 1 to ${brief.ask.maxQuestions} questions of at most ${QUESTION_LIMITS.chars} characters each. The task then waits for the answers, and its next attempt is given them.`)
+      + `with 1 to ${brief.ask.maxQuestions} questions of at most ${QUESTION_LIMITS.chars} characters each. The task then waits for the answers, and this attempt continues with them: asking spends no attempt.`)
   }
   return lines.join('\n')
 }

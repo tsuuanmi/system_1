@@ -8,19 +8,17 @@
  * @module @tsuuanmi/system-board
  */
 import { createHash, randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { type ApprovalRequest, type AutonomyVerdict, type Check, type Mode, type NewRequest, waitSeconds } from '@tsuuanmi/system-approvals-core'
-import type {} from '@tsuuanmi/system-artifacts'
-import type {} from '@tsuuanmi/system-event-log'
+import { type ApprovalRequest, type AutonomyVerdict, type Check, HOST_STOPPED_RECONCILIATION, type Mode, type NewRequest, riskTierMaps, waitSeconds } from '@tsuuanmi/system-approvals-core'
+import type {} from '@tsuuanmi/system-ledger-core'
 import {
-  type ActionClass, type ArtifactRef, Board, BoardError, type BoardTask, type BudgetLine, type CancelReason, type Charter, type CharterInput, type Claim, fundingVersion, type Project, type ProjectState, renderTasks, type RunOutcome, type Subject,
-  type TaskInput, type TaskState, TERMINAL, type Unit, type UnreleasedHold, unreleasedProblem, unreleasedText, type WaitReason,
+  type ActionClass, type ArtifactRef, Board, BoardError, type Breaker, BREAKER_DEFAULT, type BreakerLine, type Escape, type BoardTask, type BudgetLine, type CancelReason, type Charter, type CharterInput, type Claim, DEFECT_SHA, type Defect, type DefectBy, FREE_RETRIES_DEFAULT, FREE_RETRIES_MAX, freeRetriesOf, fundingVersion,
+  type InfrastructureFailure, infrastructureProblem, LANDING_WAIT_SECONDS, type LandingEnd, type Lease, LeaseLost, type Project, type ProjectState, REOPEN_REASON_MAX, type Reopening, renderTasks, type RunOutcome, StaleGeneration, type Subject, type TaskInput, type TaskState, TERMINAL, type Unit, type UnreleasedHold, unreleasedProblem, unreleasedText, type WaitReason,
 } from '@tsuuanmi/system-board-core'
 import type {} from '@tsuuanmi/system-gateway-core'
-import { contentId, SchemaError, SchemaRegistry } from '@tsuuanmi/system-libs'
-import { type Lease, LeaseLost, StaleGeneration } from '@tsuuanmi/system-leases'
-import type {} from '@tsuuanmi/system-store'
+import { clampText, contentId, isRecord, SchemaError, SchemaRegistry } from '@tsuuanmi/system-libs'
 import { registerTools } from './tools.ts'
 
 export interface Config {
@@ -41,12 +39,45 @@ export interface Config {
    * 10): a template whose attempts are each one hypothesis may need more than another's.
    */
   templateAttempts?: Record<string, number>
+  /**
+   * The budget a task gets when its proposal names none (PROP-0023 change 3): budget lines, each on
+   * a pool or a template's pools (`claude-code.agents`, ADR-0083). Empty (the default): a task with
+   * no budget reserves nothing, as before.
+   */
+  defaultBudget?: BudgetLine[]
+  /**
+   * Failed runs of one task that failed only on the infrastructure (the host stopped them, nothing
+   * of them was sent, a Worker became unavailable) and are not counted as attempts, at most (default
+   * 3, 0 to 10; INV-9, ADR-0069). Past it such a run counts as any failed run does.
+   */
+  maxFreeRetries?: number
   /** The most items one page of `board_projects` or `board_tasks` holds (default 100, the tools' own maximum). */
   pageBound?: number
   /** The most tasks the `TASKS.md` projection lists, open ones first (default 200). */
   projectionMaxTasks?: number
   /** How often the board sweeps on its own, in seconds, and once at start (a restart is a sweep); 0: only when called (default 60). */
   sweepSeconds?: number
+  /**
+   * The projects and landing branches whose results System accepts without holding them for the
+   * operator (D80, ADR-0067; default off: none). For a task of a listed project whose result is on a
+   * git working tree, the run owner's accepting decision applies only when the run's last review
+   * approved the exact result with no blocking finding left, every required check the policy names
+   * that is a command ran on the exact result and passed (its `check-run` record), and the result
+   * lands on a listed branch; otherwise the review is held for the operator, with the reasons.
+   */
+  autoAccept?: AutoAccept
+}
+
+/** Where System accepts a result without the operator (D80): project ids, and the branches a result may land on. */
+export interface AutoAccept {
+  projects: string[]
+  branches: string[]
+  /**
+   * The circuit breaker's line (ADR-0067 amendment, D93; default 2 escaped defects in 7 days): at
+   * that many escapes of auto-accepted results of a project and branch within the window,
+   * auto-accept for them turns off, until the operator or the lead turns it on once the line holds.
+   */
+  breaker?: BreakerLine
 }
 
 /** A page of a listing, and the cursor of the next one (absent on the last). */
@@ -71,6 +102,56 @@ export type Renewed = Claim & { task: BoardTask }
 const checkedBy = <T>(check: Checked<T> | undefined, value: T): T => {
   check?.(value)
   return value
+}
+
+/** The calls that propose a task, under whose name a retry-safe key is recorded. */
+type ProposeTool = 'board_propose' | 'board_propose_plan'
+
+/** The schema tag a task's record takes for a move that needs `tag`: `board-task@1.5` once it names a variant, whatever else it carries. */
+const tagOf = (task: { variant?: string }, tag: BoardTask['schema']): BoardTask['schema'] => task.variant !== undefined ? 'board-task@1.5' : tag
+
+/** One task of a plan (`board_propose_plan`): a task's proposal, named in the plan by `key`, its `dependsOn` items' keys or the project's task ids. */
+export type PlanItem = Omit<TaskInput, 'projectId' | 'fixes'> & { key: string }
+/** A plan's item and the task proposed for it. */
+export interface PlannedTask { key: string; task: BoardTask }
+/** Items a plan holds at most. */
+export const PLAN_ITEMS = 32
+
+/**
+ * The order a plan's items are proposed in, each after the items it depends on; `invalid` for an
+ * empty or oversized plan, a key named twice, or a cycle among the items, and `conflict` for two
+ * items that write one subject (INV-15). A dependency that is not one of the plan's keys is left
+ * for {@link StoreBoard.proposeTask} to resolve as a task id of the project.
+ */
+export function planOrder(items: readonly PlanItem[]): PlanItem[] {
+  if (items.length < 1 || items.length > PLAN_ITEMS) throw new BoardError('invalid', `a plan holds 1 to ${PLAN_ITEMS} tasks`)
+  const byKey = new Map<string, PlanItem>()
+  const writers = new Map<string, string>()
+  for (const item of items) {
+    if (byKey.has(item.key)) throw new BoardError('invalid', `the plan names key ${item.key} twice`)
+    byKey.set(item.key, item)
+    if (item.writes) {
+      const subject = `${item.writes.type}:${item.writes.ref}`
+      const other = writers.get(subject)
+      if (other !== undefined) throw new BoardError('conflict', `plan items ${other} and ${item.key} both write ${subject} (INV-15): one task at a time writes a subject`)
+      writers.set(subject, item.key)
+    }
+  }
+  const order: PlanItem[] = []
+  const state = new Map<string, 'visiting' | 'done'>()
+  const visit = (item: PlanItem, path: string[]): void => {
+    if (state.get(item.key) === 'done') return
+    if (state.get(item.key) === 'visiting') throw new BoardError('invalid', `the plan's dependencies form a cycle: ${[...path, item.key].join(' -> ')}`)
+    state.set(item.key, 'visiting')
+    for (const dep of item.dependsOn ?? []) {
+      const on = byKey.get(dep)
+      if (on) visit(on, [...path, item.key])
+    }
+    state.set(item.key, 'done')
+    order.push(item)
+  }
+  for (const item of items) visit(item, [])
+  return order
 }
 
 export const TASK_STATES: readonly TaskState[] = ['proposed', 'ready', 'claimed', 'running', 'review', 'waiting-for-input', 'waiting-for-approval', 'done', 'cancelled']
@@ -115,6 +196,39 @@ const MIGRATIONS = [{
   version: 2,
   sql: `ALTER TABLE board_projects ADD COLUMN charter_expires_at TEXT;
   ALTER TABLE board_client_requests ADD COLUMN charter_version INTEGER;`,
+}, {
+  // The failed runs of a task that failed only on the infrastructure and were not counted as
+  // attempts (ADR-0069): bounded by maxFreeRetries (INV-9), kept beside the record, never in it.
+  version: 3,
+  sql: 'ALTER TABLE board_tasks ADD COLUMN free_retries INTEGER NOT NULL DEFAULT 0;',
+}, {
+  // The auto-accept circuit breaker (ADR-0067 amendment, D93): the escaped defects the operator or
+  // the lead recorded against auto-accepted results (one per task), and the breakers they tripped:
+  // at most one open (not reset) per project and branch. A reset is a row's own update, never time's.
+  version: 4,
+  sql: `CREATE TABLE board_escapes (
+    escape_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, branch TEXT NOT NULL, task_id TEXT NOT NULL UNIQUE,
+    acceptance TEXT NOT NULL, found_at TEXT NOT NULL, recorded_at TEXT NOT NULL, recorded_by TEXT NOT NULL, note TEXT NOT NULL
+  );
+  CREATE INDEX board_escapes_window ON board_escapes (project_id, branch, found_at);
+  CREATE TABLE board_breakers (
+    breaker_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, branch TEXT NOT NULL, tripped_at TEXT NOT NULL, decision TEXT NOT NULL,
+    line_escapes INTEGER NOT NULL, line_days INTEGER NOT NULL, escapes TEXT NOT NULL,
+    reset_at TEXT, reset_by TEXT, reset_decision TEXT,
+    CHECK ((reset_at IS NULL) = (reset_by IS NULL) AND (reset_at IS NULL) = (reset_decision IS NULL))
+  );
+  CREATE UNIQUE INDEX board_breakers_open ON board_breakers (project_id, branch) WHERE reset_at IS NULL;`,
+}, {
+  // An answered question continues the attempt that asked (T291): the flag is set by the answer and
+  // read, then cleared, by the next start, which then does not count another attempt. Beside the record, never in it.
+  version: 5,
+  sql: 'ALTER TABLE board_tasks ADD COLUMN continues INTEGER NOT NULL DEFAULT 0;',
+}, {
+  // When the board's process last stopped cleanly (T302): one row, written as the board stops and
+  // removed as the next one starts, so a lease that expired between the two lapsed while the host was
+  // stopped. A crash writes none, and then no lost run is marked host-stopped (INV-2).
+  version: 6,
+  sql: 'CREATE TABLE board_host_stop (id INTEGER PRIMARY KEY CHECK (id = 1), stopped_ms INTEGER NOT NULL);',
 }]
 
 type Changes<T> = { [K in keyof T]?: T[K] | undefined }
@@ -123,11 +237,33 @@ interface Stored { task: BoardTask; token?: string; ttlMs?: number }
 /** A project as stored: its record and its pending charter request, with the version it asks about and when it expires. */
 interface StoredProject { project: Project; request?: string; version?: number; expiresAt?: string }
 /** An `acceptance` decision bound to a task's result: its outcome, whether the operator made it, and the checks it reports. */
-interface Acceptance { option: 'accept' | 'reject'; operator: boolean; checks?: Partial<Record<Check, boolean>> }
+/**
+ * An acceptance decision as the board reads it. `lead`: it is the task's project's lead's, on its own
+ * token (ADR-0076): a `client` decider `lead:<project>` the system produced under that id.
+ */
+interface Acceptance { option: 'accept' | 'reject'; operator: boolean; lead?: boolean; checks?: Partial<Record<Check, boolean>> }
 /** The policy's verdict for a task's next attempt, and the approval request it opened on ask. */
 interface NextAttempt { verdict: AutonomyVerdict; request?: ApprovalRequest }
-/** An accepting decision only the operator's can replace now: the verdict, the checks still pending, and how long the operator has. */
-interface Held { verdict: AutonomyVerdict; pendingChecks: Check[]; seconds: number }
+/**
+ * An accepting decision only the operator's can replace now: the verdict, the checks still pending,
+ * how long the operator has, and, when the auto-accept rule held it, why it did not apply.
+ */
+interface Held { verdict: AutonomyVerdict; pendingChecks: Check[]; seconds: number; autoAccept?: string[]; heavy?: string }
+/** A required check the operator accepted a result past, not run, with the note that says why (T293). */
+interface NotRun { check: Check; note: string }
+/** The characters an operator's note on a check not run holds at most (INV-9). */
+const NOT_RUN_NOTE_MAX = 500
+/** An accepting decision the auto-accept rule applies (D80): the records it stands on. */
+interface AutoAccepted { verdict: AutonomyVerdict; review: ArtifactRef; evidence?: ArtifactRef; checks: Check[]; branch: string }
+/** What the board does with an acceptance decision: hold it for the operator, apply it by the auto-accept rule, or apply it as it is (neither). */
+interface Gate { held?: Held; auto?: AutoAccepted }
+/** A `board_escapes` row. */
+interface EscapeRow { escape_id: string; project_id: string; branch: string; task_id: string; acceptance: string; found_at: string; recorded_at: string; recorded_by: string; note: string }
+/** A `board_breakers` row. */
+interface BreakerRow {
+  breaker_id: string; project_id: string; branch: string; tripped_at: string; decision: string; line_escapes: number; line_days: number; escapes: string
+  reset_at: string | null; reset_by: string | null; reset_decision: string | null
+}
 /** A `board_client_requests` row: what a retry-safe call made. */
 interface PriorRequest { project_id: string; task_id: string | null; approval_request: string | null; charter_version: number | null }
 /** A charter request settled by the sweep: the project as it now is, and the tasks it cancelled. */
@@ -143,11 +279,43 @@ interface Why {
   also?: Array<{ option: string; whyNot: string }>
   /** The question, when the default (from → to, or to → instead) does not say it. */
   question?: string
+  /** The rule that decided it, when not the transition table's (`board.transition`). */
+  rule?: string
 }
 
 /** The checks a policy rule can require (`autonomy-policy@1.0`). */
-const CHECKS: readonly Check[] = ['tests', 'typecheck', 'lint', 'schema', 'quote-check', 'review']
-const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
+const CHECKS: readonly Check[] = ['tests', 'typecheck', 'lint', 'schema', 'quote-check', 'review', 'red-on-base']
+/** The required checks that are commands, which a run runs on its exact result (ADR-0063) and records as `check-run@1.0`. */
+const COMMAND_CHECKS: readonly Check[] = ['tests', 'typecheck', 'lint', 'red-on-base']
+/**
+ * The command checks whose pass the auto-accept rule reads in the check-run record: `red-on-base` is
+ * left out (T306c): its enforce switch may be warn or off, or the change light, and the run's own
+ * acceptance then reports it met with no `passed` record behind it; the run owner judged it.
+ */
+const PROVEN_CHECKS: readonly Check[] = ['tests', 'typecheck', 'lint']
+/** A project id in `autoAccept` (`common@1` `id`). */
+const PROJECT_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/
+/** A branch name in `autoAccept`: a plain git branch name, never a pattern. */
+const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\/$)(?!.*\.lock$)[A-Za-z0-9._/-]{1,200}$/
+/** The most projects and branches `autoAccept` lists, each. */
+const AUTO_ACCEPT_MAX = 64
+/** `autoAccept` as configured, refused (TypeError) unless each list holds distinct valid names within the bound; undefined when off. */
+export function autoAcceptOf(config: AutoAccept | undefined): AutoAccept | undefined {
+  if (config === undefined) return undefined
+  for (const [key, pattern] of [['projects', PROJECT_ID], ['branches', BRANCH]] as const) {
+    const list = config[key]
+    if (!Array.isArray(list) || list.length > AUTO_ACCEPT_MAX) throw new TypeError(`board.autoAccept.${key} is a list of at most ${AUTO_ACCEPT_MAX} names`)
+    const bad = list.find((v) => typeof v !== 'string' || !pattern.test(v))
+    if (bad !== undefined) throw new TypeError(`board.autoAccept.${key}: ${JSON.stringify(bad)} is not a ${key === 'projects' ? 'project id' : 'branch name'}`)
+    if (new Set(list).size !== list.length) throw new TypeError(`board.autoAccept.${key} names one twice`)
+  }
+  const line = config.breaker
+  if (line !== undefined && (!isRecord(line) || !Number.isInteger(line.escapes) || line.escapes < 1 || line.escapes > 100 || !Number.isInteger(line.days) || line.days < 1 || line.days > 90)) {
+    throw new TypeError('board.autoAccept.breaker is { escapes: 1 to 100, days: 1 to 90 }')
+  }
+  // Both lists are needed: a project with no branch, or a branch with no project, accepts nothing.
+  return config.projects.length && config.branches.length ? { projects: [...config.projects], branches: [...config.branches], ...(line ? { breaker: { escapes: line.escapes, days: line.days } } : {}) } : undefined
+}
 const resourceOf = (taskId: string): string => `board-task:${taskId}`
 const charterRef = (projectId: string, version: number): string => `project:${projectId}:charter:${version}`
 /** The charter's subject version: the sha256 of its canonical JSON without its approval (reference/schemas.md#project). */
@@ -159,6 +327,13 @@ const charterHash = (charter: Charter): string => {
 const writesKey = (subject: Subject | undefined): string | null => (subject ? JSON.stringify([subject.type, subject.ref]) : null)
 /** Whether the task may make another attempt: `attempts.count` never exceeds `attempts.max`. */
 const attemptLeft = (task: BoardTask): boolean => task.attempts.count < task.attempts.max
+/** The question wait an answered gate's request names (`board-task:<id>:attempt:<n>:answered:<wait>`), for this task at its attempt; undefined for any other request. */
+const answeredWaitOf = (task: BoardTask, ref: string): string | undefined => {
+  const prefix = `board-task:${task.taskId}:attempt:${task.attempts.count}:answered:`
+  return ref.startsWith(prefix) && ref.length > prefix.length ? ref.slice(prefix.length) : undefined
+}
+/** The task with the attempt its last run made given back: that run failed only on the infrastructure (ADR-0069). */
+const refunded = (task: BoardTask): BoardTask => ({ ...task, attempts: { ...task.attempts, count: Math.max(0, task.attempts.count - 1) } })
 /** The earlier of two instants, either of which may be unknown. */
 const earliest = (a: string | undefined, b: string | undefined): string | undefined => (a === undefined ? b : b === undefined || Date.parse(a) <= Date.parse(b) ? a : b)
 const sameSubject = (a: Subject, b: Subject): boolean => a.type === b.type && a.ref === b.ref && a.version === b.version
@@ -173,11 +348,6 @@ const raised = (budget: readonly BudgetLine[], lines: readonly BudgetLine[]): Bu
 /** What the task's applied raises added to its pool and unit so far. */
 const raisedSoFar = (task: BoardTask, line: BudgetLine): number =>
   round6((task.funding ?? []).flatMap((f) => f.lines).filter((l) => samePoolUnit(l, line)).reduce((n, l) => n + l.amount, 0))
-/** At most `max` characters (code points), cut on a whole one. */
-const clamp = (text: string, max: number): string => {
-  const chars = [...text]
-  return chars.length <= max ? text : `${chars.slice(0, max - 1).join('')}…`
-}
 const newId = (prefix: string): string => `${prefix}-${randomUUID().replaceAll('-', '').slice(0, 12)}`
 /** An id derived from a client's request key, so a retry of the same call names the same record. */
 const derivedId = (prefix: string, key: string): string => `${prefix}-${createHash('sha256').update(key).digest('hex').slice(0, 24)}`
@@ -212,16 +382,61 @@ export class StoreBoard extends Board {
     leaseTtlSeconds: z.natural().min(30).max(3600).default(600).description('Lease length when a claim names none, in seconds (leases.maxTtlMs caps it)'),
     maxAttempts: z.natural().min(1).max(10).default(3).description('Attempts a task gets when its proposal names none and templateAttempts names none for its template'),
     templateAttempts: z.dict(z.natural().min(1).max(10)).default({}).description('Attempts a task of a template gets when its proposal names none, by template name (1 to 10 each)'),
+    defaultBudget: z.array(z.object({
+      pool: z.string().pattern(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/).required().description('A pool, or a template whose pools <template>/<account> the line counts together (ADR-0083)'),
+      unit: z.union(UNITS.map((u) => z.const(u))).required(),
+      amount: z.number().min(0).max(AMOUNT_MAX).required(),
+    })).max(16).default([]).description('The budget a task gets when its proposal names none (PROP-0023): lines on a pool or on a template\'s pools, such as {pool: claude-code.agents, unit: usd, amount: 6}. Empty: such a task has no budget, as before'),
+    maxFreeRetries: z.natural().max(FREE_RETRIES_MAX).default(FREE_RETRIES_DEFAULT).description('Failed runs of one task that failed only on the infrastructure (the host stopped them, nothing of them was sent, a Worker became unavailable) and are not counted as attempts, at most; past it such a run counts as any failed run (INV-9)'),
     pageBound: z.natural().min(1).max(100).default(100).description('The most items one page of board_projects or board_tasks holds'),
     projectionMaxTasks: z.natural().min(1).max(10_000).default(200).description('The most tasks the TASKS.md projection lists, open ones first'),
     sweepSeconds: z.natural().max(3600).default(60).description('Seconds between the board\'s own sweeps, and one at start; 0 sweeps only when called'),
+    autoAccept: z.object({
+      projects: z.array(z.string().pattern(PROJECT_ID)).default([]).description('Project ids whose results System accepts without the operator when the conditions hold'),
+      branches: z.array(z.string().pattern(BRANCH)).default([]).description('Branches such a result may land on (the repository\'s checked-out branch the landing merges into)'),
+      breaker: z.object({
+        escapes: z.natural().min(1).max(100).default(BREAKER_DEFAULT.escapes).description('Escaped defects of auto-accepted results, of one project and branch, at which auto-accept for them turns off'),
+        days: z.natural().min(1).max(90).default(BREAKER_DEFAULT.days).description('The rolling window the escapes are counted in, in days'),
+      }).default({ ...BREAKER_DEFAULT }).description('The circuit breaker (D93): auto-accept turns itself off for a project and branch at this many escaped defects in the window, and turns on again only by the operator or the lead once the line holds'),
+    }).description('System accepts a result without holding it for the operator when the run\'s last review approved it, its required checks passed on it, and it lands on a listed branch (D80, ADR-0067); default off'),
   })
 
   private readonly schemas = new SchemaRegistry()
+  /** `config.autoAccept`, validated; undefined when off. */
+  private readonly autoAccept: AutoAccept | undefined
+  /** `config.maxFreeRetries`, validated: infrastructure failures a task is not charged for, at most (ADR-0069, INV-9). */
+  private readonly freeRetries: number
+  /**
+   * The host's downtime before this board started (T302): from the previous board's recorded clean
+   * stop to this start. Undefined when no clean stop was recorded (a crash, or a first start): then no
+   * lost run is marked host-stopped, as nothing shows when the host stopped (INV-2).
+   */
+  private readonly downtime: { stoppedMs: number; startedMs: number } | undefined
 
   constructor(ctx: Context, private readonly config: Config = {}) {
     super(ctx)
+    const startedMs = Date.now()
+    // Refused before anything starts: a malformed setting never accepts anything (INV-2).
+    this.autoAccept = autoAcceptOf(config.autoAccept)
+    // A malformed bound on free retries never starts a board (INV-2, INV-9).
+    this.freeRetries = freeRetriesOf(config.maxFreeRetries)
     ctx.store.migrate('board', MIGRATIONS)
+    // The previous board's clean stop, read once and removed, so a crash of this one never reuses it.
+    this.downtime = ctx.store.transaction(() => {
+      const row = ctx.store.db.prepare('SELECT stopped_ms FROM board_host_stop WHERE id = 1').get() as { stopped_ms: number } | undefined
+      ctx.store.db.prepare('DELETE FROM board_host_stop').run()
+      const stoppedMs = row === undefined ? undefined : Number(row.stopped_ms)
+      return stoppedMs !== undefined && Number.isFinite(stoppedMs) && stoppedMs <= startedMs ? { stoppedMs, startedMs } : undefined
+    })
+    // Recorded as the board stops cleanly; one that cannot be written leaves none, which marks nothing.
+    ctx.effect(() => () => {
+      try {
+        ctx.store.db.prepare('INSERT OR REPLACE INTO board_host_stop (id, stopped_ms) VALUES (1, ?)').run(Date.now())
+      } catch (error) {
+        ctx.logger.warn('board: could not record its stop; no lost run will be marked host-stopped at the next start')
+        ctx.logger.warn(error)
+      }
+    })
     ctx.effect(() => {
       const seconds = config.sweepSeconds ?? 60
       if (!seconds) return () => {}
@@ -264,6 +479,23 @@ export class StoreBoard extends Board {
 
   async task(taskId: string) {
     return this.readTask(taskId)?.task
+  }
+
+  /**
+   * The paths of the worktrees of the workflow run `runId` that are still recorded (agent-workers'
+   * `agent_worktrees`, not removed) and exist on disk. Empty when there are none, or when that table
+   * is not there (no agent-workers): a re-opening then finds no worktree and is refused.
+   */
+  runWorktrees(runId: string): string[] {
+    let rows: Array<{ path: string }>
+    try {
+      rows = this.ctx.store.db.prepare('SELECT path FROM agent_worktrees WHERE workflow_run_id = ? AND removed_at IS NULL ORDER BY path').all(runId) as Array<{ path: string }>
+    } catch (error) {
+      // Only a store with no such table (no agent-workers) reads as none; any other error is not hidden.
+      if (/no such table/.test((error as Error).message)) return []
+      throw error
+    }
+    return rows.map((r) => r.path).filter((p) => existsSync(p))
   }
 
   async tasks(filter: { projectId: string; states?: TaskState[] }) {
@@ -368,7 +600,7 @@ export class StoreBoard extends Board {
     if (verdict.mode !== 'ask') throw new BoardError('invalid', `a charter is always put to the operator; the policy says ${verdict.mode}`)
     const request = await this.ask({
       subject: { type: 'content', ref: charterRef(projectId, version), version: charterHash(input.charter) },
-      action: { class: 'charter', summary: clamp(`${existing ? 'Amend' : 'Found'} ${draft.title}: ${input.charter.intent}`, 500) },
+      action: { class: 'charter', summary: clampText(`${existing ? 'Amend' : 'Found'} ${draft.title}: ${input.charter.intent}`, 500) },
       requester: { component: 'board', projectId }, verdict, classification: draft.classification ?? 'operator-shared',
     }, at)
     try {
@@ -492,10 +724,12 @@ export class StoreBoard extends Board {
   /**
    * Propose a task (`propose`), retry-safe under `clientRequestId`: a key already used returns the
    * task it made. `check` sees the task before the proposal commits: one that throws stores nothing.
+   * `tool` is the call the key was given to (a plan's items are `board_propose_plan`'s), so a key of
+   * one is never taken for the other's.
    */
-  proposeTask(input: TaskInput, at: Date = new Date(), clientRequestId?: string, check?: Checked<BoardTask>): BoardTask {
+  proposeTask(input: TaskInput, at: Date = new Date(), clientRequestId?: string, check?: Checked<BoardTask>, tool: ProposeTool = 'board_propose'): BoardTask {
     return this.ctx.store.transaction((db) => {
-      const prior = clientRequestId === undefined ? undefined : this.priorRequest(clientRequestId, 'board_propose', input.projectId)
+      const prior = clientRequestId === undefined ? undefined : this.priorRequest(clientRequestId, tool, input.projectId)
       if (prior) return checkedBy(check, this.taskOf(prior.task_id!).task)
       const { project } = this.projectOf(input.projectId)
       if (project.state === 'closed') throw new BoardError('invalid-transition', `${input.projectId} is closed`)
@@ -503,23 +737,78 @@ export class StoreBoard extends Board {
         if (this.readTask(dep)?.task.projectId !== input.projectId) throw new BoardError('invalid', `dependency ${dep} is not a task of ${input.projectId}`)
       }
       if (input.milestone !== undefined && !project.milestones.some((m) => m.id === input.milestone)) throw new BoardError('invalid', `${input.projectId} has no milestone ${input.milestone}`)
+      if (input.variant !== undefined && input.template === undefined) throw new BoardError('invalid', 'a variant is of a template: a task that names a variant names its template')
       // The proposal's own, else the template's, else the board's default.
       const max = input.maxAttempts ?? (input.template !== undefined ? this.config.templateAttempts?.[input.template] : undefined) ?? this.config.maxAttempts ?? 3
       if (!Number.isInteger(max) || max < 1 || max > 10) throw new BoardError('invalid', 'maxAttempts is a whole number from 1 to 10')
       const writes = writesKey(input.writes)
       if (writes && db.prepare('SELECT 1 FROM board_tasks WHERE writes = ?').get(writes)) throw new BoardError('conflict', `another open task writes ${input.writes!.type} ${input.writes!.ref} (INV-15)`)
+      const defect = input.fixes ? this.defectOf(input.fixes.taskId, input.fixes.sha, input.projectId, 'filed', at) : undefined
+      // Its own budget, else the board's default (PROP-0023): what its runs are held to.
+      const budget = input.budget ?? this.config.defaultBudget ?? []
       const task: BoardTask = {
-        schema: 'board-task@1.0', taskId: newId('task'), projectId: input.projectId, title: input.title, goal: input.goal,
+        schema: tagOf(input, defect ? 'board-task@1.2' : 'board-task@1.0'), taskId: newId('task'), projectId: input.projectId, title: input.title, goal: input.goal,
         acceptance: input.acceptance, dependsOn: input.dependsOn ?? [], actionClass: input.actionClass, state: 'proposed',
         attempts: { count: 0, max }, createdAt: at.toISOString(), revision: 0,
         ...(input.milestone !== undefined ? { milestone: input.milestone } : {}), ...(input.template !== undefined ? { template: input.template } : {}),
-        ...(input.writes ? { writes: input.writes } : {}), ...(input.budget ? { budget: input.budget } : {}),
+        ...(input.variant !== undefined ? { variant: input.variant } : {}),
+        ...(input.writes ? { writes: input.writes } : {}), ...(input.budget ? { budget: input.budget } : budget.length ? { budget } : {}), ...(defect ? { defect } : {}),
       }
       this.validTask(task)
       db.prepare('INSERT INTO board_tasks (task_id, project_id, state, created_at, revision, record, writes) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(task.taskId, task.projectId, task.state, task.createdAt, task.revision, JSON.stringify(task), writes)
-      if (clientRequestId !== undefined) this.recordRequest(clientRequestId, 'board_propose', task.projectId, task.taskId, undefined, at)
+      if (clientRequestId !== undefined) this.recordRequest(clientRequestId, tool, task.projectId, task.taskId, undefined, at)
       return checkedBy(check, task)
+    })
+  }
+
+  /**
+   * Propose a plan's tasks together (`board_propose_plan`): every task, or none. The items are
+   * proposed in dependency order ({@link planOrder}) through {@link proposeTask}, in one store
+   * transaction, each `dependsOn` key replaced by the id of the task proposed for it, so a refusal of
+   * any one stores none. Retry-safe under `clientRequestId`: each item's proposal is recorded under
+   * `<clientRequestId>#<key>` as `board_propose_plan`'s, so a retry returns the tasks it made and a
+   * `board_propose` naming that key is refused (`conflict`), never given a plan's task.
+   */
+  proposePlan(projectId: string, items: readonly PlanItem[], at: Date = new Date(), clientRequestId?: string, check?: Checked<PlannedTask[]>): PlannedTask[] {
+    const order = planOrder(items)
+    return this.ctx.store.transaction(() => {
+      const ids = new Map<string, string>()
+      for (const { key, dependsOn, ...rest } of order) {
+        const task = this.proposeTask({ ...rest, projectId, dependsOn: (dependsOn ?? []).map((d) => ids.get(d) ?? d) }, at,
+          clientRequestId === undefined ? undefined : `${clientRequestId}#${key}`, undefined, 'board_propose_plan')
+        ids.set(key, task.taskId)
+      }
+      // In the plan's own order, so a reader matches the tasks to its items by position too.
+      return checkedBy(check, items.map((i) => ({ key: i.key, task: this.taskOf(ids.get(i.key)!).task })))
+    })
+  }
+
+  /**
+   * The defect link a task carries: `fixes` must be a done task of `projectId`, `sha` 7 to 64 hex
+   * characters; otherwise `invalid`. A task never fixes itself (`self`, once it has an id).
+   */
+  private defectOf(fixes: string, sha: string, projectId: string, by: DefectBy, at: Date, self?: string): Defect {
+    if (typeof sha !== 'string' || !new RegExp(`^[0-9a-f]{${DEFECT_SHA.min},${DEFECT_SHA.max}}$`).test(sha)) throw new BoardError('invalid', `a defect's landing sha is ${DEFECT_SHA.min} to ${DEFECT_SHA.max} lowercase hex characters`)
+    const fixed = this.readTask(fixes)?.task
+    if (!fixed || fixed.projectId !== projectId) throw new BoardError('invalid', `${fixes} is not a task of ${projectId}: a defect is of a task of the same project`)
+    if (fixes === self) throw new BoardError('invalid', `${fixes} cannot fix a defect of itself`)
+    if (fixed.state !== 'done') throw new BoardError('invalid', `${fixes} is ${fixed.state}, not done: only a task whose change landed has a defect that escaped`)
+    return { fixes, sha, at: at.toISOString(), by }
+  }
+
+  /**
+   * Link a task to the defect it fixes, once, as the lead or the reviewer (or the operator): the same
+   * record a task filed with `fixes` has. No state moves and no decision is made (the link is a fact
+   * about the fixed task's change, not a move of this one).
+   */
+  async linkDefect(taskId: string, input: { fixes: string; sha: string; by: Exclude<DefectBy, 'filed'> }, at: Date = new Date(), check?: Checked<BoardTask>): Promise<BoardTask> {
+    if (!['lead', 'reviewer', 'operator'].includes(input.by)) throw new BoardError('invalid', 'a defect link is set by the lead, the reviewer, or the operator')
+    return this.ctx.store.transaction(() => {
+      const current = this.taskOf(taskId)
+      if (current.task.defect) throw new BoardError('invalid', `${taskId} already fixes a defect of ${current.task.defect.fixes}`)
+      const defect = this.defectOf(input.fixes, input.sha, current.task.projectId, input.by, at, taskId)
+      return checkedBy(check, this.commit(current, { changes: { schema: tagOf(current.task, 'board-task@1.2'), defect } }, at))
     })
   }
 
@@ -591,15 +880,19 @@ export class StoreBoard extends Board {
       const { project } = this.projectOf(task.projectId)
       // Fail-closed rule 1: no task starts outside an active project.
       if (project.state !== 'active') throw new BoardError('invalid-transition', `${project.projectId} is ${project.state}, not active: nothing starts`)
-      if (task.attempts.count >= task.attempts.max) throw new BoardError('invalid-transition', `${taskId} has used its ${task.attempts.max} attempt(s)`)
+      // An answered question continues the attempt that asked: this run is that attempt again, not another one (T291).
+      const continues = this.continuingNow(taskId) && task.attempts.count > 0
+      if (!continues && task.attempts.count >= task.attempts.max) throw new BoardError('invalid-transition', `${taskId} has used its ${task.attempts.max} attempt(s)`)
       if (run.brief !== undefined && !this.ctx.artifacts.get(run.brief)) throw new BoardError('invalid', `brief ${run.brief} is not a stored artifact`)
+      const attempt = continues ? task.attempts.count : task.attempts.count + 1
+      if (continues) this.ctx.store.db.prepare('UPDATE board_tasks SET continues = 0 WHERE task_id = ?').run(taskId)
       return this.commit(current, {
         changes: {
           state: 'running', run: { runId: run.runId, ...(run.brief !== undefined ? { brief: run.brief } : {}), startedAt: at.toISOString() },
-          attempts: { ...task.attempts, count: task.attempts.count + 1 }, result: undefined,
+          attempts: { ...task.attempts, count: attempt }, result: undefined,
           lastDecision: this.decision(project, task, {
-            from: 'claimed', to: 'running', why: `run ${run.runId} recorded before it starts, as attempt ${task.attempts.count + 1} of ${task.attempts.max}`,
-            whyNot: `the holder of generation ${generation} starts it`, inputs: run.brief !== undefined ? [run.brief] : [], detail: { runId: run.runId, attempt: task.attempts.count + 1 },
+            from: 'claimed', to: 'running', why: `run ${run.runId} recorded before it starts, as attempt ${attempt} of ${task.attempts.max}${continues ? ' (continued after an answer)' : ''}`,
+            whyNot: `the holder of generation ${generation} starts it`, inputs: run.brief !== undefined ? [run.brief] : [], detail: { runId: run.runId, attempt, ...(continues ? { continues: true } : {}) },
           }, at),
         },
       }, at)
@@ -629,44 +922,85 @@ export class StoreBoard extends Board {
   async accept(taskId: string, acceptance: ArtifactRef, at: Date = new Date()) {
     const before = this.taskOf(taskId).task
     this.expectState(before, 'review')
-    const read = this.readAcceptance(before, before.result!, acceptance)
-    const held = await this.held(before, read)
+    // Accepted already, it waits for its landing (T293): only the landing ends that wait, never another acceptance.
+    if (before.waiting?.reason === 'landing') throw new BoardError('invalid-transition', `${taskId}'s result is accepted and waits for its landing: it is done once its merge request is merged, or its landing finds nothing to land`)
+    const bound = await this.recordedChecksGate(before, acceptance, this.readAcceptance(before, before.result!, acceptance))
+    const { read } = bound
+    const { held, auto } = await this.acceptanceGate(before, before.result!, acceptance, read)
     if (held) {
+      // The run owner's acceptance on its exact result after the checks the hold left pending ran there
+      // (T293): held again for what still holds it (a heavy result, the auto-accept rule), its checks bound.
+      if (before.waiting?.reason === 'operator-review' && this.runOwners(acceptance) && !held.pendingChecks.length && before.waiting.pendingChecks?.length) {
+        return this.commitLater(before, at, undefined, (current) => this.holdMove(current.task, current.task.result!, acceptance, held, at))
+      }
       if (before.waiting?.reason === 'operator-review') {
-        throw new BoardError('invalid', `${acceptance} is not the operator's, and the class's required checks have not passed (autonomy decision ${held.verdict.decision}): the review is the operator's`)
+        throw new BoardError('invalid', `${acceptance} is not the operator's, and ${this.holdReason(before, held)}: the review is the operator's`)
       }
       return this.commitLater(before, at, undefined, (current) => this.holdMove(current.task, current.task.result!, acceptance, held, at))
     }
     const next = read.option === 'reject' && attemptLeft(before) ? await this.nextAttempt(before, at) : undefined
-    return this.committing(next, at, () => this.commitLater(before, at, undefined, (current) => this.acceptanceMove(current.task, current.task.result!, acceptance, read, next, at)))
+    return this.committing(next, at, () => this.commitLater(before, at, undefined, (current) => this.acceptanceMove(current.task, current.task.result!, acceptance, read, next, at, auto, bound.notRun)))
   }
 
   async reconcileRun(taskId: string, runId: string, outcome: RunOutcome, at: Date = new Date()) {
     const before = this.taskOf(taskId).task
-    if (!(before.state === 'running' || (before.state === 'waiting-for-approval' && before.waiting?.reason === 'reconciliation-failed'))) {
+    // A lost run the sweep left waiting for input (the policy gave remediation no ask) still takes a
+    // report that it failed only on the infrastructure, while a free retry is left (1.5, ADR-0069).
+    const lostWait = this.waitsOnLostRun(before)
+    if (!(before.state === 'running' || (before.state === 'waiting-for-approval' && before.waiting?.reason === 'reconciliation-failed') || lostWait)) {
       throw new BoardError('invalid-transition', `${taskId} is ${before.state}, not waiting on a run`)
     }
     if (before.run?.runId !== runId) throw new BoardError('invalid', `${taskId} recorded run ${before.run?.runId ?? '(none)'}, not ${runId}`)
     if (outcome.status !== 'completed' && outcome.status !== 'failed') throw new BoardError('invalid', 'a run is reported completed or failed; an unknown outcome is never reported')
+    // A failed run that failed only on the infrastructure (1.5, ADR-0069): checked before anything moves.
+    const infrastructure = outcome.status === 'failed' && outcome.infrastructure !== undefined ? outcome.infrastructure : undefined
+    if (infrastructure !== undefined) {
+      const problem = infrastructureProblem(infrastructure)
+      if (problem) throw new BoardError('invalid', problem)
+    }
+    // Not counted while the task has free retries left (INV-9): the attempt it made is given back.
+    // Read again inside the move's transaction, so its decision's numbers are exact.
+    const free = infrastructure !== undefined && this.freeRetriesUsed(taskId) < this.freeRetries && before.attempts.count > 0
+    if (lostWait && !free) {
+      throw new BoardError('invalid-transition', infrastructure
+        ? `${taskId} waits for input on its lost run ${runId}, and its ${this.freeRetries} free retr${this.freeRetries === 1 ? 'y is' : 'ies are'} used (board.maxFreeRetries; INV-9): the failure counts, and the task waits for a person`
+        : `${taskId} waits for input on its lost run ${runId}: only a failure only on the infrastructure, with a free retry left, is reported to it`)
+    }
+    const charged = free ? refunded(before) : before
     // Checked before anything moves, so a report that is refused changes nothing.
     let read: Acceptance | undefined
     let held: Held | undefined
+    let auto: AutoAccepted | undefined
     if (outcome.status === 'completed') {
       this.writesWhatItHolds(before, outcome.result.subject)
       read = this.readAcceptance(before, outcome.result, outcome.acceptance)
-      held = await this.held(before, read)
+      const gate = await this.acceptanceGate(before, outcome.result, outcome.acceptance, read)
+      held = gate.held
+      auto = gate.auto
     }
     const pending = before.waiting?.approvalRequest
     await this.reachable(pending ? [pending] : [])
-    const next = (outcome.status === 'failed' || read!.option === 'reject') && attemptLeft(before) ? await this.nextAttempt(before, at) : undefined
+    // A free retry asks the gate about the same attempt again, on that attempt's subject.
+    const next = (outcome.status === 'failed' || read!.option === 'reject') && attemptLeft(charged) ? await this.nextAttempt(charged, at) : undefined
     const moved = await this.committing(next, at, () => this.commitLater(before, at, undefined, (current) => {
-      if (outcome.status === 'completed') return held ? this.holdMove(current.task, outcome.result, outcome.acceptance, held, at) : this.acceptanceMove(current.task, outcome.result, outcome.acceptance, read!, next, at)
+      if (outcome.status === 'completed') return held ? this.holdMove(current.task, outcome.result, outcome.acceptance, held, at) : this.acceptanceMove(current.task, outcome.result, outcome.acceptance, read!, next, at, auto)
       const { task } = current
       const { project } = this.projectOf(task.projectId)
-      const why = `run ${runId} failed, as its owner reconciled it: attempt ${task.attempts.count} of ${task.attempts.max}`
-      if (next) return this.nextAttemptMove(project, task, next, { why, detail: { runId, outcome: 'failed' } }, at)
+      // The free retries used, read in the move's transaction: one the move did not decide on is a conflict.
+      const used = this.freeRetriesUsed(taskId)
+      if (infrastructure !== undefined && (used < this.freeRetries && task.attempts.count > 0) !== free) {
+        throw new BoardError('conflict', `${taskId}'s free retries changed while the board waited on the approval queue`)
+      }
+      if (free) return this.freeRetryMove(project, task, runId, infrastructure!, used, next!, at)
+      // The statement first, the owner's reason last: a decision's reason is clamped, and the detail keeps the reason whole.
+      const bound = infrastructure
+        ? `; the task's ${this.freeRetries} free retr${this.freeRetries === 1 ? 'y is' : 'ies are'} used (board.maxFreeRetries; INV-9), so this failure only on the infrastructure counts (${infrastructure.kind}: ${infrastructure.reason})`
+        : ''
+      const why = `run ${runId} failed, as its owner reconciled it: attempt ${task.attempts.count} of ${task.attempts.max}${bound}`
+      const detail = { runId, outcome: 'failed', ...(infrastructure ? { infrastructure, freeRetry: { used, max: this.freeRetries, counted: true } } : {}) }
+      if (next) return this.nextAttemptMove(project, task, next, { why, detail }, at)
       const decision = this.decision(project, task, {
-        from: task.state, to: 'waiting-for-input', why, whyNot: 'the run\'s owner reported its outcome, so nothing waits on it', detail: { runId, outcome: 'failed' },
+        from: task.state, to: 'waiting-for-input', why, whyNot: 'the run\'s owner reported its outcome, so nothing waits on it', detail,
       }, at)
       return { changes: { state: 'waiting-for-input', holder: undefined, waiting: this.inputWait('retries-spent', at), lastDecision: decision } }
     }))
@@ -674,6 +1008,51 @@ export class StoreBoard extends Board {
     // open request nothing waits on, which expires on its own; the accepted result is kept.
     if (pending) await this.withdrawUnheld(pending, at)
     return moved
+  }
+
+  /**
+   * Whether the task waits for input because its run was lost and the policy gave `remediation` no
+   * ask (the sweep's {@link gate}, or a {@link regate} on a policy change): its run is still its
+   * recorded one, and its `board` decision says so. A wait the operator's denial made is not one.
+   */
+  private waitsOnLostRun(task: BoardTask): boolean {
+    if (task.state !== 'waiting-for-input' || task.waiting?.reason !== 'rejected' || !task.run || !task.lastDecision) return false
+    const body = this.ctx.artifacts.get(task.lastDecision)?.body as { decisionType?: string; outcome?: { option?: string; detail?: { reason?: unknown; actionClass?: unknown } } } | undefined
+    return body?.decisionType === 'board' && body.outcome?.option === 'waiting-for-input'
+      && body.outcome.detail?.reason === 'reconciliation-failed' && body.outcome.detail.actionClass === 'remediation'
+  }
+
+  /** The task's failed runs that were not counted as attempts so far (ADR-0069). */
+  private freeRetriesUsed(taskId: string): number {
+    const row = this.ctx.store.db.prepare('SELECT free_retries FROM board_tasks WHERE task_id = ?').get(taskId) as { free_retries: number } | undefined
+    return Number(row?.free_retries ?? 0)
+  }
+
+  /** Whether the task's next start continues the attempt whose question was answered (T291). */
+  override async continuing(taskId: string): Promise<boolean> {
+    return this.continuingNow(taskId)
+  }
+
+  private continuingNow(taskId: string): boolean {
+    const row = this.ctx.store.db.prepare('SELECT continues FROM board_tasks WHERE task_id = ?').get(taskId) as { continues: number } | undefined
+    return Number(row?.continues ?? 0) === 1
+  }
+
+  /**
+   * A run that failed only on the infrastructure, with a free retry left (ADR-0069, INV-9): the
+   * attempt it made is given back (`attempts.count` one lower), the free retry is counted beside the
+   * record in the same transaction, and the task goes back for the same attempt through the gate.
+   * The move's `board` decision says why it was not counted, with the kind, the reason, and the free
+   * retries used and allowed.
+   */
+  private freeRetryMove(project: Project, task: BoardTask, runId: string, infrastructure: InfrastructureFailure, used: number, next: NextAttempt, at: Date): Move {
+    const back = refunded(task)
+    this.ctx.store.db.prepare('UPDATE board_tasks SET free_retries = free_retries + 1 WHERE task_id = ?').run(task.taskId)
+    // The statement first, the owner's reason last: a decision's reason is clamped, and the detail keeps it whole.
+    const why = `run ${runId} failed only on the infrastructure, as its owner reconciled it: it is not counted, so attempt ${task.attempts.count} of ${task.attempts.max} runs again `
+      + `(free retry ${used + 1} of ${this.freeRetries}, board.maxFreeRetries; INV-9); ${infrastructure.kind}: ${infrastructure.reason}`
+    const move = this.nextAttemptMove(project, back, next, { why, detail: { runId, outcome: 'failed', infrastructure, freeRetry: { used: used + 1, max: this.freeRetries, counted: false } } }, at)
+    return { ...move, changes: { attempts: back.attempts, ...move.changes } }
   }
 
   async block(taskId: string, generation: number, wait: { reason: 'budget-spent' | 'reconciliation-failed' | 'question'; questions?: string[]; funding?: BudgetLine[]; unreleased?: UnreleasedHold[] }, at: Date = new Date()) {
@@ -719,7 +1098,7 @@ export class StoreBoard extends Board {
     if (!Array.isArray(funding) || funding.length < 1 || funding.length > FUNDING_LINES) throw new BoardError('invalid', `a funding ask names 1 to ${FUNDING_LINES} budget lines`)
     const lines: BudgetLine[] = []
     for (const line of funding as unknown[]) {
-      if (!isObject(line) || typeof line['pool'] !== 'string' || !UNITS.includes(line['unit'] as Unit) || typeof line['amount'] !== 'number' || !Number.isFinite(line['amount']) || line['amount'] <= 0 || line['amount'] > AMOUNT_MAX) {
+      if (!isRecord(line) || typeof line['pool'] !== 'string' || !UNITS.includes(line['unit'] as Unit) || typeof line['amount'] !== 'number' || !Number.isFinite(line['amount']) || line['amount'] <= 0 || line['amount'] > AMOUNT_MAX) {
         throw new BoardError('invalid', `${JSON.stringify(line)} is not a budget line to add (pool, unit of ${UNITS.join(', ')}, amount above 0 and at most ${AMOUNT_MAX})`)
       }
       const asked: BudgetLine = { pool: line['pool'], unit: line['unit'] as Unit, amount: line['amount'] }
@@ -780,27 +1159,20 @@ export class StoreBoard extends Board {
       throw new BoardError('invalid', `answer every question of a question wait (${questions.length}); a ${before.waiting?.reason ?? 'missing'} wait takes no answers and only expires`)
     }
     if (answers.some((a) => typeof a !== 'string' || a.length === 0 || [...a].length > ANSWER_MAX)) throw new BoardError('invalid', `an answer is 1 to ${ANSWER_MAX} characters`)
-    // The next run is another attempt, so the policy is asked again (S9).
-    const next = attemptLeft(before) ? await this.nextAttempt(before, at) : undefined
+    // An answer continues the attempt that asked (T291): the count does not move, and the next start does not
+    // count again; only a failed or rejected step spends an attempt. The policy is still asked again (S9), on a
+    // request that names the wait it answers, so no earlier approval of the same attempt covers it (INV-2).
+    const next = await this.nextAttempt(before, at, before.waiting.since)
     return this.committing(next, at, () => this.commitLater(before, at, undefined, (current) => {
       const { task } = current
       const { project } = this.projectOf(task.projectId)
-      // The answers are the decision's detail, so the next attempt's brief can point to them.
-      const detail = { questions, answers, ...(task.run ? { runId: task.run.runId } : {}) }
-      const why = `every one of its ${questions.length} question(s) answered`
-      if (next) return this.nextAttemptMove(project, task, next, { why, detail }, at)
-      // A ready task with no attempt left could never start and would never expire (INV-9): it waits for input, which expires.
-      return {
-        changes: {
-          state: 'waiting-for-input', waiting: this.inputWait('retries-spent', at), run: undefined,
-          lastDecision: this.decision(project, task, {
-            from: 'waiting-for-input', to: 'waiting-for-input', instead: 'ready',
-            why: `${why}, but all ${task.attempts.max} attempt(s) are spent: it waits for input (retries-spent), which expires`,
-            whyNot: `no attempt is left to start (${task.attempts.count} of ${task.attempts.max}), and a ready task never expires`,
-            detail: { ...detail, reason: 'retries-spent' },
-          }, at),
-        },
-      }
+      // The answers are the decision's detail, so the continuing attempt's brief can point to them.
+      const detail = { questions, answers, continues: true, ...(task.run ? { runId: task.run.runId } : {}) }
+      const why = `every one of its ${questions.length} question(s) answered: attempt ${task.attempts.count} of ${task.attempts.max} continues, not spent`
+      // nextAttemptMove names the attempt after the count it is given: given the count before this attempt, it names this one.
+      const move = this.nextAttemptMove(project, { ...task, attempts: { ...task.attempts, count: Math.max(0, task.attempts.count - 1) } }, next, { why, detail }, at)
+      if (move.changes.state !== 'cancelled') this.ctx.store.db.prepare('UPDATE board_tasks SET continues = 1 WHERE task_id = ?').run(task.taskId)
+      return { ...move, changes: { attempts: task.attempts, ...move.changes } }
     }, check))
   }
 
@@ -831,7 +1203,7 @@ export class StoreBoard extends Board {
       if (!task.result) throw new BoardError('invalid-transition', `${taskId} has no result to digest`)
       if (task.result.digest === digest) return task
       if (task.result.digest) throw new BoardError('invalid-transition', `${taskId}'s result already has digest ${task.result.digest}`)
-      if (task.state === 'review' && task.waiting?.reason !== 'operator-review') {
+      if (task.state === 'review' && !task.waiting) {
         throw new BoardError('invalid-transition', `${taskId}'s reviewer holds the review: a digest attached now would change what the acceptance being made binds to`)
       }
       const envelope = this.ctx.artifacts.get(digest)
@@ -843,6 +1215,235 @@ export class StoreBoard extends Board {
       }
       return this.commit(current, { changes: { result: { ...task.result, digest } } }, at)
     })
+  }
+
+  // --- the auto-accept circuit breaker (ADR-0067 amendment, D93) ---
+
+  /** The breaker's line: the configured one, else 2 escapes in 7 days. */
+  private line(): BreakerLine {
+    return this.autoAccept?.breaker ?? BREAKER_DEFAULT
+  }
+
+  private escapeOf(row: EscapeRow): Escape {
+    return {
+      escapeId: row.escape_id, projectId: row.project_id, branch: row.branch, taskId: row.task_id, acceptance: row.acceptance as ArtifactRef,
+      foundAt: row.found_at, recordedAt: row.recorded_at, recordedBy: row.recorded_by as Escape['recordedBy'], note: row.note,
+    }
+  }
+
+  /** Escapes of a project and branch found within `days` days up to and including `at`, oldest first. */
+  private escapesIn(projectId: string, branch: string, days: number, at: Date): Escape[] {
+    const from = new Date(at.getTime() - days * 24 * 3600 * 1000).toISOString()
+    const rows = this.ctx.store.db.prepare('SELECT * FROM board_escapes WHERE project_id = ? AND branch = ? AND found_at > ? AND found_at <= ? ORDER BY found_at, rowid')
+      .all(projectId, branch, from, at.toISOString()) as unknown as EscapeRow[]
+    return rows.map((r) => this.escapeOf(r))
+  }
+
+  private breakerOf(row: BreakerRow, at?: Date): Breaker {
+    const ids = JSON.parse(row.escapes) as string[]
+    const escapes = ids.map((id) => this.escapeOf(this.ctx.store.db.prepare('SELECT * FROM board_escapes WHERE escape_id = ?').get(id) as unknown as EscapeRow))
+    const line = { escapes: Number(row.line_escapes), days: Number(row.line_days) }
+    const counted = at ? this.escapesIn(row.project_id, row.branch, line.days, at).length : undefined
+    return {
+      breakerId: row.breaker_id, projectId: row.project_id, branch: row.branch, state: row.reset_at === null ? 'tripped' : 'reset', line,
+      trippedAt: row.tripped_at, decision: row.decision as ArtifactRef, escapes,
+      ...(counted !== undefined ? { now: { counted, lineHolds: counted < line.escapes } } : {}),
+      ...(row.reset_at !== null ? { reset: { at: row.reset_at, by: row.reset_by as 'operator' | 'lead', decision: row.reset_decision as ArtifactRef } } : {}),
+    }
+  }
+
+  /** The project's and branch's breaker while tripped, else undefined. */
+  private openBreaker(projectId: string, branch: string): Breaker | undefined {
+    const row = this.ctx.store.db.prepare('SELECT * FROM board_breakers WHERE project_id = ? AND branch = ? AND reset_at IS NULL').get(projectId, branch) as unknown as BreakerRow | undefined
+    return row ? this.breakerOf(row) : undefined
+  }
+
+  /**
+   * An escaped defect of an auto-accepted result (D93). The task must be done on the auto-accept
+   * rule's own decision (`board.auto-accept`), which names the branch it landed on; one escape per
+   * task. When the escapes of that project and branch within the line's window reach the line, the
+   * breaker trips in the same transaction: a `board` decision (rule `board.auto-accept-breaker`)
+   * naming each escape it counted, after which auto-accept for them is held for the operator.
+   */
+  async recordEscape(input: { taskId: string; by: 'operator' | 'lead'; note: string; foundAt?: string }, at: Date = new Date(), check?: Checked<{ escape: Escape; breaker?: Breaker }>): Promise<{ escape: Escape; breaker?: Breaker }> {
+    if (input.by !== 'operator' && input.by !== 'lead') throw new BoardError('invalid', 'an escape is recorded by the operator or the lead')
+    if (typeof input.note !== 'string' || !input.note.trim() || [...input.note].length > 1000) throw new BoardError('invalid', 'an escape needs a note of 1 to 1000 characters saying what escaped')
+    const foundAt = input.foundAt ?? at.toISOString()
+    if (Number.isNaN(Date.parse(foundAt)) || new Date(foundAt).toISOString() !== foundAt || Date.parse(foundAt) > at.getTime()) throw new BoardError('invalid', `foundAt ${foundAt} is not an ISO instant that has passed`)
+    return this.ctx.store.transaction(() => {
+      const { task } = this.taskOf(input.taskId)
+      type Body = { decider?: { id?: string }; outcome?: { detail?: Record<string, unknown> } }
+      // Done on its landing (T293): the decision that accepted it is the landing's `accepted`.
+      const last = task.lastDecision ? this.ctx.artifacts.get(task.lastDecision)?.body as Body | undefined : undefined
+      const accepted = last?.decider?.id === 'board.landed' && typeof last.outcome?.detail?.['accepted'] === 'string' ? last.outcome.detail['accepted'] as ArtifactRef : task.lastDecision
+      const decided = accepted ? this.ctx.artifacts.get(accepted) : undefined
+      const body = decided?.body as Body | undefined
+      const branch = body?.outcome?.detail?.['branch']
+      if (task.state !== 'done' || body?.decider?.id !== 'board.auto-accept' || typeof branch !== 'string') {
+        throw new BoardError('invalid', `${input.taskId} was not accepted by the auto-accept rule (a done task whose last decision is rule board.auto-accept): only an auto-accepted result's escape counts`)
+      }
+      if (this.ctx.store.db.prepare('SELECT 1 FROM board_escapes WHERE task_id = ?').get(input.taskId)) throw new BoardError('invalid', `an escape of ${input.taskId} is already recorded`)
+      const escape: Escape = { escapeId: newId('escape'), projectId: task.projectId, branch, taskId: task.taskId, acceptance: accepted!, foundAt, recordedAt: at.toISOString(), recordedBy: input.by, note: input.note.trim() }
+      this.ctx.store.db.prepare('INSERT INTO board_escapes (escape_id, project_id, branch, task_id, acceptance, found_at, recorded_at, recorded_by, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(escape.escapeId, escape.projectId, escape.branch, escape.taskId, escape.acceptance, escape.foundAt, escape.recordedAt, escape.recordedBy, escape.note)
+      const line = this.line()
+      const counted = this.escapesIn(task.projectId, branch, line.days, at)
+      if (counted.length < line.escapes || this.openBreaker(task.projectId, branch)) return checkedBy(check, { escape })
+      const { project } = this.projectOf(task.projectId)
+      const decision = this.decision(project, undefined, {
+        from: 'auto-accept on', to: 'auto-accept off', rule: 'board.auto-accept-breaker',
+        question: `Does auto-accept stay on for ${task.projectId} on ${branch}, with ${counted.length} escaped defect(s) of auto-accepted results in ${line.days} days (the line is ${line.escapes})?`,
+        why: `${counted.length} escaped defect(s) of auto-accepted results landed on ${branch} were found within ${line.days} days, at or over the line of ${line.escapes}: ${counted.map((e) => `${e.taskId} (${e.foundAt}: ${e.note})`).join('; ')}`,
+        whyNot: 'the line is reached: results of this project and branch are held for the operator again, until the operator or the lead turns auto-accept on once the line holds; time alone never does',
+        inputs: [...new Set(counted.map((e) => e.acceptance))],
+        detail: { reason: 'auto-accept-breaker', branch, line, window: { days: line.days, until: at.toISOString() }, escapes: counted.map((e) => ({ escapeId: e.escapeId, taskId: e.taskId, foundAt: e.foundAt, recordedBy: e.recordedBy, note: e.note, acceptance: e.acceptance })) },
+      }, at)
+      const breakerId = newId('breaker')
+      this.ctx.store.db.prepare('INSERT INTO board_breakers (breaker_id, project_id, branch, tripped_at, decision, line_escapes, line_days, escapes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(breakerId, task.projectId, branch, at.toISOString(), decision, line.escapes, line.days, JSON.stringify(counted.map((e) => e.escapeId)))
+      return checkedBy(check, { escape, breaker: this.breakerOf(this.ctx.store.db.prepare('SELECT * FROM board_breakers WHERE breaker_id = ?').get(breakerId) as unknown as BreakerRow, at) })
+    })
+  }
+
+  /** Every escape recorded, of one project or all, oldest found first. */
+  async escapes(projectId?: string): Promise<Escape[]> {
+    const rows = (projectId === undefined
+      ? this.ctx.store.db.prepare('SELECT * FROM board_escapes ORDER BY found_at, rowid LIMIT 10000').all()
+      : this.ctx.store.db.prepare('SELECT * FROM board_escapes WHERE project_id = ? ORDER BY found_at, rowid LIMIT 10000').all(projectId)) as unknown as EscapeRow[]
+    return rows.map((r) => this.escapeOf(r))
+  }
+
+  /** The tripped breakers, of one project or all, with the escapes counted in their window as of `at`. */
+  async breakers(projectId?: string, at: Date = new Date()): Promise<Breaker[]> {
+    const rows = (projectId === undefined
+      ? this.ctx.store.db.prepare('SELECT * FROM board_breakers WHERE reset_at IS NULL ORDER BY tripped_at, breaker_id').all()
+      : this.ctx.store.db.prepare('SELECT * FROM board_breakers WHERE reset_at IS NULL AND project_id = ? ORDER BY tripped_at, breaker_id').all(projectId)) as unknown as BreakerRow[]
+    return rows.map((r) => this.breakerOf(r, at))
+  }
+
+  /**
+   * Turn auto-accept on again for a project and branch: by the operator or the lead, only while a
+   * breaker is tripped for them and the line holds (fewer escapes than the line within its window
+   * as of `at`). Recorded as a `board` decision naming the trip's. Never done by the sweep or by time.
+   */
+  async resetBreaker(projectId: string, branch: string, by: 'operator' | 'lead', at: Date = new Date(), check?: Checked<Breaker>): Promise<Breaker> {
+    if (by !== 'operator' && by !== 'lead') throw new BoardError('invalid', 'the breaker is turned on again by the operator or the lead')
+    return this.ctx.store.transaction(() => {
+      const open = this.openBreaker(projectId, branch)
+      if (!open) throw new BoardError('invalid-transition', `the auto-accept breaker is not tripped for ${projectId} on ${branch}`)
+      const counted = this.escapesIn(projectId, branch, open.line.days, at)
+      if (counted.length >= open.line.escapes) {
+        throw new BoardError('invalid', `the line does not hold: ${counted.length} escaped defect(s) in the last ${open.line.days} days, the line is ${open.line.escapes}; auto-accept stays off for ${projectId} on ${branch}`)
+      }
+      const { project } = this.projectOf(projectId)
+      const decision = this.decision(project, undefined, {
+        from: 'auto-accept off', to: 'auto-accept on', rule: 'board.auto-accept-breaker',
+        question: `Does auto-accept turn on again for ${projectId} on ${branch}, with ${counted.length} escaped defect(s) in ${open.line.days} days (the line is ${open.line.escapes})?`,
+        why: `the ${by} turned it on: the line holds, ${counted.length} escaped defect(s) in the last ${open.line.days} days, fewer than ${open.line.escapes}`,
+        whyNot: `the breaker tripped at ${open.trippedAt} (decision ${open.decision}) and stays tripped until the operator or the lead says otherwise`,
+        inputs: [open.decision],
+        detail: { reason: 'auto-accept-breaker-reset', branch, by, line: open.line, counted: counted.length, trip: open.decision },
+      }, at)
+      this.ctx.store.db.prepare('UPDATE board_breakers SET reset_at = ?, reset_by = ?, reset_decision = ? WHERE breaker_id = ? AND reset_at IS NULL')
+        .run(at.toISOString(), by, decision, open.breakerId)
+      return checkedBy(check, this.breakerOf(this.ctx.store.db.prepare('SELECT * FROM board_breakers WHERE breaker_id = ?').get(open.breakerId) as unknown as BreakerRow, at))
+    })
+  }
+
+  /**
+   * Send a done task's accepted result back as another attempt (contract 1.4, ADR-0068): the landing
+   * of run `back.runId`'s result found it cannot land on its target as that is now (a conflict its
+   * Worker could not resolve, a required check that failed on the rebased tree). The move a rejected
+   * attempt makes, through the gate again, its `board` decision naming `back.decision`; no attempt is
+   * counted for it (the run that made the result was).
+   */
+  async reopen(taskId: string, back: Reopening, at: Date = new Date()) {
+    const before = this.taskOf(taskId).task
+    this.reopenable(before, back)
+    const next = attemptLeft(before) ? await this.nextAttempt(before, at) : undefined
+    return this.committing(next, at, () => this.commitLater(before, at, undefined, (current) => {
+      const { task } = current
+      this.reopenable(task, back)
+      const { project } = this.projectOf(task.projectId)
+      const why = `run ${back.runId}'s accepted result could not land (decision ${back.decision}): ${back.reason}`
+      const detail = { runId: back.runId, acceptance: back.acceptance, reopened: back.decision }
+      if (next) return this.nextAttemptMove(project, task, next, { decision: back.decision, why, detail }, at)
+      const decision = this.decision(project, task, {
+        from: task.state === 'done' ? 'done' : 'landing', to: 'waiting-for-input', why: `${why}; all ${task.attempts.max} attempt(s) are spent: it waits for input (retries-spent), which expires`,
+        whyNot: 'a result that cannot land on its target as it is now is not kept done', inputs: [back.decision], detail: { ...detail, reason: 'retries-spent' },
+      }, at)
+      return { changes: { state: 'waiting-for-input', holder: undefined, waiting: this.inputWait('retries-spent', at), lastDecision: decision } }
+    }))
+  }
+
+  /**
+   * End the landing wait of a task whose accepted writing result waits for its landing (T293): done,
+   * on a `board` decision of rule `board.landed` naming the landing's decision and the acceptance,
+   * `detail.accepted` the decision that accepted it (the auto-accept rule's, when it applied).
+   */
+  async landed(taskId: string, end: LandingEnd, at: Date = new Date()) {
+    if (end.outcome !== 'merged' && end.outcome !== 'not-needed') throw new BoardError('invalid', 'a landing ends merged or not-needed')
+    if (this.ctx.artifacts.get(end.decision)?.kind !== 'decision') throw new BoardError('invalid', `${end.decision} is not a stored decision`)
+    return this.ctx.store.transaction(() => {
+      const current = this.taskOf(taskId)
+      const { task } = current
+      if (task.state !== 'review' || task.waiting?.reason !== 'landing' || task.run?.runId !== end.runId || task.result?.acceptance !== end.acceptance) {
+        throw new BoardError('invalid-transition', `${taskId} is ${task.state}${task.waiting ? ` (${task.waiting.reason})` : ''}, not waiting for the landing of run ${end.runId}'s result accepted by ${end.acceptance}`)
+      }
+      const { project } = this.projectOf(task.projectId)
+      const decision = this.decision(project, task, {
+        from: 'landing', to: 'done', rule: 'board.landed',
+        why: end.outcome === 'merged' ? `the landing of run ${end.runId}'s accepted result merged it (decision ${end.decision})` : `the landing of run ${end.runId}'s accepted result found no change to land: its target already holds it (decision ${end.decision})`,
+        whyNot: 'a writing result is done only once its change landed, or needs no landing (T293)',
+        inputs: [end.decision, end.acceptance, ...(task.lastDecision && task.lastDecision !== end.acceptance ? [task.lastDecision] : [])],
+        detail: { reason: 'landed', outcome: end.outcome, runId: end.runId, acceptance: end.acceptance, accepted: task.lastDecision ?? end.acceptance, landing: end.decision },
+      }, at)
+      return this.commit(current, { changes: { state: 'done', waiting: undefined, lastDecision: decision } }, at)
+    })
+  }
+
+  /** Refused unless the task is done, or waits for its landing (T293), on exactly `back`'s run and acceptance, and `back` names a stored decision and a reason (1.4). */
+  private reopenable(task: BoardTask, back: Reopening): void {
+    if (!(task.state === 'review' && task.waiting?.reason === 'landing')) this.expectState(task, 'done')
+    if (task.run?.runId !== back.runId || task.result?.acceptance !== back.acceptance) {
+      throw new BoardError('invalid-transition', `${task.taskId} is done on run ${task.run?.runId ?? '(none)'}'s result accepted by ${task.result?.acceptance ?? '(none)'}, not on run ${back.runId}'s accepted by ${back.acceptance}`)
+    }
+    if (typeof back.reason !== 'string' || !back.reason.trim() || back.reason.length > REOPEN_REASON_MAX) throw new BoardError('invalid', `a reopening says why, in 1 to ${REOPEN_REASON_MAX} characters`)
+    if (this.ctx.artifacts.get(back.decision)?.kind !== 'decision') throw new BoardError('invalid', `${back.decision} is not a stored decision`)
+  }
+
+  /**
+   * Bring a review-expired task back to review, held for the operator again for the policy's wait for
+   * the class (T286): by the operator or the lead, while the task still has its run and its result
+   * (`board_reopen_review` checks first that the run's worktree exists). Recorded as a `board`
+   * decision; the result is unchanged and no attempt is counted. `check` as {@link answer}'s.
+   */
+  async reopenReview(taskId: string, by: 'operator' | 'lead', reason: string, at: Date = new Date(), check?: Checked<BoardTask>) {
+    if (by !== 'operator' && by !== 'lead') throw new BoardError('invalid', 'an expired review is re-opened by the operator or the lead')
+    if (typeof reason !== 'string' || !reason.trim() || reason.length > REOPEN_REASON_MAX) throw new BoardError('invalid', `a re-opening says why, in 1 to ${REOPEN_REASON_MAX} characters`)
+    const openable = (t: BoardTask): void => {
+      if (t.state !== 'waiting-for-input' || t.waiting?.reason !== 'review-expired') {
+        throw new BoardError('invalid-transition', `${t.taskId} is ${t.state}${t.waiting ? ` (${t.waiting.reason})` : ''}, not a review-expired wait`)
+      }
+      if (!t.result || !t.run) throw new BoardError('invalid-transition', `${t.taskId} has no run's result to put back to review`)
+    }
+    const before = this.taskOf(taskId).task
+    openable(before)
+    const hold = await this.operatorHold(before, at)
+    return this.commitLater(before, at, undefined, (c) => {
+      openable(c.task)
+      return {
+        changes: {
+          state: 'review', holder: undefined, waiting: hold.waiting,
+          lastDecision: this.decision(this.projectOf(before.projectId).project, c.task, {
+            from: 'waiting-for-input', to: 'operator-review',
+            why: `the ${by} re-opened run ${c.task.run!.runId}'s result to review (${reason}): it is held for the operator until ${hold.waiting.expiresAt}, the policy's wait for ${c.task.actionClass}`,
+            whyNot: 'an expired review that still has its run and result is not left to be only cancelled',
+            inputs: hold.inputs, detail: { reason: 'operator-review', pendingChecks: hold.waiting.pendingChecks, expiresAt: hold.waiting.expiresAt, reopenedBy: by, runId: c.task.run!.runId },
+          }, at),
+        },
+      }
+    }, check)
   }
 
   async sweep(at: Date) {
@@ -1004,8 +1605,23 @@ export class StoreBoard extends Board {
       case 'running':
         // The run's outcome is unknown here; its owner may still report it (reconcileRun), which withdraws the request (INV-4).
         if (!this.lost(current, at)) return undefined
-        return this.gate(task, 'remediation', 'reconciliation-failed', at)
+        // Marked host-stopped only when its lease expired between the previous board's recorded clean
+        // stop and this start; one that lapsed while the host ran (a hung holder) is not (T302, INV-2).
+        return this.gate(task, 'remediation', 'reconciliation-failed', at, undefined, undefined, undefined, this.lapsedWhileStopped(current))
       case 'review':
+        // An accepted result's landing wait is bounded too (T293, INV-9): unlanded at its end, it waits for input.
+        if (task.waiting?.reason === 'landing') {
+          if (Date.parse(task.waiting.expiresAt) > at.getTime()) return undefined
+          return this.commitLater(task, at, undefined, (c) => ({
+            changes: {
+              state: 'waiting-for-input', waiting: this.inputWait('review-expired', at),
+              lastDecision: this.decision(this.projectOf(task.projectId).project, c.task, {
+                from: 'landing', to: 'waiting-for-input', why: `the accepted result did not land by ${c.task.waiting!.expiresAt}: no merge request of it was merged, nor was it found to need none`,
+                whyNot: 'a writing result is done only once its change landed (T293), and every wait expires (INV-9)', detail: { reason: 'review-expired', heldFor: 'landing' },
+              }, at),
+            },
+          }))
+        }
         // A review held for the operator is bounded by its wait, the policy's for the class (INV-9).
         if (task.waiting?.reason === 'operator-review') {
           if (Date.parse(task.waiting.expiresAt) > at.getTime()) return undefined
@@ -1019,17 +1635,23 @@ export class StoreBoard extends Board {
             },
           }))
         }
-        // Review is bounded: no acceptance decision came while the reviewer held the task (INV-9).
+        // A holder's lease that lapsed (its process gone, a host stop across it) never expires a review: the result is
+        // held for the operator for the policy's wait for the class, and only that wait ends it (INV-9, T286).
         if (!this.lost(current, at)) return undefined
-        return this.commitLater(task, at, undefined, (c) => ({
-          changes: {
-            state: 'waiting-for-input', holder: undefined, waiting: this.inputWait('review-expired', at),
-            lastDecision: this.decision(this.projectOf(task.projectId).project, c.task, {
-              from: 'review', to: 'waiting-for-input', why: `the reviewer's lease (generation ${c.task.holder!.generation}) lapsed with no acceptance decision`,
-              whyNot: 'review is bounded by the reviewer\'s lease, and the board never accepts by default', detail: { reason: 'review-expired' },
-            }, at),
-          },
-        }))
+        {
+          const hold = await this.operatorHold(task, at)
+          return this.commitLater(task, at, undefined, (c) => ({
+            changes: {
+              holder: undefined, waiting: hold.waiting,
+              lastDecision: this.decision(this.projectOf(task.projectId).project, c.task, {
+                from: 'review', to: 'operator-review',
+                why: `the holder's lease (generation ${c.task.holder?.generation ?? 'unknown'}) lapsed with no acceptance decision: the result is held for the operator until ${hold.waiting.expiresAt}, the policy's wait for ${c.task.actionClass}`,
+                whyNot: 'a lapsed lease, or a host stop across it, never expires a review, and the board never accepts by default',
+                inputs: hold.inputs, detail: { reason: 'operator-review', pendingChecks: hold.waiting.pendingChecks, expiresAt: hold.waiting.expiresAt, lease: 'lapsed' },
+              }, at),
+            },
+          }))
+        }
       case 'waiting-for-approval': {
         const requestId = task.waiting!.approvalRequest!
         const request = await this.ctx.approvals.get(requestId)
@@ -1074,7 +1696,8 @@ export class StoreBoard extends Board {
         return this.commitLater(task, at, undefined, (c) => {
           if (!approved) return { changes: { state: 'waiting-for-input', waiting: this.inputWait('rejected', at), lastDecision: resolution.decision } }
           // attempts.count never exceeds attempts.max: an approval to go on with no attempt left starts nothing (INV-9).
-          if (c.task.attempts.count >= c.task.attempts.max) return { changes: { state: 'waiting-for-input', waiting: this.inputWait('retries-spent', at), lastDecision: resolution.decision } }
+          // An answered question's attempt continues, so it is not spent (T291).
+          if (c.task.attempts.count >= c.task.attempts.max && !this.continuingNow(taskId)) return { changes: { state: 'waiting-for-input', waiting: this.inputWait('retries-spent', at), lastDecision: resolution.decision } }
           return { changes: { state: 'ready', waiting: undefined, run: undefined, lastDecision: resolution.decision } }
         })
       }
@@ -1132,7 +1755,7 @@ export class StoreBoard extends Board {
     const move = this.nextAttemptMove(project, { ...task, budget, funding: raises }, next, {
       decision, why: `the operator approved going on after budget-spent (request ${request.requestId}), its budget raised by ${linesText(funding, '+')}`,
     }, at)
-    return { changes: { schema: 'board-task@1.1', budget, funding: raises, ...move.changes } }
+    return { changes: { schema: tagOf(task, task.defect ? 'board-task@1.2' : 'board-task@1.1'), budget, funding: raises, ...move.changes } }
   }
 
   /**
@@ -1145,9 +1768,9 @@ export class StoreBoard extends Board {
    * again when the move commits. A spent budget's `funding` ask goes into the request's subject;
    * the reservations its holder could not release (`unreleased`, 1.3) into its consequences.
    */
-  private async gate(task: BoardTask, actionClass: ActionClass, reason: 'budget-spent' | 'reconciliation-failed', at: Date, generation?: number, funding?: BudgetLine[], unreleased?: UnreleasedHold[]): Promise<BoardTask> {
+  private async gate(task: BoardTask, actionClass: ActionClass, reason: 'budget-spent' | 'reconciliation-failed', at: Date, generation?: number, funding?: BudgetLine[], unreleased?: UnreleasedHold[], hostStopped = false): Promise<BoardTask> {
     const verdict = await this.ctx.approvals.check({ class: actionClass, projectId: task.projectId })
-    if (verdict.mode === 'ask') return this.waitForApproval(task, actionClass, reason, verdict, at, generation, funding, unreleased)
+    if (verdict.mode === 'ask') return this.waitForApproval(task, actionClass, reason, verdict, at, generation, funding, unreleased, hostStopped)
     return this.commitLater(task, at, generation, (c) => ({
       changes: {
         state: 'waiting-for-input', holder: undefined, waiting: this.inputWait('rejected', at),
@@ -1184,8 +1807,12 @@ export class StoreBoard extends Board {
     const reason = task.waiting!.reason as 'approval-needed' | 'budget-spent' | 'reconciliation-failed'
     const actionClass: ActionClass = reason === 'budget-spent' ? 'funding' : reason === 'reconciliation-failed' ? 'remediation' : task.actionClass
     const verdict = await this.ctx.approvals.check({ class: actionClass, projectId: task.projectId })
-    // A spent budget's funding ask is asked again as it was: the same lines, the same subject.
-    const request = verdict.mode === 'ask' ? await this.ask(this.taskRequest(task, actionClass, reason, verdict, task.waiting!.funding), at) : undefined
+    // A spent budget's funding ask is asked again as it was: the same lines, the same subject. So is an
+    // answered question's gate: on the wait it answered, so no other gate of the same attempt adopts its approval (INV-2, T291).
+    // A lost run keeps its host-stopped mark.
+    const answered = reason === 'approval-needed' ? answeredWaitOf(task, withdrawn.subject.ref) : undefined
+    const hostStopped = withdrawn.subject.version === HOST_STOPPED_RECONCILIATION
+    const request = verdict.mode === 'ask' ? await this.ask(this.taskRequest(task, actionClass, reason, verdict, task.waiting!.funding, undefined, answered, hostStopped), at) : undefined
     try {
       return this.commitLater(task, at, undefined, (c) => this.regateMove(c.task, reason, actionClass, verdict, request, withdrawn, at))
     } catch (error) {
@@ -1246,7 +1873,7 @@ export class StoreBoard extends Board {
     const request = verdict.mode === 'ask' && pending !== undefined && project.state !== 'closed'
       ? await this.ask({
         subject: { type: 'content', ref: charterRef(projectId, pending.version), version: charterHash(pending) },
-        action: { class: 'charter', summary: clamp(`${founding ? 'Found' : 'Amend'} ${project.title}: ${pending.intent}`, 500) },
+        action: { class: 'charter', summary: clampText(`${founding ? 'Found' : 'Amend'} ${project.title}: ${pending.intent}`, 500) },
         requester: { component: 'board', projectId }, verdict, classification: project.classification ?? 'operator-shared',
       }, at)
       : undefined
@@ -1302,18 +1929,20 @@ export class StoreBoard extends Board {
    * spent budget's `funding` ask is its subject's version ({@link fundingVersion}), so the verdict
    * binds to exactly those lines (INV-5), and its summary and consequences name them.
    */
-  private taskRequest(task: BoardTask, actionClass: ActionClass, reason: 'approval-needed' | 'budget-spent' | 'reconciliation-failed', verdict: AutonomyVerdict, funding?: BudgetLine[], unreleased?: UnreleasedHold[]): NewRequest {
+  private taskRequest(task: BoardTask, actionClass: ActionClass, reason: 'approval-needed' | 'budget-spent' | 'reconciliation-failed', verdict: AutonomyVerdict, funding?: BudgetLine[], unreleased?: UnreleasedHold[], answeredWait?: string, hostStopped = false): NewRequest {
     const { project } = this.projectOf(task.projectId)
     const asked = reason === 'budget-spent' ? funding : undefined
     // The reservations the holder could not release still count: named, so the operator sees why the step was refused (1.3).
     const held = reason === 'budget-spent' && unreleased?.length ? unreleasedText(unreleased) : undefined
     const consequences = [asked ? this.fundingConsequences(task, asked) : undefined, held].filter((c): c is string => c !== undefined).join(' ')
     return {
-      subject: { type: 'content', ref: `board-task:${task.taskId}:attempt:${task.attempts.count}`, version: asked ? fundingVersion(contentId(asked)) : reason },
+      // An answered question continues its attempt, so its request names the wait it answers: no earlier approval of that attempt covers a later gate (INV-2, T291).
+      // A lost run whose lease lapsed while the host was stopped carries the structured mark in its version (T302).
+      subject: { type: 'content', ref: `board-task:${task.taskId}:attempt:${task.attempts.count}${answeredWait ? `:answered:${answeredWait}` : ''}`, version: asked ? fundingVersion(contentId(asked)) : reason === 'reconciliation-failed' && hostStopped ? HOST_STOPPED_RECONCILIATION : reason },
       action: {
         class: actionClass,
-        summary: clamp(`${reason}: ${task.title}${asked ? `; raise its budget by ${linesText(asked, '+')}` : ''}${held ? `; ${unreleased!.length} reservation(s) not released still count` : ''}`, 500),
-        ...(consequences ? { consequences: clamp(consequences, 2000) } : {}),
+        summary: clampText(`${reason}: ${task.title}${asked ? `; raise its budget by ${linesText(asked, '+')}` : ''}${held ? `; ${unreleased!.length} reservation(s) not released still count` : ''}`, 500),
+        ...(consequences ? { consequences: clampText(consequences, 2000) } : {}),
       },
       requester: { component: 'board', projectId: task.projectId, taskId: task.taskId, ...(task.run ? { runId: task.run.runId } : {}) },
       verdict, classification: project.classification ?? 'operator-shared',
@@ -1333,10 +1962,10 @@ export class StoreBoard extends Board {
    * the verdict asks (S9): every return to ready for a new attempt goes through the gate again, so
    * one approval never covers a later attempt.
    */
-  private async nextAttempt(task: BoardTask, at: Date): Promise<NextAttempt> {
+  private async nextAttempt(task: BoardTask, at: Date, answeredWait?: string): Promise<NextAttempt> {
     const verdict = await this.ctx.approvals.check({ class: task.actionClass, projectId: task.projectId })
     if (verdict.mode !== 'ask') return { verdict }
-    return { verdict, request: await this.ask(this.taskRequest(task, task.actionClass, 'approval-needed', verdict), at) }
+    return { verdict, request: await this.ask(this.taskRequest(task, task.actionClass, 'approval-needed', verdict, undefined, undefined, answeredWait), at) }
   }
 
   /** Run `commit`; when it fails, withdraw the request `next` opened for it, unless something already waits on it. */
@@ -1380,12 +2009,12 @@ export class StoreBoard extends Board {
   }
 
   /** Put the task to the operator: one request on `board-task:<id>:attempt:<n>`, which its wait follows, keeping a spent budget's funding ask. */
-  private async waitForApproval(task: BoardTask, actionClass: ActionClass, reason: 'approval-needed' | 'budget-spent' | 'reconciliation-failed', verdict: AutonomyVerdict, at: Date, generation?: number, funding?: BudgetLine[], unreleased?: UnreleasedHold[]): Promise<BoardTask> {
-    const request = await this.ask(this.taskRequest(task, actionClass, reason, verdict, funding, unreleased), at)
+  private async waitForApproval(task: BoardTask, actionClass: ActionClass, reason: 'approval-needed' | 'budget-spent' | 'reconciliation-failed', verdict: AutonomyVerdict, at: Date, generation?: number, funding?: BudgetLine[], unreleased?: UnreleasedHold[], hostStopped = false): Promise<BoardTask> {
+    const request = await this.ask(this.taskRequest(task, actionClass, reason, verdict, funding, unreleased, undefined, hostStopped), at)
     try {
       return this.commitLater(task, at, generation, () => ({
         changes: {
-          state: 'waiting-for-approval', holder: undefined, ...(funding ? { schema: 'board-task@1.1' as const } : {}),
+          state: 'waiting-for-approval', holder: undefined, ...(funding ? { schema: tagOf(task, task.defect ? 'board-task@1.2' : 'board-task@1.1') } : {}),
           waiting: { reason, approvalRequest: request.requestId, ...(funding ? { funding } : {}), since: at.toISOString(), expiresAt: request.expiresAt }, lastDecision: request.policy.decision,
         },
       }))
@@ -1490,13 +2119,13 @@ export class StoreBoard extends Board {
     this.knownResult(result)
     const envelope = this.ctx.artifacts.get(acceptance)
     const body = envelope?.kind === 'decision'
-      ? envelope.body as { decisionType?: string; inputs?: string[]; decider?: { type?: string }; outcome?: { option?: string; detail?: Record<string, unknown> } }
+      ? envelope.body as { decisionType?: string; inputs?: string[]; decider?: { type?: string; id?: string }; outcome?: { option?: string; detail?: Record<string, unknown> } }
       : undefined
     if (body?.decisionType !== 'acceptance') throw new BoardError('invalid', `${acceptance} is not an acceptance decision`)
     const detail = body.outcome?.detail ?? {}
     if (detail['taskId'] !== task.taskId) throw new BoardError('invalid', `${acceptance} does not name task ${task.taskId} (outcome.detail.taskId)`)
     const subject = detail['subject'] as Subject | undefined
-    if (!isObject(subject) || !sameSubject(subject, result.subject)) {
+    if (!isRecord(subject) || !sameSubject(subject, result.subject)) {
       throw new BoardError('invalid', `${acceptance} does not name the result's exact subject ${result.subject.type} ${result.subject.ref}${result.subject.version ? ` at ${result.subject.version}` : ''} (outcome.detail.subject)`)
     }
     const missing = [...result.artifacts, ...(result.digest ? [result.digest] : [])].filter((a) => !body.inputs?.includes(a))
@@ -1504,13 +2133,94 @@ export class StoreBoard extends Board {
     const option = body.outcome?.option
     if (option !== 'accept' && option !== 'reject') throw new BoardError('invalid', `${acceptance} decides ${String(option)}, neither accept nor reject`)
     const checks = detail['checks']
-    if (checks !== undefined && (!isObject(checks) || Object.entries(checks).some(([k, v]) => !CHECKS.includes(k as Check) || typeof v !== 'boolean'))) {
+    if (checks !== undefined && (!isRecord(checks) || Object.entries(checks).some(([k, v]) => !CHECKS.includes(k as Check) || typeof v !== 'boolean'))) {
       throw new BoardError('invalid', `${acceptance} reports checks that are not ${CHECKS.join(', ')} with true or false (outcome.detail.checks)`)
     }
+    const leadId = `lead:${task.projectId}`
     return {
       option, operator: body.decider?.type === 'operator' && envelope!.producer.type === 'operator',
+      ...(body.decider?.type === 'client' && body.decider.id === leadId && envelope!.producer.type === 'system' && envelope!.producer.ref === leadId ? { lead: true } : {}),
       ...(checks !== undefined ? { checks: checks as Partial<Record<Check, boolean>> } : {}),
     }
+  }
+
+  /**
+   * The checks a lead's or the operator's acceptance of a writing result binds to (T293, T311): the
+   * command checks the run's own acceptance recorded on that exact tree ({@link runAcceptance}), never
+   * the accepting decision's own claims, which keep only the checks the run does not run (`review`,
+   * `schema`). An acceptance is refused (`invalid`) when the run recorded a command check failed on the
+   * result, and while one the policy requires has not passed (pending): the workflow runs it on the
+   * held tree, and an acceptance applies once it passed. Only the operator accepts past a pending check,
+   * by naming it with a note (`outcome.detail.checksNotRun`), which its own decision records. A result
+   * that is not a writing one, the run owner's own acceptance, and a rejection are read as they are.
+   */
+  private async recordedChecksGate(task: BoardTask, acceptance: ArtifactRef, read: Acceptance): Promise<{ read: Acceptance; notRun?: NotRun[] }> {
+    const result = task.result!
+    if (read.option !== 'accept' || this.runOwners(acceptance) || !this.writingResult(result)) return { read }
+    const run = this.runAcceptance(task)
+    const recorded = run?.checks ?? {}
+    const own = Object.fromEntries(Object.entries(read.checks ?? {}).filter(([c]) => !COMMAND_CHECKS.includes(c as never))) as Partial<Record<Check, boolean>>
+    const checks: Partial<Record<Check, boolean>> = { ...own, ...Object.fromEntries(COMMAND_CHECKS.filter((c) => recorded[c] !== undefined).map((c) => [c, recorded[c]!])) }
+    const on = `${result.subject.type} ${result.subject.ref}${result.subject.version ? ` at ${result.subject.version}` : ''}`
+    const failed = COMMAND_CHECKS.filter((c) => recorded[c] === false)
+    if (failed.length) {
+      throw new BoardError('invalid', `${acceptance} accepts a result whose run recorded its ${failed.join(', ')} check(s) failed on ${on} (acceptance ${run!.ref}): a result is never accepted over a failed check; a rejection sends it back`)
+    }
+    const verdict = await this.ctx.approvals.check({ class: task.actionClass, projectId: task.projectId, checks })
+    const pending = verdict.mode === 'forbid' ? [] : (verdict.failedChecks ?? []).filter((c) => COMMAND_CHECKS.includes(c as never))
+    const named = read.operator ? this.checksNotRunOf(acceptance) : {}
+    const left = pending.filter((c) => named[c] === undefined)
+    if (left.length) {
+      const since = task.waiting?.since ?? task.updatedAt ?? task.createdAt
+      throw new BoardError('invalid', `${acceptance} cannot accept the result on ${on}: its required check(s) ${left.join(', ')} have not passed on it (pending since ${since}${run ? `; the run's acceptance ${run.ref}` : '; no acceptance of the run records them'}); the run's owner runs them once on the held tree and applies its acceptance again with them, so an acceptance applies once they passed; one that cannot run there stays pending${read.operator ? ', unless the operator names each check not run with a note (outcome.detail.checksNotRun)' : ', and only the operator may accept past it'}`)
+    }
+    const notRun = pending.map((c) => ({ check: c, note: named[c]! }))
+    return { read: { ...read, checks: { ...checks, ...Object.fromEntries(notRun.map((n) => [n.check, true])) } }, ...(notRun.length ? { notRun } : {}) }
+  }
+
+  /** Whether an acceptance is the run owner's: a rule's decision in an envelope the system produced (INV-6). */
+  private runOwners(acceptance: ArtifactRef): boolean {
+    const envelope = this.ctx.artifacts.get(acceptance)
+    return envelope?.producer.type === 'system' && (envelope.body as { decider?: { type?: string } }).decider?.type === 'rule'
+  }
+
+  /** A writing result (T293): on a git tree that an agent result among its artifacts names as its worktree, at that exact version. */
+  private writingResult(result: NonNullable<BoardTask['result']>): boolean {
+    if (result.subject.type !== 'git-head' || result.subject.version === undefined) return false
+    return result.artifacts.some((ref) => {
+      const body = this.ctx.artifacts.get(ref)?.body as { schema?: string; workspace?: unknown; subject?: Subject } | undefined
+      return !!body?.schema?.startsWith('agent-result@') && typeof body.workspace === 'string' && body.subject?.type === 'git-head'
+        && body.subject.ref === result.subject.ref && body.subject.version === result.subject.version
+    })
+  }
+
+  /**
+   * The run's own acceptance of the task's exact result (T311), read from the record, whatever the
+   * board's last decision on the task is (a hold, a lapse, a re-opening): the latest `acceptance`
+   * decision of the task's run that is the run owner's and names this task and this exact subject, with
+   * the checks it reports. Undefined when the run recorded none.
+   */
+  private runAcceptance(task: BoardTask): { ref: ArtifactRef; checks: Partial<Record<Check, boolean>> } | undefined {
+    const runId = task.run?.runId
+    if (!runId || !task.result) return undefined
+    // Every step's acceptance is one too, so the page is the store's widest (1000), well past a run's steps (INV-9).
+    for (const envelope of this.ctx.artifacts.list({ kind: 'decision', decisionType: 'acceptance', runId, newest: true, limit: 1000 })) {
+      if (!this.runOwners(envelope.id as ArtifactRef)) continue
+      const detail = (envelope.body as { outcome?: { detail?: Record<string, unknown> } }).outcome?.detail ?? {}
+      if (detail['taskId'] !== task.taskId || !isRecord(detail['subject']) || !sameSubject(detail['subject'] as unknown as Subject, task.result.subject)) continue
+      const reported = isRecord(detail['checks']) ? detail['checks'] : {}
+      const checks = Object.fromEntries(Object.entries(reported).filter(([c, v]) => CHECKS.includes(c as Check) && typeof v === 'boolean')) as Partial<Record<Check, boolean>>
+      return { ref: envelope.id as ArtifactRef, checks }
+    }
+    return undefined
+  }
+
+  /** The command checks an operator's acceptance names as not run, each with its note (`outcome.detail.checksNotRun`, T293); none when it names none or names them wrongly. */
+  private checksNotRunOf(acceptance: ArtifactRef): Partial<Record<Check, string>> {
+    const named = (this.ctx.artifacts.get(acceptance)?.body as { outcome?: { detail?: Record<string, unknown> } } | undefined)?.outcome?.detail?.['checksNotRun']
+    if (!isRecord(named)) return {}
+    const valid = Object.entries(named).filter(([c, note]) => COMMAND_CHECKS.includes(c as never) && typeof note === 'string' && note.trim().length > 0 && note.length <= NOT_RUN_NOTE_MAX)
+    return Object.fromEntries(valid.map(([c, note]) => [c, (note as string).trim()]))
   }
 
   /**
@@ -1518,51 +2228,238 @@ export class StoreBoard extends Board {
    * the operator's applies only when the policy, given the checks the decision reports, leaves none
    * of the task's class's required checks failed, and does not forbid the class. Otherwise only the
    * operator's acceptance accepts the result now, and the review is held for the operator, for the
-   * policy's wait for the class (undefined when the decision applies); a reject applies either way.
+   * policy's wait for the class; a reject applies either way. Under `autoAccept`, a listed project's
+   * result on a git working tree that the policy lets apply is held too unless the auto-accept rule
+   * applies ({@link autoAccepted}), and then it is accepted on that rule's own decision.
    */
-  private async held(task: BoardTask, read: Acceptance): Promise<Held | undefined> {
-    if (read.option !== 'accept' || read.operator) return undefined
+  private async acceptanceGate(task: BoardTask, result: NonNullable<BoardTask['result']>, acceptance: ArtifactRef, read: Acceptance): Promise<Gate> {
+    if (read.option !== 'accept' || read.operator) return {}
     const verdict = await this.ctx.approvals.check({ class: task.actionClass, projectId: task.projectId, ...(read.checks ? { checks: read.checks } : {}) })
-    if (verdict.mode !== 'forbid' && !verdict.failedChecks?.length) return undefined
-    const { policies } = await this.ctx.approvals.policy(task.projectId)
-    return { verdict, pendingChecks: verdict.mode === 'forbid' ? [] : verdict.failedChecks!, seconds: waitSeconds(policies, task.actionClass) }
+    const seconds = async (): Promise<number> => waitSeconds((await this.ctx.approvals.policy(task.projectId)).policies, task.actionClass)
+    if (verdict.mode === 'forbid' || verdict.failedChecks?.length) {
+      return { held: { verdict, pendingChecks: verdict.mode === 'forbid' ? [] : verdict.failedChecks!, seconds: await seconds() } }
+    }
+    // A heavy result is never accepted unattended (ADR-0071), by the policy or by the auto-accept rule: the operator decides it.
+    const heavy = await this.heavyOf(acceptance, task.projectId)
+    if (heavy) return { held: { verdict, pendingChecks: [], seconds: await seconds(), heavy } }
+    // The project's lead decides a result the policy lets apply (ADR-0076): its acceptance is a person's, not the
+    // auto-accept rule's, so that rule (which accepts only the run owner's) does not hold it.
+    if (read.lead) return {}
+    // The auto-accept rule (D80, ADR-0067) is for a listed project's results that land: on a git working tree.
+    if (!this.autoAccept?.projects.includes(task.projectId) || result.subject.type !== 'git-head') return {}
+    const judged = this.autoAccepted(task.projectId, result, acceptance, read)
+    if ('reasons' in judged) return { held: { verdict, pendingChecks: [], seconds: await seconds(), autoAccept: judged.reasons } }
+    return { auto: { verdict, ...judged } }
+  }
+
+  /**
+   * Why an accepting decision is of a heavy result (ADR-0071), read from the record it names, never
+   * from its own account: `outcome.detail.risk.decision`, among its inputs, is a `workflow.risk-tier`
+   * decision whose outcome is `heavy`. A decision that names a tier it does not back with that record
+   * is held too (INV-2), and so is one that names no tier while a policy of the task's project
+   * carries a path map: tiering is on, so its silence is no tier. Undefined when it names no tier and
+   * no applying policy carries a map (tiering off), or a tier below heavy.
+   */
+  private async heavyOf(acceptance: ArtifactRef, projectId: string): Promise<string | undefined> {
+    const body = this.ctx.artifacts.get(acceptance)?.body as { inputs?: string[]; outcome?: { detail?: Record<string, unknown> } } | undefined
+    const risk = body?.outcome?.detail?.['risk']
+    if (risk === undefined) {
+      return riskTierMaps((await this.ctx.approvals.policy(projectId)).policies).length
+        ? `it names no risk tier (outcome.detail.risk), though a policy of project ${projectId} carries a path map (riskTiers), so the tier is taken as heavy`
+        : undefined
+    }
+    const ref = isRecord(risk) && typeof risk['decision'] === 'string' ? risk['decision'] as ArtifactRef : undefined
+    const record = ref && (body!.inputs ?? []).includes(ref) ? this.ctx.artifacts.get(ref)?.body as { decider?: { id?: string }; outcome?: { option?: string } } | undefined : undefined
+    if (!record || record.decider?.id !== 'workflow.risk-tier') return `it names a risk tier with no workflow.risk-tier decision among its inputs (outcome.detail.risk.decision), so the tier is taken as heavy`
+    if (record.outcome?.option === 'heavy') return `the result is heavy-tier (risk decision ${ref}): a heavy change is never accepted automatically`
+    return isRecord(risk) && risk['tier'] !== record.outcome?.option ? `it says the tier is ${String(risk['tier'])}, but its risk decision ${ref} says ${String(record.outcome?.option)}` : undefined
+  }
+
+  /**
+   * The auto-accept rule (D80, ADR-0067), on an accepting decision the policy lets apply, for a task
+   * of a listed project whose result is on a git working tree. It applies only when every condition
+   * holds, each read from the records the decision names, never from its own account:
+   * - it is the run owner's: a rule's decision in an envelope the system produced (INV-6);
+   * - **review**: `outcome.detail.review.assessment`, among its inputs, is an `assessment@1.x` of the
+   *   result's exact tree whose verdict is `approve` with no blocking finding left: the run's last
+   *   review (a blocking finding left at the cycle bound never passes). Blocking is a confirmed
+   *   important finding (ADR-0075): nits and pre-existing findings never hold it;
+   * - **checks**: every command check it reports passed (which covers every one the policy
+   *   requires, since the policy saw none failed) is `passed` in its `check-run@1.0` record
+   *   (`outcome.detail.checkRun.evidence`, among its inputs) on the result's exact tree (ADR-0063),
+   *   and none of them reported tests it did not run (`outcome.detail.checkRun.results[].notRun`,
+   *   T247): a pass without its browser tests waits for the lead or the operator (T255);
+   * - **landing**: `outcome.detail.landing.branch`, the branch the result would be merged into, is
+   *   listed.
+   * Otherwise every condition that does not hold, as a reason.
+   */
+  private autoAccepted(projectId: string, result: NonNullable<BoardTask['result']>, acceptance: ArtifactRef, read: Acceptance): Omit<AutoAccepted, 'verdict'> | { reasons: string[] } {
+    const envelope = this.ctx.artifacts.get(acceptance)!
+    const body = envelope.body as { inputs?: string[]; decider?: { type?: string }; outcome?: { detail?: Record<string, unknown> } }
+    const detail = body.outcome?.detail ?? {}
+    const inputs = body.inputs ?? []
+    const onResult = (subject: unknown): boolean => isRecord(subject) && (subject['type'] ?? 'git-head') === 'git-head' && subject['ref'] === result.subject.ref && subject['version'] === result.subject.version
+    const tree = `git:${result.subject.ref}:${result.subject.version ?? ''}`
+    const reasons: string[] = []
+    if (envelope.producer.type !== 'system' || body.decider?.type !== 'rule') reasons.push(`${acceptance} is not the run owner's (a rule's decision the system produced)`)
+
+    const named = isRecord(detail['review']) ? detail['review'] : undefined
+    const reviewRef = typeof named?.['assessment'] === 'string' ? named['assessment'] as ArtifactRef : undefined
+    const review = reviewRef && inputs.includes(reviewRef) ? this.ctx.artifacts.get(reviewRef) : undefined
+    const assessment = review?.kind === 'assessment' ? review.body as { schema?: string; subject?: unknown; verdict?: string; findings?: Array<{ severity?: string; repeated?: string; verification?: { vote?: string } }> } : undefined
+    if (!reviewRef) reasons.push('it names no review of the run (outcome.detail.review)')
+    else if (!assessment?.schema?.startsWith('assessment@')) reasons.push(`the review ${reviewRef} it names is not an assessment among its inputs`)
+    else {
+      // Blocking (ADR-0075): an important finding a second reviewer confirmed, or an assessment@1.0's
+      // blocking one; a nit, a pre-existing finding, or an unverified or rejected one never holds it.
+      const blocking = (assessment.findings ?? []).filter((f) => !f.repeated && (f.severity === 'blocking' || (f.severity === 'important' && f.verification?.vote === 'confirm'))).length
+      const [at, bound] = [named!['cycle'], named!['maxCycles']]
+      const cycle = typeof at === 'number' && typeof bound === 'number' ? ` (review cycle ${at} of ${bound}${at >= bound ? ', the cycle bound' : ''})` : ''
+      if (!onResult(assessment.subject)) reasons.push(`the run's last review ${reviewRef} is not of the result's exact tree ${tree}`)
+      if (assessment.verdict !== 'approve') reasons.push(`the run's last review ${reviewRef} did not approve (${String(assessment.verdict)})${blocking ? ` and left ${blocking} blocking finding(s)` : ''}${cycle}`)
+      else if (blocking) reasons.push(`the run's last review ${reviewRef} left ${blocking} blocking finding(s)${cycle}`)
+    }
+
+    const passed = PROVEN_CHECKS.filter((c) => read.checks?.[c] === true)
+    const checkRun = isRecord(detail['checkRun']) ? detail['checkRun'] : undefined
+    const evidenceRef = typeof checkRun?.['evidence'] === 'string' ? checkRun['evidence'] as ArtifactRef : undefined
+    if (passed.length) {
+      const record = evidenceRef && inputs.includes(evidenceRef) ? this.ctx.artifacts.get(evidenceRef) : undefined
+      const run = record?.kind === 'evidence' ? record.body as { schema?: string; subject?: unknown; checks?: Array<{ check?: string; outcome?: string }> } : undefined
+      if (!run?.schema?.startsWith('check-run@')) reasons.push(`its passed check(s) ${passed.join(', ')} have no check-run record among its inputs (outcome.detail.checkRun.evidence)`)
+      else if (!onResult(run.subject)) reasons.push(`the check-run record ${evidenceRef} is not of the result's exact tree ${tree}`)
+      else {
+        const unproven = passed.filter((c) => !run.checks?.some((r) => r.check === c && r.outcome === 'passed'))
+        if (unproven.length) reasons.push(`the check-run record ${evidenceRef} does not show ${unproven.join(', ')} passed`)
+      }
+      // A pass whose command reported tests it did not run (T247) says nothing of those: never accepted unattended (T255).
+      const listed: unknown = checkRun?.['results']
+      const results = Array.isArray(listed) ? listed.filter(isRecord) : []
+      for (const c of passed) {
+        const notRun = results.find((r) => r['check'] === c && typeof r['notRun'] === 'string')?.['notRun'] as string | undefined
+        if (notRun !== undefined) reasons.push(`checks passed, browser tests not run: its ${c} check passed without running ${notRun}, so its pass says nothing of those`)
+      }
+    }
+
+    const landing = isRecord(detail['landing']) ? detail['landing'] : undefined
+    const branch = typeof landing?.['branch'] === 'string' ? landing['branch'] : undefined
+    if (branch === undefined) reasons.push('no landing target is known for the result (outcome.detail.landing.branch)')
+    else if (!this.autoAccept!.branches.includes(branch)) reasons.push(`it lands on ${branch}, not on a listed branch (${this.autoAccept!.branches.join(', ')})`)
+    // The circuit breaker (D93): once tripped for this project and branch, auto-accept stays off until the operator or the lead turns it on.
+    if (branch !== undefined) {
+      const open = this.openBreaker(projectId, branch)
+      if (open) reasons.push(`the auto-accept breaker is tripped for ${projectId} on ${branch} since ${open.trippedAt}: ${open.escapes.length} escaped defect(s) counted (decision ${open.decision}); only the operator or the lead turns it on again, once the line (${open.line.escapes} in ${open.line.days} days) holds`)
+    }
+
+    if (reasons.length) return { reasons }
+    return { review: reviewRef!, ...(passed.length ? { evidence: evidenceRef! } : {}), checks: passed, branch: branch! }
+  }
+
+  /**
+   * What holds a result for the operator (T330), as one of: the policy forbids the class, the result
+   * is heavy (with its risk decision, ADR-0071), the auto-accept rule does not apply (its reasons), or
+   * required checks are pending or failed (named); each with the autonomy decision. The refusal of a
+   * non-operator's acceptance and the hold's own decision (`outcome.detail.holdReason`, which /ui
+   * shows) say the same words.
+   */
+  private holdReason(task: BoardTask, held: Held): string {
+    const decision = `autonomy decision ${held.verdict.decision}`
+    if (held.verdict.mode === 'forbid') return `the policy forbids ${task.actionClass} (${decision})`
+    if (held.heavy) return `${held.heavy} (${decision})`
+    if (held.autoAccept) return `the auto-accept rule (board.autoAccept, D80) does not apply: ${held.autoAccept.join('; ')} (${decision})`
+    return `required check(s) ${held.pendingChecks.join(', ')} have not passed (${decision})`
   }
 
   /**
    * The review held for the operator: the result recorded, the lease released, and a wait of the
    * policy's length for the class, which ends `review-expired` (INV-9). Only the operator's
    * acceptance accepts it now; a rejection, or an accepting decision with the checks passed, still
-   * applies. A `board` decision naming the acceptance and the autonomy verdict records it.
+   * applies. A `board` decision naming the acceptance, the autonomy verdict, and the hold's reason
+   * ({@link holdReason}) records it.
    */
   private holdMove(task: BoardTask, result: NonNullable<BoardTask['result']>, acceptance: ArtifactRef, held: Held, at: Date): Move {
     const { project } = this.projectOf(task.projectId)
     const expiresAt = new Date(at.getTime() + held.seconds * 1000).toISOString()
-    const why = held.verdict.mode === 'forbid' ? `the policy forbids ${task.actionClass}` : `required check(s) ${held.pendingChecks.join(', ')} not passed`
+    const why = this.holdReason(task, held)
     return {
       changes: {
         state: 'review', result, holder: undefined,
         waiting: { reason: 'operator-review', pendingChecks: held.pendingChecks, since: at.toISOString(), expiresAt },
         lastDecision: this.decision(project, task, {
           from: task.state, to: 'operator-review',
-          why: `${acceptance} is not the operator's and ${why} (autonomy decision ${held.verdict.decision}): only the operator's acceptance accepts the result, until ${expiresAt}, the policy's wait for ${task.actionClass}`,
+          why: `${acceptance} is not the operator's and ${why}: only the operator's acceptance accepts the result, until ${expiresAt}, the policy's wait for ${task.actionClass}`,
           whyNot: task.state === 'review'
             ? 'the board never accepts by default, and the reviewer\'s lease would end the operator\'s review when the run that holds it ends'
             : 'the run\'s owner reported a result the board never accepts by default',
-          inputs: [acceptance, held.verdict.decision], detail: { reason: 'operator-review', pendingChecks: held.pendingChecks, expiresAt },
+          inputs: [acceptance, held.verdict.decision],
+          detail: { reason: 'operator-review', holdReason: why, pendingChecks: held.pendingChecks, expiresAt, ...(held.autoAccept ? { autoAccept: held.autoAccept } : {}), ...(held.heavy ? { heavy: held.heavy } : {}) },
         }, at),
       },
     }
   }
 
-  /** The move an `acceptance` decision read by {@link readAcceptance} makes: done when it accepts, else another attempt or a wait for input. */
-  private acceptanceMove(task: BoardTask, result: NonNullable<BoardTask['result']>, acceptance: ArtifactRef, read: Acceptance, next: NextAttempt | undefined, at: Date): Move {
-    if (read.option === 'accept') return { changes: { state: 'done', result: { ...result, acceptance }, holder: undefined, waiting: undefined, lastDecision: acceptance } }
+  /**
+   * The move an `acceptance` decision read by {@link readAcceptance} makes: when it accepts, done, or,
+   * for a writing result (T293), the landing wait: in review, `result.acceptance` set, until its
+   * landing ends it ({@link landed}); else another attempt or a wait for input. One the auto-accept
+   * rule applies (`auto`) moves on a `board` decision of rule `board.auto-accept` naming the
+   * acceptance, the review, the check-run record, and the autonomy decision (INV-13);
+   * `result.acceptance` stays the acceptance it applied.
+   */
+  private acceptanceMove(task: BoardTask, result: NonNullable<BoardTask['result']>, acceptance: ArtifactRef, read: Acceptance, next: NextAttempt | undefined, at: Date, auto?: AutoAccepted, notRun?: NotRun[]): Move {
+    const lands = read.option === 'accept' && this.writingResult(result)
+    const to = lands ? 'landing' : 'done'
+    const accepted = (lastDecision: ArtifactRef): Move => ({
+      changes: lands
+        ? { schema: tagOf(task, 'board-task@1.3'), state: 'review', result: { ...result, acceptance }, holder: undefined, waiting: { reason: 'landing', since: at.toISOString(), expiresAt: new Date(at.getTime() + LANDING_WAIT_SECONDS * 1000).toISOString() }, lastDecision }
+        : { state: 'done', result: { ...result, acceptance }, holder: undefined, waiting: undefined, lastDecision },
+    })
+    // The operator accepted past a required check that did not run, naming it with a note (T293): its own decision says so.
+    if (read.option === 'accept' && notRun?.length) {
+      const said = notRun.map((n) => `accepted with check ${n.check} not run: ${n.note}`).join('; ')
+      const decision = this.decision(this.projectOf(task.projectId).project, task, {
+        from: task.state, to,
+        why: `the operator's acceptance ${acceptance} ${said}`,
+        whyNot: 'the operator named each required check that did not run on the result, with why, so the review is not held for it',
+        inputs: [acceptance], detail: { reason: 'checks-not-run', acceptance, checksNotRun: notRun },
+      }, at)
+      return accepted(decision)
+    }
+    if (read.option === 'accept' && auto) {
+      const decision = this.decision(this.projectOf(task.projectId).project, task, {
+        from: task.state, to, rule: 'board.auto-accept',
+        why: `the auto-accept rule (board.autoAccept, D80) applies to ${acceptance}: the run's last review ${auto.review} approved the exact result with no blocking finding left; ${auto.checks.length ? `its required check(s) ${auto.checks.join(', ')} passed on it (check-run ${auto.evidence})` : 'the policy requires no command check of it'}, and the policy left none pending (autonomy decision ${auto.verdict.decision}); it lands on ${auto.branch}, a listed branch`,
+        whyNot: 'every condition of the auto-accept rule holds, so the review is not held for the operator; the merge still asks the operator as the policy says',
+        inputs: [acceptance, auto.review, ...(auto.evidence ? [auto.evidence] : []), auto.verdict.decision],
+        detail: { reason: 'auto-accept', acceptance, review: auto.review, ...(auto.evidence ? { checkRun: auto.evidence } : {}), checks: auto.checks, branch: auto.branch },
+      }, at)
+      return accepted(decision)
+    }
+    if (read.option === 'accept') return accepted(acceptance)
     if (attemptLeft(task)) {
       return this.nextAttemptMove(this.projectOf(task.projectId).project, task, next!, {
         decision: acceptance, why: `the acceptance decision ${acceptance} rejected attempt ${task.attempts.count} of ${task.attempts.max}`,
       }, at)
     }
     return { changes: { state: 'waiting-for-input', holder: undefined, result, waiting: this.inputWait('retries-spent', at), lastDecision: acceptance } }
+  }
+
+  /**
+   * The wait of a review held for the operator that no acceptance put there (a lapsed lease, a
+   * re-opening; T286): the policy's wait for the class from `at`, and the class's required checks
+   * still pending given the checks the run's own acceptance recorded on the exact result (T311: a
+   * check the run passed is never shown pending again; none recorded, every required one; none when
+   * the policy forbids the class). `decision` is the autonomy decision that says so; `inputs`, what
+   * the hold's decision names: it, and the run's acceptance, so a surface reads the recorded checks.
+   */
+  private async operatorHold(task: BoardTask, at: Date): Promise<{ waiting: { reason: 'operator-review'; pendingChecks: Check[]; since: string; expiresAt: string }; decision: ArtifactRef; inputs: ArtifactRef[] }> {
+    const run = this.runAcceptance(task)
+    const verdict = await this.ctx.approvals.check({ class: task.actionClass, projectId: task.projectId, ...(run && Object.keys(run.checks).length ? { checks: run.checks } : {}) })
+    const seconds = waitSeconds((await this.ctx.approvals.policy(task.projectId)).policies, task.actionClass)
+    return {
+      waiting: { reason: 'operator-review', pendingChecks: verdict.mode === 'forbid' ? [] : verdict.failedChecks ?? [], since: at.toISOString(), expiresAt: new Date(at.getTime() + seconds * 1000).toISOString() },
+      decision: verdict.decision, inputs: [verdict.decision, ...(run ? [run.ref] : [])],
+    }
   }
 
   private inputWait(reason: WaitReason, at: Date, questions?: string[]): NonNullable<BoardTask['waiting']> {
@@ -1581,7 +2478,7 @@ export class StoreBoard extends Board {
         move.instead ? { option: move.instead, selected: false, reasons: [`not ${move.instead}: ${move.whyNot}`] } : { option: move.from, selected: false, reasons: [`not kept ${move.from}: ${move.whyNot}`] },
         ...(move.also ?? []).map((o) => ({ option: o.option, selected: false, reasons: [`not ${o.option}: ${o.whyNot}`] })),
       ],
-      decider: { type: 'rule', id: 'board.transition', version: '1' },
+      decider: { type: 'rule', id: move.rule ?? 'board.transition', version: '1' },
       outcome: { option: move.to, detail: { projectId: project.projectId, ...(task ? { taskId: task.taskId } : {}), from: move.from, at: at.toISOString(), ...move.detail } },
       deterministic: true,
     }, { producer: { type: 'system', ref: 'board' }, classification: project.classification ?? 'operator-shared' }).id as ArtifactRef
@@ -1612,7 +2509,9 @@ export class StoreBoard extends Board {
    * the hold expires unseen (notify's `review.expiring`): `board.review.held` names the task, its
    * project, until when, and the checks still pending; `board.review.ended` the task, its project,
    * and where it went (done, another attempt, a wait for input once it expired). Ids, states, and
-   * times only. The event log is optional here, as for the approval queue: an append that fails is
+   * times only. A task that starts waiting for input is `board.waiting` (its reason: question,
+   * retries-spent, …) and the end of that wait `board.waiting.ended`, which the project's lead inbox
+   * reads. The event log is optional here, as for the approval queue: an append that fails is
    * logged, and the move stands.
    */
   private announceReview(before: BoardTask, after: BoardTask): void {
@@ -1622,6 +2521,16 @@ export class StoreBoard extends Board {
       : held(before) && !held(after)
         ? { type: 'board.review.ended', data: { taskId: after.taskId, projectId: after.projectId, state: after.state, ...(after.waiting ? { reason: after.waiting.reason } : {}) } }
         : undefined
+    this.append(event, after)
+    // A task that waits for input, and the end of that wait (a lead's inbox reads both): its reason, ids only.
+    const waits = (t: BoardTask): string | undefined => (t.state === 'waiting-for-input' ? t.waiting?.reason : undefined)
+    const was = waits(before)
+    const now = waits(after)
+    if (now !== undefined && now !== was) this.append({ type: 'board.waiting', data: { taskId: after.taskId, projectId: after.projectId, reason: now, expiresAt: after.waiting?.expiresAt } }, after)
+    else if (was !== undefined && now === undefined) this.append({ type: 'board.waiting.ended', data: { taskId: after.taskId, projectId: after.projectId, reason: was, state: after.state } }, after)
+  }
+
+  private append(event: { type: string; data: Record<string, unknown> } | undefined, after: BoardTask): void {
     if (!event) return
     try {
       this.ctx.get('eventLog')?.append({ ...event, ...(after.lastDecision ? { decision: after.lastDecision } : {}) })
@@ -1729,14 +2638,14 @@ export class StoreBoard extends Board {
     }
   }
 
-  private priorRequest(clientRequestId: string, tool: 'board_charter' | 'board_propose', projectId: string | undefined): PriorRequest | undefined {
+  private priorRequest(clientRequestId: string, tool: 'board_charter' | ProposeTool, projectId: string | undefined): PriorRequest | undefined {
     const row = this.ctx.store.db.prepare('SELECT tool, project_id, task_id, approval_request, charter_version FROM board_client_requests WHERE client_request_id = ?').get(clientRequestId) as (PriorRequest & { tool: string }) | undefined
     if (!row) return undefined
     if (row.tool !== tool || (projectId !== undefined && row.project_id !== projectId)) throw new BoardError('conflict', `client request ${clientRequestId} was used for another call`)
     return row
   }
 
-  private recordRequest(clientRequestId: string, tool: 'board_charter' | 'board_propose', projectId: string, taskId: string | undefined, approvalRequest: string | undefined, at: Date, charterVersion?: number): void {
+  private recordRequest(clientRequestId: string, tool: 'board_charter' | ProposeTool, projectId: string, taskId: string | undefined, approvalRequest: string | undefined, at: Date, charterVersion?: number): void {
     this.ctx.store.db.prepare('INSERT INTO board_client_requests (client_request_id, tool, project_id, task_id, approval_request, created_at, charter_version) VALUES (?, ?, ?, ?, ?, ?, ?)')
       .run(clientRequestId, tool, projectId, taskId ?? null, approvalRequest ?? null, at.toISOString(), charterVersion ?? null)
   }
@@ -1779,6 +2688,20 @@ export class StoreBoard extends Board {
   }
 
   /** Whether the holder's lease is gone at `at`: lapsed, or no longer the lease on the task's resource. */
+  /**
+   * Whether the task's lease lapsed while the host was stopped (T302): it was still live when the
+   * previous board stopped cleanly (expiry after that recorded stop) and had expired by this start, and
+   * no other holder took it. A lease that lapsed while the host ran (expired before the stop, or after
+   * this start), with no clean stop recorded, or taken over, is not marked (INV-2).
+   */
+  private lapsedWhileStopped(stored: Stored): boolean {
+    const lease = this.leaseOf(stored)
+    if (!this.downtime || !lease || !Number.isFinite(lease.expiresAt)) return false
+    if (lease.expiresAt <= this.downtime.stoppedMs || lease.expiresAt > this.downtime.startedMs) return false
+    const held = this.ctx.leases.current(lease.resource)
+    return !held || (held.token === lease.token && held.generation === lease.generation)
+  }
+
   private lost(stored: Stored, at: Date): boolean {
     const lease = this.leaseOf(stored)
     if (!lease || lease.expiresAt <= at.getTime()) return true

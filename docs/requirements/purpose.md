@@ -1,7 +1,7 @@
 # Purpose
 
 This is the canonical answer to the question **"what is `system` for?"** Every
-requirement, decision, and design choice should trace back to one of the four
+requirement, decision, and design choice should trace back to one of the seven
 purposes below. A feature that serves none of them does not belong in `system`.
 
 > **Right Worker, right job. Spend intelligence where intelligence matters.**
@@ -9,7 +9,7 @@ purposes below. A feature that serves none of them does not belong in `system`.
 ## The problem
 
 People who work with AI coding agents such as Claude Code and Codex hit the same
-three walls:
+the same walls:
 
 1. **Token and quota cost.** Coding agents and APIs bill or limit by token. Long
    research, broad reading, and repeated reasoning burn that budget fast, even
@@ -25,8 +25,15 @@ three walls:
 4. **One model tier does every job.** A frontier model also does the trivial
    work, such as triage, extraction, summarizing, formatting, and status checks.
    That spends the most expensive intelligence on the least demanding work.
+5. **Work is tied to one Worker.** A session that stops, runs out of quota, or is
+   replaced takes its context with it, and the next Worker starts over.
+6. **One workflow is hardcoded.** Tools built for one kind of work, such as
+   software development, do not carry over to scientific research or to work
+   outside code.
+7. **The person becomes the bottleneck.** Agents ask about every step, so the
+   person approves routine actions instead of deciding what matters.
 
-## The four purposes
+## The seven purposes
 
 ### P1: Save tokens by spending the separate ChatGPT chat quota
 
@@ -112,9 +119,36 @@ website quota absorbs the expensive reasoning.
 
 *Requirements:* REQ-WRK-9, REQ-WRK-10. *Design:* [routing](../design/routing.md#intelligence-tiers).
 
+### P5: Any Worker can continue unfinished work
+
+Workers are replaceable. Work state lives in artifacts, not in a Worker's
+session: every input, result, decision, and handoff is an immutable artifact with
+its own id, and Workers communicate by artifact id. A Worker that stops, runs out
+of quota, or is replaced leaves nothing behind that the next Worker needs, so any
+Worker that proves the capabilities can pick the work up from its artifacts
+([INV-13](../architecture/invariants.md#inv-13-every-decision-is-an-artifact),
+[artifacts](../design/artifacts.md)).
+
+### P6: Any workflow, not one built in
+
+`system` is workflow-agnostic. A workflow, whether software development,
+scientific research, or work outside code, is a definition: its steps, the
+capability and minimum tier each step needs, its acceptance, and its review.
+The engine runs every workflow the same way, and no core path is special to one
+of them ([workflow engine](../design/workflow-engine.md),
+[templates](../reference/workflow-templates.md)).
+
+### P7: The person decides only what matters
+
+The person sets intent, approves what only a person should approve (a charter, a
+merge, a policy change, spending), and resolves real disagreements. Routine
+actions inside an approved boundary run without asking. A mechanism that adds
+routine decisions for the person works against this purpose
+([approvals](../design/approvals.md)).
+
 ### Purposes per preset
 
-The default composition serves all four purposes. The `api-first` preset
+The default composition serves all seven purposes. The `api-first` preset
 ([ADR-0025](../decisions/adr/0025-api-first-composition.md)), for organizations that cannot
 accept automated use of consumer websites (CON-3), serves P3 and P4 with API, local, and agent
 Workers only. P1 and P2 need website Workers, so they are unavailable there.
@@ -158,6 +192,9 @@ agents, and wants them to work together as one system (CON-6).
 | P2 | number of website-native capabilities (Deep Research, search, connectors) reachable as admitted capabilities |
 | P3 | zero local-data egress outside policy; local jobs run only on local Workers; acceptance rate per Worker kind and job type |
 | P4 | share of jobs completed at `economy` tier; escalation rate per job type (low means tiers are declared well) |
+| P5 | share of tasks finished by a Worker other than the one that started them, with no rework |
+| P6 | workflows run in production per domain (software, research, other) |
+| P7 | person decisions per day; share of tasks finished unattended |
 
 What each release must deliver toward these purposes is defined in
 [release scope](release-scope.md).

@@ -63,6 +63,41 @@ The **`agents` Worker source**: agent runtimes as Workers
   `mcp__workspace__…` tool. Such a Worker's Tools section (`unaskedNote`, never a
   review member's) names them as its reading tools and tells it to read with them,
   never with a shell.
+- **The repository's lessons** (`src/lessons.ts`, T220; rendered by libs'
+  `lessonsSectionOf`, which the workflow engine measures them by too): a run is sent, before
+  its Tools section, a section "Lessons of this repository": the `- ` lines of
+  `docs/engineering/lessons.md` as its repository (the configured `workspace`)
+  has it committed at HEAD, read by git, never from the working tree, at most 30
+  lessons of at most 400 characters each and 5,800 UTF-8 bytes in all (1,450
+  estimated tokens, the handbook's share for them), the rest counted. A run whose
+  brief records its handbook slice (`brief@1.6` `handbook.selection`,
+  [handbook](../../../docs/design/handbook.md)) gets the lessons that apply to
+  its role and touched paths (a lesson's `Applies:` clause after its `Check:`;
+  none: `develop` and `review`), whatever its sandbox, so a reviewer gets those
+  whose check is the review; any other run, on a writing Worker
+  (`workspace-write`, never a review member), every lesson. No file committed
+  there, or no repository, is no section. It is appended before the egress check,
+  which sees it.
+- **The source's half of the handbook slice** (`src/handbook.ts`): for a run of a
+  workflow run whose brief records its slice, an `agent-workers.handbook` event of
+  that run names the execution and step, and what it rendered: the Tools section
+  (version: the policy it was rendered from) and the lessons (version: the lessons
+  file's blob at HEAD; how many), each with its sha256 and estimated tokens
+  (`ceil(UTF-8 bytes / 4)`). The Tools section is bounded at 4,000 UTF-8 bytes.
+  The workflow's `explain` shows it beside the brief's record.
+- **A board task's dossier tools** (`src/dossier.ts`, ADR-0070,
+  [design](../../../docs/design/task-dossier.md)): a run that serves a step of a
+  board task's workflow run (its row's `workflow_run_id`, `step_node`, and
+  `task_id`, from the engine's start request), never a review member's, on a
+  runtime that reports `hostTools`, is given `dossier_read` and `dossier_append`
+  as host tools (`RunSpec.hostTools`), bound to that workflow run, step, and the
+  run itself as the step's execution, never to anything the agent names. They
+  call the engine's `readDossier` and `appendToDossier` (found as the `workflow`
+  service; this source does not depend on the engine), which take them only
+  while that execution runs the step, and record the entry as the step's
+  Worker's. The gate classifies only the host tools the run was given
+  (`mcp__system__dossier_read` a `read`, `…dossier_append` a `workspace-write`),
+  each with only its own fields, and the Tools section says what to write.
 - **Workers = account × role** (`src/roles.ts`; PROP-0012 phase F,
   [design](../../../docs/design/agent-runtimes.md#workers--account--role)):
   - a **role** (`roles`) is defined once: `id`, an absolute `workspace`,
@@ -70,7 +105,21 @@ The **`agents` Worker source**: agent runtimes as Workers
     (as a hand-named Worker's, for each of its Workers), and under
     `runtimes.<runtime>` what differs per runtime (`tools`, `model`,
     `maxTurns`, `family`; a review member's role names the family of each
-    runtime it is assigned on);
+    runtime it is assigned on), and, instead of one `tier`, the **tiers** it
+    offers there (`tiers: { economy?, standard?, frontier? }`, each
+    `{ model, tools?, maxTurns? }`; ADR-0073,
+    [design](../../../docs/design/agent-runtimes.md#tiers-per-role)): its Worker
+    offers every tier (`capability-descriptor@1.10` `tiers`, each with its pools
+    and closed while its model's pool is), a run takes the routed tier
+    (`WorkerStart.tier`, kept on the run with its model, migration 20) and its
+    model, tools, and turn limit, and its result is `agent-result@1.4` (`tier`,
+    `configuredModel`). A run whose Worker no longer offers its tier, or whose
+    tier runs another model now (the configuration changed while it waited),
+    fails unsent as `worker_changed` (`IMMEDIATE`: routed again), never on
+    another model.
+    A provider's `modelPools: [{ model, pool, windows }]` gives a model one more
+    pool per account: a run on it reserves on both, and an observation its
+    windows map is that pool's alone, so its limit closes only its tiers;
   - an **assignment** (`assignments`) gives an enrolled account its roles, by
     the id `system account list` shows: `{ account, roles }`, one entry per
     account. An account with no assignment has no Worker;
@@ -251,6 +300,9 @@ The **`agents` Worker source**: agent runtimes as Workers
   source 5 s):
   - a describe waits only for the first probe of a runtime in a home; a result past `probeTtlMs`
     admits nothing (the Worker is `unavailable`) until the probe in the background finishes;
+    while a probe is only late (or timed out), the Worker still lists what its runtime's last
+    available probe proved (its role's offers before any), with `expectedBack` one `probeTtlMs` on
+    (`capability-descriptor@1.12`, T282), so routing refuses it for its state and the step waits;
   - each probe, a background one included, re-reads the runtime's `ready` accounts (an account
     home's alone) before its result stands;
   - an account home is probed in the background only while a Worker whose account is `ready`
@@ -327,7 +379,12 @@ The **`agents` Worker source**: agent runtimes as Workers
     descriptor (through `/proc/self/fd`), so nothing is checked by name before
     it is used and nothing swapped in at the name meanwhile is written through.
     Each file is written whole, read-only (0444), beside its name and renamed
-    over it, never through a link; edits are never read back. A repository
+    over it, never through a link; edits are never read back. The directory
+    then holds exactly this brief's files (T267): a file an earlier run's brief
+    placed and this one's does not name (the dossier, the board) is removed
+    before the agent starts, also for a run whose brief places none, so an
+    author's fresh-context self-review never finds the author's dossier there
+    (a `.system` the repository tracks is its own, and is left alone then). A repository
     that tracks anything under `.system/`, a `.system`
     that is not a plain directory, or a file of it that is not a plain file,
     fails the run unsubmitted (`config_error`). The prompt names the files
@@ -392,23 +449,54 @@ The **`agents` Worker source**: agent runtimes as Workers
       Each command starts through a fixed launcher (System's own Node, bound back
       read-only) that spawns it and says on fd 3 `started` once the exec itself
       succeeded, or `exec-failed <code>` (a missing `#!` interpreter among them);
-      the command may report on the descriptor `SYSTEM_CHECK_REPORT_FD` names
-      (fd 4). Exit 0 is `passed`, any other code (127 too) `failed`; a command
-      never executed, a nonzero
-      exit whose command reported `nested-confinement-refused: <detail>` there,
-      a timeout, or a signal is an `error`; after each, the tree is captured
+      the command may report in its report file, the path
+      `SYSTEM_CHECK_REPORT_PATH` names (fresh, owner-only, in the check's private
+      directory, bound writable at its own path, read once it ended; T247).
+      Exit 0 is `passed`, any other code (127 too) `failed`; a command never
+      executed, a nonzero exit whose command reported
+      `nested-confinement-refused: <detail>` there, a report file that cannot be
+      read, a timeout, or a signal is an `error`; a check that reported
+      `browser-tests-not-run: <detail>` keeps its outcome, its reason and answer
+      (`notRun`) saying what did not run; after each, the tree is captured
       again, and a check that changed it is an `error`, the later ones not run;
     - each check that ran is stored (`agent_check_runs`: run, worktree, subject,
       check, argv, setup hash; `started`, then `done` with its record) and its
-      record is the answer when asked again on that key, after a restart too; one
-      left `started` by a crash is an `error` stored in its place; a stop of the
-      run (a lost lease) is honoured only once the check's outcome is stored: as
-      it ended, or an `error` when the stop killed it (INV-4);
+      record is the answer when asked again on that key, after a restart too; a
+      stop of the run (a lost lease) is honoured only once the check's outcome is
+      stored: as it ended, or an `error` when the stop killed it (INV-4). Each row
+      names the daemon that started it (an id per start): one the host cut (left
+      `started` by a stop or a crash of an earlier daemon, or killed by the host's
+      own stop, never an operator's stop of the run or a lost lease) came to nothing, and runs again on the same subject at the
+      next ask, a `gate` decision of rule `agent-workers.check-cut-rerun` among the
+      evidence's inputs and an `agent-workers.check.rerun` event (T269); one cut
+      three times stays an `error` (INV-9), and one a stop killed in this daemon
+      stays the `error` it was stored as;
     - what ran is one `check-run@1.0` evidence artifact (its inputs the commands'
       `autonomy` decisions; per check the argv, exit code, duration, and the last
       4000 characters of its output with its length and SHA-256), at the run's
-      classification, returned with the results. Nothing is retried; the engine's
+      classification, returned with the results. Nothing is retried but a check the host cut; the engine's
       acceptance reports each `passed` or `failed`, and an `error` stays pending;
+    - **the setup owns installation** (T235, `src/dependencies.ts`, `refresh` in
+      `src/setup.ts`, [design](../../../docs/design/workflow-engine.md#a-result-that-changes-its-dependencies)):
+      a setup decision records the hashes of the worktree's `dependencyFiles`;
+      when the result's differ, the setup runs again on it before its checks
+      (commands allowed unasked only, confined, offline), a `gate` decision of
+      rule `agent-workers.worktree-setup-again`; an install that lacks a
+      package refuses the checks as `dependency_unavailable`, naming it. Setups
+      run with pnpm offline, and checks and a landing's generated files' commands
+      with pnpm's verify-deps-before-run off and offline (`noInstallEnvironment`),
+      each under its `pnpm_config_` and `npm_config_` names (pnpm 11 and later
+      read only the first); a check quiet for `checkStallSeconds` (default
+      300) is told by `agent-workers.check` events (`stalled` with its deadline,
+      `resumed`, `ended`). Checks run under a bounded load (T292): at most
+      `checks.maxConcurrent` (default 2) at once on the host, the rest queued in
+      order and told by `agent-workers.check.queue` events (`queued`, with how
+      many wait ahead; `retried`); each command gets `SYSTEM_CHECK_MAX_WORKERS`,
+      its share of the host's cores (`checks.maxWorkers` sets it), which the
+      repository's vitest config reads; one that failed only on tests that timed
+      out runs once more alone, with `SYSTEM_CHECK_ALONE=1`, on a `gate`
+      decision of rule `agent-workers.check-timeout-rerun`, and that second
+      result counts;
   - an agent can write the worktree's `.git` file, so git never follows it: a
     run whose worktree's `.git` file no longer points to the worktree's own
     directory fails as `reconciliation_failed`, and the worktree is left for
@@ -436,9 +524,39 @@ The **`agents` Worker source**: agent runtimes as Workers
     accepted subject, `git add --all` and one commit by the system with the engine's message and a
     `System-Subject: git:<head>:<version>` trailer (`committed`); a clean worktree whose HEAD is
     that commit on top of the accepted HEAD is `committed` with `committed: false`; anything else
-    is `moved`. It answers the base (the repository's checked-out branch and head; a detached HEAD
-    or a `system/run/` branch is refused `base-moved`), whether the base holds the head, and the
-    `git diff --stat` against it (1,500 characters at most);
+    is `moved`; so is one whose HEAD is the system's rebase of that commit (ADR-0068, followed back
+    through its `System-Rebased-From` trailers). It answers the base (the repository's checked-out
+    branch and head; a detached HEAD or a `system/run/` branch is refused `base-moved`), whether the
+    base holds the head, where the head forked from it (`fork`), and the `git diff --stat` against
+    it (1,500 characters at most);
+  - `record` (board T232, a review's history): `gone` or `failed` as `commit`; only while
+    `captureGitSubject` gives the subject asked (`moved` otherwise, read again after the commit is
+    made, so a tree that moved meanwhile moves no ref), the tree is written from an index of its own
+    (the HEAD's, then `git add --all`, `.system/` left out unless the repository tracks it) and
+    committed by the system on `refs/system/reviews/<runId>`, on top of its last commit, else the
+    HEAD, with a `System-Subject` trailer (`recorded`); no commit when that one already holds the
+    tree (`recorded: false`). The worktree's HEAD, branch, index, and files never move;
+  - `rebase` ([ADR-0068](../../../docs/decisions/adr/0068-an-accepted-result-is-rebased-onto-its-target-and-checked-again-before-it-lands.md)):
+    `busy`, `gone`, or `failed` as `commit`; the worktree stays on its branch. `start`, from a clean
+    worktree at the head and the base where the step says (`head-moved`, `moved`, `base-moved`
+    otherwise): the head kept as `refs/system/rebase/<runId>/<head>`, the branch moved to the base
+    (`git update-ref`, only from the head), its tracked files made the base's, the head squash-merged
+    on top; a conflict only in declared generated files takes a side; then everything staged, the
+    generated files made again (`worktreeSetup[].generated`, ./regenerate.ts, nothing else changed),
+    and one system commit with the head's message and `System-Rebased-From` / `System-Rebased-Onto`
+    trailers (`rebased`, with the committed tree's subject and the stat). A conflict elsewhere is left
+    marked, uncommitted (`conflicted`: up to 50 files, and the base's commits since the fork, up to
+    20). `resolved` commits it the same way when no changed file holds a `<<<<<<<` or `>>>>>>>` line
+    (`conflict` otherwise, the worktree left as it is); `abandon` moves the branch back to the head
+    and its tracked files with it (`abandoned`, naming untracked files left). Each phase finds a
+    rebase begun, replayed, or done after a restart from git's refs, never from the worktree's files
+    alone: `refs/system/rebase-replayed/<runId>/<head>` is set to the base only once the worktree
+    holds the whole replay, so a rebase begun without it (a crash between moving the branch and
+    making the worktree the base's) has its worktree made the base's again and is replayed again,
+    and a `resolved` for it is refused (`failed`). A rebase found done is answered only from a clean
+    worktree, its subject the committed tree that lands (`moved` while anything else is in the
+    worktree, left as it is). A regeneration that fails puts the branch back (`failed`).
+    The retention refuses to commit a worktree with unmerged paths;
   - `merge`: `head-moved` unless the branch is at the approved head; `base-moved` unless the
     repository has the approved branch checked out at the approved head (a base that holds the head
     already is `merged`, `already: true`); `dirty` while its tracked files hold changes; then
@@ -454,8 +572,11 @@ The **`agents` Worker source**: agent runtimes as Workers
     again in the run's worktree (intact, free, clean, on its branch at the head): detached at the
     base, `git merge --no-ff --no-commit`, each conflicted file taken from either side, then the
     commands run in order, each only when the policy lets its argv run unasked, in the setup's
-    confinement and views (`confineIn`), within the setup's deadline, in a worktree set up under
-    the setup loaded now. They must exit 0, change only declared files, and leave the index; the
+    confinement and views (`confineIn`), within the setup's deadline, with pnpm's
+    verify-deps-before-run off and offline as a check's (`noInstallEnvironment`), in a worktree set
+    up under the setup loaded now; before them, when the merge (or a rebase) changed the setup's
+    `dependencyFiles`, the setup runs again on that tree as for a check (`refresh`, its decision
+    among the autonomy decisions), and a setup that cannot refuses (T263). They must exit 0, change only declared files, and leave the index; the
     merge is committed (parents the base and the head), the commands run again and must change
     nothing, and the base, checked again, is fast-forwarded to that commit (`merged` with
     `regenerated`: the files, the commands, their autonomy decisions). The worktree goes back on
@@ -717,10 +838,31 @@ The **`agents` Worker source**: agent runtimes as Workers
     another host): looked at again after a minute, doubling, at most 15 minutes;
     after `maxUnknownVerdicts` (default 3) in a row it fails as
     `reconciliation_failed` for the operator, the decision saying it is not
-    declared dead, and `agent-workers.run.unknown` is appended. Its session and
+    declared dead, and `agent-workers.run.unknown` is appended. Either way its
+    error is marked `infrastructure: host-stopped` (its holder's stop alone ended
+    it, so a board task's attempt is not spent on it, ADR-0069); a sandbox or
+    `.git` violation, or a result not captured, is never marked. Its session and
     its workflow run's worktree stay held until the operator frees them (below):
     the source runs nothing more in either (`config_error`, unsent), and the
     retention sweep keeps the worktree.
+  - A run this source's own stop cut (a drain, shutdown, or update: its runtime
+    was ended by `stopped`) is marked `host_stopped_at` as it stops (T283), and
+    is not reconciled as lost. At the next start (after waiting, at most a
+    minute, for its runtime to register) the same run runs again: its own native
+    conversation continued, told only to go on, when the runtime resumes one and
+    the run's own handle was recorded (only then is its prompt in it); else its
+    prompt again in the same worktree with a note, as the run would be sent anew
+    (continuing its session's conversation, an earlier run's, where the runtime
+    resumes one), so its task is never left out; a
+    `reconciliation` decision of rule `agent-workers.resume-cut@1` (`resume` or
+    `restart`) and an `agent-workers.run.resumed` event say which. It is no
+    failure, so it spends no attempt and asks no one. Not so when no stop marked
+    it (a crash), an agent process of it is still present, or it was cut more
+    than 5 times (INV-9): those are reconciled as above. Its usage is not
+    invented either: its cut execution keeps the `usage.unknown` fact the stop
+    gave it, and what its runtime reports after the restart is recorded as a
+    lower bound of the run (`partial`), its own unit, so the run stays unknown
+    until its transcript is reconciled.
 
   Its reservation is released,
   and its usage is not invented: no result message means no `runtime-result`

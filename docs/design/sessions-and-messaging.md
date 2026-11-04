@@ -1,17 +1,17 @@
 # Worker sessions, direct messaging, and long-running work
 
 > Target state. Seam: `ctx.workerSessions` ([plugin model](../architecture/plugin-model.md#seam-catalog)).
-> Decision: [ADR-0015](../decisions/adr/0015-worker-sessions-and-peer-messaging.md).
+> Decision: [ADR-0015](../decisions/adr/0015-worker-sessions-and-peer-messaging.md); for Workers that
+> share no session, [ADR-0070](../decisions/adr/0070-workers-that-share-no-session-work-through-a-tasks-dossier.md).
 > Requirements: REQ-SES-1..8. Shapes: [`worker-session.v1.json`](../../schemas/worker-session.v1.json),
-> [`message.v1.json`](../../schemas/message.v1.json).
+> [`message.v1.json`](../../schemas/message.v1.json), [`task-dossier-entry.v1.json`](../../schemas/task-dossier-entry.v1.json).
 >
 > Implemented in [`worker-sessions`](../../packages/plugins/worker-sessions/README.md) (sessions,
 > groups, mailboxes, budgets) and [`workflow`](../../packages/plugins/workflow/README.md)
 > (wake-on-message, checkpoints, compaction); differs from target: a Worker sends a message only
 > as its reply to a wake, and `session_send` is the operator's or a client's;
 > sessions start `IDLE` at their first admission (no `FORMING`) and are never `CLOSED`; a group
-> lives for its run, not inside one `team` node; the A2A adapter is planned.
-
+> lives for its run, not inside one `team` node; there is no A2A adapter yet.
 ## Concepts
 
 | Concept | Meaning | Lifetime |
@@ -37,7 +37,7 @@ collaboration identity, and it is chosen through admission once, at formation
 | ACP agent | ACP `sessionId` | `session/resume` (v2) or `session/load` (v1) |
 | An agent runtime that cannot resume (the Antigravity CLI), as a review member only | none | a replay, not a resume: the `agents` source sends the session's earlier turns, exactly as recorded, before each new one, and records them with the answer ([review members](agent-runtimes.md#review-members)) |
 | Model Worker | none | the `models` source replays the session's transcript ([ADR-0031](../decisions/adr/0031-model-worker-sessions-by-replay.md)) |
-| A2A remote agent (planned) | `contextId` (+ current `taskId`) | `SubscribeToTask` / Get Task |
+| A2A remote agent | `contextId` (+ current `taskId`) | `SubscribeToTask` / Get Task |
 
 A Worker can serve a session only if it proves `persistent-conversation`
 ([routing](routing.md#capability-vocabulary)), for that work when its offer is scoped to one kind
@@ -115,7 +115,77 @@ the team's result. The DAG gives the durable macro structure. Sessions give
 long-running, conversational work inside it
 ([ADR-0012](../decisions/adr/0012-dag-execution-model.md)).
 
-## A2A alignment (for the planned adapter)
+### A step its session's Worker cannot take
+
+A session stays on its Worker: a template's later step on the run's one
+conversation (`persistent`, `caller`) routes only to the Workers the session's
+source names (`affinity`). When every one of them is refused for a reason no
+wait can change (its input bound, a capability it does not prove, its tier,
+where it runs), the step does not fail for that alone (for example, a research
+run whose session stayed on a website that takes 30,000 characters, while its
+evidence step was 56,350). It runs this once off the
+session, on any other Worker admission takes, with the rest of its rules
+(provider diversity, an assigned account) kept:
+
+- **sessionless**, when its brief already quotes every earlier turn of the
+  session (a template's step points at the results it builds on,
+  `{{node:<id>}}`): it does not need the conversation, so it starts without it;
+- **handoff**, otherwise: its brief carries, as `prior` pointers, the results of
+  the session's earlier turns it does not quote, from this run and from earlier
+  runs on the same session (what the conversation held that the step could
+  need, as a compaction's `handoff` summary carries a conversation forward).
+
+The session itself does not move: it keeps its Worker and its conversation, and a later step
+that runs on it again is handed the results of the steps that ran off it. The choice is a
+`route` decision by `workflow.session-move` (`stay`, `sessionless`, `handoff`, `fail`, each with
+why). A Worker of the session that is busy, at its limit, or signed out is a wait, not a move. A
+team member's session never moves (Model A). Code: `packages/plugins/workflow/src/session-moves.ts`.
+
+### A review fix continues its author's session
+
+One task, one author session (the operator's rule: "when a fix is
+needed, message it; after a review, message that session directly to update;
+the whole task stays in one session while still getting outside information
+from an independent reviewer"). A review's fix is not routed like any step to a
+fresh context: it takes the session of the step that wrote the change, and the
+review's findings are that session's next message, on its Worker, resuming its
+native conversation. The author fixes its own work on top of what it did, its
+earlier turns in view; the reviewer stays independent, in a session of its own,
+never the author's ([review cycles](workflow-engine.md#review-cycles)).
+
+When the author's Worker cannot take the fix, the fix never starts fresh in
+silence. Each path is a `route` decision by `workflow.fix-session`:
+
+| Path | When | What happens |
+|---|---|---|
+| `continue` | the session's Worker takes it, and keeps a native session to resume | the fix is the session's next message there |
+| `wait` | the session's Worker cannot take it now (out of quota, signed out, not listed) | the fix waits for it, sending nothing and spending no attempt, at most `fixSessionWaitMinutes` (default 60; INV-9) from its first wait; recorded once |
+| `handoff` (session lost) | no Worker keeps the session, or it keeps no native session to resume | the fix starts a new conversation of the same session, its brief carrying the session's earlier turns as `prior` pointers |
+| handoff (moved) | the session's Worker can never take it, or the wait passed its bound | the step moves off the session for this execution ([above](#a-step-its-sessions-worker-cannot-take), a `workflow.session-move` `handoff`, its `stay` reason saying the bounded wait ended) |
+
+A later fix of the same task continues the same session again, and is handed
+what ran off it. Each fix's result is kept as its own commit of the run's
+review history (`refs/system/reviews/<runId>`), never on the worktree's HEAD,
+which stays the commit the task binds its result to
+([review cycles](workflow-engine.md#review-cycles)).
+
+### Workers that share no session: the task's dossier
+
+A step that moves off its session, a fix that cannot continue its author's session, a new attempt, and a review
+(which never shares the author's conversation) all reach a Worker that cannot be messaged and never
+saw the conversation. For a board task they work through one artifact instead, the task's
+[dossier](task-dossier.md) ([ADR-0070](../decisions/adr/0070-workers-that-share-no-session-work-through-a-tasks-dossier.md)):
+an append-only chain of entries (`plan`, `progress`, `review`, `response`, `evidence`), carried
+across the task's attempts. Each step's brief points at a bounded slice of it, and the whole of it is
+readable on demand. A continued session keeps writing it; a handoff's `prior` pointers still carry
+the session's earlier results, and the dossier carries what the Workers wrote about the work. A
+reviewer reads the dossier, never the author's conversation. A Worker appends through a narrow,
+gated tool its run holds (`dossier_append`, with `dossier_read`), bound by its source to the step it
+runs and its execution, never named by the Worker: an agent Worker's host tools where its runtime
+offers them (Claude Code). The engine writes the evidence, and the entry of a step that wrote none (a
+website Worker's answer as it is).
+
+## A2A alignment
 
 | `system` | A2A 1.0 |
 |---|---|

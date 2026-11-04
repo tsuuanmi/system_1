@@ -138,4 +138,65 @@ export const MIGRATIONS = [{
   UPDATE workflow_dispatch SET mode = CASE WHEN json_extract(choice, '$.board') IS NOT NULL THEN 'board' ELSE 'ask' END;
   UPDATE workflow_dispatch SET started_at = json_extract(outcome, '$.at') WHERE state = 'started';
   CREATE INDEX workflow_dispatch_started ON workflow_dispatch (started_at) WHERE started_at IS NOT NULL;`,
+}, {
+  // An attempt not spent on the infrastructure (ADR-0069): a failed step's mark, as JSON
+  // `{ kind, reason }`, when it failed only because the host stopped it or a Worker became
+  // unavailable. A step failed before it existed is unmarked, and its attempt counts.
+  version: 22,
+  sql: 'ALTER TABLE workflow_nodes ADD COLUMN infrastructure TEXT;',
+}, {
+  // A board task's dossier (docs/design/task-dossier.md, ADR-0070): its entries in order, each a
+  // content-hashed `task-dossier-entry@1.0` artifact naming the one before it, carried across the
+  // task's attempts. Append-only: a row is never updated (the trigger refuses it), and `seq` has no gap.
+  // `step` is the node's `<attempt>:<escalations>` an entry a Worker appended was written in.
+  version: 23,
+  sql: `CREATE TABLE workflow_dossiers (
+    task_id TEXT NOT NULL, seq INTEGER NOT NULL, project_id TEXT NOT NULL, attempt INTEGER NOT NULL, kind TEXT NOT NULL, entry TEXT NOT NULL,
+    author_type TEXT NOT NULL, run_id TEXT, node_id TEXT, step TEXT, created_at TEXT NOT NULL, PRIMARY KEY (task_id, seq)
+  );
+  CREATE INDEX workflow_dossiers_step ON workflow_dossiers (run_id, node_id, step);
+  CREATE TRIGGER workflow_dossiers_append_only BEFORE UPDATE ON workflow_dossiers
+  BEGIN SELECT RAISE(ABORT, 'a task dossier entry never changes: append another'); END;`,
+}, {
+  // The project a run belongs to when it serves no board task (T285, ADR-0076): a lead's ask or
+  // research is tagged with the lead's project, so a lead reaches only its own project's runs. A
+  // run of a board task has its task's project; a run with neither belongs to no project.
+  version: 24,
+  sql: 'ALTER TABLE workflow_runs ADD COLUMN project_id TEXT;',
+}, {
+  // Scheduled reviews (docs/design/handbook.md#scheduled-review, D93 item 8): one row per review of an
+  // area of a repository at its tip, with the counts the report sums per area over time and the board
+  // tasks it proposed (JSON `[{ taskId, key, title }]`), which later runs read to file nothing twice.
+  // At most one scheduled (not manual) review a day. `run_id` is written as soon as its run is admitted,
+  // with the subject and the files shown (JSON `{ path: lines }`), so a review a restart cut is settled
+  // from its durable run on the next start.
+  version: 25,
+  sql: `CREATE TABLE workflow_scheduled_reviews (
+    review_id TEXT PRIMARY KEY, day TEXT NOT NULL, trigger TEXT NOT NULL, area TEXT NOT NULL, guide_file TEXT NOT NULL, guide_version INTEGER NOT NULL,
+    repo_ref TEXT NOT NULL, commit_sha TEXT NOT NULL, subject TEXT, shown TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL, run_id TEXT, problem TEXT,
+    files_read INTEGER NOT NULL DEFAULT 0, files_left INTEGER NOT NULL DEFAULT 0,
+    important INTEGER NOT NULL DEFAULT 0, confirmed INTEGER NOT NULL DEFAULT 0, rejected INTEGER NOT NULL DEFAULT 0, unverified INTEGER NOT NULL DEFAULT 0,
+    nits INTEGER NOT NULL DEFAULT 0, filed INTEGER NOT NULL DEFAULT 0, duplicates INTEGER NOT NULL DEFAULT 0, capped INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
+    tasks TEXT NOT NULL DEFAULT '[]', started_at TEXT NOT NULL, finished_at TEXT
+  );
+  CREATE UNIQUE INDEX workflow_scheduled_reviews_day ON workflow_scheduled_reviews (day) WHERE trigger = 'schedule';
+  CREATE INDEX workflow_scheduled_reviews_area ON workflow_scheduled_reviews (area, started_at);
+  CREATE INDEX workflow_scheduled_reviews_running ON workflow_scheduled_reviews (state) WHERE state = 'running';`,
+}, {
+  // The board tasks whose handbook slice the engine built (docs/design/handbook.md#the-6000-token-bound):
+  // one row per task, the first time; their count moves the bound from warn to refuse.
+  version: 26,
+  sql: 'CREATE TABLE workflow_handbook_tasks (task_id TEXT PRIMARY KEY, created_at TEXT NOT NULL);',
+}, {
+  // The daily run of every browser spec on a ref's tip (T305b, D104): one row per run, the commit it
+  // checked, its state, the failing lines (JSON array), and the board task a failure proposed. At most
+  // one scheduled (not manual) run a day; `check_id` names the check's worktree and stored outcome, so a
+  // run a restart cut resumes its own check.
+  version: 27,
+  sql: `CREATE TABLE workflow_daily_checks (
+    check_id TEXT PRIMARY KEY, day TEXT NOT NULL, trigger TEXT NOT NULL, repo_ref TEXT NOT NULL, commit_sha TEXT NOT NULL, state TEXT NOT NULL, problem TEXT,
+    failures TEXT NOT NULL DEFAULT '[]', evidence TEXT, last_green TEXT, task_id TEXT, duplicate INTEGER NOT NULL DEFAULT 0, started_at TEXT NOT NULL, finished_at TEXT
+  );
+  CREATE UNIQUE INDEX workflow_daily_checks_day ON workflow_daily_checks (day) WHERE trigger = 'schedule';
+  CREATE INDEX workflow_daily_checks_state ON workflow_daily_checks (state, started_at);`,
 }]

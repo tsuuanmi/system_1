@@ -4,7 +4,7 @@
  * something needs the operator), or `down` (work cannot run); the report is the worst of them.
  */
 import { statfsSync } from 'node:fs'
-import { agentToolDenialOf, countUnknownUsage, MAX_UNKNOWN_ENTRIES, nodeVersionProblem, type UnknownUsageSources } from '@tsuuanmi/system-libs'
+import { agentToolDenialOf, countUnknownUsage, MAX_UNKNOWN_ENTRIES, nodeVersionProblem, type UnknownUsageSources, unique } from '@tsuuanmi/system-libs'
 
 export type HealthState = 'ok' | 'degraded' | 'down'
 
@@ -46,7 +46,7 @@ export interface HealthSources {
   /** Events of `type` committed since `sinceIso`. */
   events?: (type: string, sinceIso: string) => Array<{ data?: Record<string, unknown> | undefined }>
   /** Plugins of the composition that failed to activate or wait for a service no one supplies. */
-  plugins?: () => Array<{ name: string; state: 'failed' | 'pending'; detail: string }>
+  plugins?: () => Array<{ name: string; state: 'failed' | 'pending' | 'off'; detail: string }>
   /**
    * The plugins of the composition as the plugin host read them (REQ-HOST-7): whether a row mounts
    * each, its manifest's state and why it is not valid, and what the manifest check found in it.
@@ -205,10 +205,13 @@ export async function healthReport(sources: HealthSources): Promise<HealthReport
   // A plugin that is not running takes its tools and its dependents with it: work cannot run as composed.
   if (sources.plugins) {
     checks.push(await guarded('plugins', () => {
-      const broken = sources.plugins!()
+      const all = sources.plugins!()
+      const broken = all.filter((p) => p.state !== 'off')
+      // A dependent of a row that is off waits as Cordis makes it wait: it is off with that reason, not down.
+      const off = all.filter((p) => p.state === 'off')
       return broken.length
         ? { name: 'plugins', state: 'down', detail: `${listOf(broken.map((p) => `${p.name} ${p.state}: ${p.detail}`), '; ')}. See the daemon's log, fix the configuration, and restart (docs/operations/runbooks.md)` }
-        : ok('plugins', 'every plugin of the composition is active')
+        : ok('plugins', ['every plugin of the composition is active', ...(off.length ? [`off: ${listOf(off.map((p) => `${p.name} ${p.detail}`), '; ')}`] : [])].join('; '))
     }))
   }
   // A finding of the manifest check fails closed: the host cannot keep that plugin from running, so it
@@ -486,7 +489,7 @@ export async function healthReport(sources: HealthSources): Promise<HealthReport
   if (undeleted) {
     checks.push(await guarded('conversations', () => {
       const failed = undeleted()
-      const accounts = [...new Set(failed.map((c) => c.account))].sort()
+      const accounts = unique(failed.map((c) => c.account))
       return failed.length
         ? { name: 'conversations', state: 'degraded', detail: `${failed.length} website conversation(s) of ${listOf(accounts)} could not be deleted: see system conversations --state failed, and the playbook (docs/operations/playbooks.md)` }
         : ok('conversations', 'every released website conversation was deleted or is due')
@@ -520,7 +523,7 @@ export async function healthReport(sources: HealthSources): Promise<HealthReport
       const failed = new Set(events('workflow.node.failed', since).filter((e) => e.data?.kind === 'ui_drift').map((e) => String(e.data?.message ?? ''))
         .filter((message) => !reported.some((prefix) => message.startsWith(`${prefix} `))))
       const count = drifted.size + failed.size
-      const named = [...new Set(drifted.values())].sort()
+      const named = unique(drifted.values())
       return count
         ? { name: 'ui-drift', state: 'degraded', detail: `${count} provider UI change(s) seen recently${named.length ? ` (${listOf(named)})` : ''}: update the UI map (docs/operations/playbooks.md)` }
         : ok('ui-drift', 'no provider UI change seen recently')

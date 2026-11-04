@@ -1,14 +1,14 @@
 import { execFile } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
-import { type Confinement, confinedCommand, meteringOf, type ToolCall } from '@tsuuanmi/system-agent-runtime-core'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { type AgentHome, agentHome, type Confinement, confinedCommand, HOME_STARTUP_DIRECTORIES, HOME_STATE_DIRECTORIES, type HostTool, meteringOf, type ToolCall, writableUnixSockets } from '@tsuuanmi/system-agent-runtime-core'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { agentRuntimeProviderConformance, expectConsistentMetering } from '../../../agent-runtime-core/conformance/agent-runtimes.ts'
 import { BWRAP, needsBubblewrap } from '../../../agent-runtime-core/tests/host.ts'
-import { ClaudeAgentRuntime, type ConfinedRun, commandSandbox, type QueryFn, type RuntimeOptions, type SpawnConfined } from '../src/index.ts'
+import { ClaudeAgentRuntime, type ConfinedRun, commandSandbox, type QueryFn, type RuntimeOptions, type SpawnConfined, withHomeState } from '../src/index.ts'
 
 type Call = { prompt: string; options: Record<string, unknown> }
 
@@ -25,10 +25,17 @@ const confine = (bind: { readOnly?: readonly string[]; writable?: readonly strin
 /** The run directory of these tests, where each run's private shell home is made (T198). */
 const RUN_DIR = mkdtempSync(join(tmpdir(), 'system-claude-run-'))
 afterAll(() => rmSync(RUN_DIR, { recursive: true, force: true }))
+/** A run's shell home's tool-state directories, writable, and fish's startup directories in them, read-only (T270). */
+const homeDirectories = (home: string): { state: string[]; startup: string[] } => ({
+  state: HOME_STATE_DIRECTORIES.map((name) => join(home, name)), startup: HOME_STARTUP_DIRECTORIES.map((name) => join(home, name)),
+})
 /** A host where both layers start: the read confinement is proven, a nested sandbox starts, and Claude Code is signed in. */
 const confined: Partial<RuntimeOptions> = {
   confine, prove: async () => ({ confined: true, detail: 'host state hidden by /usr/bin/bwrap' }), nested: async () => '', status: async () => '{"loggedIn": true, "apiProvider": "firstParty"}',
   runDir: RUN_DIR,
+  // No host socket to mask here: a test that cares names its own (T265).
+  sockets: () => ({ sockets: [], complete: true }),
+  socketDirectories: () => ({ directories: [], complete: true }),
 }
 
 /** The SDK's `modelUsage`: its `inputTokens` excludes cached input. */
@@ -81,8 +88,20 @@ describe('claude-agent-sdk: the configured policy, exactly', () => {
     expect(await runtime(scripted()).probe()).toEqual({
       available: true, detail: 'Claude Code 2.1.294; host state hidden by /usr/bin/bwrap; commands confined: a sandbox with no network starts inside it', version: '2.1.294',
       sandboxes: ['read-only', 'workspace-write'], resume: true, executes: true, readsConfined: true, gatesToolCalls: true, homes: true, cleanShells: false,
+      readTools: ['Read', 'Grep', 'Glob'], hostTools: true, webTools: true, sandboxedCommands: true,
     })
     expect(await runtime(scripted(), null).probe()).toMatchObject({ available: false, detail: expect.stringMatching(/not installed/) })
+  })
+
+  it('gives a research run (web) its reading tools and WebSearch and WebFetch, each pre-approved by name and gated; nothing else, and never writing (T262)', async () => {
+    const calls: Call[] = []
+    await runtime(scripted(calls)).run({ prompt: 'x', workspace, sandbox: 'read-only', web: true }, new AbortController().signal)
+    expect(calls[0]!.options.tools).toEqual(['Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch'])
+    expect(calls[0]!.options.allowedTools).toEqual(['Read(./**)', 'Grep(./**)', 'Glob(./**)', 'WebSearch', 'WebFetch'])
+    // A read-only run that is no research run gets no web tool; a research run never writes or runs a command.
+    await expect(runtime(scripted()).run({ prompt: 'x', workspace, sandbox: 'read-only', tools: ['Read', 'WebFetch'] }, new AbortController().signal)).rejects.toThrow(/refusing WebFetch/)
+    await expect(runtime(scripted()).run({ prompt: 'x', workspace, sandbox: 'read-only', web: true, tools: ['WebSearch', 'Bash'] }, new AbortController().signal)).rejects.toThrow(/a research run allows only .*; refusing Bash/)
+    await expect(runtime(scripted()).run({ prompt: 'x', workspace, sandbox: 'workspace-write', web: true }, new AbortController().signal)).rejects.toThrow(/read-only; refusing a workspace-write one/)
   })
 
   it('starts Claude Code without the daemon\'s credentials; a credential reaches it only when forwarded by name (INV-8)', async () => {
@@ -106,12 +125,53 @@ describe('claude-agent-sdk: the configured policy, exactly', () => {
 
   it('runs read-only: no prompts, no settings files, only the allowed tools, in the workspace', async () => {
     const calls: Call[] = []
-    const result = await runtime(scripted(calls)).run({ prompt: 'review', workspace, sandbox: 'read-only', model: 'opus-x', maxTurns: 5, resume: 'h-0' }, new AbortController().signal)
-    expect(result).toEqual({ text: 'echo: review', nativeHandle: 'h-1', turns: 2, costUsd: 0.01, resultId: 'h-1:r-1', model: 'model-main', ...NORMALIZED })
+    const result = await runtime(scripted(calls)).run({ prompt: 'review', workspace, sandbox: 'read-only', model: 'model-x', maxTurns: 5, resume: 'h-0' }, new AbortController().signal)
+    // The result reports its session's running totals: it names the session, so the ledger counts the difference (PROP-0022).
+    expect(result).toEqual({ text: 'echo: review', nativeHandle: 'h-1', turns: 2, costUsd: 0.01, resultId: 'h-1:r-1', sessionTotals: 'h-1', model: 'model-main', ...NORMALIZED })
     expect(calls[0]!.options).toMatchObject({
       cwd: workspace, permissionMode: 'dontAsk', permissionPrompts: 'none', allowedTools: ['Read(./**)', 'Grep(./**)', 'Glob(./**)'], tools: ['Read', 'Grep', 'Glob'],
-      settingSources: [], mcpServers: {}, strictMcpConfig: true, pathToClaudeCodeExecutable: '/usr/bin/claude', model: 'opus-x', maxTurns: 5, resume: 'h-0',
+      settingSources: [], mcpServers: {}, strictMcpConfig: true, pathToClaudeCodeExecutable: '/usr/bin/claude', model: 'model-x', maxTurns: 5, resume: 'h-0',
     })
+  })
+
+  it('gives the run its host tools as an in-process server `system`, each pre-approved by its exact name, the input checked before the tool is called (ADR-0070)', async () => {
+    const calls: Call[] = []
+    const seen: Array<Record<string, unknown>> = []
+    const hostTools: HostTool[] = [{
+      name: 'dossier_append', description: 'Append an entry', readOnly: false,
+      inputSchema: { type: 'object', additionalProperties: false, required: ['kind', 'text'], properties: { kind: { type: 'string', enum: ['plan', 'progress'] }, text: { type: 'string', minLength: 1, maxLength: 10 } } },
+      call: async (input) => (seen.push(input), { text: 'appended #1', isError: false }),
+    }]
+    await runtime(scripted(calls)).run({ prompt: 'x', workspace, sandbox: 'read-only', hostTools }, new AbortController().signal)
+    expect(calls[0]!.options).toMatchObject({
+      allowedTools: ['Read(./**)', 'Grep(./**)', 'Glob(./**)', 'mcp__system__dossier_append'], strictMcpConfig: true,
+      mcpServers: { system: { type: 'sdk', name: 'system' } },
+    })
+    expect(Object.keys(calls[0]!.options.mcpServers as object)).toEqual(['system'])
+    // The server the SDK connects: it lists the tool with its own schema, and answers a call only on an input the schema takes.
+    const server = (calls[0]!.options.mcpServers as { system: { instance: { connect(t: unknown): Promise<void> } } }).system.instance
+    const sent: Array<Record<string, unknown>> = []
+    const transport: { onmessage?: (m: unknown) => void; send(m: unknown): Promise<void> } = { send: async (m) => void sent.push(m as Record<string, unknown>) }
+    await server.connect(transport)
+    const ask = async (message: Record<string, unknown>): Promise<Record<string, unknown>> => {
+      const before = sent.length
+      transport.onmessage!({ jsonrpc: '2.0', ...message })
+      return vi.waitFor(() => sent[before] ?? Promise.reject(new Error('no answer yet')))
+    }
+    expect(await ask({ id: 1, method: 'tools/list' })).toMatchObject({ id: 1, result: { tools: [{ name: 'dossier_append', inputSchema: hostTools[0]!.inputSchema, annotations: { readOnlyHint: false } }] } })
+    expect(await ask({ id: 2, method: 'tools/call', params: { name: 'dossier_append', arguments: { kind: 'plan', text: 'go', runId: 'run_other' } } }))
+      .toMatchObject({ id: 2, result: { isError: true, content: [{ text: expect.stringContaining('"runId" is not an argument of this tool') }] } })
+    expect(await ask({ id: 3, method: 'tools/call', params: { name: 'dossier_append', arguments: { kind: 'evidence', text: 'go' } } }))
+      .toMatchObject({ result: { isError: true, content: [{ text: 'refused: kind is none of plan, progress' }] } })
+    expect(seen).toEqual([])
+    expect(await ask({ id: 4, method: 'tools/call', params: { name: 'dossier_append', arguments: { kind: 'plan', text: 'go' } } }))
+      .toMatchObject({ result: { isError: false, content: [{ type: 'text', text: 'appended #1' }] } })
+    expect(seen).toEqual([{ kind: 'plan', text: 'go' }])
+    // A host tool the seam cannot render is refused before anything runs.
+    const before = calls.length
+    await expect(runtime(scripted(calls)).run({ prompt: 'x', workspace, sandbox: 'read-only', hostTools: [{ ...hostTools[0]!, name: 'Bad Name' }] }, new AbortController().signal))
+      .rejects.toMatchObject({ kind: 'config_error', message: expect.stringContaining('is not a host tool name') })
+    expect(calls).toHaveLength(before)
   })
 
   it('never runs with no tools: an empty list means the minimal read set (live 2026-10-12)', async () => {
@@ -188,13 +248,13 @@ describe('claude-agent-sdk: what a run consumed, from the SDK\'s own numbers (do
       event({ status: 'allowed', rateLimitType: 'seven_day' }),
       event({ status: 'allowed' }),
       // A reset in milliseconds would be centuries away: not believed.
-      event({ status: 'allowed', rateLimitType: 'seven_day_opus', resetsAt: RESET * 1000 }),
+      event({ status: 'allowed', rateLimitType: 'seven_day_family_a', resetsAt: RESET * 1000 }),
     ]
     const result = await runtime(scripted([], {}, { before })).run(spec, new AbortController().signal)
     expect(result.limits).toEqual([
       { window: 'five_hour', status: 'warning', resetsAt: '2026-10-22T14:00:00.000Z', usedPercentage: 82, observedAt: expect.any(String) },
       { window: 'seven_day', status: 'allowed', observedAt: expect.any(String) },
-      { window: 'seven_day_opus', status: 'allowed', observedAt: expect.any(String) },
+      { window: 'seven_day_family_a', status: 'allowed', observedAt: expect.any(String) },
     ])
     expectConsistentMetering(result)
   })
@@ -491,21 +551,225 @@ describe('claude-agent-sdk: two confinements, reads by the host and commands by 
   it('enables the SDK\'s sandbox in a workspace-write run with exactly ADR-0038\'s settings, and offers Bash there', async () => {
     const calls: Call[] = []
     await runtime(scripted(calls)).run({ prompt: 'run the tests', workspace, sandbox: 'workspace-write' }, new AbortController().signal)
-    // Its commands write the workspace only, and never where a later command's shell reads startup
-    // code (T198): Claude Code's home, which holds the shell snapshot it sources, nor the shells' HOME.
+    // Its commands write the workspace and the shells' tool-state directories (T270), and never where a
+    // later command's shell reads startup code (T198): Claude Code's home, which holds the shell
+    // snapshot it sources, nor fish's startup directories. The shells' HOME is not denied whole, since
+    // a deny wins over an allow: the rest of it is in no allow, so it stays read-only.
     const shellHome = (calls[0]!.options.env as Record<string, string>).HOME!
     expect(shellHome).toMatch(new RegExp(`^${RUN_DIR}/agent-home-`))
+    const { state, startup } = homeDirectories(shellHome)
     expect(calls[0]!.options.sandbox).toEqual({
       enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false,
-      filesystem: { allowWrite: [workspace], denyWrite: [HOME, shellHome] },
-      network: { allowedDomains: [], strictAllowlist: true },
+      // The workspace, and the confinement's private /dev/shm, which a headless Chrome writes (T265).
+      filesystem: { allowWrite: [workspace, '/dev/shm', ...state], denyWrite: [HOME, ...startup] },
+      // No network; unix sockets, which Chrome needs, the host's own masked in the run first (T265).
+      network: { allowedDomains: [], strictAllowlist: true, allowAllUnixSockets: true },
     })
-    expect(calls[0]!.options.sandbox).toEqual(commandSandbox(workspace, [HOME, shellHome]))
+    expect(calls[0]!.options.sandbox).toEqual(commandSandbox(workspace, [HOME, ...startup], { write: ['/dev/shm', ...state], unixSockets: true }))
+    // No allowed directory lies under a denied one: it would be denied (a deny wins).
+    for (const allowed of state) expect([HOME, ...startup].some((denied) => allowed === denied || allowed.startsWith(`${denied}/`)), allowed).toBe(false)
     expect(calls[0]!.options).toMatchObject({ tools: expect.arrayContaining(['Bash']), allowedTools: expect.arrayContaining(['Bash']) })
     // A Worker that lists its tools without Bash runs no command, in the same sandbox.
     const listed: Call[] = []
     await runtime(scripted(listed)).run({ prompt: 'x', workspace, sandbox: 'workspace-write', tools: ['Read', 'Edit'] }, new AbortController().signal)
-    expect(listed[0]!.options).toMatchObject({ tools: ['Read', 'Edit'], allowedTools: ['Read(./**)', 'Edit(./**)'], sandbox: commandSandbox(workspace, [HOME, (listed[0]!.options.env as Record<string, string>).HOME!]) })
+    const other = homeDirectories((listed[0]!.options.env as Record<string, string>).HOME!)
+    expect(listed[0]!.options).toMatchObject({ tools: ['Read', 'Edit'], allowedTools: ['Read(./**)', 'Edit(./**)'], sandbox: commandSandbox(workspace, [HOME, ...other.startup], { write: ['/dev/shm', ...other.state], unixSockets: true }) })
+  })
+
+  it('gives a writing run\'s commands what a browser test needs, as a check\'s confinement does: the managed Chrome the confinement names readable, its private /dev/shm and the run\'s report file writable, the file named to them, unix sockets with the host\'s masked (T265)', async () => {
+    const browsers = mkdtempSync(join(tmpdir(), 'system-claude-browsers-'))
+    const report = join(mkdtempSync(join(tmpdir(), 'system-claude-report-')), 'report')
+    writeFileSync(report, '', { mode: 0o600 })
+    try {
+      const calls: Call[] = []
+      const spawned: string[][] = []
+      const spawn: SpawnConfined = (command, args) => {
+        spawned.push([command, ...args])
+        return { pid: 4243 } as unknown as ReturnType<SpawnConfined>
+      }
+      const withBrowsers = (bind: { readOnly?: readonly string[]; writable?: readonly string[] }): Confinement => ({ ...confine(bind), env: { SYSTEM_BROWSERS_DIR: browsers } })
+      await runtime(scripted(calls), '/usr/bin/claude', { confine: withBrowsers, spawn })
+        .run({ prompt: 'run the browser tests', workspace, sandbox: 'workspace-write', reportFile: report }, new AbortController().signal)
+      const { state, startup } = homeDirectories((calls[0]!.options.env as Record<string, string>).HOME!)
+      expect(calls[0]!.options.sandbox).toEqual(commandSandbox(workspace, [HOME, ...startup], { read: [browsers], write: ['/dev/shm', report, ...state], unixSockets: true }))
+      expect(calls[0]!.options.sandbox).toMatchObject({ filesystem: { allowWrite: [workspace, '/dev/shm', report, ...state], allowRead: [browsers], denyWrite: [HOME, ...startup] } })
+      // Claude Code itself starts with the report file bound back writable and named in SYSTEM_CHECK_REPORT_PATH.
+      const start = calls[0]!.options.spawnClaudeCodeProcess as (options: { command: string; args: string[]; env: Record<string, string | undefined>; signal: AbortSignal }) => unknown
+      start({ command: '/usr/bin/claude', args: [], env: {}, signal: new AbortController().signal })
+      const line = spawned[0]!.join(' ')
+      expect(line).toContain(`--bind ${realpathSync(report)} ${realpathSync(report)}`)
+      expect(line).toContain(`--setenv SYSTEM_CHECK_REPORT_PATH ${report}`)
+      expect(line).toContain(`--setenv SYSTEM_BROWSERS_DIR ${browsers}`)
+      // Unix sockets, which Chrome needs, by default; no network either way.
+      expect((calls[0]!.options.sandbox as { network: Record<string, unknown> }).network).toEqual({ allowedDomains: [], strictAllowlist: true, allowAllUnixSockets: true })
+      // Refused where the operator turned them off.
+      const refused: Call[] = []
+      await runtime(scripted(refused), '/usr/bin/claude', { confine: withBrowsers, unixSockets: false })
+        .run({ prompt: 'run the browser tests', workspace, sandbox: 'workspace-write', reportFile: report }, new AbortController().signal)
+      expect((refused[0]!.options.sandbox as { network: Record<string, unknown> }).network).toEqual({ allowedDomains: [], strictAllowlist: true })
+      // A host socket the run could connect to is masked in its confinement before its commands may make one, after every bind:
+      // here under the workspace, which the run binds back writable (the host's /tmp itself is a private tmpfs inside, where an unbound socket is not seen).
+      const daemon = createServer(() => undefined)
+      const socket = join(workspace, 'daemon.sock')
+      await new Promise<void>((resolve) => daemon.listen(socket, resolve))
+      try {
+        const masking: Call[] = []
+        const masked: string[][] = []
+        const spawnMasked: SpawnConfined = (command, args) => (masked.push([command, ...args]), { pid: 4244 } as unknown as ReturnType<SpawnConfined>)
+        await runtime(scripted(masking), '/usr/bin/claude', { confine: withBrowsers, spawn: spawnMasked, sockets: () => ({ sockets: [socket], complete: true }) })
+          .run({ prompt: 'run the browser tests', workspace, sandbox: 'workspace-write' }, new AbortController().signal)
+        const begin = masking[0]!.options.spawnClaudeCodeProcess as (options: { command: string; args: string[]; env: Record<string, string | undefined>; signal: AbortSignal }) => unknown
+        begin({ command: '/usr/bin/claude', args: [], env: {}, signal: new AbortController().signal })
+        const args = masked[0]!.join(' ')
+        const mask = `--ro-bind /dev/null ${realpathSync(socket)}`
+        expect(args).toContain(`--bind ${realpathSync(workspace)} ${realpathSync(workspace)}`)
+        expect(args).toContain(mask)
+        expect(args.lastIndexOf(mask)).toBeGreaterThan(args.lastIndexOf(`--bind ${realpathSync(workspace)}`))
+        expect(masking[0]!.options.sandbox).toMatchObject({ network: { allowAllUnixSockets: true } })
+        // A scan that may have missed one: unix sockets stay refused.
+        const partial: Call[] = []
+        await runtime(scripted(partial), '/usr/bin/claude', { confine: withBrowsers, sockets: () => ({ sockets: [socket], complete: false }) })
+          .run({ prompt: 'run the browser tests', workspace, sandbox: 'workspace-write' }, new AbortController().signal)
+        expect((partial[0]!.options.sandbox as { network: Record<string, unknown> }).network).toEqual({ allowedDomains: [], strictAllowlist: true })
+        // Where the command sandbox does not start with the masks (a host's bubblewrap that cannot mount
+        // over a socket) and the socket's own directory cannot be hidden instead (here it is the
+        // workspace), the run is proven again without them and runs with unix sockets refused, as
+        // before T265: never a writing Worker the masks took away.
+        const fallback: Call[] = []
+        const fallbackLines: string[][] = []
+        const proofs: string[] = []
+        const nested: ConfinedRun = async (command) => {
+          const line = command.args.join(' ')
+          proofs.push(line)
+          if (line.includes(mask)) throw new Error('bwrap: Can\'t bind mount /oldroot/dev/null on /newroot/daemon.sock: Not a directory')
+          return ''
+        }
+        await runtime(scripted(fallback), '/usr/bin/claude', { confine: withBrowsers, nested, spawn: (command, args) => (fallbackLines.push([command, ...args]), { pid: 4246 } as unknown as ReturnType<SpawnConfined>), sockets: () => ({ sockets: [socket], complete: true }) })
+          .run({ prompt: 'run the browser tests', workspace, sandbox: 'workspace-write' }, new AbortController().signal)
+        expect(proofs).toHaveLength(2)
+        expect(proofs[0]).toContain(mask)
+        expect(proofs[1]).not.toContain(mask)
+        expect((fallback[0]!.options.sandbox as { network: Record<string, unknown> }).network).toEqual({ allowedDomains: [], strictAllowlist: true })
+        const fallbackStart = fallback[0]!.options.spawnClaudeCodeProcess as (options: { command: string; args: string[]; env: Record<string, string | undefined>; signal: AbortSignal }) => unknown
+        fallbackStart({ command: '/usr/bin/claude', args: [], env: {}, signal: new AbortController().signal })
+        expect(fallbackLines[0]!.join(' ')).not.toContain(mask)
+        // Bubblewrap 0.4 cannot mount over a socket: a socket in a directory the run does not work in
+        // (a tool's own runtime directory) is kept from its commands by hiding that directory instead,
+        // proven next, and its commands make unix sockets; where that does not start either, they stay refused.
+        // (Outside the host's /tmp, which the confinement replaces with a private tmpfs, so the child
+        // would see it; a plain file stands for the socket, as the scan is scripted here.)
+        const toolDir = realpathSync(mkdtempSync('/dev/shm/system-claude-tool-run-'))
+        const toolSocket = join(toolDir, 'tool.sock')
+        writeFileSync(toolSocket, '')
+        try {
+          const toolMask = `--ro-bind /dev/null ${toolSocket}`
+          const cover = `--tmpfs ${toolDir}`
+          for (const coverStarts of [true, false]) {
+            const run: Call[] = []
+            const lines: string[][] = []
+            const tried: string[] = []
+            const oldBwrap: ConfinedRun = async (command) => {
+              const line = command.args.join(' ')
+              tried.push(line)
+              if (line.includes(toolMask)) throw new Error('bwrap: Can\'t create file at ' + toolSocket + ': No such device or address')
+              if (!coverStarts && line.includes(cover)) throw new Error('bwrap: Can\'t mount tmpfs')
+              return ''
+            }
+            await runtime(scripted(run), '/usr/bin/claude', { confine: withBrowsers, nested: oldBwrap, spawn: (command, args) => (lines.push([command, ...args]), { pid: 4248 } as unknown as ReturnType<SpawnConfined>), sockets: () => ({ sockets: [toolSocket], complete: true }) })
+              .run({ prompt: 'run the browser tests', workspace, sandbox: 'workspace-write' }, new AbortController().signal)
+            expect(tried).toHaveLength(coverStarts ? 2 : 3)
+            expect(tried[0]).toContain(toolMask)
+            expect(tried[1]).toContain(cover)
+            expect(tried[1]).not.toContain(toolMask)
+            const begin = run[0]!.options.spawnClaudeCodeProcess as (options: { command: string; args: string[]; env: Record<string, string | undefined>; signal: AbortSignal }) => unknown
+            begin({ command: '/usr/bin/claude', args: [], env: {}, signal: new AbortController().signal })
+            const line = lines[0]!.join(' ')
+            expect(line).not.toContain(toolMask)
+            if (coverStarts) {
+              expect(line).toContain(cover)
+              expect(run[0]!.options.sandbox).toMatchObject({ network: { allowAllUnixSockets: true } })
+            } else {
+              expect(tried[2]).not.toContain(cover)
+              expect(line).not.toContain(cover)
+              expect((run[0]!.options.sandbox as { network: Record<string, unknown> }).network).toEqual({ allowedDomains: [], strictAllowlist: true })
+            }
+          }
+        } finally {
+          rmSync(toolDir, { recursive: true, force: true })
+        }
+        // The real scanner, given what the run's confinement hides and binds back: the workspace lies
+        // under a hidden directory (as a run's worktree lies under the hidden DSH home) and is bound
+        // back writable, so its socket is seen, found in the kernel's list, and masked.
+        const hiddenParent = dirname(workspace)
+        const underHidden = (bind: { readOnly?: readonly string[]; writable?: readonly string[] }): Confinement => ({ ...withBrowsers(bind), hide: [hiddenParent] })
+        const asked: Array<{ hide: readonly string[]; rebound: readonly string[] }> = []
+        const realScan = (hide: readonly string[], rebound: readonly string[]) => (asked.push({ hide, rebound }), writableUnixSockets([], hide, undefined, rebound))
+        const scanned: Call[] = []
+        const lines: string[][] = []
+        await runtime(scripted(scanned), '/usr/bin/claude', { confine: underHidden, sockets: realScan, spawn: (command, args) => (lines.push([command, ...args]), { pid: 4245 } as unknown as ReturnType<SpawnConfined>) })
+          .run({ prompt: 'run the browser tests', workspace, sandbox: 'workspace-write' }, new AbortController().signal)
+        expect(asked[0]!.hide).toContain(hiddenParent)
+        expect(asked[0]!.rebound).toContain(workspace)
+        const go = scanned[0]!.options.spawnClaudeCodeProcess as (options: { command: string; args: string[]; env: Record<string, string | undefined>; signal: AbortSignal }) => unknown
+        go({ command: '/usr/bin/claude', args: [], env: {}, signal: new AbortController().signal })
+        expect(lines[0]!.join(' ')).toContain(mask)
+        expect(scanned[0]!.options.sandbox).toMatchObject({ network: { allowAllUnixSockets: true } })
+      } finally {
+        await new Promise((resolve) => daemon.close(resolve))
+      }
+      // A socket a daemon makes after the run's scan, while the run goes on (dockerd starting, making
+      // its socket in /run), is never in the masks, a snapshot: the directories where the host's
+      // daemons make their sockets are denied to the run's commands for the whole run instead.
+      const daemonDir = mkdtempSync(join(tmpdir(), 'system-claude-run-dir-'))
+      const late = join(daemonDir, 'docker.sock')
+      const lateDaemon = createServer(() => undefined)
+      let listening: Promise<void> | undefined
+      try {
+        const during: Call[] = []
+        const lateLines: string[][] = []
+        const inner = scripted(during)
+        // The model's turn is under way: the scan is done, and the daemon starts now.
+        const query = ((params: Parameters<QueryFn>[0]) => {
+          listening = new Promise<void>((resolve) => lateDaemon.listen(late, resolve))
+          return inner(params)
+        }) as unknown as QueryFn
+        await runtime(query, '/usr/bin/claude', { confine: withBrowsers, socketDirectories: () => ({ directories: [daemonDir], complete: true }), spawn: (command, args) => (lateLines.push([command, ...args]), { pid: 4247 } as unknown as ReturnType<SpawnConfined>) })
+          .run({ prompt: 'run the browser tests', workspace, sandbox: 'workspace-write' }, new AbortController().signal)
+        await listening
+        expect(existsSync(late)).toBe(true)
+        const lateStart = during[0]!.options.spawnClaudeCodeProcess as (options: { command: string; args: string[]; env: Record<string, string | undefined>; signal: AbortSignal }) => unknown
+        lateStart({ command: '/usr/bin/claude', args: [], env: {}, signal: new AbortController().signal })
+        // The snapshot missed it, as it must: the scan ran before the socket was there.
+        expect(lateLines[0]!.join(' ')).not.toContain(late)
+        // The run's commands are denied its whole directory, for the whole run, unix sockets or not reachable through it.
+        expect(during[0]!.options.sandbox).toMatchObject({ filesystem: { denyRead: [daemonDir] }, network: { allowAllUnixSockets: true } })
+        // Where its commands make no unix socket, nothing is denied them beyond what was.
+        const off: Call[] = []
+        await runtime(scripted(off), '/usr/bin/claude', { confine: withBrowsers, unixSockets: false, socketDirectories: () => ({ directories: [daemonDir], complete: true }) })
+          .run({ prompt: 'run the browser tests', workspace, sandbox: 'workspace-write' }, new AbortController().signal)
+        expect((off[0]!.options.sandbox as { filesystem: Record<string, unknown> }).filesystem).not.toHaveProperty('denyRead')
+        // A socket directory that could not be made (so could not be covered, and a daemon could still
+        // make it, and its socket, during the run): unix sockets stay refused for the run.
+        const unmade: Call[] = []
+        await runtime(scripted(unmade), '/usr/bin/claude', { confine: withBrowsers, socketDirectories: () => ({ directories: [daemonDir], complete: false }) })
+          .run({ prompt: 'run the browser tests', workspace, sandbox: 'workspace-write' }, new AbortController().signal)
+        expect((unmade[0]!.options.sandbox as { network: Record<string, unknown> }).network).toEqual({ allowedDomains: [], strictAllowlist: true })
+        expect((unmade[0]!.options.sandbox as { filesystem: Record<string, unknown> }).filesystem).not.toHaveProperty('denyRead')
+      } finally {
+        await new Promise((resolve) => lateDaemon.close(resolve))
+        rmSync(daemonDir, { recursive: true, force: true })
+      }
+      // A read-only run runs no command: no sandbox.
+      const reading: Call[] = []
+      await runtime(scripted(reading), '/usr/bin/claude', { confine: withBrowsers }).run({ prompt: 'review', workspace, sandbox: 'read-only', reportFile: report }, new AbortController().signal)
+      expect(reading[0]!.options).not.toHaveProperty('sandbox')
+      // A report file that is not a regular file is refused before anything runs.
+      await expect(runtime(scripted(), '/usr/bin/claude', { confine: withBrowsers }).run({ prompt: 'x', workspace, sandbox: 'workspace-write', reportFile: dirname(report) }, new AbortController().signal))
+        .rejects.toMatchObject({ kind: 'config_error' })
+    } finally {
+      rmSync(browsers, { recursive: true, force: true })
+      rmSync(dirname(report), { recursive: true, force: true })
+    }
   })
 
   it('keeps Bash off in a read-only run, and refuses it there before anything runs', async () => {
@@ -573,14 +837,24 @@ describe('claude-agent-sdk: two confinements, reads by the host and commands by 
         return messages
       }) as unknown as QueryFn
       await runtime(starting, '/usr/bin/claude', { spawn }).run({ prompt: 'x', workspace, sandbox }, new AbortController().signal)
-      const shellHome = binds.at(-1)!.readOnly!.at(-1)!
+      const shellHome = binds.at(-1)!.readOnly!.find((path) => /\/agent-home-[^/]+$/.test(path))!
       shellHomes.push(shellHome)
       expect(shellHome).toMatch(new RegExp(`^${RUN_DIR}/agent-home-`))
-      expect(binds.at(-1)).toEqual(sandbox === 'read-only' ? { writable: [HOME], readOnly: [workspace, shellHome] } : { writable: [HOME, workspace], readOnly: [shellHome] })
+      // Its tool-state directories writable over it, fish's startup directories in them read-only again (T270).
+      const { state, startup } = homeDirectories(shellHome)
+      expect(binds.at(-1)).toEqual(sandbox === 'read-only'
+        ? { writable: [HOME, ...state], readOnly: [workspace, shellHome, ...startup] }
+        : { writable: [HOME, workspace, ...state], readOnly: [shellHome, ...startup] })
     }
+    // Shallowest first: the home read-only, its tool-state directories writable over it, and each startup directory read-only over the one it lies in.
+    const home = (h: string): string[] => [
+      '--ro-bind', h, h, '--bind', join(h, '.cache'), join(h, '.cache'), '--bind', join(h, '.config'), join(h, '.config'),
+      '--ro-bind', join(h, '.config/fish'), join(h, '.config/fish'), '--bind', join(h, '.local/share'), join(h, '.local/share'), '--bind', join(h, '.local/state'), join(h, '.local/state'),
+      '--ro-bind', join(h, '.local/share/fish'), join(h, '.local/share/fish'),
+    ]
     expect(spawned).toEqual([
-      { command: '/usr/bin/bwrap', args: [...OPTIONS, ...PRIVATE_TMP, '--ro-bind', workspace, workspace, '--bind', HOME, HOME, '--ro-bind', shellHomes[0], shellHomes[0], ...TEMP_ENV, '--', '/usr/bin/claude', '--output-format', 'stream-json'], cwd: workspace, env: { CLAUDE_CONFIG_DIR: HOME } },
-      { command: '/usr/bin/bwrap', args: [...OPTIONS, ...PRIVATE_TMP, '--bind', HOME, HOME, '--bind', workspace, workspace, '--ro-bind', shellHomes[1], shellHomes[1], ...TEMP_ENV, '--', '/usr/bin/claude', '--output-format', 'stream-json'], cwd: workspace, env: { CLAUDE_CONFIG_DIR: HOME } },
+      { command: '/usr/bin/bwrap', args: [...OPTIONS, ...PRIVATE_TMP, '--ro-bind', workspace, workspace, '--bind', HOME, HOME, ...home(shellHomes[0]!), ...TEMP_ENV, '--', '/usr/bin/claude', '--output-format', 'stream-json'], cwd: workspace, env: { CLAUDE_CONFIG_DIR: HOME } },
+      { command: '/usr/bin/bwrap', args: [...OPTIONS, ...PRIVATE_TMP, '--bind', HOME, HOME, '--bind', workspace, workspace, ...home(shellHomes[1]!), ...TEMP_ENV, '--', '/usr/bin/claude', '--output-format', 'stream-json'], cwd: workspace, env: { CLAUDE_CONFIG_DIR: HOME } },
     ])
   })
 
@@ -635,7 +909,9 @@ describe('claude-agent-sdk: two confinements, reads by the host and commands by 
       const script = scripted() as unknown as (params: { prompt: string; options?: Record<string, unknown> }) => unknown
       const spy = ((params: { prompt: string; options?: Record<string, unknown> }) => {
         const env = params.options!.env as Record<string, string>
-        homes.push({ home: env.HOME!, env, entries: readdirSync(env.HOME!), mode: statSync(env.HOME!).mode & 0o777 })
+        // Its files, never its directories: it holds only the empty tool-state and startup directories (T270).
+        const entries = readdirSync(env.HOME!, { recursive: true, withFileTypes: true }).filter((e) => !e.isDirectory()).map((e) => join(e.parentPath, e.name))
+        homes.push({ home: env.HOME!, env, entries, mode: statSync(env.HOME!).mode & 0o777 })
         return script(params)
       }) as unknown as QueryFn
       for (const sandbox of ['read-only', 'workspace-write'] as const) {
@@ -646,7 +922,7 @@ describe('claude-agent-sdk: two confinements, reads by the host and commands by 
         for (const name of ['BASH_ENV', 'ENV', 'PS4', 'BASH_FUNC_echo%%']) expect(env, name).not.toHaveProperty(name)
       }
       for (const { home, entries, mode } of homes) {
-        // Made in the run directory: not in the workspace (where its tools write and git sees it), empty, owner-only.
+        // Made in the run directory: not in the workspace (where its tools write and git sees it), with no file, owner-only.
         expect(home.startsWith(`${RUN_DIR}/agent-home-`)).toBe(true)
         expect(home.startsWith(workspace)).toBe(false)
         expect(entries).toEqual([])
@@ -664,7 +940,7 @@ describe('claude-agent-sdk: two confinements, reads by the host and commands by 
 
   it('never reports cleanShells: Claude Code starts its shells its own way, sourcing a snapshot of its own, so no gate takes its shell command for a read (T198)', async () => {
     expect(await runtime(scripted()).probe()).toMatchObject({ executes: true, cleanShells: false })
-    expect(await runtime(scripted(), '/usr/bin/claude', { nested: failing('no namespace') }).probe()).toMatchObject({ executes: false, cleanShells: false })
+    expect(await runtime(scripted(), '/usr/bin/claude', { nested: failing('no namespace') }).probe()).toMatchObject({ executes: false, cleanShells: false, sandboxedCommands: false })
   })
 })
 
@@ -683,7 +959,8 @@ describe('claude-agent-sdk under the real bubblewrap: both layers nest on this h
   const server = createServer((socket) => socket.end())
   let port = 0
   beforeAll(async () => {
-    for (const dir of [home, workspace, outside, join(root, 'bin'), shellHome, join(home, 'shell-snapshots')]) mkdirSync(dir, { recursive: true, mode: 0o700 })
+    for (const dir of [home, workspace, outside, join(root, 'bin'), join(dsh, 'system', 'run'), join(home, 'shell-snapshots')]) mkdirSync(dir, { recursive: true, mode: 0o700 })
+    shell = agentHome(join(dsh, 'system', 'run'), workspace)
     writeFileSync(vaultKey, 'vault key')
     writeFileSync(claude, '#!/bin/sh\ncase "$1" in\n  --version) echo "2.1.308 (Claude Code)" ;;\n  auth) echo \'{"loggedIn": true}\' ;;\n  *) exit 2 ;;\nesac\n', { mode: 0o755 })
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -694,17 +971,20 @@ describe('claude-agent-sdk under the real bubblewrap: both layers nest on this h
     rmSync(root, { recursive: true, force: true })
   })
 
-  /** A run's private shell home (T198): in the run directory, which the confinement hides, bound back read-only. */
-  const shellHome = join(dsh, 'system', 'run', 'agent-home-test')
+  /** A run's private shell home (T198), as a run makes it: in the run directory, which the confinement hides. */
+  let shell: AgentHome
 
   /**
    * A command in the sandbox a workspace-write run's settings ask for, rendered as the SDK's
    * sandbox renders them on Linux (bubblewrap): the root read-only, each `allowWrite` path writable,
    * each `denyWrite` path read-only over it, and its own network namespace when no domain is
-   * allowed; nested inside the run's confinement, as a run's (its shell home read-only).
+   * allowed; nested inside the run's confinement, bound as a run's (its shell home read-only, its
+   * tool-state directories writable, fish's startup directories in them read-only, T270). With
+   * `outer: false`, the confinement binds the whole shell home writable, so the second layer's own
+   * settings alone decide what it may write there.
    */
-  const sandboxed = async (script: string): Promise<number> => {
-    const settings = commandSandbox(workspace, [home, shellHome])
+  const sandboxed = async (script: string, { outer = true }: { outer?: boolean } = {}): Promise<number> => {
+    const settings = commandSandbox(workspace, [home, ...shell.startup], withHomeState({ read: [], write: [] }, shell))
     const writable = settings.filesystem?.allowWrite ?? []
     const denied = settings.filesystem?.denyWrite ?? []
     const network = settings.network?.allowedDomains?.length ? [] : ['--unshare-net']
@@ -712,7 +992,8 @@ describe('claude-agent-sdk under the real bubblewrap: both layers nest on this h
       '--die-with-parent', '--new-session', ...network, '--unshare-pid', '--ro-bind', '/', '/', ...writable.flatMap((path) => ['--bind', path, path]),
       ...denied.flatMap((path) => ['--ro-bind', path, path]), '--dev', '/dev', '--proc', '/proc', '--', 'sh', '-c', script,
     ]
-    const c = confinedCommand('bwrap', inner, confine({ writable: [home, workspace], readOnly: [shellHome] }))
+    const binds = outer ? { writable: [home, workspace, ...shell.writable], readOnly: [shell.path, ...shell.startup] } : { writable: [home, workspace, shell.path] }
+    const c = confinedCommand('bwrap', inner, confine(binds))
     return promisify(execFile)(c.command, c.args).then(() => 0, (error: { code?: number }) => error.code ?? 1)
   }
   const connect = `${process.execPath} -e "require('net').connect(PORT, '127.0.0.1').on('connect', () => process.exit(0)).on('error', () => process.exit(3))"`
@@ -737,12 +1018,43 @@ describe('claude-agent-sdk under the real bubblewrap: both layers nest on this h
 
   it('lets no sandboxed command write startup code a later command\'s shell would run: not Claude Code\'s shell snapshot, not a startup file in the shells\' HOME (T198)', async () => {
     const plant = 'echo() { builtin printf pwned; }'
-    for (const file of [join(home, 'shell-snapshots', 'snapshot-bash-1.sh'), join(shellHome, '.bashrc'), join(shellHome, '.bash_profile'), join(shellHome, '.profile')]) {
-      expect(await sandboxed(`printf '%s\\n' '${plant}' > ${file}`), file).not.toBe(0)
+    const h = shell.path
+    const files = [
+      join(home, 'shell-snapshots', 'snapshot-bash-1.sh'), join(h, '.bashrc'), join(h, '.bash_profile'), join(h, '.profile'),
+      // Nor beside or inside the tool-state directories: the home's top and `.local` stay read-only, fish's directories too (T270).
+      join(h, '.local', 'bashrc'), join(h, '.config', 'fish', 'config.fish'), join(h, '.local', 'share', 'fish', 'vendor_conf.d', 'x.fish'),
+    ]
+    for (const file of files) {
+      expect(await sandboxed(`mkdir -p ${join(file, '..')}; printf '%s\\n' '${plant}' > ${file}`), file).not.toBe(0)
+      expect(existsSync(file), file).toBe(false)
+    }
+    // Fish's directories are refused by the second layer itself too, whatever the confinement binds (T270).
+    for (const file of [join(h, '.config', 'fish', 'config.fish'), join(h, '.local', 'share', 'fish', 'x.fish')]) {
+      expect(await sandboxed(`printf '%s\\n' '${plant}' > ${file}`, { outer: false }), file).not.toBe(0)
       expect(existsSync(file), file).toBe(false)
     }
     // The workspace stays writable: the denial is of those directories, not of every write.
     expect(await sandboxed(`printf '%s\\n' '${plant}' > ${join(workspace, '.bashrc')}`)).toBe(0)
+  })
+
+  it('lets a sandboxed command make and write a tool\'s state under ~/.local, ~/.cache and ~/.config, through both layers, quietly (T270)', async () => {
+    const h = shell.path
+    for (const dir of [join(h, '.local', 'share', 'tool'), join(h, '.local', 'state', 'tool'), join(h, '.cache', 'tool'), join(h, '.config', 'tool')]) {
+      // The second layer itself allows it (its deny list names no parent of it), and so does the run's confinement.
+      expect(await sandboxed(`mkdir -p ${dir} && printf x > ${join(dir, 'state')}`, { outer: false }), dir).toBe(0)
+      rmSync(dir, { recursive: true })
+      expect(await sandboxed(`mkdir -p ${dir} && printf x > ${join(dir, 'state')}`), dir).toBe(0)
+      expect(readFileSync(join(dir, 'state'), 'utf8'), dir).toBe('x')
+    }
+    // With HOME the shells' home, what a tool does on its first run (the noise each test file printed) prints nothing.
+    const settings = commandSandbox(workspace, [home, ...shell.startup], withHomeState({ read: [], write: [] }, shell))
+    const c = confinedCommand('bwrap', [
+      '--die-with-parent', '--new-session', '--unshare-net', '--unshare-pid', '--ro-bind', '/', '/',
+      ...(settings.filesystem?.allowWrite ?? []).flatMap((path) => ['--bind', path, path]), ...(settings.filesystem?.denyWrite ?? []).flatMap((path) => ['--ro-bind', path, path]),
+      '--dev', '/dev', '--proc', '/proc', '--setenv', 'HOME', h, '--', 'sh', '-c',
+      'mkdir -p "$HOME/.local" "$HOME/.local/share/applications" && touch "$HOME/.local/share/applications/mimeapps.list" && mkdir -p "$HOME/.cache/x" "$HOME/.config/x"',
+    ], confine({ writable: [home, workspace, ...shell.writable], readOnly: [h, ...shell.startup] }))
+    expect(await promisify(execFile)(c.command, c.args)).toEqual({ stdout: '', stderr: '' })
   })
 
   it('cuts a sandboxed command off the network, while the confinement alone still reaches it (the check can see a connection)', async () => {

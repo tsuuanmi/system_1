@@ -12,7 +12,7 @@ import { readFileSync, rmSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import { assertSafeBind, endpointUrl, formatRoster, guardRequest, LOOPBACK_HOSTS, McpTools, readJsonBody, readRoster, reply, type RosterServices, scopeTokens, SCOPES, tokenFile, type ToolHandler, type ToolScope, type ToolSpec } from '@tsuuanmi/system-gateway-core'
+import { assertSafeBind, endpointUrl, formatRoster, guardRequest, leadId, leadTokenFile, leadTokens, LOOPBACK_HOSTS, McpTools, readJsonBody, readRoster, reply, type RosterServices, scopeTokens, SCOPES, tokenFile, type ToolHandler, type ToolScope, type ToolSpec } from '@tsuuanmi/system-gateway-core'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import z from '@deepseek-ai/schemastery'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
@@ -20,8 +20,9 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { countedWhole, dshHome, ensurePrivateDir, registerSecretPath, SchemaRegistry, USAGE_UNKNOWN_EVENT, writeFileDurable } from '@tsuuanmi/system-libs'
-import type { PluginRecord } from '@tsuuanmi/system-plugin-host-core'
+import { type PluginRecord, SwitchError } from '@tsuuanmi/system-plugin-host-core'
 import type {} from '@tsuuanmi/system-resources-core'
+import { type AvailabilityLog, recordAvailability } from './availability.ts'
 import { type HealthReport, healthReport, type LivenessRead } from './health.ts'
 import { z as zod } from 'zod'
 
@@ -39,6 +40,8 @@ export interface Config {
   driftWindowHours?: number
   /** How long the store's integrity check result is reused, in minutes (default 15): it blocks while it runs. */
   storeCheckMinutes?: number
+  /** Seconds between reads of the roster that record a change of a Worker's availability (default 60; 0 records none). */
+  availabilitySeconds?: number
 }
 
 export type { ToolContext, ToolHandler, ToolScope, ToolSpec } from '@tsuuanmi/system-gateway-core'
@@ -74,7 +77,8 @@ function withoutZodDefaults(schema: unknown): unknown {
 }
 
 /** Whether a caller holding `scope` may see and call a tool of `tool` scope. */
-const visible = (tool: ToolScope, scope: ToolScope): boolean => scope === 'operator' || tool === 'client'
+const visible = (tool: Pick<ToolSpec, 'scope' | 'lead'>, scope: ToolScope, lead?: string): boolean =>
+  scope === 'operator' || (tool.scope ?? 'operator') === 'client' || (lead !== undefined && tool.lead === true)
 
 const NOT_INSTALLED =
   'The workflow engine is not mounted in this composition, so this tool has nothing to run; mount the workflow plugin (the system bundle does).'
@@ -106,6 +110,7 @@ export class McpEndpoint extends McpTools {
     minFreeBytes: z.natural().default(2 ** 30).description('Free space under the DSH home below which health is degraded'),
     driftWindowHours: z.natural().min(1).default(24).description('How long a provider UI change keeps health degraded'),
     storeCheckMinutes: z.natural().min(1).default(15).description('Minutes the store integrity check result is reused (it blocks the host while it runs)'),
+    availabilitySeconds: z.natural().default(60).description('Seconds between reads of the roster that record a change of a Worker\'s availability in the event log, for the maturity metrics; 0 records none'),
   })
 
   private readonly tools = new Map<string, Tool>()
@@ -126,19 +131,55 @@ export class McpEndpoint extends McpTools {
     const tokens = scopeTokens(tokenDir)
     const tokenFiles = Object.fromEntries(SCOPES.map((scope) => [scope, tokenFile(tokenDir, scope)]))
     // Agent Workers never read a control token, wherever tokenDir puts them (ADR-0024).
+    // A lead token's file is as secret as the operator's: registered when seen, for the endpoint's lifetime (the CLI issues them while the host runs).
+    const leadFiles = new Map<string, () => void>()
+    const seeLeads = (): ReadonlyMap<string, string> => {
+      const found = leadTokens(tokenDir)
+      for (const project of found.keys()) if (!leadFiles.has(project)) leadFiles.set(project, registerSecretPath(leadTokenFile(tokenDir, project)))
+      return found
+    }
     ctx.effect(() => {
       const unregister = Object.values(tokenFiles).map(registerSecretPath)
-      return () => unregister.forEach((u) => u())
+      seeLeads()
+      return () => {
+        unregister.forEach((u) => u())
+        for (const u of leadFiles.values()) u()
+        leadFiles.clear()
+      }
     })
 
+    // Worker availability over time: each change the roster shows is an event the maturity metrics read.
+    const every = (config.availabilitySeconds ?? 60) * 1000
+    if (every > 0) {
+      ctx.effect(() => {
+        let reading = false
+        const tick = async (): Promise<void> => {
+          const log = this.ctx.get('eventLog' as never) as AvailabilityLog | undefined
+          if (reading || !log || !this.ctx.get('workers')) return
+          reading = true
+          try {
+            recordAvailability(log, await readRoster(this.rosterServices(), { scope: 'client' }))
+          } catch (error) {
+            this.ctx.logger.warn(`mcp-server: Worker availability was not recorded this time: ${(error as Error).message.slice(0, 300)}`)
+          } finally {
+            reading = false
+          }
+        }
+        const timer = setInterval(() => void tick(), every)
+        timer.unref()
+        return () => clearInterval(timer)
+      })
+    }
+
     const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-      // The model token reaches only the model gateways, never /mcp.
-      const verdict = guardRequest(req, { tokens: { operator: tokens.operator, client: tokens.client }, allowedHosts })
+      // The model token reaches only the model gateways, never /mcp. A lead token is a client's, with its project (ADR-0076).
+      const verdict = guardRequest(req, { tokens: { operator: tokens.operator, client: tokens.client }, allowedHosts, leads: seeLeads })
       if (!verdict.ok) {
         res.writeHead(verdict.status, { 'content-type': 'text/plain' }).end(verdict.reason)
         return
       }
       const scope = verdict.scope as ToolScope
+      const lead = verdict.lead
       let body: unknown
       try {
         body = await readJsonBody(req, maxBodyBytes)
@@ -146,14 +187,19 @@ export class McpEndpoint extends McpTools {
         res.writeHead((error as { status?: number }).status ?? 400, { 'content-type': 'text/plain' }).end('invalid request body')
         return
       }
-      const denied = this.outOfScope(body, scope)
+      const denied = this.outOfScope(body, scope, lead)
       if (denied) {
         // The MCP authorization error for a token without the scope a call needs.
         res.writeHead(403, { 'content-type': 'application/json', 'www-authenticate': `Bearer error="insufficient_scope", scope="${denied.scope}"` })
-          .end(JSON.stringify({ error: 'insufficient_scope', error_description: `tool ${denied.tool} needs the ${denied.scope} scope` }))
+          .end(JSON.stringify({
+            error: 'insufficient_scope',
+            error_description: lead !== undefined
+              ? `tool ${denied.tool} is the operator's alone: the lead token of project ${lead} (decider ${leadId(lead)}) reaches the client tools and the lead's closed list of decisions, never this`
+              : `tool ${denied.tool} needs the ${denied.scope} scope`,
+          }))
         return
       }
-      const server = this.createServer(scope)
+      const server = this.createServer(scope, lead)
       // Stateless mode needs an explicit `sessionIdGenerator: undefined`; the SDK's option and
       // Transport types are not written for exactOptionalPropertyTypes, hence the boundary casts.
       type TransportOptions = ConstructorParameters<typeof StreamableHTTPServerTransport>[0]
@@ -206,14 +252,14 @@ export class McpEndpoint extends McpTools {
    * validates each call's arguments with the tool's zod schema; `tools/list` is this endpoint's own
    * (`listing`), so what every client pays for each session carries no boilerplate.
    */
-  createServer(scope: ToolScope): McpServer {
+  createServer(scope: ToolScope, lead?: string): McpServer {
     const server = new McpServer({ name: 'system', version: '0.0.0' })
     const listed: ListedTool[] = []
     for (const [name, tool] of this.tools) {
-      const { scope: declared = 'operator', ...spec } = tool.spec
-      if (!visible(declared, scope)) continue
+      const { scope: _scope, lead: _lead, ...spec } = tool.spec
+      if (!visible(tool.spec, scope, lead)) continue
       // The SDK passes (args, extra) to a tool with an input schema and (extra) alone otherwise.
-      const handler = (args: unknown, extra: unknown): ReturnType<ToolHandler> => tool.handler((extra === undefined ? {} : args) as Record<string, unknown>, { scope })
+      const handler = (args: unknown, extra: unknown): ReturnType<ToolHandler> => tool.handler((extra === undefined ? {} : args) as Record<string, unknown>, { scope, ...(lead !== undefined ? { lead } : {}) })
       server.registerTool(name, spec, handler as never)
       listed.push(this.listing(name, tool))
     }
@@ -244,12 +290,12 @@ export class McpEndpoint extends McpTools {
   }
 
   /** The first registered tool a JSON-RPC message (or batch) calls that `scope` may not use. */
-  private outOfScope(body: unknown, scope: ToolScope): { tool: string; scope: ToolScope } | undefined {
+  private outOfScope(body: unknown, scope: ToolScope, lead?: string): { tool: string; scope: ToolScope } | undefined {
     for (const message of Array.isArray(body) ? body : [body]) {
       const call = message as { method?: unknown; params?: { name?: unknown } } | null
       if (call?.method !== 'tools/call' || typeof call.params?.name !== 'string') continue
-      const declared = this.tools.get(call.params.name)?.spec.scope ?? 'operator'
-      if (this.tools.has(call.params.name) && !visible(declared, scope)) return { tool: call.params.name, scope: declared }
+      const spec = this.tools.get(call.params.name)?.spec
+      if (spec && !visible(spec, scope, lead)) return { tool: call.params.name, scope: spec.scope ?? 'operator' }
     }
     return undefined
   }
@@ -385,6 +431,70 @@ export class McpEndpoint extends McpTools {
             : `${read.id}: ${read.state}`)
         } catch (error) {
           return { isError: true, content: [{ type: 'text', text: (error as Error).message }] }
+        }
+      },
+    })
+    // The operator's runtime switches (ADR-0078): a row turned off or on in the running host, and a mechanism's enforce mode.
+    const switched = (error: unknown) => {
+      if (error instanceof SwitchError) return { isError: true, content: [{ type: 'text' as const, text: `${error.failure}: ${error.message}` }] }
+      throw error
+    }
+    const noHost = (what: string) => ({ isError: true, content: [{ type: 'text' as const, text: `the plugin host in this composition cannot ${what} (plugin host contract 1.2): it is not mounted, or an older one` }] })
+    this.tools.set('plugin', {
+      placeholder: false,
+      spec: {
+        scope: 'operator',
+        description: 'The rows of the composition, each on or off, required or optional, with its last runtime turn; or turn an optional row off or on in the running host, with no restart: its plugin finishes or hands back its work and stops (or starts), the turn is recorded as a lifecycle decision and kept in the profile\'s patch. A required row is refused with why.',
+        inputSchema: {
+          action: zod.enum(['list', 'off', 'on']).optional().describe('list (default), off, or on'),
+          row: zod.string().min(1).max(200).optional().describe('The row id to turn (off, on)'),
+          reason: zod.string().max(500).optional().describe('Why, recorded with the turn'),
+        },
+      },
+      handler: async (args) => {
+        const host = this.ctx.get('pluginHost')
+        const action = (args.action as 'list' | 'off' | 'on' | undefined) ?? 'list'
+        if (action === 'list') {
+          if (!host?.rows) return noHost('list its rows')
+          const rows = host.rows()
+          return reply({ rows }, `${rows.length} rows: ${rows.filter((r) => !r.on).length} off (${rows.filter((r) => !r.on).map((r) => r.id).join(', ') || 'none'})`)
+        }
+        if (!host?.turn) return noHost('turn a row while it runs')
+        if (typeof args.row !== 'string') return { isError: true, content: [{ type: 'text', text: `${action} needs the row to turn` }] }
+        try {
+          const turned = await host.turn(args.row, action === 'on', typeof args.reason === 'string' ? args.reason : undefined)
+          const kept = turned.patch ? `kept in ${turned.patch}` : 'in no profile patch: a restart does not keep it'
+          return reply(turned, turned.changed ? `row ${turned.row.id} is ${action}; ${kept}` : `row ${turned.row.id} was already ${action}; nothing changed`)
+        } catch (error) {
+          return switched(error)
+        }
+      },
+    })
+    this.tools.set('enforce', {
+      placeholder: false,
+      spec: {
+        scope: 'operator',
+        description: 'Each gate-like mechanism\'s enforce mode (on, warn, off) and the modes it takes; or set one live, with no restart (mode configured clears the override). Recorded as a gate decision; a mode the mechanism does not take is refused with why.',
+        inputSchema: {
+          mechanism: zod.string().min(1).max(100).optional().describe('The mechanism to set; none lists every one'),
+          mode: zod.enum(['off', 'warn', 'on', 'configured']).optional().describe('Its new mode; configured clears the live override'),
+          reason: zod.string().max(500).optional().describe('Why, recorded with the change'),
+        },
+      },
+      handler: async (args) => {
+        const host = this.ctx.get('pluginHost')
+        if (args.mechanism === undefined) {
+          if (!host?.enforcement) return noHost('list the mechanisms\' modes')
+          const mechanisms = host.enforcement()
+          return reply({ mechanisms }, mechanisms.map((m) => `${m.mechanism} ${m.mode}${m.override ? ' (set live)' : ''}`).join(', '))
+        }
+        if (!host?.setEnforce) return noHost('set a mechanism\'s mode')
+        if (args.mode === undefined) return { isError: true, content: [{ type: 'text', text: 'setting a mechanism needs its mode' }] }
+        try {
+          const state = host.setEnforce(String(args.mechanism), args.mode as 'off' | 'warn' | 'on' | 'configured', typeof args.reason === 'string' ? args.reason : undefined)
+          return reply(state, `${state.mechanism} is ${state.mode}${state.override ? ' (set live)' : ' (as configured)'}`)
+        } catch (error) {
+          return switched(error)
         }
       },
     })
@@ -594,8 +704,23 @@ export function pluginView(p: PluginRecord): Record<string, unknown> {
  * plugins count: an anonymous `ctx.inject` callback inside a plugin (DSH's own wait for a
  * `settings` service, say) is that plugin's optional part, not a plugin of the composition.
  */
-export function brokenPlugins(ctx: Context): Array<{ name: string; state: 'failed' | 'pending'; detail: string }> {
-  const out: Array<{ name: string; state: 'failed' | 'pending'; detail: string }> = []
+export function brokenPlugins(ctx: Context): Array<{ name: string; state: 'failed' | 'pending' | 'off'; detail: string }> {
+  const out: Array<{ name: string; state: 'failed' | 'pending' | 'off'; detail: string }> = []
+  // The services whose providing row is off (disabled in the composition, or turned off at runtime), by the manifests the plugin host read.
+  const offServices = new Set<string>()
+  const listed = (ctx.get('pluginHost') as { list?: () => PluginRecord[] } | undefined)?.list?.() ?? []
+  const records = listed.filter((p) => p.manifest)
+  for (const p of records) if (!p.mounted) for (const { seam } of p.manifest!.provides) offServices.add(seam)
+  // A package that ships no manifest (a DSH package, `optionalWithoutManifest`) declares no seam: its row's id is taken as the service it supplies (`llm` supplies ctx.llm).
+  for (const p of listed) if (!p.mounted && !p.manifest) for (const row of p.rows) offServices.add(row)
+  // A mounted plugin that consumes a seam whose row is off waits too, so the seams it provides are absent for that reason (the chain: display, browser, Login).
+  for (let grew = true; grew;) {
+    grew = false
+    for (const p of records) {
+      if (!p.mounted || !p.manifest!.consumes.some((c) => !c.optional && offServices.has(c.seam))) continue
+      for (const { seam } of p.manifest!.provides) if (!offServices.has(seam)) { offServices.add(seam); grew = true }
+    }
+  }
   for (const runtime of ctx.registry.values()) {
     const name = runtime.name?.trim()
     if (!name) continue
@@ -605,7 +730,9 @@ export function brokenPlugins(ctx: Context): Array<{ name: string; state: 'faile
       if (state === 3) out.push({ name, state: 'failed', detail: String((fiber as unknown as { _error?: Error })._error?.message ?? 'activation failed').slice(0, 300) })
       else if (state === 0) {
         const missing = Object.entries(fiber.inject ?? {}).filter(([service, spec]) => (spec as { required?: boolean } | null)?.required !== false && fiber.parent.get(service as never) === undefined).map(([service]) => service)
-        if (missing.length) out.push({ name, state: 'pending', detail: `waiting for service ${missing.join(', ')}` })
+        // Pending only on services whose row is off: off, with that reason. Any service no row provides, or whose row is on and has not started, keeps it down (INV-2).
+        if (missing.length && missing.every((s) => offServices.has(s))) out.push({ name, state: 'off', detail: missing.map((s) => `waits for service ${s}, whose row is off`).join('; ') })
+        else if (missing.length) out.push({ name, state: 'pending', detail: `waiting for service ${missing.join(', ')}` })
       }
     }
   }

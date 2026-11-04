@@ -27,9 +27,9 @@ const shipped = (dir: string, edit: (m: Record<string, any>) => void): string =>
 
 describe('the manifests the workspace ships (REQ-HOST-7)', () => {
   it('has one for every plugin and every seam definition, each valid as the host reads it, and all agreeing with the code', () => {
-    expect(derived.map((d) => d.path).filter((p) => p.startsWith('packages/plugins/')).length).toBe(39)
+    expect(derived.map((d) => d.path).filter((p) => p.startsWith('packages/plugins/')).length).toBe(43)
     expect(derived.filter((d) => d.manifest.defines).map((d) => d.dir).sort()).toEqual([
-      'agent-runtime-core', 'approvals-core', 'board-core', 'digest-core', 'evaluations-core', 'experiments-core', 'gateway-core', 'models-core', 'plugin-host-core', 'provider-core',
+      'agent-runtime-core', 'approvals-core', 'board-core', 'decision-core', 'digest-core', 'gateway-core', 'landing-core', 'ledger-core', 'models-core', 'plugin-host-core', 'provider-core',
       'resources-core', 'workers-core',
     ])
     for (const d of derived) expect(readManifest(readFileSync(join(root, d.path, 'plugin-manifest.json'), 'utf8'), d.manifest.name).state, d.dir).toBe('valid')
@@ -37,24 +37,32 @@ describe('the manifests the workspace ships (REQ-HOST-7)', () => {
   })
 
   it('derives each version from the conformance contract, each class from the seam catalog, and each consumer\'s range from its provider', () => {
-    expect(of('workflow').manifest).toMatchObject({ class: { kind: 'core', component: 'work-state-machine' }, provides: [{ seam: 'workflow', version: '1.10.0' }] })
-    expect(of('web-ui').manifest.consumes).toContainEqual({ seam: 'workflow', range: '^1.10.0' })
-    expect(of('board-core').manifest).toMatchObject({ schema: 'plugin-manifest@1.1', class: { kind: 'core', component: 'work-state-machine' }, provides: [], defines: [{ seam: 'board', version: '1.3.0' }] })
-    expect(of('experiments-core').manifest).toMatchObject({ class: { kind: 'core', component: 'work-state-machine' }, defines: [{ seam: 'experiments', version: '1.0.0' }] })
-    expect(of('evaluations-core').manifest).toMatchObject({ class: { kind: 'core', component: 'gate' }, defines: [{ seam: 'evaluations', version: '1.0.0' }] })
+    expect(of('workflow').manifest).toMatchObject({ class: { kind: 'core', component: 'work-state-machine' }, provides: [{ seam: 'workflow', version: '1.12.0' }] })
+    expect(of('workflow').manifest.consumes).toContainEqual({ seam: 'dispatchAdvisor', range: '^1.0.0', optional: true })
+    expect(of('web-ui').manifest.consumes).toContainEqual({ seam: 'workflow', range: '^1.12.0' })
+    expect(of('decision-core').manifest).toMatchObject({ schema: 'plugin-manifest@1.1', class: { kind: 'family', family: 'decision' }, provides: [], defines: [{ seam: 'dispatchAdvisor', version: '1.0.0' }] })
+    // The landing seam (PROP-0017 L0): a gate, defined in landing-core, provided by landing-local, consumed by the engine when present.
+    expect(of('landing-core').manifest).toMatchObject({ schema: 'plugin-manifest@1.1', class: { kind: 'core', component: 'gate' }, provides: [], defines: [{ seam: 'landing', version: '1.0.0' }] })
+    expect(of('landing-local').manifest).toMatchObject({ class: { kind: 'core', component: 'gate' }, provides: [{ seam: 'landing', version: '1.0.0' }], consumes: [{ seam: 'workers', range: expect.stringMatching(/^\^1\./) }] })
+    expect(of('workflow').manifest.consumes).toContainEqual({ seam: 'landing', range: '^1.0.0', optional: true })
+    expect(of('board-core').manifest).toMatchObject({ schema: 'plugin-manifest@1.1', class: { kind: 'core', component: 'work-state-machine' }, provides: [], defines: [{ seam: 'board', version: '1.5.0' }, { seam: 'leases', version: '1.1.0' }] })
+    expect(of('workers-core').manifest).toMatchObject({ class: { kind: 'core', component: 'gate' }, defines: [{ seam: 'egress', version: '1.0.0' }, { seam: 'workers', version: '1.0.0' }] })
+    // Two core seams in one package (PROP-0018 T12): it takes the class of the first, sorted.
     expect(of('runtime-claude-agent-sdk').manifest.class).toEqual({ kind: 'family', family: 'worker' })
-    expect(of('report').manifest).toMatchObject({ class: { kind: 'family', family: 'surface' }, provides: [], consumes: expect.arrayContaining([{ seam: 'board', range: '^1.3.0', optional: true }]) })
+    expect(of('report').manifest).toMatchObject({ class: { kind: 'family', family: 'surface' }, provides: [], consumes: expect.arrayContaining([{ seam: 'board', range: '^1.5.0', optional: true }]) })
     expect(of('plugin-host').manifest).toMatchObject({ class: { kind: 'core', component: 'plugin-host' }, consumes: expect.arrayContaining([{ seam: 'loader', range: '^1.0.0' }, { seam: 'profileContext', range: '^1.0.0', optional: true }]) })
     expect(seamClasses().get('mcp')).toEqual({ kind: 'family', family: 'surface' })
     expect(familyNames().get('profile-scientific-research')).toEqual(['workflow'])
   })
 
   it('derives each plugin\'s configuration keys from its Config, and holds no secret in any (INV-8)', () => {
-    expect(of('plugin-host').manifest.config).toEqual([{ key: 'allowWithoutManifest', sensitive: false }])
+    expect(of('plugin-host').manifest.config).toEqual([{ key: 'allowWithoutManifest', sensitive: false }, { key: 'optionalWithoutManifest', sensitive: false }, { key: 'quiesceSeconds', sensitive: false }])
     expect(of('store').manifest.config?.map((c) => c.key)).toEqual(['path', 'busyTimeoutMs', 'synchronous'])
     expect(of('report').manifest.config).toBeUndefined()
-    expect(derived.filter((d) => d.manifest.config).length).toBe(36)
-    expect(of('profile-software-development').manifest.config).toEqual([{ key: 'kinds', sensitive: false }])
+    expect(derived.filter((d) => d.manifest.config).length).toBe(38)
+    // The decisions row (T328): a surface with no seam of its own, and its one key.
+    expect(of('decisions').manifest).toMatchObject({ class: { kind: 'family', family: 'surface' }, provides: [], config: [{ key: 'pageSize', sensitive: false }] })
+    expect(of('profile-software-development').manifest.config).toEqual([{ key: 'pipeline', sensitive: false }, { key: 'kinds', sensitive: false }])
     // The notifier's webhook URL is a credential reference's value, never configuration.
     expect(of('notify').manifest.config?.find((c) => c.key === 'webhook')).toEqual({ key: 'webhook', sensitive: false })
     expect(of('notify').manifest).toMatchObject({ class: { kind: 'family', family: 'surface' }, provides: [] })
@@ -97,16 +105,16 @@ describe('the check catches each kind of disagreement', () => {
     expect(check(of('board'), shipped('board', (m) => { m.provides = [] }))).toEqual([expect.stringMatching(/the code provides ctx\.board, which it does not declare in provides/)])
     expect(check(of('board'), shipped('board', (m) => { m.provides.push({ seam: 'approvals', version: '1.0.0' }) }))).toEqual([expect.stringMatching(/provides ctx\.approvals, which the code does not provide/)])
     expect(check(of('board-core'), shipped('board-core', (m) => { m.defines = [{ seam: 'approvals', version: '1.0.0' }] })))
-      .toEqual([expect.stringMatching(/defines ctx\.approvals, which the code does not define/), expect.stringMatching(/the code defines ctx\.board, which it does not declare/)])
+      .toEqual([expect.stringMatching(/defines ctx\.approvals, which the code does not define/), expect.stringMatching(/the code defines ctx\.board, which it does not declare/), expect.stringMatching(/the code defines ctx\.leases, which it does not declare/)])
   })
 
   it('a version that disagrees with the conformance contract, of a provider, a definition, or a consumer\'s range', () => {
     expect(check(of('workflow'), shipped('workflow', (m) => { m.provides[0].version = '1.2.0' })))
-      .toEqual([expect.stringMatching(/provides ctx\.workflow at 1\.2\.0, but its conformance run pins contract 1\.10 \(packages\/plugins\/workflow\/tests\/conformance\.spec\.ts\), so it is at 1\.10\.0/)])
+      .toEqual([expect.stringMatching(/provides ctx\.workflow at 1\.2\.0, but its conformance run pins contract 1\.12 \(packages\/plugins\/workflow\/tests\/conformance\.spec\.ts\), so it is at 1\.12\.0/)])
     expect(check(of('approvals-core'), shipped('approvals-core', (m) => { m.defines[0].version = '1.0.0' })))
       .toEqual([expect.stringMatching(/defines ctx\.approvals at 1\.0\.0, but its suite is at contract 1\.1/)])
     expect(check(of('web-ui'), shipped('web-ui', (m) => { m.consumes.find((c: { seam: string }) => c.seam === 'workflow').range = '^2.0.0' })))
-      .toEqual([expect.stringMatching(/consumes ctx\.workflow in the range \^2\.0\.0, which its version in this workspace \(1\.10\.0, workflow\) does not satisfy/)])
+      .toEqual([expect.stringMatching(/consumes ctx\.workflow in the range \^2\.0\.0, which its version in this workspace \(1\.12\.0, workflow\) does not satisfy/)])
     expect(check(of('web-ui'), shipped('web-ui', (m) => { m.consumes.find((c: { seam: string }) => c.seam === 'workflow').range = '>=1' })))
       .toEqual([expect.stringMatching(/not a caret range/)])
   })

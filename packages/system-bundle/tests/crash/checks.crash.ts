@@ -1,10 +1,10 @@
 /**
  * Crash injection while a run's required check runs (ADR-0063, T151, INV-4): the daemon is killed
  * with SIGKILL while the `tests` check of a completed run runs, confined, in the run's worktree,
- * before its acceptance is decided. A check is never run again to replace what it came to (T164):
- * after a restart the engine advances the run again, the source answers the check the crash
- * interrupted with a stored `error`, not a second run (which would pass now), and the acceptance is
- * decided once, the check pending. Run with `pnpm test:crash` (it builds first).
+ * before its acceptance is decided. A check the host cut, by a stop or a crash, came to nothing (T269):
+ * after a restart the engine advances the run again, the source runs that check again on the same
+ * subject (a `gate` decision of rule `agent-workers.check-cut-rerun`), and the acceptance is decided
+ * once, on the second run's outcome. Run with `pnpm test:crash` (it builds first).
  */
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -54,7 +54,7 @@ function daemon(args: string[]): { child: ChildProcess; message: (key: string) =
 
 describe('crash injection while a run\'s required check runs (ADR-0063, INV-4)', () => {
   needsBubblewrap()
-  it('a daemon killed while the tests check runs leaves the run unaccepted; the restart never runs the check again: it is an error, pending, and the run is accepted once', async () => {
+  it('a daemon killed while the tests check runs leaves the run unaccepted; the restart runs the cut check again, once, and the run is accepted once on its outcome (T269)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'system-crash-checks-'))
     onTestFinished(() => rmSync(dir, { recursive: true, force: true }))
     const repo = join(dir, 'repo')
@@ -84,8 +84,7 @@ describe('crash injection while a run\'s required check runs (ADR-0063, INV-4)',
     const done = (await second.message('done')).done as { status: string; acceptances: number; detail: { checks: Record<string, boolean>; pendingChecks: string[]; checkRun: { outcome: string } } }
     expect(done.status).toBe('completed')
     expect(done.acceptances).toBe(1)
-    // The interrupted check is an error, never replaced by a second run's pass: it stays pending.
-    expect(done.detail).toMatchObject({ pendingChecks: ['tests'], checkRun: { outcome: 'checked', asked: ['tests'], results: [{ check: 'tests', outcome: 'error' }] } })
-    expect(done.detail.checks).not.toHaveProperty('tests')
+    // The check the crash cut ran again on the same subject (no `hang` now, so it passes): nothing is pending.
+    expect(done.detail).toMatchObject({ pendingChecks: [], checkRun: { outcome: 'checked', asked: ['tests'], results: [{ check: 'tests', outcome: 'passed' }] } })
   }, 180_000)
 })

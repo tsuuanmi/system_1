@@ -18,6 +18,10 @@ describe('agents source: a run is gone only on a liveness verdict (PROP-0013, AD
     const execution = first.ctx.workers.source('agents')!.start({ key: 'k', worker: 'agent:reviewer', prompt: 'long', sessionId: session, requirement: requirement(), decisions: admitted.decisions })
     await new Promise((resolve) => setTimeout(resolve, 300))
     await first.stop()
+    // The host died with the run in flight: no stop marked it as cut (T283), so its holder is lost, not stopped.
+    const db = new DatabaseSync(join(dir, 'system.db'))
+    db.prepare('UPDATE agent_runs SET host_stopped_at = NULL WHERE run_id = ?').run(execution.id)
+    db.close()
     return { dir, id: execution.id, session }
   }
   const restart = async (dir: string, config: Partial<Config> = {}) => {
@@ -40,6 +44,8 @@ describe('agents source: a run is gone only on a liveness verdict (PROP-0013, AD
     const { ctx, again, stop } = await restart(dir)
     const done = await ctx.workers.source('agents')!.wait(id, 10_000)
     expect(done).toMatchObject({ status: 'failed', submitted: true, error: { kind: 'reconciliation_failed', disposition: 'USER_ACTION', message: expect.stringContaining('it is gone (liveness dead') } })
+    // Its holder's stop alone ended it, and this source says so: the host's failure, not the run's (ADR-0069).
+    expect(done.error).toMatchObject({ infrastructure: 'host-stopped' })
     expect(again.runs).toEqual([])
     const decision = decisionOf(ctx, done)!
     expect(decision).toMatchObject({ decider: { id: 'agent-workers.reconcile', version: '2' }, outcome: { option: 'dead', detail: { verdict: 'dead', rule: 'liveness@1', looks: 1, deadAfterSeconds: 1 } } })

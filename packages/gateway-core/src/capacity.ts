@@ -14,7 +14,7 @@
  * @module
  */
 import { type AccountQuota, accountQuotaOf, compareHeadroom, headroomOrderOf, QUOTA_DEFAULTS, type QuotaPool, type QuotaSettings } from '@tsuuanmi/system-libs'
-import type { Known, Roster, RosterDescriptor, RosterEntry, RosterPoolView } from './roster.ts'
+import { type Known, type Roster, type RosterDescriptor, type RosterEntry, type RosterPoolView, UNREAD_MARK } from './roster.ts'
 
 /** What capacity now lists and reads at most (INV-9). */
 export const CAPACITY_BOUNDS = {
@@ -100,10 +100,12 @@ export const accountName = (name: string): string => { const i = name.lastIndexO
  * the step's kind of work (ADR-0057: a Worker that lists no kinds takes any). Routing decides at the
  * start; this decides nothing.
  */
-export function canTakeStep(d: { capabilities?: ReadonlyArray<{ capability: string; scope?: unknown }> | undefined; tier: RosterDescriptor['tier']; kinds?: string[] | undefined }, step: CapacityStep): boolean {
+export function canTakeStep(d: { capabilities?: ReadonlyArray<{ capability: string; scope?: unknown }> | undefined; tier: RosterDescriptor['tier']; tiers?: ReadonlyArray<{ tier: RosterDescriptor['tier'] }> | undefined; kinds?: string[] | undefined }, step: CapacityStep): boolean {
   const offers = d.capabilities ?? []
+  // A Worker that offers several tiers (ADR-0073) takes a step at or below its highest.
+  const highest = Math.max(TIERS.indexOf(d.tier), ...(d.tiers ?? []).map((t) => TIERS.indexOf(t.tier)))
   return step.capabilities.every((c) => offers.some((o) => o.capability === c && o.scope === undefined))
-    && TIERS.indexOf(d.tier) >= TIERS.indexOf(step.tier)
+    && highest >= TIERS.indexOf(step.tier)
     && (d.kinds === undefined || (step.kind !== undefined && d.kinds.includes(step.kind)))
 }
 
@@ -131,6 +133,8 @@ function limitOf(entries: RosterEntry[], pools: Known<RosterPoolView[]>): { unti
 export function quotaPoolsOf(pools: readonly RosterPoolView[]): QuotaPool[] {
   return pools.map((p) => ({
     pool: p.pool, kind: p.kind, available: p.available, ...(p.until ? { until: p.until } : {}),
+    // The roster marks the windows of a pool configured `unknown: available` that no reading covers (T294).
+    ...(p.windows.some((w) => !isKnown(w.used) && w.used.unknown.includes(UNREAD_MARK)) ? { unknown: 'available' as const } : {}),
     windows: p.windows.map((w) => ({ id: w.id, kind: w.kind, ...(w.seconds !== undefined ? { seconds: w.seconds } : {}) })),
     // A window the roster shows with no observation has no reading; `resets` is already the later of resetsAt and cooldownUntil.
     readings: p.windows.filter((w) => w.observedAt !== undefined).map((w) => ({
@@ -148,6 +152,7 @@ export function quotaPoolsOf(pools: readonly RosterPoolView[]): QuotaPool[] {
 function quotaOf(quota: AccountQuota | null): Known<CapacityQuota | null> {
   if (quota === null) return known(null)
   const b = quota.binding
+  if (quota.unread) return unknown('unread: no window of its account has a reading yet (its pool is configured unknown: available); dispatch admits it at the unread bound, after every account with headroom')
   if (quota.knowledge !== 'known' || !b) {
     const read = quota.pools.some((p) => p.windows.some((w) => w.known))
     return unknown(`${read ? 'not every' : 'no'} window of its account has a current reading (${quota.why[0] ?? 'its quota is unknown'})`)

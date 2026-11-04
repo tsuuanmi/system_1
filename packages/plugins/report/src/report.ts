@@ -6,17 +6,18 @@
  */
 import type { ActionClass, ApprovalRequest } from '@tsuuanmi/system-approvals-core'
 import type { BoardTask, Project, TaskState } from '@tsuuanmi/system-board-core'
-import { type DrawFigure, drawFigures, type QuotaDraw, type UsageUnknown } from '@tsuuanmi/system-libs'
+import { ADVICE_EVENT, ADVICE_OUTCOME_EVENT, ADVICE_QUESTIONS, ADVICE_SHADOW_ATTEMPTS, type AdviceQuestion, brierScores, type DrawFigure, drawFigures, type QuestionScore, type QuotaDraw, type UsageUnknown } from '@tsuuanmi/system-libs'
 import type { UsageRecord } from '@tsuuanmi/system-resources-core'
+import type { Metrics } from './metrics.ts'
 
-export const TASK_STATES: readonly TaskState[] = ['proposed', 'ready', 'claimed', 'running', 'review', 'waiting-for-input', 'waiting-for-approval', 'done', 'cancelled']
+const TASK_STATES: readonly TaskState[] = ['proposed', 'ready', 'claimed', 'running', 'review', 'waiting-for-input', 'waiting-for-approval', 'done', 'cancelled']
 /** Projects one report lists (`mcp-report@1` bounds it); the rest are counted. */
 export const MAX_PROJECTS = 100
 /** Pools one report lists (`mcp-report@1`), as many as the ledger configures at once. */
-export const MAX_POOLS = 64
+const MAX_POOLS = 64
 /** The longest period one report covers (INV-9). */
 export const MAX_DAYS = 366
-export const DEFAULT_DAYS = 7
+const DEFAULT_DAYS = 7
 const DAY_MS = 86_400_000
 
 /** A period from `since` (inclusive) to `until` (exclusive). */
@@ -48,7 +49,7 @@ export function periodOf(input: ReportInput, now: Date): Period {
 export interface Recorded { seq: number; at: string; type: string; runId?: string; decision?: string; data?: Record<string, unknown> }
 
 /** A decision the report reads: who made it, when, and what it decided. */
-export interface DecisionRead { createdAt: string; decisionType: string; deciderType: string; deciderId: string; option: string; checks?: Record<string, boolean> }
+export interface DecisionRead { createdAt: string; decisionType: string; deciderType: string; deciderId: string; deciderVersion?: string; option: string; checks?: Record<string, boolean> }
 
 /** A settled digest request as its provider holds it. */
 export interface DigestRead { kept?: number; dropped?: number; escalated: boolean }
@@ -74,7 +75,7 @@ export interface Sources {
   tasks: BoardTask[]
   requests: ApprovalRequest[]
   usage: UsageRecord[]
-  /** `workflow.task.reported`, `workflow.task.digest`, `workflow.graph.grown`, `workflow.gate.opened`, `workflow.gate.closed`, `approvals.batched`, and {@link LIVENESS_EVENTS}. */
+  /** `workflow.task.reported`, `workflow.task.digest`, `workflow.graph.grown`, `workflow.gate.opened`, `workflow.gate.closed`, `approvals.batched`, `workflow.dispatch.advised`, `workflow.dispatch.outcome`, and {@link LIVENESS_EVENTS}. */
   events: Recorded[]
   decisions: ReadonlyMap<string, DecisionRead>
   /** By request id; absent when no digest provider is loaded. */
@@ -83,6 +84,8 @@ export interface Sources {
   unknowns?: UnknownRead[]
   /** What the agent runs that ended in the period drew (`quota.draw`); none when absent. */
   draws?: DrawRead[]
+  /** The dispatch advisor's probabilities by its decision's id, then by question id (`accepted:A`), for the outcomes of the period (PROP-0015 J1). */
+  advice?: ReadonlyMap<string, Readonly<Record<string, number>>>
   /** What could not be counted, found while reading. */
   notes: string[]
 }
@@ -148,12 +151,12 @@ interface HeldReview { taskId: string; projectId: string; title: string; expires
 /** What the agent runs of the period drew (`mcp-report@1.4`): the figures per kind and window, and per kind, template step, and window. */
 interface QuotaDraws { records: number; byKind: DrawFigure[]; byStep: DrawFigure[]; omitted?: number }
 /** Figures of each list one report lists (`mcp-report@1.4`); the rest are counted. */
-export const MAX_DRAW_FIGURES = 256
+const MAX_DRAW_FIGURES = 256
 
 /** The event-log entries of an agent run's liveness the report counts (PROP-0013). */
 export const LIVENESS_EVENTS = ['agent-workers.run.stalled', 'agent-workers.run.unknown', 'agent-workers.run.freed'] as const
 /** Held runs, and held reviews, one report lists (`mcp-report@1.2`, `@1.3`); the rest are counted. */
-export const MAX_HELD = 64
+const MAX_HELD = 64
 
 /** The `report` tool's output (`$defs/report-output`). */
 export interface Report {
@@ -172,7 +175,26 @@ export interface Report {
   usage: { total: UsageTotals; pools: Array<UsageTotals & { pool: string }>; byOutcome: { completed: number; failed: number; aborted: number; unknown: number }; unknown?: UnknownUsage; draws?: QuotaDraws }
   digests: { attached: number; bypassed: number; claimsKept?: number; claimsDropped?: number; escalated?: number }
   baseline: { acceptedResults: number; interruptions: number; attempts: number; perAcceptedResult?: { tokens: number; costUsd: number; turns: number; interruptions: number; attempts: number } }
+  /** `advice` (1.5): the dispatch advisor in shadow and its calibration (PROP-0015 J1); only when a choice was advised or an outcome recorded in the period. */
+  advice?: AdviceCalibration
+  /** `maturity` (1.6): the maturity metrics over the 30 days to the period's end and the L3 reading (PROP-0016 I4); absent when they could not be read (a note says why). */
+  maturity?: Metrics
   notes: string[]
+}
+
+/** The dispatch advisor in the period (`mcp-report@1.5`): choices advised, outcomes, and each question's Brier score. */
+export interface AdviceCalibration {
+  /** Dispatch choices the advisor answered. */
+  advised: number
+  /** Dispatch choices it gave no advice on (off, insufficient data, an error, a timeout), recorded as such. */
+  unavailable: number
+  /** Dispatched attempts whose outcome was recorded. */
+  outcomes: number
+  /** Of those, the ones whose choice was advised: what the scores are over. */
+  scored: number
+  /** D74: outcomes the shadow period needs before the advice may be shown. */
+  shadowAttempts: number
+  questions: QuestionScore[]
 }
 
 const round = (value: number, places: number): number => {
@@ -417,11 +439,42 @@ export function buildReport(period: Period, sources: Sources, projectId?: string
     } : {}),
   }
 
+  // The dispatch advisor in shadow (PROP-0015 J1): each recorded outcome scores the probabilities its
+  // choice's advice gave the chosen candidate (alias A), one Brier score per question.
+  const advised = ofType(ADVICE_EVENT)
+  const outcomes = ofType(ADVICE_OUTCOME_EVENT)
+  let advice: AdviceCalibration | undefined
+  if (advised.length || outcomes.length) {
+    const pairs: Array<{ question: AdviceQuestion; p: number; y: 0 | 1 }> = []
+    let scored = 0
+    for (const e of outcomes) {
+      const ref = e.data?.['advice']
+      const alias = typeof e.data?.['alias'] === 'string' ? e.data['alias'] : 'A'
+      const labels = e.data?.['labels'] as Record<string, unknown> | undefined
+      const probabilities = typeof ref === 'string' ? sources.advice?.get(ref) : undefined
+      if (!probabilities || !labels) continue
+      let any = false
+      for (const question of ADVICE_QUESTIONS) {
+        const p = probabilities[`${question}:${alias}`]
+        const y = labels[question]
+        if (typeof p === 'number' && (y === 0 || y === 1)) {
+          pairs.push({ question, p, y })
+          any = true
+        }
+      }
+      if (any) scored += 1
+    }
+    advice = {
+      advised: advised.filter((e) => e.data?.['status'] === 'advice').length, unavailable: advised.filter((e) => e.data?.['status'] === 'unavailable').length,
+      outcomes: outcomes.length, scored, shadowAttempts: ADVICE_SHADOW_ATTEMPTS, questions: brierScores(pairs),
+    }
+  }
+
   return {
     period, ...(projectId !== undefined ? { projectId } : {}), asOf: sources.asOf,
     projects: listed, ...(projects.length > MAX_PROJECTS ? { projectsOmitted: projects.length - MAX_PROJECTS } : {}),
     tasks, attempts, remediation, approvals, attention,
     usage: { total, pools: [...pools.values()].sort(byKey((p) => p.pool)), byOutcome, ...(unknown ? { unknown } : {}), ...(draws ? { draws } : {}) },
-    digests, baseline, notes: notes.slice(0, 16),
+    digests, baseline, ...(advice ? { advice } : {}), notes: notes.slice(0, 16),
   }
 }

@@ -27,6 +27,7 @@ export const LAYER_OF: Record<string, Layer> = {
   'libs': 'host and libraries',
   'system-bundle': 'host and libraries',
   // kernel
+  'ledger-core': 'kernel',
   'store': 'kernel',
   'event-log': 'kernel',
   'leases': 'kernel',
@@ -56,6 +57,7 @@ export const LAYER_OF: Record<string, Layer> = {
   'agent-workers': 'capabilities',
   'models-core': 'capabilities',
   'models': 'capabilities',
+  'workers-fake': 'capabilities',
   // routing
   'workers-core': 'routing',
   'approvals-core': 'routing',
@@ -69,11 +71,11 @@ export const LAYER_OF: Record<string, Layer> = {
   'board-core': 'orchestration',
   'board': 'orchestration',
   'digest-core': 'orchestration',
+  'decision-core': 'orchestration',
+  'landing-core': 'orchestration',
+  'landing-local': 'orchestration',
   'digest': 'orchestration',
   'digest-extractive': 'orchestration',
-  'experiments-core': 'orchestration',
-  'evaluations-core': 'orchestration',
-  'statistics': 'orchestration',
   'worker-sessions': 'orchestration',
   'profile-software-development': 'orchestration',
   'profile-scientific-research': 'orchestration',
@@ -86,6 +88,8 @@ export const LAYER_OF: Record<string, Layer> = {
   'web-ui': 'gateways',
   'report': 'gateways',
   'notify': 'gateways',
+  'lead-inbox': 'gateways',
+  decisions: 'gateways',
   'cli': 'gateways',
 }
 

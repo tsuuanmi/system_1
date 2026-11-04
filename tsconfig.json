@@ -132,6 +132,9 @@
       "@tsuuanmi/system-gateway-core": [
         "packages/gateway-core/src/index.ts"
       ],
+      "@tsuuanmi/system-ledger-core": [
+        "packages/ledger-core/src/index.ts"
+      ],
       "@tsuuanmi/system-approvals-core": [
         "packages/approvals-core/src/index.ts"
       ],
@@ -141,11 +144,29 @@
       "@tsuuanmi/system-digest-core": [
         "packages/digest-core/src/index.ts"
       ],
+      "@tsuuanmi/system-decision-core": [
+        "packages/decision-core/src/index.ts"
+      ],
+      "@tsuuanmi/system-landing-core": [
+        "packages/landing-core/src/index.ts"
+      ],
+      "@tsuuanmi/system-landing-local": [
+        "packages/plugins/landing-local/src/index.ts"
+      ],
       "@tsuuanmi/system-digest": [
         "packages/plugins/digest/src/index.ts"
       ],
       "@tsuuanmi/system-digest-extractive": [
         "packages/plugins/digest-extractive/src/index.ts"
+      ],
+      "@tsuuanmi/system-decisions": [
+        "packages/plugins/decisions/src/index.ts"
+      ],
+      "@tsuuanmi/system-lead-inbox": [
+        "packages/plugins/lead-inbox/src/index.ts"
+      ],
+      "@tsuuanmi/system-workers-fake": [
+        "packages/plugins/workers-fake/src/index.ts"
       ],
       "@tsuuanmi/system-report": [
         "packages/plugins/report/src/index.ts"
@@ -167,15 +188,6 @@
       ],
       "@tsuuanmi/system-plugin-host": [
         "packages/plugins/plugin-host/src/index.ts"
-      ],
-      "@tsuuanmi/system-experiments-core": [
-        "packages/experiments-core/src/index.ts"
-      ],
-      "@tsuuanmi/system-evaluations-core": [
-        "packages/evaluations-core/src/index.ts"
-      ],
-      "@tsuuanmi/system-statistics": [
-        "packages/statistics/src/index.ts"
       ]
     }
   },
@@ -184,7 +196,6 @@
     "packages/**/fixtures/**/*.ts",
     "packages/**/src/**/*.ts",
     "packages/**/tests/**/*.ts",
-    "scripts/**/*.ts",
-    "spikes/**/*.ts"
+    "scripts/**/*.ts"
   ]
 }

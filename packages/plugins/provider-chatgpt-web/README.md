@@ -126,8 +126,7 @@ The **ChatGPT Web provider driver**
     model or level is unknown, or if a model is locked.
   - An account without a model picker (such as ChatGPT Free) has no preset:
     the driver fails the turn as `ui_drift` and sends nothing. PROP-0004
-    removed the empty `site` preset; such an account is
-    [removed](../../../docs/operations/runbooks.md#remove-the-free-chatgpt-account).
+    removed the empty `site` preset; leave such an account out of the catalog.
 - **Deep research** (`feature: 'deep-research'`, persistent only):
   - "+" → "Deep research" → the mention chip is checked → the prompt goes after
     the chip;

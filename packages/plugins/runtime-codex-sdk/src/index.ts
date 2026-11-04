@@ -59,7 +59,7 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { accessSync, constants, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
-import { delimiter, isAbsolute, join } from 'node:path'
+import { delimiter, dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { Codex, type CodexOptions, type ThreadEvent, type ThreadOptions } from '@openai/codex-sdk'
@@ -67,21 +67,21 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import {
   type AgentHome, type AgentRuntimeProvider, type Confinement, type IdentityReading, type LimitObservation, type LimitReport, type LimitsOptions, type LoginCommand, type ProbeOptions, type RunResult, type RunSpec,
-  type RuntimeEvidence, type ToolCall, WORKSPACE_READS_SCRIPT, type WorkspaceReadBounds, agentHome, agentShellEnvironment, childEnvironment, confinedCommand, homeProblem, identityHmac, proveConfinement,
-  readHomeJson, withMetering, workspaceReadArgs, workspaceReadBounds, writeLauncher,
+  type RuntimeEvidence, type ToolCall, WORKSPACE_READS_SCRIPT, type WorkspaceReadBounds, agentHome, agentShellEnvironment, childEnvironment, confinedCommand, homeProblem, identityHmac, proveConfinement, withTestWorkers,
+  readHomeJson, tailOf, toolSandboxAllowances, withMetering, withRunReport, workspaceReadArgs, workspaceReadBounds, writeLauncher,
 } from '@tsuuanmi/system-agent-runtime-core'
 import { dshHome, ensurePrivateDir } from '@tsuuanmi/system-libs'
 import { ProviderError } from '@tsuuanmi/system-provider-core'
 import { type Deferral, type GateChannel, hookOverrides, openGateChannel } from './gate.ts'
 import { VERIFIED_LIMIT_VERSIONS, childTimeZone, limitFromMessage } from './limits.ts'
-import { configOverrides, readsOverride, refused } from './overrides.ts'
+import { configOverrides, readsOverride, refused, writableRootsOverride } from './overrides.ts'
 import { probeGate, proofFailure, startProbeModel } from './proof.ts'
 import { APP_SERVER_ARGS, VERIFIED_RATE_LIMITS_VERSIONS, askRateLimits, endAppServer, limitsFromRateLimits } from './rate-limits.ts'
 import { TurnUsage } from './usage.ts'
 
 export { VERIFIED_LIMIT_VERSIONS, childTimeZone, limitFromMessage } from './limits.ts'
 export { FEATURES_OFF } from './overrides.ts'
-export { APP_SERVER_ARGS, VERIFIED_RATE_LIMITS_VERSIONS, askRateLimits, limitsFromRateLimits } from './rate-limits.ts'
+export { APP_SERVER_ARGS, VERIFIED_RATE_LIMITS_VERSIONS, limitsFromRateLimits } from './rate-limits.ts'
 
 /** The part of a Codex thread a run uses (the SDK's `Thread`, or a test double). */
 export interface CodexThread {
@@ -154,7 +154,7 @@ export type SpawnAppServer = (command: string, args: string[], options: { cwd: s
  * session gets a terminal (`/dev/ptmx`, or where it links into `/dev/pts`), and no process reaches
  * the operator's own terminals (`/dev/pts/<n>`).
  */
-export const NO_TERMINAL: readonly string[] = ['/dev/ptmx', '/dev/pts']
+const NO_TERMINAL: readonly string[] = ['/dev/ptmx', '/dev/pts']
 
 /** Codex items that are not a tool's work: messages, reasoning, the plan, errors. Any other item is a tool call's. */
 const PLAIN_ITEMS = new Set(['agent_message', 'reasoning', 'todo_list', 'error'])
@@ -235,6 +235,8 @@ export class CodexRuntime implements AgentRuntimeProvider {
     // One account's own home (ADR-0051): an owner-only directory that exists, or nothing runs.
     const named = spec.home !== undefined ? homeProblem(spec.home) : undefined
     if (named) throw new ProviderError('config_error', `codex-sdk: ${named}; nothing was run`)
+    // It reports no web tools (RuntimeEvidence.webTools, T262): a research run is refused, never run without them.
+    if (spec.web) throw new ProviderError('config_error', 'codex-sdk: it offers no web tools to a research run (RunSpec.web); nothing was run')
     const home = spec.home ?? this.home
     if (signal.aborted) throw new ProviderError('aborted', 'codex-sdk: the run was stopped before it started')
     if (spec.sandbox !== 'read-only' && spec.sandbox !== 'workspace-write') throw new ProviderError('config_error', `codex-sdk: unknown sandbox ${String(spec.sandbox)}`)
@@ -291,18 +293,29 @@ export class CodexRuntime implements AgentRuntimeProvider {
         }
       }
       // The workspace is bound back as the sandbox allows; Codex's own sandbox still confines writes.
-      // The shells' home is bound back read-only (T198): it stays empty, so whatever shell and login
+      // The shells' home is bound back read-only (T198): it holds no file, so whatever shell and login
       // mode a call picks finds no startup file there, and no call can write one for a later call.
+      // Its tool-state directories are writable over it, and fish's startup directories in them
+      // read-only again (T270): a tool's state under ~ is written, never a shell's startup code.
       // The workspace reads server's script and node are bound back read-only too: Codex starts the
       // server, which confines itself again, the workspace read-only to it (T200b).
       const own = channel ? [channel.dir, this.hook(), this.node()] : []
-      const readOnly = [...new Set([shell.path, ...own, this.readsScript(), this.node()])]
-      const bind = spec.sandbox === 'workspace-write' ? { writable: [home, spec.workspace], readOnly } : { writable: [home], readOnly: [spec.workspace, ...readOnly] }
+      const readOnly = [...new Set([shell.path, ...shell.startup, ...own, this.readsScript(), this.node()])]
+      const writes = spec.sandbox === 'workspace-write'
+      const bind = writes ? { writable: [home, spec.workspace, ...shell.writable], readOnly } : { writable: [home, ...shell.writable], readOnly: [spec.workspace, ...readOnly] }
       let confined: { command: string; args: string[] }
       let reads: { command: string; args: string[] }
+      // A writing run's commands run a browser test as a check's confinement does (T265): its report
+      // file bound back writable and named to them, and Codex's sandbox lets them write it (its
+      // directory, a writable root being a directory) and the confinement's private /dev/shm.
+      let roots: string[] = []
       try {
         reads = this.readsCommand(spec.workspace, readBounds)
-        confined = confinedCommand(executable, [], this.confinement(bind))
+        const confinement = withTestWorkers(withRunReport(this.confinement(bind), writes ? spec.reportFile : undefined), writes ? spec.testWorkers : undefined)
+        confined = confinedCommand(executable, [], confinement)
+        // And the shells' tool-state directories (T270): fish's startup directories in them stay
+        // read-only, bound so by the confinement, which no sandbox inside it can undo.
+        if (writes) roots = [...toolSandboxAllowances(confinement, spec.reportFile).write.map((path) => (path === spec.reportFile ? dirname(path) : path)), ...shell.writable]
       } catch (error) {
         throw new ProviderError('config_error', `codex-sdk: ${firstLine(error)}; nothing was run`, { cause: error })
       }
@@ -312,7 +325,7 @@ export class CodexRuntime implements AgentRuntimeProvider {
       env = this.environment(home, channel, shell.path)
       const client = (this.options.client ?? ((options) => new Codex(options)))({
         codexPathOverride: program,
-        configOverrides: [...this.overrides, readsOverride(reads, readBounds), ...(channel ? hookOverrides(this.node(), this.hook()) : [])],
+        configOverrides: [...this.overrides, readsOverride(reads, readBounds), ...(channel ? hookOverrides(this.node(), this.hook()) : []), ...(roots.length ? [writableRootsOverride(this.options.config, roots)] : [])],
         env,
       })
       const thread: ThreadOptions = {
@@ -332,6 +345,20 @@ export class CodexRuntime implements AgentRuntimeProvider {
         else if (event.type === 'error') failure = event.message
         else if (event.type === 'item.started' || event.type === 'item.updated' || event.type === 'item.completed') {
           if (event.type === 'item.completed' && event.item.type === 'agent_message') text = event.item.text
+          // A command that ended is reported to the run's source with the exit code Codex reports (T284).
+          if (event.type === 'item.completed' && event.item.type === 'command_execution' && spec.onToolResult) {
+            const { command, exit_code: exitCode, aggregated_output: output, status } = event.item
+            // Ended only with an exit code Codex reports: an item still in progress, or one with none, is no command that ran to its end.
+            const ended = status !== 'in_progress' && typeof exitCode === 'number'
+            try {
+              spec.onToolResult({
+                tool: 'Bash', input: { command }, callId: event.item.id, isError: status === 'failed' || (ended && exitCode !== 0),
+                ...(ended ? { exitCode } : { unfinished: true }), tail: tailOf(output),
+              })
+            } catch {
+              // Observing never fails the run.
+            }
+          }
           // A tool's item that no allowed call accounts for ran past the gate: its hook failed or never ran.
           if (channel && !seen.has(event.item.id)) {
             seen.add(event.item.id)

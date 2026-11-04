@@ -1,5 +1,6 @@
 /**
- * Routing seam definition: `ctx.workers`, the Worker registry and deterministic router
+ * Gate seam definitions: `ctx.workers` and `ctx.egress` (explicit data egress, INV-12; see
+ * `./egress.ts`). `ctx.workers` is the routing seam: the Worker registry and deterministic router
  * (docs/design/routing.md). Worker sources (the website turn runtime today; agent runtimes
  * later) register for their plugin's lifetime and describe what each Worker proves now;
  * `route` turns a work requirement into one admitted Worker or an {@link AdmissionFailure}.
@@ -7,6 +8,8 @@
  * @module @tsuuanmi/system-workers-core
  */
 import { type Context, Service } from '@deepseek-ai/cordis'
+
+export * from './egress.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -90,9 +93,45 @@ export interface WorkerAccount {
   limitUntil?: string
 }
 
+/**
+ * One tier a Worker offers (`@1.10`; ADR-0073): the tier, the ledger pools a run at it draws on (its
+ * account's own and its model's, opaque ids), and, when its model's pool is closed now, until when
+ * (`closed`; `until` when known). Routing serves a Worker at the lowest offered tier within a
+ * requirement's bounds that is not closed ({@link servedTier}); it never names a model (INV-11).
+ */
+export interface TierOffer {
+  tier: Tier
+  /** The ledger pools a run at this tier draws on; absent: every pool of its account. */
+  pools?: string[]
+  /** Its model's limit closes this tier now (the Worker's other tiers stay open). */
+  closed?: true
+  /** When a closed tier is expected back, when its source knows. */
+  until?: string
+  /** `@1.11`: its model's display label, as the live profile gives it (for people only, never a routing input). */
+  label?: string
+  /** `@1.11`: the turn limit a run at this tier gets, when one is set. */
+  maxTurns?: number
+}
+
+/** The tiers a Worker offers, lowest first: its `tiers` (`@1.10`), else its one `tier`. */
+export const offeredTiers = (worker: Pick<CapabilityDescriptor, 'tier' | 'tiers'>): TierOffer[] =>
+  worker.tiers?.length ? [...worker.tiers].sort((a, b) => TIERS.indexOf(a.tier) - TIERS.indexOf(b.tier)) : [{ tier: worker.tier }]
+
+/** The offers of a Worker within a requirement's tier bounds, lowest first, closed ones included. */
+export const tiersWithin = (worker: Pick<CapabilityDescriptor, 'tier' | 'tiers'>, bounds: WorkRequirement['tier']): TierOffer[] =>
+  offeredTiers(worker).filter((o) => TIERS.indexOf(o.tier) >= TIERS.indexOf(bounds.min) && (bounds.max === undefined || TIERS.indexOf(o.tier) <= TIERS.indexOf(bounds.max)))
+
+/**
+ * The offer a Worker serves work at (ADR-0073): the lowest offered tier within the requirement's
+ * bounds whose model's pool is open; undefined when none is (routing then refuses it, for its `tier`
+ * or, when its tiers in bounds are only closed, its limit).
+ */
+export const servedTier = (worker: Pick<CapabilityDescriptor, 'tier' | 'tiers'>, bounds: WorkRequirement['tier']): TierOffer | undefined =>
+  tiersWithin(worker, bounds).find((o) => !o.closed)
+
 /** What a Worker has proven right now (`capability-descriptor@1.0`; `@1.1` adds `family`). */
 export interface CapabilityDescriptor {
-  schema: 'capability-descriptor@1.0' | 'capability-descriptor@1.1' | 'capability-descriptor@1.2' | 'capability-descriptor@1.3' | 'capability-descriptor@1.4' | 'capability-descriptor@1.5' | 'capability-descriptor@1.6' | 'capability-descriptor@1.7' | 'capability-descriptor@1.8'
+  schema: 'capability-descriptor@1.0' | 'capability-descriptor@1.1' | 'capability-descriptor@1.2' | 'capability-descriptor@1.3' | 'capability-descriptor@1.4' | 'capability-descriptor@1.5' | 'capability-descriptor@1.6' | 'capability-descriptor@1.7' | 'capability-descriptor@1.8' | 'capability-descriptor@1.9' | 'capability-descriptor@1.10' | 'capability-descriptor@1.11' | 'capability-descriptor@1.12'
   worker: string
   /** Informational only; routing never branches on it (INV-11). */
   provider: string
@@ -114,6 +153,19 @@ export interface CapabilityDescriptor {
    * routing never reads it, and only a provider plugin or the operator names a tool in it (INV-11).
    */
   title?: string
+  /**
+   * Why it takes no work (`@1.9`), when its state is `unavailable` and its source knows: a failed
+   * probe's detail, a workspace problem, a gate's reason. Plain text on one line, at most 300
+   * characters. For people only (the roster, capacity, health): routing never reads it.
+   */
+  unavailableReason?: string
+  /**
+   * When its source expects to know again whether this unavailable Worker takes work (`@1.12`,
+   * T282): it is unavailable only for a while that passes by itself, as an agent runtime's late
+   * probe, whose next result is due by then. Only with state `unavailable`; its capabilities are what
+   * it last proved. Routing tells a caller to try the work again then (`AdmissionFailure.retryAt`).
+   */
+  expectedBack?: string
   /**
    * The longest input this Worker takes, in characters (code points) of what it is sent, when its
    * source knows one (`@1.2`; ADR-0032). Admission refuses it work whose input is longer.
@@ -137,7 +189,13 @@ export interface CapabilityDescriptor {
    * names one of them ({@link takesKind}; check `capability`). Absent: work of any kind, or of none.
    */
   kinds?: string[]
+  /** Its lowest tier; with `tiers`, the first of them. */
   tier: Tier
+  /**
+   * Every tier it offers (`@1.10`; ADR-0073), each once, its lowest equal to `tier`: one Worker of an
+   * agent role that declares a model per tier. Absent: it offers `tier` alone, as before.
+   */
+  tiers?: TierOffer[]
   quotaClass: QuotaClass
   locality: 'local' | 'remote'
   capabilities: CapabilityOffer[]
@@ -145,11 +203,19 @@ export interface CapabilityDescriptor {
   observedAt: string
 }
 
-/** The input to routing (`work-requirement@1.0`; `@1.1` adds `scope`, `@1.2` `kind`). */
+/** The input to routing (`work-requirement@1.0`; `@1.1` adds `scope`, `@1.2` `kind`, `@1.3` `prefers`). */
 export interface WorkRequirement {
-  schema: 'work-requirement@1.0' | 'work-requirement@1.1' | 'work-requirement@1.2'
+  schema: 'work-requirement@1.0' | 'work-requirement@1.1' | 'work-requirement@1.2' | 'work-requirement@1.3'
   objective: string
   capabilities: string[]
+  /**
+   * Capabilities the work prefers but does not need (`@1.3`; T262): among the admitted Workers, one
+   * that proves every one of them (for this work, as {@link provesFor} reads it) ranks before one that
+   * does not, after the reserve key and before tier. Never a refusal, and never a family: the research
+   * template's second review prefers `web-search`, so a Worker that can search is chosen before one
+   * that can only cite. Set by the workflow engine from the admitted spec, never from model text.
+   */
+  prefers?: string[]
   /**
    * The kind of work this is (`@1.1`; ADR-0049), so offers scoped to it count: set by the workflow
    * engine from the admitted spec (a review team member's step), never from a template or model text.
@@ -204,6 +270,12 @@ export interface WorkerStart {
    * with what the execution drew (the `agents` source's `quota-draw@1.0`, PROP-0015 E2).
    */
   step?: { template: string; node: string } | undefined
+  /**
+   * The tier routing served the work at (`AdmittedWorker.tier`, ADR-0073), for a Worker that offers
+   * several: its source runs that tier's model. Absent: the source serves the lowest tier it offers at
+   * or above the requirement's minimum, by the same rule.
+   */
+  tier?: Tier | undefined
   /** The requirement the Worker was admitted for, and the decisions that admitted it. */
   requirement: WorkRequirement
   decisions: { tier: ArtifactRef; route: ArtifactRef }
@@ -224,6 +296,9 @@ export interface WorkerSandbox {
 }
 
 /** One execution, as its owning runtime reports it. */
+/** What of the infrastructure alone ended an execution, as its source knows it (ADR-0069). */
+export type ExecutionInfrastructure = 'host-stopped' | 'worker-unavailable'
+
 export interface WorkerExecution {
   id: string
   status: ExecutionStatus
@@ -235,8 +310,16 @@ export interface WorkerExecution {
    * Why it failed. `siteError` (optional, ADR-0062): the input was sent, and the site answered it with
    * its own error in place of an answer, read on the execution's own page; nothing was answered. Only
    * a source that read that says so; absent, nothing is known of it.
+   *
+   * `infrastructure` (optional, ADR-0069): the source knows it failed only on the infrastructure,
+   * whatever was sent: `host-stopped`, its holder stopped with it in flight (a drain or restart of
+   * the host) and the source ended it for that alone when it started again; `worker-unavailable`,
+   * its Worker became unavailable while it ran (its runtime, account, or process gone) and that
+   * alone ended it. Only a source that knows the cause says so; a failure for any reason of the
+   * execution's own (a sandbox or worktree violation, a result not captured, its own answer) never
+   * carries it. A caller does not count such a failure against the work it served.
    */
-  error?: { kind: string; disposition: string; message: string; siteError?: true }
+  error?: { kind: string; disposition: string; message: string; siteError?: true; infrastructure?: ExecutionInfrastructure }
   /** Decisions the runtime made for this execution, such as `egress`. */
   decisions: ArtifactRef[]
 }
@@ -301,10 +384,38 @@ export interface LivenessQuery {
  * - `merge`: merge the branch, only while it is still at `head`, into the repository's checked-out
  *   branch `base.branch`, only while that is still at `base.sha` and its working tree is clean, as one
  *   merge commit with `message`. Never a force, a reset, or a push.
+ * - `rebase` (ADR-0068): the result's change, the branch at `head` against where it forked from the
+ *   base, made again on top of `base.sha` in the worktree, the branch moved there; `phase` `start`
+ *   replays it (the declared generated files made again, the new commit on the branch with `message`
+ *   when nothing else conflicts; else the worktree left on its branch at `base.sha`, the replay
+ *   uncommitted, the conflicted files marked, for a writing step to resolve); `resolved` commits a
+ *   resolution once no conflict marker is left; `abandon` puts the branch and the worktree back at
+ *   `head`. Only while the worktree is intact and no agent run of the workflow run can still write it
+ *   (INV-15). The pre-rebase head is kept under a ref of the repository's own; never a push.
+ *   `stacked` (the landing queue's batch): `base.sha` is the rebased head of the result before it in the
+ *   stack, not the base branch's own head; it is accepted while it holds the base branch's head.
+ * - `record` (board T232): keep the worktree's tree, while it is still exactly `subject`, as a commit
+ *   with `message` on the run's own history ref ({@link reviewRef}), on top of the last one recorded
+ *   there (else the worktree's HEAD): what each review read, and each fix's result, one commit each.
+ *   The worktree's HEAD, branch, index, and files are never touched, so a board task bound to its HEAD
+ *   still binds the run's result.
+ * - `release` (T345): the landing ended merged, or with nothing to land, and the task will not retry
+ *   this run: remove the worktree now, only while it is intact, no agent run of the workflow run can
+ *   still write it, and it holds nothing uncommitted. Its branch stays; nothing is forced.
  */
 export type LandStep =
   | { step: 'commit'; runId: string; workspace: string; subject: { ref: string; version: string }; message: string }
+  | { step: 'record'; runId: string; workspace: string; subject: { ref: string; version: string }; message: string }
   | { step: 'merge'; runId: string; workspace: string; head: string; base: { branch: string; sha: string }; message: string }
+  | { step: 'rebase'; runId: string; workspace: string; phase: RebasePhase; head: string; base: { branch: string; sha: string }; message: string; stacked?: true }
+  | { step: 'release'; runId: string; workspace: string }
+
+/** The ref that keeps a workflow run's review history (a {@link LandStep} `record`): never its branch, never checked out. */
+export const reviewRef = (runId: string): string => `refs/system/reviews/${runId}`
+
+/** Where a {@link LandStep} `rebase` is (ADR-0068). */
+export type RebasePhase = 'start' | 'resolved' | 'abandon'
+export const REBASE_PHASES: readonly RebasePhase[] = ['start', 'resolved', 'abandon']
 
 /**
  * A merge's generated files made again (T166): the files (repository-relative) the merge conflicted in
@@ -330,11 +441,42 @@ export type LandRefusal = 'moved' | 'gone' | 'busy' | 'base-moved' | 'head-moved
  *   before this step, such as after a restart); `regenerated` when the merge conflicted only in files
  *   the repository declares generated, and they were made again by its commands (T166);
  * - `refused`: nothing changed, and why.
+ *
+ * `committed` names, optionally, `fork`: where `head` forked from the base branch (their merge base);
+ * one that is not `base.sha` means the base moved since the result's work started (ADR-0068). A
+ * `rebase` step (ADR-0068) answers:
+ * - `rebased`: the branch's `head` is the change made again on top of `base.sha` (from `from`), the
+ *   worktree clean there at `subject`; `stat` the change against the base; `regenerated` when the
+ *   declared generated files were made again; `already` when it was before this step (a restart);
+ * - `conflicted`: the worktree is on its branch at `base.sha`, the replay uncommitted, and `files`
+ *   (repository-relative, at most {@link REBASE_FILES_MAX}, `more` past them) hold conflict markers;
+ *   `moved`, the base's commits since the fork, one line each (at most {@link REBASE_MOVED_MAX});
+ * - `abandoned`: the branch and the worktree are back at `head`; `left`, untracked files the
+ *   resolution made, kept where they are.
+ *
+ * A `record` step answers `recorded`: `commit` holds the tree on `ref`, on top of `parent`;
+ * `recorded` false when nothing new was made (the ref's last commit, or the worktree's HEAD, already
+ * held that tree; then `commit` is that one).
+ *
+ * A `release` step answers `released`: the worktree at `path` is removed, its `branch` kept, on the
+ * `retention` decision `decision` (INV-13); or `refused`, the worktree left where it is. A `commit`
+ * asked again after the release finds the landing commit on the branch (`committed` false, INV-4).
  */
 export type Landed =
-  | { outcome: 'committed'; repository: string; branch: string; head: string; committed: boolean; base: { branch: string; sha: string }; contained: boolean; stat: string }
+  /** `subject`: the tree the worktree holds once committed, where a landing whose base did not move runs its full suite (T299). */
+  | { outcome: 'committed'; repository: string; branch: string; head: string; committed: boolean; base: { branch: string; sha: string }; contained: boolean; stat: string; fork?: string; subject?: { ref: string; version: string } }
   | { outcome: 'merged'; repository: string; branch: string; head: string; base: { branch: string; sha: string }; commit: string; already: boolean; regenerated?: Regenerated }
+  | { outcome: 'rebased'; repository: string; branch: string; head: string; from: string; base: { branch: string; sha: string }; subject: { ref: string; version: string }; stat: string; already: boolean; regenerated?: Regenerated }
+  | { outcome: 'conflicted'; repository: string; branch: string; from: string; base: { branch: string; sha: string }; fork: string; files: string[]; more: number; moved: string[] }
+  | { outcome: 'abandoned'; repository: string; branch: string; head: string; left: string[] }
+  | { outcome: 'recorded'; repository: string; ref: string; commit: string; parent: string; recorded: boolean }
+  | { outcome: 'released'; repository: string; branch: string; path: string; decision: string }
   | { outcome: 'refused'; cause: LandRefusal; reason: string }
+
+/** Conflicted files a `conflicted` rebase names at most (INV-9). */
+export const REBASE_FILES_MAX = 50
+/** The base's commits since the fork a `conflicted` rebase names at most (INV-9). */
+export const REBASE_MOVED_MAX = 20
 
 /** One file of a run's change (`WorkChange`): its path, how it changed, its lines added and removed, and its diff. */
 export interface ChangedFile {
@@ -386,19 +528,25 @@ export interface WorkChange {
 export const CHANGE_BOUNDS = { files: 200, fileChars: 64_000, totalChars: 512_000 } as const
 
 /**
- * Start a workflow run's worktree from an earlier run's work (ADR-0061): the next attempt of a board
- * task whose previous attempt's writing step completed, and failed only after it, continues from that
- * tree instead of redoing it. The source that holds `from.workspace` as the worktree of workflow run
- * `from.runId` commits it on that worktree's branch, only while it is still exactly `from.subject`
- * (the tree the writing step left) and no run of it can still write it, with `message`; then it cuts
- * the worktree of `runId` at the commit `from.subject.ref` names, only while that is still the
- * repository's HEAD (where a fresh worktree is cut from), holding the committed tree as changes on top.
- * Never a force, a reset, or a push.
+ * Start a workflow run's worktree from an earlier run's work (ADR-0061, T271): the next attempt of a
+ * board task whose previous attempt's writing step completed, and that ended unaccepted, continues
+ * from that tree instead of redoing it. The source that holds `from.workspace` as the worktree of
+ * workflow run `from.runId` commits it on that worktree's branch (or finds it committed there, kept as
+ * that attempt's result), only while it is still exactly `from.subject` (the tree the writing step
+ * left) and no run of it can still write it, with `message`; then it cuts the worktree of `runId` at
+ * the repository's HEAD (where a fresh worktree is cut from) holding the change as changes on top,
+ * replayed there when HEAD is not `from.subject.ref`; when the replay conflicts, at `from.subject.ref`
+ * itself, the conflict named in the answer. Never a force, a reset, or a push.
  */
 export interface CarryStep {
   runId: string
   from: { runId: string; workspace: string; subject: { ref: string; version: string } }
   message: string
+  /**
+   * The commit the task writes now (T271): the carry goes onto it, and only while it is the
+   * repository's HEAD; else it is refused as `base-moved`. Absent: onto the HEAD, whatever it is.
+   */
+  onto?: string
 }
 
 /**
@@ -406,9 +554,12 @@ export interface CarryStep {
  * before. `moved`: the earlier tree is no longer the subject its writing step left; `gone`: its worktree
  * was removed; `busy`: a run of it is unfinished or not known to be gone; `base-moved`: the repository's
  * HEAD is no longer the tree's base; `exists`: the new run has a worktree (or its branch) already;
- * `empty`: the earlier tree holds no change; `failed`: anything else, such as a worktree not intact.
+ * `empty`: the earlier tree holds no change; `no-room`: the host has no room to cut the new run's
+ * worktree now (the disk floor, T345), a passing condition: the carry is asked again, not settled,
+ * for as long as the earlier tree is kept (once it is removed, the carry is refused `gone`);
+ * `failed`: anything else, such as a worktree not intact.
  */
-export type CarryRefusal = 'moved' | 'gone' | 'busy' | 'base-moved' | 'exists' | 'empty' | 'failed'
+export type CarryRefusal = 'moved' | 'gone' | 'busy' | 'base-moved' | 'exists' | 'empty' | 'no-room' | 'failed'
 
 /**
  * What a carry did (ADR-0061):
@@ -419,15 +570,24 @@ export type CarryRefusal = 'moved' | 'gone' | 'busy' | 'base-moved' | 'exists' |
  *   as the retention would commit it).
  */
 export type Carried =
-  | { outcome: 'carried'; repository: string; from: { branch: string; commit: string }; base: string; branch: string; worktree: string; carried: boolean }
+  | {
+    outcome: 'carried'; repository: string; from: { branch: string; commit: string }; base: string; branch: string; worktree: string; carried: boolean
+    /**
+     * What a move of the repository's HEAD since the tree's base did (T271): `rebased`, the change
+     * replays on it without conflict, so `base` is that HEAD and the worktree holds the replayed change;
+     * `conflict`, the replay conflicts (`files`), so `base` stays the tree's own base and the Worker
+     * resolves the move. Absent: HEAD was still the tree's base.
+     */
+    rebase?: { outcome: 'rebased' | 'conflict'; from: string; onto: string; files?: string[] }
+  }
   | { outcome: 'refused'; cause: CarryRefusal; reason: string }
 
 /**
  * The checks a policy can require that are commands (`autonomy-policy` `requires`): what a run's
  * checks run (T151). The others (`schema`, `review`, `quote-check`) are judged by the run itself.
  */
-export type RunCheck = 'tests' | 'typecheck' | 'lint'
-export const RUN_CHECKS: readonly RunCheck[] = ['tests', 'typecheck', 'lint']
+export type RunCheck = 'tests' | 'typecheck' | 'lint' | 'red-on-base'
+export const RUN_CHECKS: readonly RunCheck[] = ['tests', 'typecheck', 'lint', 'red-on-base']
 
 /**
  * Run a workflow run's required checks on its result (T151): the source that holds `workspace` as
@@ -442,7 +602,41 @@ export interface CheckStep {
   subject: { ref: string; version: string }
   checks: RunCheck[]
   classification: 'public' | 'operator-shared' | 'local-private'
+  /**
+   * What the checks are for (T299): `acceptance` (the default), the result's own tree, where a
+   * `tests` command runs the tests related to the files the result changed; `landing`, the tree
+   * rebased onto its base, where it runs the whole suite, once per landing. A result of one scope is
+   * never taken for the other's. `daily` (T305b) is a tip's own, set by {@link TipCheckStep}'s run:
+   * the whole suite with every browser test.
+   */
+  scope?: 'acceptance' | 'landing' | 'daily'
+  /**
+   * The task's criteria say `refactor: no behaviour change` (T306c): a check that reads it
+   * (`red-on-base`) requires that no existing test was changed, instead of that new tests fail on the base.
+   */
+  refactor?: boolean
 }
+
+/**
+ * Run a check on the tip of a ref of a repository, with no workflow run's result behind it (T305b: the
+ * daily run of every browser spec): the source that holds the repository cuts a worktree of its own at
+ * `commit`, sets it up as it does a run's, and runs the `tests` check at the `daily` scope (the whole
+ * suite, every browser test with it), confined and read-only, in the host's one queue of checks.
+ * `runId` names the worktree and the check's record; it is no workflow run.
+ */
+export interface TipCheckStep {
+  runId: string
+  /** The repository's absolute path (the operator's configuration names it). */
+  repository: string
+  /** The commit the ref named when the day's run started: the tree that is checked. */
+  commit: string
+  classification: 'public' | 'operator-shared' | 'local-private'
+}
+
+/** What a {@link TipCheckStep} came to: the check's result, as a run's check gives it, or why nothing ran. */
+export type TipChecked =
+  | { outcome: 'checked'; result: CheckResult; evidence?: string }
+  | { outcome: 'refused'; cause: CheckRefusal; reason: string }
 
 /**
  * One check of a {@link CheckStep}: `passed` (its command exited 0 on the subject, and left it as it
@@ -456,20 +650,38 @@ export interface CheckResult {
   outcome: 'passed' | 'failed' | 'error'
   exitCode?: number
   reason: string
+  /**
+   * What the command itself reported it did not run, though it exited (a `passed` or `failed`
+   * check): its browser tests, with why (no usable browser there). Its outcome says nothing of
+   * those tests, and a review is told so (T247).
+   */
+  notRun?: string
+  /**
+   * A `failed` check's failing lines, read from its output by the source that ran it: the names of
+   * its failing tests and their assertion lines, at most 200 lines of 240 characters, so the Worker
+   * that must fix it reads them in the task's dossier (T270). Absent for a check that did not fail.
+   */
+  failures?: string[]
 }
 
-/** Why a run's checks did not run at all: the worktree moved off the subject, was removed, may still be written, or anything else. */
-export type CheckRefusal = 'moved' | 'gone' | 'busy' | 'failed'
+/**
+ * Why a run's checks did not run at all: the worktree moved off the subject, was removed, may still be
+ * written, the result changed its dependencies and the setup run again for them needed a package it
+ * cannot get without the network (`dependency_unavailable`, the packages named in the reason, T235),
+ * or anything else.
+ */
+export type CheckRefusal = 'moved' | 'gone' | 'busy' | 'dependency_unavailable' | 'failed'
 
 /**
  * What a run's checks came to (T151):
  * - `checked`: one result per check asked, in its order; `evidence`, the `check-run@1.0` evidence
  *   artifact that records what ran, when any command was started;
- * - `refused`: nothing ran, and why; every check stays pending.
+ * - `refused`: nothing ran, and why; every check stays pending. `requests`: the approval requests it
+ *   waits on (a new lockfile's verification, T333): once each is resolved, asking again runs the checks.
  */
 export type Checked =
   | { outcome: 'checked'; results: CheckResult[]; evidence?: string }
-  | { outcome: 'refused'; cause: CheckRefusal; reason: string }
+  | { outcome: 'refused'; cause: CheckRefusal; reason: string; requests?: string[] }
 
 /**
  * Contributes Workers and runs work on them (the Worker's three questions: can it accept
@@ -496,6 +708,12 @@ export interface WorkerSource {
    * policy allows (`NO_LOCAL_SANDBOX`).
    */
   sandbox?(worker: string, runId?: string): WorkerSandbox | undefined
+  /**
+   * The model a run on this Worker at `tier` asks for, as its source's configuration gives it
+   * (ADR-0073), for the brief to record beside the served tier; undefined when the source names none.
+   * Configuration, shown only: routing never reads it (INV-11).
+   */
+  model?(worker: string, tier: Tier): string | undefined
   /** The Workers a continued session must stay on, when this source owns the session. */
   affinity?(sessionId: string): string[] | undefined
   /**
@@ -557,6 +775,12 @@ export interface WorkerSource {
    * the step then throws.
    */
   check?(step: CheckStep, signal?: AbortSignal): Promise<Checked | undefined>
+  /**
+   * Run the `tests` check on the tip commit of a repository this source holds (T305b), in a worktree
+   * it cuts for the step, at the `daily` scope. Undefined when it holds no such repository. The
+   * check is confined and read-only like a run's, queued with them, and stored on the step's `runId`.
+   */
+  checkTip?(step: TipCheckStep, signal?: AbortSignal): Promise<TipChecked | undefined>
   /**
    * The caller is done with these sessions for good (their run was deleted or expired): what the
    * source created for them outside `system` (a website conversation) is deleted. How many of
@@ -638,6 +862,8 @@ export interface Candidate {
   source: string
   /** Every admission check it fails, in the router's order and words; empty when routing admits it. */
   failed: Rejection['failed']
+  /** The tier it would serve the work at ({@link servedTier}, ADR-0073), when routing admits it. */
+  tier?: Tier
 }
 
 /**
@@ -662,6 +888,12 @@ export interface AdmittedWorker {
   worker: CapabilityDescriptor
   /** Name of the source that describes the Worker, and runs work on it. */
   source: string
+  /**
+   * The tier it serves this work at (ADR-0073): the lowest tier it offers within the requirement's
+   * bounds whose model's pool is open; the `tier` decision's outcome. Optional for a router that
+   * predates it: then the Worker's `tier`.
+   */
+  tier?: Tier
   /** The stored work requirement and the decisions that chose the Worker (INV-13). */
   requirement: ArtifactRef
   decisions: { tier: ArtifactRef; route: ArtifactRef }
@@ -698,9 +930,13 @@ export interface Acceptance extends AcceptanceCheck {
  * `limitUntil` (ADR-0052): when every Worker refused only for its limit is on an assigned account,
  * the earliest reset among their known limits, so the caller may wait for it instead of failing;
  * absent otherwise, and when no reset is known.
+ * `retryAt` (T282): when a Worker that proves the work is refused only for a while that passes by
+ * itself (out of quota or at a limit with no reset `limitUntil` names, or unavailable with its
+ * source's `expectedBack`), the next time the work is worth routing again, so the caller waits,
+ * bounded, instead of failing it; absent otherwise. A caller that knows nothing of it fails as before.
  */
 export class AdmissionFailure extends Error {
-  constructor(readonly rejections: readonly Rejection[], readonly decision: ArtifactRef, message: string, readonly limitUntil?: string) {
+  constructor(readonly rejections: readonly Rejection[], readonly decision: ArtifactRef, message: string, readonly limitUntil?: string, readonly retryAt?: string) {
     super(message)
     this.name = 'AdmissionFailure'
   }
@@ -786,6 +1022,13 @@ export abstract class Workers extends Service {
    * checks stay pending (T151).
    */
   abstract check?(step: CheckStep, signal?: AbortSignal): Promise<(Checked & { source: string }) | undefined>
+
+  /**
+   * Run the tests check on the tip of a repository, by the source that holds it (`WorkerSource.checkTip`),
+   * with that source's name; undefined when none does. A source that throws, unless `signal` stopped it,
+   * is a refusal (`failed`), never a check passed (INV-2). Optional (T305b).
+   */
+  abstract checkTip?(step: TipCheckStep, signal?: AbortSignal): Promise<(TipChecked & { source: string }) | undefined>
 
   /** Release sessions for good, at every source that owns some of them: how many records became due. */
   abstract release(sessionIds: readonly string[], reason: string): { due: number }

@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-16 (accepted 2026-10-16)
-- **Related:** [PROP-0004](../../proposals/0004-claude-code-lead-mvp.md),
+- **Related:** PROP-0004 (removed; in Git history),
   [ADR-0011](0011-mvp-integration-via-mcp.md), [ADR-0027](0027-provider-diversity-in-routing.md),
   [INV-13](../../architecture/invariants.md#inv-13-every-decision-is-an-artifact),
   [INV-15](../../architecture/invariants.md#inv-15-one-writer-per-subject), REQ-TEAM-6, REQ-TEAM-7

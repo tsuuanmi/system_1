@@ -18,6 +18,11 @@
  * branch, only while both are still where the approval saw them. A conflict is aborted, so the
  * repository is as it was; nothing is ever forced, reset, or pushed.
  *
+ * Review history (board T232): on the engine's ask, the tree a review read and each fix's result are
+ * kept as commits on the run's own ref `refs/system/reviews/<runId>`, built in an index of their own:
+ * the worktree's HEAD, branch, index, and files never move, so the commit a board task writes stays
+ * the HEAD its result binds to.
+ *
  * Carrying (ADR-0061): a board task's next attempt may start from the work its previous attempt left,
  * when that attempt failed only after its writing step. On the engine's ask, the earlier worktree is
  * committed on its branch, only while it is still exactly the tree its writing step left, and the new
@@ -34,33 +39,85 @@
  */
 import { execFile, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeSync } from 'node:fs'
 import { type FileHandle, open } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { promisify } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
-import type {} from '@tsuuanmi/system-artifacts'
-import { BRIEF_FILE_PATH, captureGitSubject, ensurePrivateDir, subjectId } from '@tsuuanmi/system-libs'
-import type {} from '@tsuuanmi/system-store'
-import { type Carried, type CarryRefusal, type CarryStep, CHANGE_BOUNDS, type ChangedFile, type Landed, type LandStep, type WorkChange } from '@tsuuanmi/system-workers-core'
+import type {} from '@tsuuanmi/system-ledger-core'
+import { BRIEF_FILE_PATH, captureGitSubject, ensurePrivateDir, sandboxPlaceholder, subjectId } from '@tsuuanmi/system-libs'
+import {
+  type Carried, type CarryRefusal, type CarryStep, CHANGE_BOUNDS, type ChangedFile, type Landed, type LandRefusal, type LandStep, REBASE_FILES_MAX, REBASE_MOVED_MAX, type Regenerated, reviewRef, type WorkChange,
+} from '@tsuuanmi/system-workers-core'
 import type { Regeneration } from './regenerate.ts'
 
 /** A workflow run id as it may name a branch and a directory: letters, digits, `_`, `-`. */
 export const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
 /** git 2.17 added `git worktree remove`. */
-export const WORKTREE_GIT_FLOOR = [2, 17] as const
+const WORKTREE_GIT_FLOOR = [2, 17] as const
 /** At most this many worktrees are retired by one sweep; the rest wait for the next. */
-export const SWEEP_BATCH = 50
+const SWEEP_BATCH = 50
 /** Who commits a worktree's pending changes before it is removed. */
-export const SYSTEM_AUTHOR = { name: 'system', email: 'system@localhost' } as const
+const SYSTEM_AUTHOR ={ name: 'system', email: 'system@localhost' } as const
 
 /** The trailer a landing's commit carries: the exact subject it holds, so a commit repeated after a restart is found done (INV-4). */
 export const SUBJECT_TRAILER = 'System-Subject'
 /** The trailer the commit of a carried tree carries: the workflow run whose worktree starts from it (ADR-0061). */
-export const CARRIED_TRAILER = 'System-Carried-To'
+const CARRIED_TRAILER = 'System-Carried-To'
 /** The first line of the commit by which the retention keeps a worktree's uncommitted work on its branch. */
-export const keptSubject = (runId: string): string => `system: keep the uncommitted work of workflow run ${runId}`
+const keptSubject =(runId: string): string => `system: keep the uncommitted work of workflow run ${runId}`
+
+/**
+ * The trailers of a landing's rebase commit (ADR-0068): the head it was made from and the base commit
+ * it is on, so a step repeated after a restart finds it done (INV-4). The last of each is the latest.
+ */
+export const REBASED_TRAILER = 'System-Rebased-From'
+export const ONTO_TRAILER = 'System-Rebased-Onto'
+/** Rebases of one result a landing follows back to its landing commit, at most. */
+const REBASE_DEPTH = 8
+/**
+ * The ref that keeps a run's head from before its landing rebased it (ADR-0068), one per head: the
+ * branch moves, and what it held stays reachable, for the operator and for a restart mid-rebase.
+ */
+export const rebaseRef = (runId: string, head: string): string => `refs/system/rebase/${runId}/${head}`
+/**
+ * The ref that says a landing's rebase of `head` was replayed in its worktree (ADR-0068): set to the
+ * base once the worktree holds the replay (its generated conflicts already taking a side), never
+ * before. A rebase begun without it may have stopped anywhere between moving the branch and the
+ * replay, so its worktree is made the base's again and the replay run again; only with it is what the
+ * worktree holds the replay, to commit (INV-4).
+ */
+const replayedRef =(runId: string, head: string): string => `refs/system/rebase-replayed/${runId}/${head}`
+/** The head a rebase commit's message says it was made from (its last {@link REBASED_TRAILER}), when it says one. */
+const rebasedFrom = (message: readonly string[]): string | undefined => {
+  const line = message.findLast((l) => l.startsWith(`${REBASED_TRAILER}: `))
+  const from = line?.slice(REBASED_TRAILER.length + 2).trim()
+  return from && /^[0-9a-f]{40,64}$/.test(from) ? from : undefined
+}
+/** A conflict marker line git writes (`<<<<<<< ours`, `>>>>>>> theirs`); `=======` alone is too common a line (a heading's underline) to count. */
+const MARKER = /^(?:<{7}|>{7})(?: |$)/m
+/** The largest file a resolution's marker check reads; a larger one is taken as holding markers (INV-2, INV-9). */
+const MARKER_FILE_BYTES = 8 * 1024 * 1024
+
+/** Whether the file at `path` (never followed through a link) holds a conflict marker; anything but a regular file holds none. */
+function hasMarkers(path: string): boolean {
+  let fd: number
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  } catch {
+    return false
+  }
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isFile()) return false
+    if (stat.size > MARKER_FILE_BYTES) return true
+    return MARKER.test(readFileSync(fd, 'utf8'))
+  } finally {
+    closeSync(fd)
+  }
+}
 
 /**
  * A worktree cut from an earlier run's work (ADR-0061): that workflow run, and the commit on its
@@ -78,6 +135,14 @@ export const CARRY_MIGRATION = {
 export const FORK_MIGRATION = {
   version: 16,
   sql: 'ALTER TABLE agent_worktrees ADD COLUMN forked_at TEXT;',
+}
+/**
+ * When a check on a tip (T305b), which has no agent run, last started or ended in the worktree: its
+ * retention counts from then, never from when the worktree was cut, so a long daily run is never past it.
+ */
+export const USED_MIGRATION = {
+  version: 23,
+  sql: 'ALTER TABLE agent_worktrees ADD COLUMN used_at TEXT;',
 }
 /** Characters of a change's `git diff --stat` a landing reports at most (INV-9). */
 const STAT_CHARS = 1500
@@ -106,13 +171,27 @@ export const notKnownGone = (alias: string): string => `${alias}liveness_decisio
 const FREE = `NOT EXISTS (SELECT 1 FROM agent_runs r WHERE r.workflow_run_id = w.workflow_run_id AND r.status IN ('queued', 'running'))
   AND NOT EXISTS (SELECT 1 FROM agent_runs r WHERE r.workflow_run_id = w.workflow_run_id AND ${notKnownGone('r.')} AND r.run_id IS NOT ?)`
 
-/** A worktree that is {@link FREE} (with no run excepted), and whose workflow run's last agent run ended before the cutoff (the second `?`). */
+/**
+ * When a worktree was last used: its workflow run's last agent run, or the last start or end of a check
+ * on a tip in it (`used_at`, T305b), whichever is later; when it was cut, with neither.
+ */
+const LAST_USED = `max(COALESCE((SELECT MAX(r.updated_at) FROM agent_runs r WHERE r.workflow_run_id = w.workflow_run_id), w.created_at), COALESCE(w.used_at, ''))`
+
+/** A worktree that is {@link FREE} (with no run excepted), and last used before the cutoff (the second `?`). */
 const IDLE = `${FREE}
-  AND COALESCE((SELECT MAX(r.updated_at) FROM agent_runs r WHERE r.workflow_run_id = w.workflow_run_id), w.created_at) < ?`
+  AND ${LAST_USED} < ?`
 
 /** A worktree that cannot be prepared, checked, or retired; what git said, if it ran. */
-export class WorktreeError extends Error {
+class WorktreeError extends Error {
   override readonly name = 'WorktreeError'
+}
+
+/**
+ * No new worktree is cut now: the worktrees' filesystem is under the disk floor (T345). A passing host
+ * condition, never the run's own failure: its start waits for room (`overloaded`), and is not counted.
+ */
+export class DiskFloorError extends Error {
+  override readonly name = 'DiskFloorError'
 }
 
 /** What a failed git said, as one line: its stderr without hints, else `fallback`. */
@@ -146,9 +225,9 @@ function controlFile(path: string): string {
 const failed = (dir: string, args: string[], why: string): WorktreeError => new WorktreeError(`git ${args.find((a) => !a.startsWith('-') && !a.includes('=')) ?? ''} in ${dir}: ${why.slice(0, 300)}`)
 
 /** `git -C dir …`, bounded; rejects with what git said. */
-async function git(dir: string, args: string[]): Promise<string> {
+async function git(dir: string, args: string[], env: Record<string, string> = {}): Promise<string> {
   try {
-    return (await execFileAsync('git', ['-C', dir, ...SAFE, ...args], { env: ENV, timeout: GIT_MS, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024 })).stdout
+    return (await execFileAsync('git', ['-C', dir, ...SAFE, ...args], { env: { ...ENV, ...env }, timeout: GIT_MS, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024 })).stdout
   } catch (error) {
     const e = error as NodeJS.ErrnoException & { stderr?: string; killed?: boolean }
     throw failed(dir, args, e.code === 'ENOENT' ? 'git is not installed' : e.killed ? `it took longer than ${GIT_MS / 1000} s` : said(e.stderr ?? '', e.message))
@@ -206,6 +285,32 @@ function gitRead(dir: string, args: string[], take: (text: string) => boolean): 
   })
 }
 
+/**
+ * The text of `path` (relative to the repository's top level) as the repository at `dir` has it
+ * committed at HEAD, never as its working tree has it, so an uncommitted edit is never read; at most
+ * `maxChars` characters, read no further (INV-9), `cut` when there was more. Undefined when `dir` is
+ * in no repository, it has no commit, or no file is committed at that path; git runs as every git
+ * here does (no hooks, no configuration of the machine's, bounded time).
+ */
+export async function committedText(dir: string, path: string, maxChars: number): Promise<{ text: string; cut: boolean } | undefined> {
+  const object = `HEAD:${path}`
+  const type = await git(dir, ['cat-file', '-t', object]).then((out) => out.trim(), () => undefined)
+  if (type !== 'blob') return undefined
+  let text = ''
+  const { stopped } = await gitRead(dir, ['cat-file', 'blob', object], (piece) => {
+    text += piece
+    return text.length > maxChars
+  })
+  const cut = stopped || text.length > maxChars
+  return { text: text.slice(0, maxChars), cut }
+}
+
+/** The git blob id of `path` as committed at `dir`'s HEAD, or undefined when HEAD holds no such blob. */
+export async function committedBlob(dir: string, path: string): Promise<string | undefined> {
+  const id = await git(dir, ['rev-parse', '--verify', '--quiet', `HEAD:${path}`]).then((out) => out.trim(), () => undefined)
+  return id && /^[0-9a-f]{40,64}$/.test(id) ? id : undefined
+}
+
 /** Characters one NUL-separated field of git's output may have (a path, a status): longer is not git's listing. */
 const FIELD_CHARS = 64 * 1024
 
@@ -219,6 +324,26 @@ function fields(field: (value: string) => boolean): (text: string) => boolean {
     for (const part of parts) if (field(part)) return true
     return false
   }
+}
+
+/** Dependency files {@link dependencyPaths} lists at most: past it, the listing is refused, never cut (INV-2, INV-9). */
+const DEPENDENCY_PATHS_MAX = 2000
+
+/**
+ * The paths of the worktree at `path` whose file name is one of `names` (a dependency manifest, the
+ * lockfile), at any depth: tracked (in its index, there or not) or untracked and not ignored, as git
+ * lists them with the worktree's own administrative directory `gitdir`, never through what its `.git`
+ * file says. Sorted. Throws past {@link DEPENDENCY_PATHS_MAX}, or when git fails.
+ */
+export async function dependencyPaths(path: string, gitdir: string, names: readonly string[]): Promise<string[]> {
+  const wanted = new Set(names)
+  const found = new Set<string>()
+  const { stopped } = await gitRead(path, [`--git-dir=${gitdir}`, `--work-tree=${path}`, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], fields((p) => {
+    if (wanted.has(basename(p))) found.add(p)
+    return found.size > DEPENDENCY_PATHS_MAX
+  }))
+  if (stopped) throw new WorktreeError(`${path} holds more than ${DEPENDENCY_PATHS_MAX} dependency files (${names.join(', ')})`)
+  return [...found].sort()
 }
 
 const DIFF_HEADER = 'diff --git '
@@ -298,7 +423,7 @@ const real = (path: string): string | undefined => {
 
 const under = (path: string, root: string): boolean => path === root || path.startsWith(root.endsWith(sep) ? root : root + sep)
 
-export const branchOf = (runId: string): string => `system/run/${runId}`
+const branchOf =(runId: string): string => `system/run/${runId}`
 
 /** The directory of a repository's worktrees: its name, then a short hash of its real path. */
 export function repositoryKey(repository: string): string {
@@ -349,6 +474,16 @@ function notPlainFile(path: string): boolean {
   }
 }
 
+/** Whether anything is at `path`, never following a link at it. */
+function lexists(path: string): boolean {
+  try {
+    lstatSync(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** A directory opened as itself, and the path that reaches it through its descriptor. The caller closes `fd`. */
 export interface OpenedDirectory { fd: number; at: string }
 
@@ -389,6 +524,8 @@ interface WorktreeRow {
   /** The worktree's administrative directory, recorded when it was added (real path). */
   gitdir: string
   created_at: string
+  /** The last start or end of a check on a tip in it (T305b). */
+  used_at?: string | null
   removed_at: string | null
   /** The `retention` decision that retires it, once the rule has decided. */
   decision: string | null
@@ -465,17 +602,22 @@ export type RunWorktreeRelease = WorktreeRelease & { runId: string }
 
 export class Worktrees {
   private readonly queues = new Map<string, Promise<unknown>>()
+  /** The worktrees a check on a tip uses now, in this process (T305b), by repository and run: none is retired while it is. */
+  private readonly inUse = new Set<string>()
   private version: [number, number] | undefined
 
   /**
    * `root` is where worktrees go: `<root>/<repository key>/<runId>`. `regeneration` names, for a
    * repository (real path) and a worktree's stored setup hash, the files a landing may regenerate on a
-   * conflict and how (./regenerate.ts, T166); none, and every conflict refuses the merge.
+   * conflict and how (./regenerate.ts, T166); none, and every conflict refuses the merge. `diskFloor`
+   * says why no new worktree may be cut now (the disk floor, T345), or nothing: asked before every cut
+   * ({@link acquire} of a new one, a carry's cut), never for a worktree a run has already.
    */
   constructor(
     private readonly ctx: Pick<Context, 'store' | 'artifacts' | 'logger'>,
     private readonly root: string,
     private readonly regeneration?: (repository: string, setupHash: string | null) => Regeneration | undefined,
+    private readonly diskFloor?: () => string | undefined,
   ) {}
 
   /**
@@ -513,6 +655,36 @@ export class Worktrees {
   }
 
   /**
+   * Hold the worktree of `runId` on `repository` (a real path) for a check on a tip (T305b), which has no
+   * agent run to keep it: from now until the returned release, through its setup, its wait in the queue
+   * of checks, and its command, neither the retention nor the operator's removal retires it, and it is
+   * listed in use. Its `used_at` is set at both ends, so its retention counts from the check's end, and a
+   * stop that cuts the check (the hold is this process's) leaves it counted from the check's start.
+   * Taken before {@link acquire}, so no sweep comes between the worktree's cut and its hold.
+   */
+  use(repository: string, runId: string): () => void {
+    const key = `${repository}\0${runId}`
+    const stamp = (): void => {
+      this.ctx.store.transaction((db) => {
+        db.prepare('UPDATE agent_worktrees SET used_at = ? WHERE repository = ? AND workflow_run_id = ? AND removed_at IS NULL').run(new Date().toISOString(), repository, runId)
+      })
+    }
+    this.inUse.add(key)
+    stamp()
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      stamp()
+      this.inUse.delete(key)
+    }
+  }
+
+  private used(row: Pick<WorktreeRow, 'repository' | 'workflow_run_id'>): boolean {
+    return this.inUse.has(`${row.repository}\0${row.workflow_run_id}`)
+  }
+
+  /**
    * Where the worktree of `runId` on the repository at `workspace` is, or where {@link acquire} adds
    * it: the stored path, else the planned one. Reads only: a run's brief names it before it exists.
    */
@@ -525,9 +697,10 @@ export class Worktrees {
    * The worktree of `runId` on `repository` (a real path from {@link check}): the stored one,
    * after checking it is still this run's, or a new one. A new one is added from the run's branch
    * when that exists (a run continued after its worktree was removed), else on a new branch from
-   * the repository's HEAD. One change at a time per repository. Throws {@link WorktreeError}.
+   * the repository's HEAD, or at the commit `at` (the daily check's tip, T305b). One change at a
+   * time per repository. Throws {@link WorktreeError}.
    */
-  acquire(repository: string, runId: string): Promise<string> {
+  acquire(repository: string, runId: string, at = 'HEAD'): Promise<string> {
     if (!RUN_ID.test(runId)) return Promise.reject(new WorktreeError(`${runId} cannot name a worktree`))
     return this.exclusive(repository, async () => {
       const row = this.row(repository, runId)
@@ -538,6 +711,9 @@ export class Worktrees {
         await this.verify(row)
         return row.path
       }
+      // A new checkout is cut: not under the disk floor (T345).
+      const low = this.diskFloor?.()
+      if (low) throw new DiskFloorError(low)
       let path = row?.path
       if (!path) {
         mkdirSync(this.root, { recursive: true, mode: 0o700 })
@@ -556,7 +732,7 @@ export class Worktrees {
           throw new WorktreeError(`${branch} ends in ${tip}, the retention's commit of the worktree cut to start from the work of run ${row.carried_from}, which never got into it: that commit holds no run's work (the files it did not get are deleted), so no worktree is added from it; the branch is left for the operator`)
         }
       }
-      await git(repository, exists ? ['worktree', 'add', path, branch] : ['worktree', 'add', '-b', branch, path, 'HEAD'])
+      await git(repository, exists ? ['worktree', 'add', path, branch] : ['worktree', 'add', '-b', branch, path, at])
       const common = real(resolve(repository, (await git(repository, ['rev-parse', '--git-common-dir'])).trim()))
       const gitdir = pointer(path)
       if (!common || !gitdir || !under(gitdir, join(common, 'worktrees'))) throw new WorktreeError(`${path} was added, and its .git file does not point into the worktrees of ${repository}; it is left for the operator`)
@@ -569,7 +745,7 @@ export class Worktrees {
           ON CONFLICT (repository, workflow_run_id) DO UPDATE SET path = excluded.path, branch = excluded.branch, gitdir = excluded.gitdir, created_at = excluded.created_at,
           removed_at = NULL, decision = NULL, failure = NULL, failed_at = NULL, setup_hash = NULL, setup_decision = NULL, carried_from = NULL, carried_commit = NULL, forked_at = excluded.forked_at`).run(repository, runId, path, branch, gitdir, new Date().toISOString(), forkedAt)
       })
-      this.ctx.logger.info(`agent Workers: run ${runId} works in ${path} on ${branch}, ${exists ? 'added again from that branch' : `branched from the HEAD of ${repository}`}`)
+      this.ctx.logger.info(`agent Workers: run ${runId} works in ${path} on ${branch}, ${exists ? 'added again from that branch' : `branched from ${at === 'HEAD' ? 'the HEAD' : at} of ${repository}`}`)
       return path
     })
   }
@@ -584,15 +760,23 @@ export class Worktrees {
    * a plain directory (or file) of the worktree: a link is never followed out of the workspace.
    * `.system` is opened once, as itself, and every file is written relative to that descriptor
    * ({@link openDirectory}), so nothing is checked by name before it is used.
+   *
+   * The directory then holds exactly this brief's files (T267): a file an earlier run's brief placed
+   * there and this one's does not name (the dossier an author's step was given, say) is removed before
+   * the agent starts, so a step whose brief places none (an author's fresh-context self-review) finds
+   * none. Called for every run in a worktree of its own, with no files too.
    */
   async place(workspace: string, files: ReadonlyArray<{ path: string; text: string }>): Promise<void> {
-    if (!files.length) return
+    const dir = join(workspace, '.system')
+    // With no file to place and no `.system` there, nothing is to be done (lstat never follows a link).
+    if (!files.length && !lexists(dir)) return
     const row = this.ctx.store.db.prepare('SELECT gitdir FROM agent_worktrees WHERE path = ? AND removed_at IS NULL').get(workspace) as { gitdir: string } | undefined
     if (!row || pointer(workspace) !== row.gitdir) throw new WorktreeError(`${workspace} is not an intact worktree of a run; no file is written there`)
     for (const file of files) if (!BRIEF_FILE_PATH.test(file.path)) throw new WorktreeError(`${JSON.stringify(file.path)} is not a file under .system/; nothing is written`)
     const tracked = await git(workspace, [`--git-dir=${row.gitdir}`, `--work-tree=${workspace}`, 'ls-files', '-z', '--', '.system'])
+    // A `.system` the repository tracks is its own, never system's: with nothing to place, nothing of system's is there to remove.
+    if (tracked.length && !files.length) return
     if (tracked.length) throw new WorktreeError(`the repository tracks files under .system/ (${tracked.split('\0')[0]}); system's workspace files would change them, so none is written`)
-    const dir = join(workspace, '.system')
     // Made when absent (mkdir never follows a link at its name), then opened as itself.
     try {
       mkdirSync(dir, { mode: 0o755 })
@@ -602,6 +786,14 @@ export class Worktrees {
     const opened = openDirectory(dir)
     if (typeof opened === 'string') throw new WorktreeError(`${dir} is not a directory of the worktree; nothing is written`)
     try {
+      // What an earlier brief left and this one does not name goes first: only this run's files stay.
+      const keep = new Set(['.gitignore', ...files.map((f) => f.path.slice('.system/'.length))])
+      for (const name of readdirSync(opened.at)) {
+        if (keep.has(name)) continue
+        const path = join(opened.at, name)
+        if (lstatSync(path).isDirectory()) throw new WorktreeError(`${join(dir, name)} is a directory, never one system placed; nothing is written`)
+        rmSync(path, { force: true })
+      }
       for (const [name, text] of [['.gitignore', '# Written by system: this directory is never part of the work.\n*\n'], ...files.map((f) => [f.path.slice('.system/'.length), f.text])] as const) {
         const path = join(opened.at, name)
         if (notPlainFile(path)) throw new WorktreeError(`${join(dir, name)} is not a plain file; nothing more is written`)
@@ -650,11 +842,16 @@ export class Worktrees {
       ORDER BY failed_at IS NOT NULL, failed_at, created_at LIMIT ?`).all(null, cutoff, SWEEP_BATCH) as unknown as WorktreeRow[]
     for (const candidate of due) {
       if (stopped.aborted) break
+      // A check on a tip uses it now (T305b): it stays, whatever its age.
+      if (this.used(candidate)) {
+        outcome.kept.push(candidate.path)
+        continue
+      }
       await this.exclusive(candidate.repository, async () => {
         // Looked at again alone: a run of the workflow run may have taken the worktree meanwhile.
         const row = this.ctx.store.db.prepare(`SELECT * FROM agent_worktrees w WHERE repository = ? AND workflow_run_id = ? AND removed_at IS NULL AND ${IDLE}`)
           .get(candidate.repository, candidate.workflow_run_id, null, cutoff) as WorktreeRow | undefined
-        if (!row) return
+        if (!row || this.used(row)) return
         try {
           // Decided once: a worktree that stays in place is retried under the same decision.
           const decision = row.decision ?? this.decide(row, retentionHours)
@@ -694,7 +891,7 @@ export class Worktrees {
   async plan(workflowRunId: string, commit: boolean, freeing: string): Promise<WorktreeRelease[]> {
     const plans: WorktreeRelease[] = []
     for (const row of this.ctx.store.db.prepare('SELECT * FROM agent_worktrees WHERE workflow_run_id = ? AND removed_at IS NULL ORDER BY path').all(workflowRunId) as unknown as WorktreeRow[]) {
-      plans.push(await this.exclusive(row.repository, () => this.planOne(row, commit, freeing)))
+      plans.push(await this.exclusive(row.repository, () => this.planSafely(row, commit, freeing)))
     }
     return plans
   }
@@ -709,11 +906,11 @@ export class Worktrees {
     const rows = this.ctx.store.db.prepare(`SELECT w.*,
       EXISTS (SELECT 1 FROM agent_runs r WHERE r.workflow_run_id = w.workflow_run_id AND r.status IN ('queued', 'running')) AS busy,
       EXISTS (SELECT 1 FROM agent_runs r WHERE r.workflow_run_id = w.workflow_run_id AND r.status NOT IN ('queued', 'running') AND ${notKnownGone('r.')}) AS held,
-      COALESCE((SELECT MAX(r.updated_at) FROM agent_runs r WHERE r.workflow_run_id = w.workflow_run_id), w.created_at) AS last
+      ${LAST_USED} AS last
       FROM agent_worktrees w WHERE removed_at IS NULL ORDER BY created_at, workflow_run_id LIMIT ?`).all(limit) as unknown as Array<WorktreeRow & { busy: number; held: number; last: string }>
     const worktrees: RunWorktree[] = []
     for (const row of rows) {
-      const state = row.busy ? 'in-use' : row.held ? 'held' : 'finished'
+      const state = row.busy || this.used(row) ? 'in-use' : row.held ? 'held' : 'finished'
       worktrees.push({
         runId: row.workflow_run_id, repository: row.repository, path: row.path, branch: row.branch, createdAt: row.created_at, lastActivityAt: row.last, state,
         changes: await this.exclusive(row.repository, () => this.changesOf(row)),
@@ -736,8 +933,17 @@ export class Worktrees {
     const total = Number((this.ctx.store.db.prepare(`SELECT COUNT(*) AS n FROM agent_worktrees WHERE ${where}`).get(...args) as { n: number }).n)
     const rows = this.ctx.store.db.prepare(`SELECT * FROM agent_worktrees WHERE ${where} ORDER BY created_at, workflow_run_id LIMIT ?`).all(...args, SWEEP_BATCH) as unknown as WorktreeRow[]
     const plans: RunWorktreeRelease[] = []
-    for (const row of rows) plans.push({ runId: row.workflow_run_id, ...await this.exclusive(row.repository, () => this.planOne(row, commit, null)) })
+    for (const row of rows) plans.push({ runId: row.workflow_run_id, ...await this.exclusive(row.repository, () => this.planSafely(row, commit, null)) })
     return { plans, more: total - rows.length }
+  }
+
+  /** {@link planOne}, one that git cannot look at kept with why: it never fails the others (T250). */
+  private async planSafely(row: WorktreeRow, commit: boolean, freeing: string | null): Promise<WorktreeRelease> {
+    try {
+      return await this.planOne(row, commit, freeing)
+    } catch (error) {
+      return { path: row.path, branch: row.branch, outcome: 'kept', why: `git could not look at it, so it stays: ${(error as Error).message.slice(0, 300)}` }
+    }
   }
 
   /** What a worktree holds, as {@link RunWorktree.changes} says it; git runs only in an intact one. */
@@ -755,6 +961,7 @@ export class Worktrees {
   /** {@link plan} of one worktree, `freeing` the agent run the operator frees (not counted as holding it), or none. */
   private async planOne(row: WorktreeRow, commit: boolean, freeing: string | null): Promise<WorktreeRelease> {
     const base = { path: row.path, branch: row.branch }
+    if (this.used(row)) return { ...base, outcome: 'kept', why: `a check on a tip runs in it now (${row.workflow_run_id}), so it stays` }
     if (!this.ctx.store.db.prepare(`SELECT 1 FROM agent_worktrees w WHERE repository = ? AND workflow_run_id = ? AND ${FREE}`).get(row.repository, row.workflow_run_id, freeing)) {
       return {
         ...base, outcome: 'kept',
@@ -791,7 +998,7 @@ export class Worktrees {
         continue
       }
       done.push(await this.exclusive(row.repository, async (): Promise<WorktreeRelease> => {
-        const again = await this.planOne(row, commit, freeing)
+        const again = await this.planSafely(row, commit, freeing)
         if (again.outcome !== 'remove') return again
         try {
           const committed = await this.retire(row)
@@ -817,7 +1024,118 @@ export class Worktrees {
   async land(step: LandStep): Promise<Landed | undefined> {
     const row = this.ctx.store.db.prepare('SELECT * FROM agent_worktrees WHERE workflow_run_id = ? AND path = ?').get(step.runId, step.workspace) as WorktreeRow | undefined
     if (!row) return undefined
-    return this.exclusive(row.repository, () => (step.step === 'commit' ? this.commitAccepted(row, step) : this.merge(row, step)))
+    return this.exclusive(row.repository, () => (step.step === 'commit' ? this.commitAccepted(row, step) : step.step === 'record' ? this.record(row, step)
+      : step.step === 'release' ? this.releaseLanded(row) : step.step === 'merge' ? this.merge(row, step) : this.rebase(row, step)))
+  }
+
+  /**
+   * Remove the worktree of a run whose landing ended merged, or with nothing to land (T345): nothing needs
+   * it after, and its branch stays (a continued run gets its worktree back from it). Only while it is
+   * intact, nothing holds it (no agent run of its workflow run is unfinished or not known to be gone, no
+   * check on a tip uses it), and it holds nothing uncommitted: anything else stays for the retention, and
+   * the answer says why. Recorded as a `retention` decision on its row (INV-13), then removed, never forced.
+   */
+  private async releaseLanded(row: WorktreeRow): Promise<Landed> {
+    const refused = (cause: LandRefusal, reason: string): Landed => ({ outcome: 'refused', cause, reason })
+    if (row.removed_at !== null || !existsSync(row.path)) return refused('gone', `the worktree ${row.path} was removed already`)
+    if (this.used(row) || !this.ctx.store.db.prepare(`SELECT 1 FROM agent_worktrees w WHERE repository = ? AND workflow_run_id = ? AND ${FREE}`).get(row.repository, row.workflow_run_id, null)) {
+      return refused('busy', `an agent run or a check still holds the worktree ${row.path}: it stays for the retention`)
+    }
+    try {
+      await this.verify(row)
+      if (halfCarried(row)) return refused('failed', `the worktree ${row.path} was cut for work it never got: it stays for the retention`)
+      if ((await git(row.path, [`--git-dir=${row.gitdir}`, `--work-tree=${row.path}`, 'status', '--porcelain', '--untracked-files=all'])).trim()) {
+        return refused('dirty', `the worktree ${row.path} holds changes not committed after the landing: it stays for the retention, which commits them on ${row.branch}`)
+      }
+      // Decided once: a removal that fails is retried by the retention under the same decision.
+      const decision = row.decision ?? this.ctx.artifacts.recordDecision({
+        schema: 'decision@1.3', decisionType: 'retention', question: `Is the worktree ${row.path} of workflow run ${row.workflow_run_id} removed now its landing has ended?`, inputs: [],
+        candidates: [
+          { option: 'remove', selected: true, reasons: [`the landing of ${row.workflow_run_id} ended merged, or with nothing to land, and the worktree is clean: its work is on ${row.branch}, which stays, so nothing needs the worktree`] },
+          { option: 'keep', selected: false, reasons: ['not keep: a landed run is never retried, and a worktree holds a full checkout of the host\'s disk (T345)'] },
+        ],
+        decider: { type: 'rule', id: 'agent-workers.worktree-release', version: '1' },
+        outcome: { option: 'remove', detail: { runId: row.workflow_run_id, repository: row.repository, path: row.path, branch: row.branch } },
+        deterministic: true,
+      }, { producer: { type: 'system', ref: 'agent-workers' }, runId: row.workflow_run_id }).id
+      this.ctx.store.transaction((db) => {
+        db.prepare('UPDATE agent_worktrees SET decision = ? WHERE repository = ? AND workflow_run_id = ?').run(decision, row.repository, row.workflow_run_id)
+      })
+      await this.retire(row)
+      this.ctx.store.transaction((db) => {
+        db.prepare('UPDATE agent_worktrees SET removed_at = ?, failure = NULL, failed_at = NULL WHERE repository = ? AND workflow_run_id = ?').run(new Date().toISOString(), row.repository, row.workflow_run_id)
+      })
+      this.ctx.logger.info(`agent Workers: removed the worktree ${row.path} of run ${row.workflow_run_id} once its landing ended (decision ${decision}); the branch ${row.branch} stays`)
+      return { outcome: 'released', repository: row.repository, branch: row.branch, path: row.path, decision }
+    } catch (error) {
+      return refused('failed', `the worktree ${row.path} stays for the retention: ${(error as Error).message.slice(0, 300)}`)
+    }
+  }
+
+  /**
+   * A commit step asked again once the worktree is gone (released after its landing, or retired): done when
+   * the branch's tip is the system's landing commit of `accepted`, read from the branch (INV-4); else undefined.
+   */
+  private async committedOnBranch(row: WorktreeRow, accepted: string): Promise<Landed | undefined> {
+    const tip = (await git(row.repository, ['rev-parse', '--verify', '--quiet', `refs/heads/${row.branch}^{commit}`]).catch(() => '')).trim()
+    if (!tip) return undefined
+    const [author, ...message] = (await git(row.repository, ['log', '-1', '--format=%an <%ae>%n%B', tip])).split('\n')
+    if (author !== `${SYSTEM_AUTHOR.name} <${SYSTEM_AUTHOR.email}>` || !message.includes(`${SUBJECT_TRAILER}: ${accepted}`)) return undefined
+    const base = await this.baseOf(row.repository)
+    if ('problem' in base) return { outcome: 'refused', cause: 'base-moved', reason: base.problem }
+    const contained = await this.contains(row.repository, base.sha, tip)
+    const stat = contained ? '' : await this.statOf(row.repository, base.sha, tip)
+    const fork = contained ? '' : (await git(row.repository, ['merge-base', tip, base.sha]).catch(() => '')).trim()
+    return { outcome: 'committed', repository: row.repository, branch: row.branch, head: tip, committed: false, base, contained, stat, ...(fork ? { fork } : {}) }
+  }
+
+  /**
+   * Keep the worktree's tree, while it is exactly `step.subject`, as a commit on the run's review
+   * history ref (board T232, {@link reviewRef}): on top of the last commit there, else the worktree's
+   * HEAD. Built in an index of its own, so the worktree's HEAD, branch, index, and files stay as they
+   * are, and a board task bound to the HEAD still binds the run's result. The tree is read again after
+   * the commit is made: a tree that moved meanwhile moves no ref. The system's `.system/` files are
+   * left out, as a landing's commit leaves them. No commit when the last one recorded, or the HEAD
+   * with nothing on top, already holds the tree (INV-4).
+   */
+  private async record(row: WorktreeRow, step: Extract<LandStep, { step: 'record' }>): Promise<Landed> {
+    const wanted = subjectId({ type: 'git-head', ...step.subject })
+    if (row.removed_at !== null || !existsSync(row.path)) return { outcome: 'refused', cause: 'gone', reason: `the worktree ${row.path} was removed, so the tree ${wanted} can no longer be recorded` }
+    try {
+      await this.verify(row)
+    } catch (error) {
+      return { outcome: 'refused', cause: 'failed', reason: (error as Error).message }
+    }
+    const still = (): boolean => {
+      const now = captureGitSubject(row.path)?.subject
+      return now?.ref === step.subject.ref && now.version === step.subject.version
+    }
+    if (!still()) return { outcome: 'refused', cause: 'moved', reason: `the worktree ${row.path} is no longer ${wanted}, so it is not recorded` }
+    const ref = reviewRef(step.runId)
+    const scratch = mkdtempSync(join(tmpdir(), 'system-record-'))
+    try {
+      const inside = (args: string[], env: Record<string, string> = {}): Promise<string> => git(row.path, [`--git-dir=${row.gitdir}`, `--work-tree=${row.path}`, ...args], env)
+      const index = { GIT_INDEX_FILE: join(scratch, 'index') }
+      const tip = (await inside(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).catch(() => '')).trim()
+      const head = (await inside(['rev-parse', 'HEAD'])).trim()
+      await inside(['read-tree', 'HEAD'], index)
+      const own = !(await inside(['ls-files', '-z', '--', '.system'], index)).length
+      await inside(['add', '--all', '--', '.', ...(own ? [':(exclude).system'] : [])], index)
+      const tree = (await inside(['write-tree'], index)).trim()
+      const parent = tip || head
+      if ((await inside(['rev-parse', `${parent}^{tree}`])).trim() === tree) {
+        return { outcome: 'recorded', repository: row.repository, ref, commit: parent, parent, recorded: false }
+      }
+      const commit = (await inside(['commit-tree', tree, '-p', parent, '-m', `${step.message.trimEnd()}\n\n${SUBJECT_TRAILER}: ${wanted}`])).trim()
+      if (!still()) return { outcome: 'refused', cause: 'moved', reason: `the worktree ${row.path} changed while ${wanted} was recorded, so no ref moved` }
+      // Only from the tip read above: a ref another step moved meanwhile is not overwritten.
+      await inside(['update-ref', '-m', `system: record ${wanted}`, ref, commit, ...(tip ? [tip] : [])])
+      return { outcome: 'recorded', repository: row.repository, ref, commit, parent, recorded: true }
+    } catch (error) {
+      return { outcome: 'refused', cause: 'failed', reason: (error as Error).message }
+    } finally {
+      rmSync(scratch, { recursive: true, force: true })
+    }
   }
 
   /**
@@ -826,7 +1144,7 @@ export class Worktrees {
    * is intact, no agent run of its workflow run is unfinished or not known to be gone (INV-15), and
    * it is exactly `subject` now (INV-5); else why not. Read only.
    */
-  async checkable(runId: string, workspace: string, subject: { ref: string; version: string }): Promise<undefined | { repository: string; path: string; setupHash: string | null } | { cause: 'moved' | 'gone' | 'busy' | 'failed'; reason: string }> {
+  async checkable(runId: string, workspace: string, subject: { ref: string; version: string }): Promise<undefined | { repository: string; path: string; setupHash: string | null; forkedAt: string | null } | { cause: 'moved' | 'gone' | 'busy' | 'failed'; reason: string }> {
     const row = this.ctx.store.db.prepare('SELECT * FROM agent_worktrees WHERE workflow_run_id = ? AND path = ?').get(runId, workspace) as (WorktreeRow & { setup_hash?: string | null }) | undefined
     if (!row) return undefined
     const tree = subjectId({ type: 'git-head', ...subject })
@@ -842,7 +1160,8 @@ export class Worktrees {
     const current = captureGitSubject(row.path)
     if (!current) return { cause: 'failed', reason: `${row.path} is no longer a git working tree` }
     if (current.subject.ref !== subject.ref || current.subject.version !== subject.version) return { cause: 'moved', reason: `the worktree ${row.path} is now ${subjectId(current.subject)}, not ${tree}, the tree the result is on` }
-    return { repository: row.repository, path: row.path, setupHash: row.setup_hash ?? null }
+    // The commit the worktree was cut at: the run's own change is read from it (T299).
+    return { repository: row.repository, path: row.path, setupHash: row.setup_hash ?? null, forkedAt: row.forked_at }
   }
 
   /**
@@ -1075,10 +1394,13 @@ export class Worktrees {
    * - the earlier worktree is committed on its branch, as the retention commits it, only while no
    *   agent run of its workflow run is unfinished or not known to be gone (INV-15), while it is intact,
    *   and while it is still exactly `step.from.subject`, the tree its writing step left (INV-5);
-   * - only while that subject's commit is still the repository's HEAD, where a fresh worktree is cut
-   *   from: the carry never moves a run onto another base;
-   * - the new worktree is added on the run's branch at that commit and given the committed tree, staged,
-   *   so its subject is the base with the earlier change on top, as if the change had been made in it.
+   *   A commit the system made of exactly that subject (a carry's before a restart, or the commit that
+   *   kept it as its attempt's result, T271) is taken as it is;
+   * - only while the commit the task writes now (`step.onto`) is the repository's HEAD, where a fresh
+   *   worktree is cut from;
+   * - the new worktree is added on the run's branch at the HEAD and given the change replayed there
+   *   (a three-way merge of the trees), staged, so its subject is the HEAD with the earlier change on
+   *   top; when the replay conflicts, at the change's own base, the conflicting files named (T271).
    *
    * Each step checks first that its work is not done already, so a carry repeated after a restart says
    * so instead of doing it twice (INV-4). Nothing is forced, reset, deleted, or pushed.
@@ -1103,7 +1425,9 @@ export class Worktrees {
         } catch (error) {
           return { outcome: 'refused', cause: 'failed', reason: (error as Error).message }
         }
-        return { outcome: 'carried', repository, from: { branch: from.branch, commit: earlier.carried_commit }, base, branch: earlier.branch, worktree: earlier.path, carried: false }
+        // What the move of HEAD did is said again as the carry first said it (INV-4): derived from where the worktree was cut.
+        const rebase = await this.movedAt(repository, base, earlier.forked_at ?? base, step, earlier.carried_commit)
+        return { outcome: 'carried', repository, from: { branch: from.branch, commit: earlier.carried_commit }, base: earlier.forked_at ?? base, branch: earlier.branch, worktree: earlier.path, carried: false, ...(rebase ? { rebase } : {}) }
       }
     }
     let carried: Carried | undefined
@@ -1137,9 +1461,11 @@ export class Worktrees {
     } catch (error) {
       return refuse('failed', (error as Error).message)
     }
-    // A fresh worktree is cut from the repository's HEAD: the earlier work is carried only onto that same commit.
+    // A fresh worktree is cut from the repository's HEAD: the earlier work is carried onto that commit, replayed there when HEAD moved
+    // since the tree's base (T271), and only while it is the commit the task writes now.
     const head = (await git(repository, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']).catch(() => '')).trim()
-    if (!cut && head !== base) return refuse('base-moved', `the HEAD of ${repository} is ${head || 'unreadable'} now, not ${base}, the commit the tree ${subject} is on: a fresh worktree starts from the HEAD, so the earlier work is not carried onto another base`)
+    if (!cut && !head) return refuse('base-moved', `the HEAD of ${repository} is unreadable now: a fresh worktree starts from the HEAD, so the earlier work is not carried`)
+    if (!cut && step.onto !== undefined && step.onto !== head) return refuse('base-moved', `the HEAD of ${repository} is ${head} now, not ${step.onto}, the commit the task writes: a fresh worktree starts from the HEAD, so the earlier work is not carried onto another base`)
     // Where the run's worktree goes, checked before anything changes: nothing there is ever taken over.
     const branch = branchOf(step.runId)
     let path = cut?.path
@@ -1149,6 +1475,10 @@ export class Worktrees {
       path = join(realpathSync(this.root), repositoryKey(repository), step.runId)
       ensurePrivateDir(dirname(path))
       if (lstatSync(path, { throwIfNoEntry: false })) return refuse('exists', `${path} exists and is not the worktree of run ${step.runId}; nothing was changed`)
+      // A new checkout is cut for the carried work: not under the disk floor (T345), before anything changes.
+      // A passing condition: refused `no-room`, so the engine asks again once there is room, while the earlier tree is kept.
+      const low = this.diskFloor?.()
+      if (low) return refuse('no-room', low)
     }
     const inside = (args: string[]): Promise<string> => git(from.path, [`--git-dir=${from.gitdir}`, `--work-tree=${from.path}`, ...args])
     await this.clearSystem(from, inside)
@@ -1164,36 +1494,99 @@ export class Worktrees {
       return refuse('moved', `the worktree ${from.path} is now ${subjectId(current.subject)}, not ${subject} as its writing step left it: it changed since, so its work is not carried`)
     }
     const commit = (await inside(['rev-parse', 'HEAD'])).trim()
+    // Where the run's worktree is cut, and the tree it is given (T271): the commit itself on its own base; its replay on the HEAD
+    // that moved since; or, when the replay conflicts, the commit on its own base, the conflict named for the Worker to resolve.
+    let onto = cut?.forked_at ?? base
+    let tree = commit
+    let rebase: Extract<Carried, { outcome: 'carried' }>['rebase']
+    if (cut ? onto !== base : head !== base) {
+      // A worktree cut before a restart was cut at the commit its replay went onto: the same replay gives it the same tree.
+      const target = cut ? onto : head
+      const replayed = await this.replayOnto(repository, base, target, commit)
+      if ('tree' in replayed) {
+        onto = target
+        tree = replayed.tree
+        rebase = { outcome: 'rebased', from: base, onto: target }
+      } else if (cut) return refuse('failed', `the work of ${from.branch} at ${commit} no longer replays on ${target}, where ${cut.path} was cut for it`)
+      else rebase = { outcome: 'conflict', from: base, onto: head, files: replayed.files }
+    } else if (cut) {
+      // Cut at its own base before a restart: a conflict then, said again now (INV-4).
+      rebase = await this.movedAt(repository, base, onto, step, commit)
+    }
     if (!cut) {
-      // Added on its own branch at the base, its files not checked out: the commit's tree is read in next.
-      await git(repository, ['worktree', 'add', '--no-checkout', '-b', branch, path, base])
+      // Added on its own branch at its base, its files not checked out: the tree is read in next.
+      await git(repository, ['worktree', 'add', '--no-checkout', '-b', branch, path, onto])
       const common = real(resolve(repository, (await git(repository, ['rev-parse', '--git-common-dir'])).trim()))
       const gitdir = pointer(path)
       if (!common || !gitdir || !under(gitdir, join(common, 'worktrees'))) throw new WorktreeError(`${path} was added, and its .git file does not point into the worktrees of ${repository}; it is left for the operator`)
       this.ctx.store.transaction((db) => {
         db.prepare(`INSERT INTO agent_worktrees (repository, workflow_run_id, path, branch, gitdir, created_at, removed_at, decision, failure, failed_at, carried_from, carried_commit, forked_at) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, NULL, ?)
           ON CONFLICT (repository, workflow_run_id) DO UPDATE SET path = excluded.path, branch = excluded.branch, gitdir = excluded.gitdir, created_at = excluded.created_at,
-          removed_at = NULL, decision = NULL, failure = NULL, failed_at = NULL, setup_hash = NULL, setup_decision = NULL, carried_from = excluded.carried_from, carried_commit = NULL, forked_at = excluded.forked_at`).run(repository, step.runId, path, branch, gitdir, new Date().toISOString(), from.workflow_run_id, base)
+          removed_at = NULL, decision = NULL, failure = NULL, failed_at = NULL, setup_hash = NULL, setup_decision = NULL, carried_from = excluded.carried_from, carried_commit = NULL, forked_at = excluded.forked_at`).run(repository, step.runId, path, branch, gitdir, new Date().toISOString(), from.workflow_run_id, onto)
       })
       cut = this.row(repository, step.runId)!
     }
     if (pointer(cut.path) !== cut.gitdir) return refuse('failed', `the .git file of ${cut.path} no longer points to the worktree's own directory ${cut.gitdir}; it is left for the operator`)
     try {
-      // Index and files become the commit's tree; HEAD stays at the base, so the earlier change is the worktree's own change.
-      await git(cut.path, [`--git-dir=${cut.gitdir}`, `--work-tree=${cut.path}`, 'read-tree', '-u', '--reset', commit])
+      // Index and files become the tree; HEAD stays at the base, so the earlier change is the worktree's own change.
+      await git(cut.path, [`--git-dir=${cut.gitdir}`, `--work-tree=${cut.path}`, 'read-tree', '-u', '--reset', tree])
     } catch (error) {
       return refuse('failed', `the work of ${from.branch} at ${commit} could not be read into ${cut.path}: ${(error as Error).message}`)
     }
     this.ctx.store.transaction((db) => void db.prepare('UPDATE agent_worktrees SET carried_commit = ? WHERE repository = ? AND workflow_run_id = ?').run(commit, repository, step.runId))
-    this.ctx.logger.info(`agent Workers: run ${step.runId} works in ${cut.path} on ${cut.branch}, starting from the work of run ${from.workflow_run_id} (${commit} on ${from.branch}, on top of ${base})`)
-    return { outcome: 'carried', repository, from: { branch: from.branch, commit }, base, branch: cut.branch, worktree: cut.path, carried: true }
+    this.ctx.logger.info(`agent Workers: run ${step.runId} works in ${cut.path} on ${cut.branch}, starting from the work of run ${from.workflow_run_id} (${commit} on ${from.branch}, on top of ${base}${rebase ? `; ${rebase.outcome === 'rebased' ? `replayed on ${rebase.onto}` : `${rebase.onto} moved and the replay conflicts, so it stays on ${base}`}` : ''})`)
+    return { outcome: 'carried', repository, from: { branch: from.branch, commit }, base: onto, branch: cut.branch, worktree: cut.path, carried: true, ...(rebase ? { rebase } : {}) }
   }
 
-  /** The earlier worktree is clean, and its HEAD is the system's commit of `subject` for `runId` on top of `base`: committed before a restart. */
+  /**
+   * What a move of the repository's HEAD did to a carry made before a restart (T271, INV-4), derived
+   * from where its worktree was cut, as nothing else of it is stored: cut at another commit than the
+   * tree's base, it was replayed there (`rebased`); cut at the base while the commit the task writes
+   * (`step.onto`, else the HEAD) is another, the replay conflicted (`conflict`, the files found by the
+   * same replay again). Undefined when nothing moved.
+   */
+  private async movedAt(repository: string, base: string, forkedAt: string, step: CarryStep, commit: string): Promise<Extract<Carried, { outcome: 'carried' }>['rebase']> {
+    if (forkedAt !== base) return { outcome: 'rebased', from: base, onto: forkedAt }
+    const target = step.onto ?? (await git(repository, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']).catch(() => '')).trim()
+    if (!target || target === base) return undefined
+    const replayed = await this.replayOnto(repository, base, target, commit)
+    return { outcome: 'conflict', from: base, onto: target, files: 'files' in replayed ? replayed.files : [] }
+  }
+
+  /**
+   * The change `commit` made on `base`, replayed on `onto` (T271): a three-way merge of the trees in a
+   * scratch index of its own (`git read-tree -m -i --aggressive`, plumbing every git has; no working
+   * tree, no ref, nothing of the repository's own index touched), then its tree written. Only the
+   * merges git resolves at the level of whole files are taken: a file both sides changed is a conflict,
+   * named, and the change then stays on its own base for the Worker to resolve. Fail closed: a replay
+   * git cannot do at all is a conflict with no file named.
+   */
+  private async replayOnto(repository: string, base: string, onto: string, commit: string): Promise<{ tree: string } | { files: string[] }> {
+    const scratch = mkdtempSync(join(tmpdir(), 'system-replay-'))
+    const index = { GIT_INDEX_FILE: join(scratch, 'index') }
+    try {
+      await git(repository, ['read-tree', '-m', '-i', '--aggressive', base, onto, commit], index)
+      const unmerged = (await git(repository, ['ls-files', '--unmerged', '-z'], index)).split('\0').filter(Boolean)
+      if (unmerged.length) return { files: [...new Set(unmerged.map((l) => l.slice(l.indexOf('\t') + 1)))].slice(0, 50) }
+      const tree = (await git(repository, ['write-tree'], index)).trim()
+      return /^[0-9a-f]{40,64}$/.test(tree) ? { tree } : { files: [] }
+    } catch {
+      return { files: [] }
+    } finally {
+      rmSync(scratch, { recursive: true, force: true })
+    }
+  }
+
+  /**
+   * The earlier worktree is clean, and its HEAD is the system's commit of exactly `subject` on top of
+   * `base`: committed by a carry to run `runId` before a restart, or kept as its attempt's result when
+   * that attempt ended (T271); never a carry's commit to another run.
+   */
   private async carriedCommit(inside: (args: string[]) => Promise<string>, base: string, subject: string, runId: string): Promise<boolean> {
     if ((await inside(['status', '--porcelain', '--untracked-files=all'])).trim()) return false
     const [parent, author, ...message] = (await inside(['log', '-1', '--format=%P%n%an <%ae>%n%B', 'HEAD'])).split('\n')
-    return parent === base && author === `${SYSTEM_AUTHOR.name} <${SYSTEM_AUTHOR.email}>` && message.includes(`${SUBJECT_TRAILER}: ${subject}`) && message.includes(`${CARRIED_TRAILER}: ${runId}`)
+    return parent === base && author === `${SYSTEM_AUTHOR.name} <${SYSTEM_AUTHOR.email}>` && message.includes(`${SUBJECT_TRAILER}: ${subject}`)
+      && !message.some((l) => l.startsWith(`${CARRIED_TRAILER}: `) && l !== `${CARRIED_TRAILER}: ${runId}`)
   }
 
   /**
@@ -1221,7 +1614,11 @@ export class Worktrees {
   /** Commit the worktree's changes on its branch, while it is still exactly the accepted subject. */
   private async commitAccepted(row: WorktreeRow, step: Extract<LandStep, { step: 'commit' }>): Promise<Landed> {
     const accepted = subjectId({ type: 'git-head', ...step.subject })
-    if (row.removed_at !== null || !existsSync(row.path)) return { outcome: 'refused', cause: 'gone', reason: `the worktree ${row.path} was removed (its branch ${row.branch} keeps what the retention committed), so the accepted tree ${accepted} can no longer be checked` }
+    if (row.removed_at !== null || !existsSync(row.path)) {
+      // Removed after its landing committed it (T345): the branch holds the landing commit, so the step is done (INV-4).
+      const done = await this.committedOnBranch(row, accepted).catch(() => undefined)
+      return done ?? { outcome: 'refused', cause: 'gone', reason: `the worktree ${row.path} was removed (its branch ${row.branch} keeps what the retention committed), so the accepted tree ${accepted} can no longer be checked` }
+    }
     if (!this.ctx.store.db.prepare(`SELECT 1 FROM agent_worktrees w WHERE repository = ? AND workflow_run_id = ? AND ${FREE}`).get(row.repository, row.workflow_run_id, null)) {
       return { outcome: 'refused', cause: 'busy', reason: `an agent run of workflow run ${row.workflow_run_id} is unfinished or not known to be gone, so it may still write ${row.path} (INV-15)` }
     }
@@ -1243,15 +1640,45 @@ export class Worktrees {
         // Nothing moves the tree while the commit is made (no run of it is left, and one change at a time per repository): what is left over is not the accepted change.
         if ((await inside(['status', '--porcelain', '--untracked-files=all'])).trim()) return { outcome: 'refused', cause: 'failed', reason: `${row.path} still holds changes after the commit on ${row.branch}; it is left for the operator` }
       }
-    } else if (!(await this.landedCommit(row, inside, step.subject.ref, accepted))) {
+    } else if (!(await this.landedCommit(row, inside, step.subject.ref, accepted)) && !(await this.rebasedLanding(inside, step.subject.ref, accepted))) {
       return { outcome: 'refused', cause: 'moved', reason: `the worktree ${row.path} is now ${subjectId(current.subject)}, not the accepted ${accepted}: it changed after the acceptance, so nothing is committed` }
     }
     const head = (await inside(['rev-parse', 'HEAD'])).trim()
     const base = await this.baseOf(row.repository)
     if ('problem' in base) return { outcome: 'refused', cause: 'base-moved', reason: base.problem }
     const contained = await this.contains(row.repository, base.sha, head)
-    const stat = contained ? '' : (await git(row.repository, ['diff', '--stat=100', '--no-color', '--no-ext-diff', '--no-textconv', `${base.sha}...${head}`])).trimEnd()
-    return { outcome: 'committed', repository: row.repository, branch: row.branch, head, committed, base, contained, stat: stat.length > STAT_CHARS ? `${stat.slice(0, STAT_CHARS)}\n…` : stat }
+    const stat = contained ? '' : await this.statOf(row.repository, base.sha, head)
+    // Where the result forked from the base: the base moved since its work started when that is not the base's head (ADR-0068).
+    const fork = contained ? '' : (await git(row.repository, ['merge-base', head, base.sha]).catch(() => '')).trim()
+    // The tree the worktree holds now, as committed: a landing whose base did not move runs its full suite on it (T299).
+    const after = captureGitSubject(row.path)?.subject
+    const subject = after?.ref === head && after.version ? { subject: { ref: after.ref, version: after.version } } : {}
+    return { outcome: 'committed', repository: row.repository, branch: row.branch, head, committed, base, contained, stat, ...(fork ? { fork } : {}), ...subject }
+  }
+
+  /** The change of `head` against `base` (`git diff --stat`, from where they forked), bounded. */
+  private async statOf(repository: string, base: string, head: string): Promise<string> {
+    const stat = (await git(repository, ['diff', '--stat=100', '--no-color', '--no-ext-diff', '--no-textconv', `${base}...${head}`])).trimEnd()
+    return stat.length > STAT_CHARS ? `${stat.slice(0, STAT_CHARS)}\n…` : stat
+  }
+
+  /**
+   * The worktree is clean, and its HEAD is the system's rebase (ADR-0068) of its landing commit of
+   * `accepted` on top of `parent`, through at most {@link REBASE_DEPTH} rebases: committed and rebased
+   * before a restart, or before a base that moved again asked for the commit once more (INV-4).
+   */
+  private async rebasedLanding(inside: (args: string[]) => Promise<string>, parent: string, accepted: string): Promise<boolean> {
+    if ((await inside(['status', '--porcelain', '--untracked-files=all'])).trim()) return false
+    let commit = (await inside(['rev-parse', 'HEAD'])).trim()
+    for (let depth = 0; depth <= REBASE_DEPTH; depth++) {
+      const [parents, author, ...message] = (await inside(['log', '-1', '--format=%P%n%an <%ae>%n%B', commit])).split('\n')
+      if (author !== `${SYSTEM_AUTHOR.name} <${SYSTEM_AUTHOR.email}>` || !message.includes(`${SUBJECT_TRAILER}: ${accepted}`)) return false
+      if (depth > 0 && parents === parent) return true
+      const from = rebasedFrom(message)
+      if (!from) return false
+      commit = from
+    }
+    return false
   }
 
   /** The worktree is clean, and its HEAD is the system's landing commit of `accepted` on top of `parent`: committed before a restart. */
@@ -1390,6 +1817,9 @@ export class Worktrees {
     }
     if (zPaths(await inside(['diff', '--name-only', '-z', '--diff-filter=U'])).length) return 'conflicts were left after a side of each was taken'
     const index = (await inside(['write-tree'])).trim()
+    // The commands never install: the setup runs again first when the merge changed what it installs.
+    const ready = await regeneration.prepare(row.path, row.workflow_run_id, `landing:merge:${step.base.sha}:${step.head}`)
+    if (!ready.ok) return ready.reason
     // The files git ignores, as they are before the commands: a command must not change them either.
     const ignored = await this.ignoredFiles(row)
     // The worktree's .git file, which git lists neither as changed nor as ignored: a command must not change it either.
@@ -1416,7 +1846,7 @@ export class Worktrees {
     if (changed.length) return `a repeat of the commands changed ${named(changed)} again, so they do not build the same tree`
     const changedIgnored = await this.ignoredChanged(row, ignored)
     if (changedIgnored.length) return `a repeat of the commands changed ${named(changedIgnored)}, which git ignores, so ${changedIgnored.length === 1 ? 'it is' : 'they are'} not among the generated files of the merge`
-    return { commit, files: [...new Set([...conflicts, ...touched])].sort(), autonomy: [...new Set([...ran.autonomy, ...again.autonomy])] }
+    return { commit, files: [...new Set([...conflicts, ...touched])].sort(), autonomy: [...new Set([...ready.autonomy, ...ran.autonomy, ...again.autonomy])] }
   }
 
   /** The files of a worktree that differ from its index, and the untracked ones it does not ignore. */
@@ -1490,6 +1920,219 @@ export class Worktrees {
     await inside(['checkout', '--quiet', '--force', row.branch, '--'])
   }
 
+  /**
+   * A landing's rebase (ADR-0068): the result's change, the run's branch at `step.head` against where
+   * it forked from the base, made again on top of `step.base.sha` in the run's worktree, which stays
+   * on its branch. Only while the worktree is intact and free of agent runs (INV-15).
+   * - `start`: with the worktree clean on its branch at the head, and the base where the step says,
+   *   the head is kept under {@link rebaseRef}, the branch moved to the base (only from the head), the
+   *   worktree's tracked files made the base's, and the change replayed there uncommitted (a squash
+   *   merge of the kept head); conflicts only in declared generated files take a side; then
+   *   {@link finishRebase}. Conflicts in any other file leave it so, marked, for a writing step:
+   *   `conflicted`.
+   * - `resolved`: once no file the replay changed holds a conflict marker, {@link finishRebase}.
+   * - `abandon`: the branch moved back to the head (only from the base, or from its own rebase
+   *   commit), the worktree's tracked files the head's; untracked files are left, named.
+   * Each phase finds its own work done after a restart (INV-4), from what git keeps, never from the
+   * worktree's files alone: a branch at the base with the head kept is a rebase begun; with
+   * {@link replayedRef} at the base too, one replayed (only then is the worktree the replay, to
+   * commit); a branch at the system's rebase commit of the head is one done, taken as it is only on a
+   * clean worktree, its subject that committed tree ({@link rebasedAnswer}). A rebase begun and not
+   * replayed may have stopped between moving the branch and making the worktree the base's (its files
+   * still the head's), or mid-replay: its worktree is made the base's again and the replay run again,
+   * so the head's tree is never committed on the base as if it were the replay.
+   */
+  private async rebase(row: WorktreeRow, step: Extract<LandStep, { step: 'rebase' }>): Promise<Landed> {
+    const refuse = (cause: LandRefusal, reason: string): Landed => ({ outcome: 'refused', cause, reason })
+    if (row.removed_at !== null || !existsSync(row.path)) return refuse('gone', `the worktree ${row.path} was removed, so the result cannot be rebased there`)
+    if (!this.ctx.store.db.prepare(`SELECT 1 FROM agent_worktrees w WHERE repository = ? AND workflow_run_id = ? AND ${FREE}`).get(row.repository, row.workflow_run_id, null)) {
+      return refuse('busy', `an agent run of workflow run ${row.workflow_run_id} is unfinished or not known to be gone, so it may still write ${row.path} (INV-15)`)
+    }
+    try {
+      await this.verify(row)
+    } catch (error) {
+      return refuse('failed', (error as Error).message)
+    }
+    const repository = row.repository
+    const inside = (args: string[]): Promise<string> => git(row.path, [`--git-dir=${row.gitdir}`, `--work-tree=${row.path}`, ...args])
+    const at = async (ref: string): Promise<string> => (await git(repository, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).catch(() => '')).trim()
+    const tip = await at(`refs/heads/${row.branch}`)
+    const kept = rebaseRef(row.workflow_run_id, step.head)
+    const begun = tip === step.base.sha && (await at(kept)) === step.head
+    const replayed = begun && (await at(replayedRef(row.workflow_run_id, step.head))) === step.base.sha
+    const regeneration = this.regeneration?.(repository, (row as WorktreeRow & { setup_hash?: string | null }).setup_hash ?? null)
+    await this.clearSystem(row, inside)
+    const done = tip !== step.head && !begun && await this.isRebaseOf(inside, tip, step.head, step.base.sha)
+    if (step.phase === 'abandon') {
+      if (!begun && !done && tip !== step.head) return refuse('head-moved', `${row.branch} is at ${tip || '(gone)'}: neither ${step.head}, nor ${step.base.sha} with ${step.head} kept, nor its rebase; nothing is put back`)
+      // At the head, and no rebase of it ever begun: nothing of a rebase is there to put back, and nothing else is touched.
+      if (tip === step.head && (await at(kept)) !== step.head) return { outcome: 'abandoned', repository, branch: row.branch, head: step.head, left: [] }
+      if (tip !== step.head) await git(repository, ['update-ref', `refs/heads/${row.branch}`, step.head, tip])
+      await inside(['read-tree', '-u', '--reset', 'HEAD'])
+      // Last: until the worktree is the head's again, a restart finds the abandon to finish.
+      await this.forgetReplay(row, step)
+      const left = zPaths(await inside(['ls-files', '--others', '--exclude-standard', '-z']))
+      this.ctx.logger.info(`agent Workers: the rebase of ${row.branch} onto ${step.base.sha} is abandoned; the branch is back at ${step.head}${left.length ? `, ${named(left)} left untracked` : ''}`)
+      return { outcome: 'abandoned', repository, branch: row.branch, head: step.head, left }
+    }
+    if (done) return this.rebasedAnswer(row, step, inside, true)
+    if (step.phase === 'resolved') {
+      if (!begun) return refuse('head-moved', `${row.branch} is at ${tip || '(gone)'}, not at ${step.base.sha} with ${step.head} kept, where its rebase was left to resolve`)
+      if (!replayed) return refuse('failed', `the rebase of ${row.branch} onto ${step.base.sha} was begun but never replayed in ${row.path}, so there is no resolution of it to commit`)
+      // What the replay and its resolution changed against the base, untracked included: none may hold a marker.
+      const changed = [...new Set([
+        ...zPaths(await inside(['diff', '--name-only', '-z', '--no-ext-diff', '--no-textconv', 'HEAD'])),
+        ...zPaths(await inside(['diff', '--name-only', '-z', '--diff-filter=U'])),
+        ...zPaths(await inside(['ls-files', '--others', '--exclude-standard', '-z'])),
+      ])].sort()
+      const marked = changed.filter((path) => hasMarkers(join(row.path, path)))
+      if (marked.length) return refuse('conflict', `conflict markers are left in ${named(marked)}: the rebase of ${row.branch} onto ${step.base.branch} at ${step.base.sha} is not resolved; the worktree is left as it is`)
+      return this.finishRebase(row, step, inside, regeneration, [])
+    }
+    if (begun && replayed) {
+      // A restart after the replay: its conflicts are still there (the generated ones already took a side), or it was not committed yet.
+      const unmerged = zPaths(await inside(['diff', '--name-only', '-z', '--diff-filter=U'])).filter((path) => !regeneration?.generated(path))
+      if (unmerged.length) return this.conflictedAnswer(row, step, unmerged)
+      return this.finishRebase(row, step, inside, regeneration, [])
+    }
+    if (begun) {
+      // A restart after the branch moved and before the replay was whole: the worktree may still hold the head's files, or part of a
+      // replay; none of it is anyone's work (the worktree was clean at the head, and no writing step has had it). Made the base's again, and replayed.
+      await inside(['read-tree', '-u', '--reset', 'HEAD'])
+      return this.replay(row, step, inside, regeneration)
+    }
+    if (tip !== step.head) return refuse('head-moved', `${row.branch} is at ${tip || '(gone)'}, not at ${step.head} as accepted, nor its rebase onto ${step.base.sha}`)
+    const pending = (await inside(['status', '--porcelain', '--untracked-files=all'])).trimEnd()
+    if (pending) return refuse('moved', `${row.path} holds uncommitted changes (${pending.split('\n').slice(0, 5).map((l) => l.slice(3)).join(', ')}), so its branch is not rebased`)
+    const base = await this.baseOf(repository)
+    if ('problem' in base) return refuse('base-moved', base.problem)
+    // A stacked rebase is onto the commit before it in its stack, which holds the base branch's head (the landing queue's batch).
+    const onBase = base.sha === step.base.sha || (step.stacked === true && await this.contains(repository, step.base.sha, base.sha))
+    if (base.branch !== step.base.branch || !onBase) return refuse('base-moved', `${repository} has ${base.branch} at ${base.sha} now, not ${step.stacked ? `under ${step.base.sha} on ` : ''}${step.base.branch} at ${step.base.sha}`)
+    // Already on top of the base: nothing to rebase.
+    if (await this.contains(repository, step.head, step.base.sha)) return this.rebasedAnswer(row, step, inside, true)
+    // A replay mark left by an earlier rebase of this head is not this one's: gone before the branch moves.
+    await this.forgetReplay(row, step)
+    await git(repository, ['update-ref', kept, step.head])
+    // Only from the head: a branch moved meanwhile is not moved again.
+    await git(repository, ['update-ref', `refs/heads/${row.branch}`, step.base.sha, step.head])
+    await inside(['read-tree', '-u', '--reset', 'HEAD'])
+    return this.replay(row, step, inside, regeneration)
+  }
+
+  /** {@link rebase}'s replay of the kept head on the base the worktree is at: committed by {@link finishRebase}, or left `conflicted`. */
+  private async replay(row: WorktreeRow, step: Extract<LandStep, { step: 'rebase' }>, inside: (args: string[]) => Promise<string>, regeneration: Regeneration | undefined): Promise<Landed> {
+    const ran = await inside(['merge', '--squash', '--quiet', rebaseRef(row.workflow_run_id, step.head)]).then(() => undefined, (error: unknown) => (error as Error).message)
+    const unmerged = zPaths(await inside(['diff', '--name-only', '-z', '--diff-filter=U']))
+    if (ran !== undefined && !unmerged.length) return this.giveUp(row, step, inside, `git did not replay ${step.head} on ${step.base.sha}: ${ran}`)
+    const generated = unmerged.filter((path) => regeneration?.generated(path))
+    for (const path of generated) {
+      // A generated file is made again from the replayed sources once the rest is resolved: either side will do, as for a merge (T166).
+      const taken = await inside(['checkout', '--theirs', '--', path]).then(() => true, () => inside(['checkout', '--ours', '--', path]).then(() => true, () => false))
+      if (!taken) return this.giveUp(row, step, inside, `neither side of the generated file ${path} could be taken`)
+      await inside(['add', '--', path])
+    }
+    // The worktree is the replay now: marked so, before its conflicts are anyone's or it is committed (INV-4).
+    await git(row.repository, ['update-ref', replayedRef(row.workflow_run_id, step.head), step.base.sha])
+    // Conflicts in other files are the writing step's: only those are left marked, and named.
+    const other = unmerged.filter((path) => !generated.includes(path))
+    if (other.length) return this.conflictedAnswer(row, step, other)
+    return this.finishRebase(row, step, inside, regeneration, generated)
+  }
+
+  /**
+   * The replay, its conflicts resolved, committed on the branch at the base: every change staged, the
+   * declared generated files made again by the repository's commands (./regenerate.ts), which may
+   * change no other file, nor any file git ignores, nor the worktree's .git file; then one commit by the
+   * system, the head's message with the step's line and the rebase trailers. Anything else gives up,
+   * the branch back at the head.
+   */
+  private async finishRebase(row: WorktreeRow, step: Extract<LandStep, { step: 'rebase' }>, inside: (args: string[]) => Promise<string>, regeneration: Regeneration | undefined, generatedConflicts: string[]): Promise<Landed> {
+    await inside(['add', '--all'])
+    let regenerated: Regenerated | undefined
+    if (regeneration) {
+      // The commands never install: the setup runs again first when the rebase changed what it installs.
+      const ready = await regeneration.prepare(row.path, row.workflow_run_id, `landing:rebase:${step.base.sha}:${step.head}`)
+      if (!ready.ok) return this.giveUp(row, step, inside, `the declared generated files were not made again: ${ready.reason}`)
+      const ignored = await this.ignoredFiles(row)
+      const control = controlFile(row.path)
+      const ran = await regeneration.run(row.path)
+      if (!ran.ok) return this.giveUp(row, step, inside, `the declared generated files were not made again: ${ran.reason}`)
+      if (controlFile(row.path) !== control) return this.giveUp(row, step, inside, `the generated files' commands (${regeneration.lines.join('; ')}) changed ${join(row.path, '.git')}, the worktree's git control file`)
+      const touched = await this.touched(inside)
+      const stray = touched.filter((path) => !regeneration.generated(path))
+      if (stray.length) return this.giveUp(row, step, inside, `the generated files' commands (${regeneration.lines.join('; ')}) changed ${named(stray)}, which ${stray.length === 1 ? 'is' : 'are'} not declared generated`)
+      const strayIgnored = await this.ignoredChanged(row, ignored)
+      if (strayIgnored.length) return this.giveUp(row, step, inside, `the generated files' commands (${regeneration.lines.join('; ')}) changed ${named(strayIgnored)}, which git ignores`)
+      if (touched.length) await inside(['add', '--all', '--', ...touched])
+      regenerated = { files: [...new Set([...generatedConflicts, ...touched])].sort(), commands: [...regeneration.lines], autonomy: [...new Set([...ready.autonomy, ...ran.autonomy])] }
+    }
+    const message = (await inside(['log', '-1', '--format=%B', step.head])).trimEnd().split('\n')
+    // The head's trailers stay last, the rebase's after them; the step's line goes before them.
+    const cut = message.lastIndexOf('')
+    const body = cut < 0 ? [...message, '', step.message.trimEnd()] : [...message.slice(0, cut), '', step.message.trimEnd(), ...message.slice(cut)]
+    await inside(['commit', '--quiet', '--no-verify', '--allow-empty', '-m', [...body, `${REBASED_TRAILER}: ${step.head}`, `${ONTO_TRAILER}: ${step.base.sha}`].join('\n')])
+    if ((await inside(['status', '--porcelain', '--untracked-files=all'])).trim()) return this.giveUp(row, step, inside, `${row.path} still holds changes after the rebase was committed`)
+    // Committed: the branch at the rebase commit says it is done from now on.
+    await this.forgetReplay(row, step)
+    return this.rebasedAnswer(row, step, inside, false, regenerated)
+  }
+
+  /** Whether `tip` is the system's rebase commit of `from` onto `onto`. */
+  private async isRebaseOf(inside: (args: string[]) => Promise<string>, tip: string, from: string, onto: string): Promise<boolean> {
+    if (!tip) return false
+    const [parents, author, ...message] = (await inside(['log', '-1', '--format=%P%n%an <%ae>%n%B', tip]).catch(() => '')).split('\n')
+    return parents === onto && author === `${SYSTEM_AUTHOR.name} <${SYSTEM_AUTHOR.email}>` && rebasedFrom(message) === from
+  }
+
+  /**
+   * The rebase as it is committed: its head, and the subject its required checks run on again, which
+   * is that committed tree and nothing else. A worktree that holds anything beside the commit (an edit
+   * after a restart found the rebase done) is refused, left as it is: the checks would run on a tree
+   * other than the one that lands (INV-5).
+   */
+  private async rebasedAnswer(row: WorktreeRow, step: Extract<LandStep, { step: 'rebase' }>, inside: (args: string[]) => Promise<string>, already: boolean, regenerated?: Regenerated): Promise<Landed> {
+    const head = (await inside(['rev-parse', 'HEAD'])).trim()
+    const pending = (await inside(['status', '--porcelain', '--untracked-files=all'])).trimEnd()
+    if (pending) {
+      return {
+        outcome: 'refused', cause: 'moved',
+        reason: `${row.path} holds uncommitted changes (${pending.split('\n').slice(0, 5).map((l) => l.slice(3)).join(', ')}) beside ${row.branch}'s rebase commit ${head}, so the rebase is not taken as it is: its checks run again only on the committed tree that lands; the worktree is left as it is`,
+      }
+    }
+    const current = captureGitSubject(row.path)
+    if (!current) return { outcome: 'refused', cause: 'failed', reason: `${row.path} is no longer a git working tree` }
+    if (current.subject.ref !== head) return { outcome: 'refused', cause: 'moved', reason: `${row.path} moved from ${head} to ${current.subject.ref} while its rebase was read, so it is not taken as it is` }
+    if (!already) this.ctx.logger.info(`agent Workers: ${row.branch} is rebased onto ${step.base.branch} at ${step.base.sha} as ${head} (from ${step.head})${regenerated ? `, its generated files made again (${named(regenerated.files)})` : ''}`)
+    return {
+      outcome: 'rebased', repository: row.repository, branch: row.branch, head, from: step.head, base: step.base,
+      subject: { ref: current.subject.ref, version: current.subject.version! }, stat: await this.statOf(row.repository, step.base.sha, head), already, ...(regenerated ? { regenerated } : {}),
+    }
+  }
+
+  private async conflictedAnswer(row: WorktreeRow, step: Extract<LandStep, { step: 'rebase' }>, files: string[]): Promise<Landed> {
+    const fork = (await git(row.repository, ['merge-base', step.head, step.base.sha]).catch(() => '')).trim()
+    const moved = fork ? (await git(row.repository, ['log', '--no-color', '--format=%h %s', `--max-count=${REBASE_MOVED_MAX}`, `${fork}..${step.base.sha}`]).catch(() => '')).split('\n').filter(Boolean) : []
+    return { outcome: 'conflicted', repository: row.repository, branch: row.branch, from: step.head, base: step.base, fork, files: files.slice(0, REBASE_FILES_MAX), more: Math.max(0, files.length - REBASE_FILES_MAX), moved }
+  }
+
+  /** A rebase that cannot go on: the branch put back at the head, the worktree its tracked files, and why (INV-2). */
+  private async giveUp(row: WorktreeRow, step: Extract<LandStep, { step: 'rebase' }>, inside: (args: string[]) => Promise<string>, why: string): Promise<Landed> {
+    const back = await (async () => {
+      const tip = (await git(row.repository, ['rev-parse', '--verify', '--quiet', `refs/heads/${row.branch}^{commit}`]).catch(() => '')).trim()
+      if (tip !== step.head) await git(row.repository, ['update-ref', `refs/heads/${row.branch}`, step.head, tip])
+      await inside(['read-tree', '-u', '--reset', 'HEAD'])
+      await this.forgetReplay(row, step)
+    })().then(() => `${row.branch} is back at ${step.head}`, (error: unknown) => `and ${row.branch} could not be put back at ${step.head} (${(error as Error).message}): look at ${row.path}`)
+    return { outcome: 'refused', cause: 'failed', reason: `${why}; ${back}` }
+  }
+
+  /** Drop the mark that a rebase of `step.head` was replayed ({@link replayedRef}), if there is one. */
+  private async forgetReplay(row: WorktreeRow, step: Extract<LandStep, { step: 'rebase' }>): Promise<void> {
+    const ref = replayedRef(row.workflow_run_id, step.head)
+    if ((await git(row.repository, ['rev-parse', '--verify', '--quiet', ref]).catch(() => '')).trim()) await git(row.repository, ['update-ref', '-d', ref])
+  }
+
   /** The repository's checked-out branch and its head: where a landing merges into. */
   private async baseOf(repository: string): Promise<{ branch: string; sha: string } | { problem: string }> {
     const ref = (await git(repository, ['symbolic-ref', '--quiet', 'HEAD']).catch(() => '')).trim()
@@ -1511,6 +2154,11 @@ export class Worktrees {
    * descriptor, as place writes it, then removed by name: rmdir takes only an empty directory, never a link.
    */
   private async clearSystem(row: WorktreeRow, inside: (args: string[]) => Promise<string>): Promise<void> {
+    // A command sandbox's empty placeholders left in the worktree (T265) are not the work either:
+    // never in its subject, and so never committed with it. Only an untracked one that holds nothing.
+    for (const path of (await inside(['ls-files', '--others', '--exclude-standard', '-z'])).split('\0')) {
+      if (path && sandboxPlaceholder(row.path, path)) rmSync(join(row.path, path), { recursive: true, force: true })
+    }
     const system = join(row.path, '.system')
     const own = openDirectory(system)
     if (typeof own !== 'object') return
@@ -1526,7 +2174,7 @@ export class Worktrees {
 
   /** The `retention` decision that retires a worktree (INV-13), recorded on its row. */
   private decide(row: WorktreeRow, retentionHours: number): string {
-    const last = (this.ctx.store.db.prepare('SELECT MAX(updated_at) AS last FROM agent_runs WHERE workflow_run_id = ?').get(row.workflow_run_id) as { last: string | null }).last ?? row.created_at
+    const last = (this.ctx.store.db.prepare(`SELECT ${LAST_USED} AS last FROM agent_worktrees w WHERE repository = ? AND workflow_run_id = ?`).get(row.repository, row.workflow_run_id) as { last: string | null } | undefined)?.last ?? row.created_at
     const decision = this.ctx.artifacts.recordDecision({
       schema: 'decision@1.3', decisionType: 'retention', question: `Is the worktree ${row.path} of workflow run ${row.workflow_run_id} removed?`, inputs: [],
       candidates: [
@@ -1560,6 +2208,10 @@ export class Worktrees {
     // system's own workspace files are never part of the work: gone before the commit.
     await this.clearSystem(row, inside)
     if (halfCarried(row)) await this.putBack(row)
+    // A landing's rebase left to resolve (ADR-0068): its conflict markers are no one's work to keep.
+    if (zPaths(await inside(['diff', '--name-only', '-z', '--diff-filter=U'])).length) {
+      throw new WorktreeError(`${row.path} holds a landing's rebase whose conflicts are not resolved (ADR-0068): nothing of it is committed, and it is left for its landing or the operator`)
+    }
     let commit: string | undefined
     if ((await inside(['status', '--porcelain', '--untracked-files=all'])).trim()) {
       await inside(['add', '--all'])

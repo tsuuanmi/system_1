@@ -59,6 +59,13 @@ function repository(): string {
     '',
   ].join('\n'))
   writeFileSync(join(dir, 'fail.mjs'), "console.error('gen: the sources do not parse')\nprocess.exit(2)\n")
+  // What pnpm does before a script unless told not to (T235): an install, which needs the network the confinement does not give.
+  writeFileSync(join(dir, 'pnpm-like.mjs'), [
+    "if (process.env.pnpm_config_verify_deps_before_run !== 'false') { console.error('pnpm-like: verify-deps-before-run started an install: failed to lookup address'); process.exit(1) }",
+    "if (process.env.pnpm_config_offline !== 'true') { console.error('pnpm-like: not offline'); process.exit(1) }",
+    "await import('./gen.mjs')",
+    '',
+  ].join('\n'))
   writeFileSync(join(dir, 'dep.js'), 'export const dep = 1\n')
   writeFileSync(join(dir, 'generated.txt'), listing('dep.js'))
   git(dir, 'add', '.')
@@ -127,9 +134,10 @@ async function boot(repo: string, commands: string[], setup: string[] = SETUP) {
    * One writing run of `agent:dev` in workflow run `runId`, its result committed on its branch as a
    * landing commits it; then the base moves on `main` (`main.js` added, `generated.txt` made again),
    * and the merge of the branch, approved on the base as it is then, is asked of the source;
-   * `meddle`, when given, acts on the worktree just before that.
+   * `meddle`, when given, acts on the worktree just before that; `moves`, when given, changes more of
+   * the base in the same commit.
    */
-  const land = async (runId: string, prompt = 'write', meddle?: (workspace: string, base: { branch: string; sha: string }) => void) => {
+  const land = async (runId: string, prompt = 'write', meddle?: (workspace: string, base: { branch: string; sha: string }) => void, moves?: () => void) => {
     const source = ctx.workers.source('agents')!
     const started = source.start({ key: `${runId}-${Math.random()}`, worker: 'agent:dev', prompt, sessionId: `ses_${runId}`, runId, requirement, decisions: { tier: 'sha256:0', route: 'sha256:0' } as never })
     const done = await source.wait(started.id, 30_000)
@@ -140,6 +148,7 @@ async function boot(repo: string, commands: string[], setup: string[] = SETUP) {
     if (committed?.outcome !== 'committed') throw new Error(`not committed: ${JSON.stringify(committed)}`)
     writeFileSync(join(repo, 'main.js'), 'export const main = 1\n')
     writeFileSync(join(repo, 'generated.txt'), listing('dep.js', 'main.js'))
+    moves?.()
     git(repo, 'add', '.')
     git(repo, 'commit', '-q', '-m', 'main moves')
     const base = { branch: 'main', sha: git(repo, 'rev-parse', 'HEAD') }
@@ -176,6 +185,48 @@ describe('a landing\'s conflict confined to generated files (worktreeSetup gener
       // Asked again (a restart): found merged, not made twice.
       expect(await ctx.workers.land!({ step: 'merge', runId: 'run_gen', workspace, head, base, message: 'again' })).toMatchObject({ outcome: 'merged', commit: merged.commit, already: true })
       expect(git(repo, 'rev-parse', 'HEAD')).toBe(merged.commit)
+    })
+
+    it('runs the generated files\' commands with pnpm\'s verify-deps-before-run off and offline, as a check\'s, so a pnpm script never starts an install (T235)', async () => {
+      const repo = repository()
+      const { merged } = await (await boot(repo, ['node pnpm-like.mjs'])).land('run_pnpm')
+      expect(merged).toMatchObject({ outcome: 'merged', regenerated: { files: ['generated.txt'], commands: ['node pnpm-like.mjs'] } })
+      expect(readFileSync(join(repo, 'generated.txt'), 'utf8')).toBe(listing('dep.js', 'main.js', 'used.js'))
+    })
+
+    it('sets the worktree up again before the generated files\' commands when the moved base changed a dependency file, so they run on what the merged tree names, never on stale dependencies; refuses when it cannot (T263)', async () => {
+      /** A repository whose generator reads a dependency the setup installs from package.json's `genDep`. */
+      const versioned = (): string => {
+        const repo = repository()
+        writeFileSync(join(repo, 'package.json'), '{"genDep": "1"}\n')
+        writeFileSync(join(repo, 'install.mjs'), [
+          "import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'",
+          "const { genDep } = JSON.parse(readFileSync('package.json', 'utf8'))",
+          "if (genDep === 'unavailable') { console.error('install: gen-dep@unavailable is not in the store'); process.exit(1) }",
+          "mkdirSync('node_modules', { recursive: true })",
+          "writeFileSync('node_modules/gen-dep.txt', `${genDep}\\n`)",
+          '',
+        ].join('\n'))
+        writeFileSync(join(repo, 'gen-dep.mjs'), [
+          "import { readdirSync, readFileSync, writeFileSync } from 'node:fs'",
+          "writeFileSync('generated.txt', readdirSync('.').filter((n) => n.endsWith('.js')).sort().join('\\n') + '\\n' + `gen-dep ${readFileSync('node_modules/gen-dep.txt', 'utf8')}`)",
+          '',
+        ].join('\n'))
+        git(repo, 'add', '.')
+        git(repo, 'commit', '-q', '-m', 'a generator with a dependency')
+        return repo
+      }
+      const repo = versioned()
+      const { merged } = await (await boot(repo, ['node gen-dep.mjs'], ['node install.mjs'])).land('run_dep', 'write', undefined, () => writeFileSync(join(repo, 'package.json'), '{"genDep": "2"}\n'))
+      expect(merged).toMatchObject({ outcome: 'merged', regenerated: { files: ['generated.txt'] } })
+      expect(readFileSync(join(repo, 'generated.txt'), 'utf8')).toBe(`${listing('dep.js', 'main.js', 'used.js')}gen-dep 2\n`)
+      expect(git(repo, 'status', '--porcelain')).toBe('')
+
+      const other = versioned()
+      const { merged: refused, base } = await (await boot(other, ['node gen-dep.mjs'], ['node install.mjs'])).land('run_nodep', 'write', undefined, () => writeFileSync(join(other, 'package.json'), '{"genDep": "unavailable"}\n'))
+      expect(refused).toMatchObject({ outcome: 'refused', cause: 'conflict', reason: expect.stringMatching(/the worktree's setup did not run again for the dependency files of landing:merge:.*gen-dep@unavailable is not in the store/) })
+      expect(git(other, 'rev-parse', 'HEAD')).toBe(base.sha)
+      expect(git(other, 'status', '--porcelain')).toBe('')
     })
 
     it('refuses a merge that also conflicts in a source file: nothing is run, and the repository is as it was (INV-2)', async () => {
@@ -270,8 +321,9 @@ describe('a landing\'s conflict confined to generated files (worktreeSetup gener
     const repo = repository()
     const load = (generated: unknown) => () => loadSetups([{ repository: repo, commands: ['true'], generated: generated as never }], [repo])
     expect(load({ paths: [], commands: ['true'] })).toThrow(/generated\.paths holds 1 to 32 paths/)
-    expect(load({ paths: ['../outside'], commands: ['true'] })).toThrow(/generated path 1 \(\.\.\/outside\) is not a relative path/)
-    expect(load({ paths: ['/etc/passwd'], commands: ['true'] })).toThrow(/is not a relative path/)
+    expect(load({ paths: ['../outside'], commands: ['true'] })).toThrow(/generated path 1 \(\.\.\/outside\) has a \. or \.\. segment/)
+    expect(load({ paths: ['/etc/passwd'], commands: ['true'] })).toThrow(/is not a repository-relative path/)
+    expect(load({ paths: ['docs/'], commands: ['true'] })).toThrow(/or ends in \//)
     expect(load({ paths: ['docs/**/x.md'], commands: ['true'] })).toThrow(/holds a glob character other than a single \*/)
     expect(load({ paths: ['.git/config'], commands: ['true'] })).toThrow(/names \.git, \.system, or every top-level entry/)
     expect(load({ paths: ['a.md', 'a.md'], commands: ['true'] })).toThrow(/names a path twice/)
@@ -296,6 +348,6 @@ describe('a landing\'s conflict confined to generated files (worktreeSetup gener
 
   it('refuses at load, through the plugin\'s own config, a generated declaration that is not one', () => {
     const repo = repository()
-    expect(() => new AgentWorkers(new Context(), { workers: [writer(repo)], worktreeSetup: [{ repository: repo, commands: ['true'], generated: { paths: ['x/../y'], commands: ['true'] } }] })).toThrow(/generated path 1 \(x\/\.\.\/y\) is not a relative path/)
+    expect(() => new AgentWorkers(new Context(), { workers: [writer(repo)], worktreeSetup: [{ repository: repo, commands: ['true'], generated: { paths: ['x/../y'], commands: ['true'] } }] })).toThrow(/generated path 1 \(x\/\.\.\/y\) has a \. or \.\. segment/)
   })
 })

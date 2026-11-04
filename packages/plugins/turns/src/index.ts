@@ -13,17 +13,14 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { type Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { AccountStatus } from '@tsuuanmi/system-accounts'
-import type { Classification } from '@tsuuanmi/system-egress'
-import type {} from '@tsuuanmi/system-event-log'
+import { type Lease, LeaseLost, StaleGeneration } from '@tsuuanmi/system-board-core'
+import type {} from '@tsuuanmi/system-ledger-core'
 import { reply } from '@tsuuanmi/system-gateway-core'
 import type {} from '@tsuuanmi/system-login'
-import type {} from '@tsuuanmi/system-artifacts'
-import { type Lease, LeaseLost, StaleGeneration } from '@tsuuanmi/system-leases'
 import { type ContentId, contentId, LABEL, pooledTermsDecision, sha256 } from '@tsuuanmi/system-libs'
 import { type BrowserTurn, type ConversationMode, type Disposition, type PortableState, type ProviderDriver, ProviderError, type ProviderFeature, ProviderScheduler, type Tier, type TurnReceipt, type TurnSnapshot, boundaryMissing, dispositionOf, promptOfStart, toProviderError } from '@tsuuanmi/system-provider-core'
-import type {} from '@tsuuanmi/system-store'
 import type {} from '@tsuuanmi/system-turn-receipts'
-import type { CapabilityDescriptor, WorkerExecution, WorkerStart, WorkerState } from '@tsuuanmi/system-workers-core'
+import type { CapabilityDescriptor, Classification, ExecutionInfrastructure, WorkerExecution, WorkerStart, WorkerState } from '@tsuuanmi/system-workers-core'
 import { z as zod } from 'zod'
 import { type ConversationView, deleteDue, LEDGER_MIGRATION, type LedgerHost, type LedgerState, listConversations, recordConversation, releaseSessions, sessionReleased } from './ledger.ts'
 
@@ -60,8 +57,11 @@ export interface TurnView {
   routeDecision?: ContentId
   tierDecision?: ContentId
   egressDecision?: ContentId
-  /** `siteError`: the site answered the sent prompt with its own error in place of an answer (ADR-0062). */
-  error?: { kind: string; disposition: Disposition; message: string; siteError?: true }
+  /**
+   * `siteError`: the site answered the sent prompt with its own error in place of an answer (ADR-0062).
+   * `infrastructure`: the host's stop alone ended it (ADR-0069).
+   */
+  error?: { kind: string; disposition: Disposition; message: string; siteError?: true; infrastructure?: ExecutionInfrastructure }
   createdAt: string
   updatedAt: string
 }
@@ -216,6 +216,9 @@ const LEASE_TTL_MS = 60_000
 
 export class Turns extends Service {
   static inject = ['store', 'artifacts', 'leases', 'egress', 'turnReceipts', 'accounts', 'browser', 'providers', 'workers']
+
+  /** The clock a turn's deadlines read (milliseconds), for a test to control; the wall clock when unset. */
+  stallClock: (() => number) | undefined
 
   static Config: z<Config> = z.object({
     maxConcurrentTurnsPerAccount: z.natural().min(1).default(2).description('Parallel turns per account (different sessions)'),
@@ -1024,9 +1027,10 @@ export class Turns extends Service {
     // Routed before a restart, then unmapped by the operator: never served by another mode (INV-2).
     const preset = view.tiers[tier]
     if (!preset) throw new ProviderError('config_error', `${accountId} no longer maps tier ${tier} to a mode; the turn is not sent`)
-    const deadlines = research
+    const limits = research
       ? { timeoutMs: this.config.researchTimeoutMs ?? 60 * 60_000, stallTimeoutMs: this.config.researchStallTimeoutMs ?? 30 * 60_000 }
       : { timeoutMs: this.config.turnTimeoutMs ?? 15 * 60_000, stallTimeoutMs: this.config.stallTimeoutMs ?? 5 * 60_000 }
+    const deadlines = this.stallClock ? { ...limits, now: this.stallClock } : limits
     // A session-bound account's persistent session keeps its tab between turns (ADR-0030). Its page
     // follows the turn's signal only until the answer is in: the turn's end must not close a page
     // that is being kept.
@@ -1236,8 +1240,9 @@ export class Turns extends Service {
         continue
       }
       if (outcome === 'AMBIGUOUS' || Date.now() > deadline) {
+        // Its previous owner's stop alone left it unknown: the host's failure, not the turn's (ADR-0069).
         this.fail(row.turn_id, new ProviderError('reconciliation_failed',
-          `the host stopped after this prompt was sent and the outcome cannot be established (decision ${decision}); it is not resent automatically`), lease)
+          `the host stopped after this prompt was sent and the outcome cannot be established (decision ${decision}); it is not resent automatically`), lease, 'host-stopped')
         return 'done'
       }
       // WAIT: the provider is still generating; look again shortly (a cancel or a stop ends the wait).
@@ -1265,7 +1270,8 @@ export class Turns extends Service {
     return this.ctx.store.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(turnId) as Row | undefined
   }
 
-  private fail(turnId: string, error: unknown, lease?: () => Lease): void {
+  /** `infrastructure`: what of the infrastructure alone ended it, when this runtime knows it (ADR-0069). */
+  private fail(turnId: string, error: unknown, lease?: () => Lease, infrastructure?: ExecutionInfrastructure): void {
     // A finished turn stays as it finished: a later failure (closing its browser turn) never rewrites it.
     if (TERMINAL.has(this.row(turnId)?.status ?? 'queued')) return
     const typed = toProviderError(error)
@@ -1276,7 +1282,7 @@ export class Turns extends Service {
     // written (ADR-0062): told to the caller, whose rule alone may start the work again. Without a
     // receipt nothing was sent, so it is not that.
     const siteError = typed.siteError && row?.submitted_at ? { siteError: true } : {}
-    this.update(turnId, { status: 'failed', error: JSON.stringify({ kind: typed.kind, disposition: dispositionOf(typed.kind), message: typed.message, ...siteError }) }, lease)
+    this.update(turnId, { status: 'failed', error: JSON.stringify({ kind: typed.kind, disposition: dispositionOf(typed.kind), message: typed.message, ...siteError, ...(infrastructure ? { infrastructure } : {}) }) }, lease)
   }
 
   /** Write turn fields; with a lease, only while that lease still holds the turn (fenced). */

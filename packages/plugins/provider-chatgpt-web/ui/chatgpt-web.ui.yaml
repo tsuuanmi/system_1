@@ -1,5 +1,5 @@
 # ChatGPT Web UI map (ui-map@1.0, ADR-0021). Checked against the live site on 2026-10-11
-# (docs/research/browser-interaction-and-self-healing.md#live-check-2026-10-11-signed-in-account-read-only).
+# (a research note, now in Git history).
 # When the site changes, edit this file (and the fixture), not the driver code.
 schema: ui-map@1.3
 provider: chatgpt-web

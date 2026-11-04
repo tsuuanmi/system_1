@@ -43,6 +43,13 @@ dated section, `## Amendment (YYYY-MM-DD): <title>`, below the original text.
 Anything that changes the decision needs a new ADR that supersedes the old one,
 in whole or in part.
 
+## Deleting what is no longer current
+
+Git keeps the history, so the documentation holds only what is current. An ADR
+superseded in whole, a `Proposed` ADR no longer pursued, a proposal that is
+implemented or abandoned, and research no open proposal cites are deleted, with
+every link to them updated in the same change. An ADR superseded in part stays.
+
 ## Work state and conversations
 
 What the operator and the agents building `system` decide and do lives in artifacts any later

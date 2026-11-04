@@ -8,15 +8,14 @@ about `system` itself, beside the [self-build](../self-build.md) record and the
 | Experiment | Question | State |
 |---|---|---|
 | [Lead agnosticism](lead-agnosticism.md) | Can a lead of another provider family carry on a project another lead started, through `system`'s MCP tools alone, with no step lost or repeated? | ready, once the live install is updated |
-| [Worker agnosticism on `review`](worker-agnosticism.md) | Does swapping one review member's Worker (ChatGPT website for Codex CLI, beside a fixed Antigravity CLI member) leave the team's outcomes within pre-registered margins? The first record of PROP-0011's feedback loop | pre-registered 2026-10-23; not run: its [preconditions](worker-agnosticism.md#preconditions) are open |
+| [Reviewer eval](reviewer-eval.md) | Does the reviewer still find what it found? Past escaped defects and clean changes, run on every change to the review template, its prompts, or the reviewer's tier or model; recall and false-important rate | no measured run recorded: its [preconditions](reviewer-eval.md#preconditions) are open |
 
 ## How an experiment is written and run
 
 - **Written before it runs.** The question, the pass criteria or the hypothesis and its metrics,
   and the protocol are committed before the first call. A change after the first trial is a new
   revision, cited, never an edit ([records](records/README.md)).
-- **Records.** One JSON document per record in [records](records/README.md). The worker-agnosticism
-  records follow PROP-0011's field lists and are not yet converted to its schemas (F1).
+- **Records.** One JSON document per record in [records](records/README.md).
 - **Evidence outside the repository.** Run exports and transcripts stay in the experiment's
   directory on the host (`~/experiments/<experiment id>/`); the committed record names each file
   with its sha256.

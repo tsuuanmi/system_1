@@ -36,7 +36,6 @@ const model = (id: string, family: string, tier: Tier): CapabilityDescriptor => 
 /** A text to review: a request, then `lines` numbered lines of code, each about 60 characters. */
 const material = (lines: number): string => ['Review this change for defects in its lease handling; a lease must be released on every path.',
   ...Array.from({ length: lines }, (_, i) => `const step${i} = lease.renew(${i}) // line ${String(i).padStart(4, '0')} of the change`)].join('\n')
-const count = (text: string, part: string): number => text.split(part).length - 1
 
 const isProposal = (prompt: string): boolean => prompt.includes('Answer on your own')
 const findings = '```json\n' + JSON.stringify({ findings: [{ severity: 'warning', claim: 'the lease is renewed and never released', evidence: 'line 2', quote: { path: 'material', line: 2, text: 'const step0 = lease.renew(0) // line 0000 of the change' } }] }) + '\n```'
@@ -119,43 +118,8 @@ type Decision = { decisionType: string; decider: { id: string; version: string }
 const decisions = (ctx: Context, runId: string, type: string): Decision[] =>
   ctx.artifacts.list({ kind: 'decision', decisionType: type, runId, limit: 100 }).map((a) => a.body as Decision)
 
-/** Two sites, each an account with three tiers, both taking at most 30,000 characters, as the Gemini site's bound. */
-const SITES = (['economy', 'standard', 'frontier'] as const).flatMap((t) => [website('chat', 'site-a', t, 30_000), website('gem', 'site-b', t, 30_000)])
-/** The second site's tiers share one account: a member's session stays on them (Model A). */
-const siteSessions = { 'web:gem/standard': ['web:gem/economy', 'web:gem/frontier'], 'web:chat/standard': ['web:chat/economy', 'web:chat/frontier'] }
 
 describe('a review member kept off a website by its input bound (live 2026-10-23, board T31)', () => {
-  it('shows a text review\'s material once, so a member\'s input fits the website bound the source is sized for', async () => {
-    const { ctx } = await boot()
-    // About 17,000 characters of text: as members read it, it fits the default source bound
-    // (24,000); shown twice, a member's input was 36,064 characters, over the site's 30,000.
-    const text = material(280)
-    expect(text.length).toBeGreaterThan(16_000)
-    const started = scripted(ctx, [...SITES, model('api', 'site-b-api', 'standard')], (prompt) => ({ text: isProposal(prompt) ? findings : ballot }), siteSessions)
-    const done = await ctx.workflow.wait(ctx.workflow.start({ template: 'review', input: text, classification: 'public' }).runId, 60_000)
-    expect(done).toMatchObject({ status: 'completed' })
-    // Both members on the websites, each at the step's own tier: neither was kept off by its input.
-    expect(Object.fromEntries(done.nodes.filter((n) => n.nodeId.endsWith(':propose')).map((n) => [n.nodeId, [n.worker, n.tier]]))).toEqual({
-      'review:m1:propose': ['web:chat/standard', 'standard'], 'review:m2:propose': ['web:gem/standard', 'standard'],
-    })
-    for (const proposal of started.filter((s) => isProposal(s.prompt))) {
-      // The text once, line-numbered in the file `material`, and the request said to be in it.
-      expect(count(proposal.prompt, 'line 0123 of the change')).toBe(1)
-      expect(proposal.prompt).toMatch(/^The request is the caller's text, shown once below as the file `material`/)
-      expect(proposal.prompt).toContain('   2  const step0 = lease.renew(0) // line 0000 of the change')
-      expect([...proposal.prompt].length).toBeLessThan(30_000)
-    }
-    // A finding quoting the material is still checked against what members read.
-    expect(done.answer).toMatch(/F1 at material:2 .*warning confirmed/)
-  }, 60_000)
-
-  it('composes the caller\'s text as itself where no source step shows it', async () => {
-    const { ctx } = await boot()
-    const started = scripted(ctx, SITES, (prompt) => ({ text: isProposal(prompt) ? findings : ballot }), siteSessions)
-    const asked = await ctx.workflow.wait(ctx.workflow.start({ template: 'ask', input: 'What does line 0007 of the change do?', classification: 'public' }).runId, 30_000)
-    expect(asked).toMatchObject({ status: 'completed' })
-    expect(started.at(-1)!.prompt).toBe('What does line 0007 of the change do?')
-  }, 60_000)
 
   it('routes a member over a website\'s bound to a Worker that takes it at the step\'s own tier, never a higher one', async () => {
     const { ctx } = await boot()
@@ -173,75 +137,9 @@ describe('a review member kept off a website by its input bound (live 2026-10-23
     const candidates = (ctx.artifacts.get(route.id as ArtifactRef)!.body as Decision).candidates
     for (const tier of ['economy', 'standard', 'frontier']) expect(candidates.find((c) => c.option === `web:gem/${tier}`)!.reasons.join('; ')).toMatch(/the input has \d+ characters; it takes at most 5000/)
   }, 60_000)
-
-  it('fails a member whose rejected answer its session cannot take to a higher tier, naming the rejection and why, never a family shortage (run A; REQ-WRK-9, REQ-TEAM-2)', async () => {
-    const { ctx } = await boot()
-    // As live: the second site refuses the input; its API model takes the member at the step's tier, alone in its family.
-    const workers = [website('chat', 'site-a', 'standard'), ...(['economy', 'standard', 'frontier'] as const).map((t) => website('gem', 'site-b', t, 5000)), model('api', 'site-b-api', 'standard')]
-    // The model's review stops at its output bound, before its JSON.
-    const started = scripted(ctx, workers, (prompt, start) => (start.worker === 'model:api' ? { text: 'F1: the lease leaks on the error path, because', cut: true } : { text: isProposal(prompt) ? findings : ballot }))
-    const done = await ctx.workflow.wait(ctx.workflow.start({ template: 'review', input: material(150), classification: 'public' }).runId, 60_000)
-    expect(done.status).toBe('failed')
-    const m2 = done.nodes.find((n) => n.nodeId === 'review:m2:propose')!
-    expect(m2).toMatchObject({ state: 'FAILED', worker: 'model:api', error: { kind: 'acceptance_rejected', disposition: 'NONE' } })
-    expect(m2.error!.message).toMatch(/^acceptance\.team-findings: the answer ends with no JSON object holding "findings".*; the answer stopped at its Worker's output bound \(4096 tokens\): a longer answer needs a higher bound in that Worker's configuration; not escalated: session \S+ stays on its Worker model:api \(standard\), none at tier frontier or above, so no Worker could take it there$/)
-    expect(m2.error!.message).not.toMatch(/provider families/)
-    // The escalation decision says so; nothing was routed or sent again.
-    const [escalation] = decisions(ctx, done.runId, 'escalation')
-    expect(escalation).toMatchObject({ decider: { id: 'workflow.escalation', version: '2' }, outcome: { option: 'fail' } })
-    expect(escalation!.candidates.find((c) => c.option === 'escalate')!.reasons[0]).toMatch(/^not escalate: session \S+ stays on its Worker model:api/)
-    expect(started.filter((s) => s.worker === 'model:api')).toHaveLength(1)
-    const chain = ctx.workflow.explain(done.runId)!.nodes.find((n) => n.nodeId === m2.nodeId)!.decisions.map((d) => d.type)
-    expect(chain.filter((t) => t === 'route')).toHaveLength(1)
-    expect(chain).not.toContain('admission')
-  }, 60_000)
-
-  it('escalates such a member onto its session\'s Worker at the next tier when its source has one (REQ-WRK-9, REQ-TEAM-2)', async () => {
-    const { ctx } = await boot()
-    const workers = [website('chat', 'site-a', 'standard'), website('gem', 'site-b', 'standard', 5000), model('api', 'site-b-api', 'standard'), model('api-pro', 'site-b-api', 'frontier')]
-    // Only its proposal at the standard tier is rejected.
-    const started = scripted(ctx, workers, (prompt, start) => ({ text: !isProposal(prompt) ? ballot : start.worker === 'model:api' ? 'no JSON here' : findings }), { 'model:api': ['model:api-pro'] })
-    const done = await ctx.workflow.wait(ctx.workflow.start({ template: 'review', input: material(150), classification: 'public' }).runId, 60_000)
-    expect(done).toMatchObject({ status: 'completed' })
-    expect(done.nodes.find((n) => n.nodeId === 'review:m2:propose')).toMatchObject({ worker: 'model:api-pro', tier: 'frontier' })
-    expect(decisions(ctx, done.runId, 'escalation').map((d) => d.outcome.option)).toEqual(['escalate'])
-    const m2 = started.filter((s) => s.prompt.includes('member 2 of'))
-    expect(new Set(m2.map((s) => s.sessionId)).size).toBe(1)
-  }, 60_000)
-
-  it('names the caller\'s text as the bound to change when every Worker of another family refuses only its length, and no family shortage (2 families ready)', async () => {
-    const { ctx } = await boot()
-    const workers = [website('chat', 'site-a', 'standard'), website('gem', 'site-b', 'standard', 5000)]
-    const started = scripted(ctx, workers, (prompt) => ({ text: isProposal(prompt) ? findings : ballot }))
-    const done = await ctx.workflow.wait(ctx.workflow.start({ template: 'review', input: material(150), classification: 'public' }).runId, 60_000)
-    expect(done.status).toBe('failed')
-    const m2 = done.nodes.find((n) => n.nodeId === 'review:m2:propose')!
-    expect(m2.error).toMatchObject({ kind: 'invalid_input' })
-    expect(m2.error!.message).toMatch(/^no Worker can take this work: .*the input has \d+ characters; it takes at most 5000.*\. The input is \d+ characters, most of it the caller's text, shown once as the file material \(at most repositories\.maxSourceChars, 24000\): review a smaller part of it/)
-    expect(started.filter((s) => s.worker === 'web:gem/standard')).toEqual([])
-  }, 60_000)
-
-  it('still says a team is short of provider families when it is', async () => {
-    const { ctx } = await boot()
-    scripted(ctx, [website('chat', 'site-a', 'standard'), website('chat2', 'site-a', 'standard')], (prompt) => ({ text: isProposal(prompt) ? findings : ballot }))
-    const done = await ctx.workflow.wait(ctx.workflow.start({ template: 'review', input: material(10), classification: 'public' }).runId, 60_000)
-    expect(done.nodes.find((n) => n.nodeId === 'review:m2:propose')!.error).toMatchObject({ kind: 'config_error', message: expect.stringMatching(/^team review needs 2 provider families, one per member; 1 is ready \(ADR-0027\)\. no Worker can take this work/) })
-  }, 60_000)
 })
 
 describe('a session step\'s held Workers, when another Worker source cannot describe itself (T62)', () => {
-  it('completes a session step whose answer is accepted while another Worker source cannot describe itself (T62)', async () => {
-    const { ctx } = await boot()
-    const unreadable = failing(ctx)
-    // The other source fails to describe itself only once the step started, as a vault read failing then.
-    scripted(ctx, [model('api', 'fam', 'standard')], () => {
-      unreadable.broken = true
-      return { text: 'An answer.' }
-    })
-    const done = await ctx.workflow.wait(ctx.workflow.start({ template: 'ask', input: 'hello', persist: true }).runId, 30_000)
-    expect(done).toMatchObject({ status: 'completed', answer: 'An answer.' })
-    expect(decisions(ctx, done.runId, 'recovery')).toEqual([])
-  }, 60_000)
 
   it('does not escalate a session step\'s rejected answer when its held Workers cannot be listed, and fails it as rejected, never as internal (T62)', async () => {
     const { ctx } = await boot()

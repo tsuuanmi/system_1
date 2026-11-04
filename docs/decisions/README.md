@@ -17,4 +17,6 @@ architecture, design, source, and tests.
   decision unchanged may be appended as a dated amendment
   ([rule](../governance/documentation.md#amending-an-accepted-adr)); a material
   replacement creates a successor that explicitly supersedes the earlier record.
+- A record superseded in whole is deleted; Git keeps it
+  ([rule](../governance/documentation.md#deleting-what-is-no-longer-current)).
 - Do not use ADRs as current-state design manuals.

@@ -1,5 +1,7 @@
 # @tsuuanmi/system-gateway-responses
 
+> **Parked and frozen (security fixes only)** since 2026-11-01: [components](../../../docs/architecture/components.md#parked).
+
 The **OpenAI Responses gateway**, on the DSH webserver under `/openai` (loopback
 only). Codex selects a custom model provider whose base URL is here, and uses
 website Workers as its model ([gateways](../../../docs/design/gateways.md),

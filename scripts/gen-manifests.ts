@@ -76,7 +76,7 @@ export async function codeFacts(): Promise<CodeFacts> {
     if (schema.type !== 'object' || !schema.dict) throw new Error(`gen-manifests: packages/plugins/${dir}: its Config is not an object schema, so its keys cannot be told`)
     configs.set(dir, configKeys(schema))
   }
-  const egress = await import(pathToFileURL(join(root, 'packages', 'plugins', 'egress', 'src', 'index.ts')).href) as { WORKER_CLASSES: Record<string, Classification[]> }
+  const egress = await import(pathToFileURL(join(root, 'packages', 'workers-core', 'src', 'index.ts')).href) as { WORKER_CLASSES: Record<string, Classification[]> }
   return { configs, workerClasses: egress.WORKER_CLASSES }
 }
 
@@ -303,8 +303,9 @@ export function derive(facts: CodeFacts, pkgs: Pkg[] = scan(), model: string = r
         if (!c) problems.push(`${p.path}: ctx.${s} is not in the seam catalog (docs/architecture/plugin-model.md#seam-catalog)`)
         return c ? JSON.stringify(c) : undefined
       }).filter((c): c is string => c !== undefined))]
-      if (found.length > 1) problems.push(`${p.path}: its seams ${seams.join(', ')} are of several classes in the seam catalog`)
-      if (found.length === 1) cls = JSON.parse(found[0]!) as Class
+      // A package that defines several core seams (ledger-core) takes the class of the first; a core and a family seam together are a mistake.
+      if (found.length > 1 && found.some((c) => (JSON.parse(c) as Class).kind !== 'core')) problems.push(`${p.path}: its seams ${seams.join(', ')} are of several classes in the seam catalog`)
+      else if (found.length >= 1) cls = JSON.parse(found[0]!) as Class
       classSource = `the seam catalog's class of ctx.${seams.join(', ctx.')}`
     } else {
       const named = families.get(p.dir) ?? []

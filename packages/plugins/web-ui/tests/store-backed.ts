@@ -25,6 +25,7 @@ import { expect, onTestFinished } from 'vitest'
 import { parse } from 'yaml'
 import { CONFIG, readyTask, ScriptedWorkers, TEMPLATES } from '../../workflow/conformance/workflow.ts'
 import * as WebUi from '../src/index.ts'
+import { builtClient } from './client-build.ts'
 
 /** The `approvals` row's policies, as the bundle ships them (`cordis.patch.yml`). */
 export function bundlePolicies(): AutonomyPolicy[] {
@@ -76,7 +77,7 @@ export async function boot(options: { dir?: string; approvals?: Partial<Approval
     ctx.plugin(WorkerRouter, {}), ctx.plugin(WorkerSessions, {}),
     ctx.plugin({ name: 'scripted-workers', inject: ['workers', 'artifacts'], apply: (c: Context) => void c.workers.register(workers.source(c)) }),
     ctx.plugin(Workflow, { ...CONFIG, templates: TEMPLATES }),
-    ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 }), ctx.plugin(WebUi, { tokenDir: dir }),
+    ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 }), ctx.plugin(WebUi, { tokenDir: dir, clientDir: builtClient() }),
     // A resource ledger with these pools, when asked: dispatch chooses only Workers whose account's windows it reads.
     ...(options.pools ? [ctx.plugin(StoreResources, { pools: options.pools })] : []),
   ]
@@ -106,9 +107,9 @@ export async function boot(options: { dir?: string; approvals?: Partial<Approval
   return { ctx, workers, dir, ...(refused ? { refused } : {}), call, client: CLIENT, stop }
 }
 
-/** A workspace-write task of project p1 run to completion: under the bundle's policy, its run reports neither tests nor lint, so it waits in review for the operator. */
-export async function reviewed(ctx: Context, title: string): Promise<{ task: BoardTask; run: RunView }> {
-  const task = await readyTask(ctx, title, { actionClass: 'workspace-write', maxAttempts: 2 })
+/** A workspace-write task of project p1 (or another) run to completion: under the bundle's policy, its run reports neither tests nor lint, so it waits in review for the operator. */
+export async function reviewed(ctx: Context, title: string, projectId = 'p1'): Promise<{ task: BoardTask; run: RunView }> {
+  const task = await readyTask(ctx, title, { actionClass: 'workspace-write', maxAttempts: 2, projectId })
   const run = await ctx.workflow.start({ template: 'solo', input: `change ${title}`, classification: 'public', task: { taskId: task.taskId } })
   const deadline = Date.now() + 60_000
   while (ctx.workflow.get(run.runId)?.task?.phase !== 'reported') {

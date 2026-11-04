@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { request } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,10 +8,12 @@ import WebServer from '@deepseek-ai/dsh-host-webserver'
 import type { ApprovalRequest, Verdict, VerdictResult } from '@tsuuanmi/system-approvals-core'
 import { type Browser, chromium, type Page } from 'patchright-core'
 import { describe, expect, it, onTestFinished } from 'vitest'
-import { canRunBrowser, testChrome } from '../../browser-patchright/tests/support.ts'
+import { headlessIt, headlessLaunchOptions } from '../../browser-patchright/tests/support.ts'
 import { SchemaRegistry } from '@tsuuanmi/system-libs'
 import * as WebUi from '../src/index.ts'
 import { lanWebServer } from '../../../gateway-core/tests/lan.ts'
+import { APP_CSS, builtClient, PAGE_HTML } from './client-build.ts'
+import { BEFORE_WORDS, noteWords, opened, shoot, wordsInSight } from './glance.ts'
 import { decisionsIn, descriptionOf } from './wording.ts'
 
 const RUN = {
@@ -52,7 +55,9 @@ class StubWorkflow extends Service {
   gone = false
   get(id: string) { return this.gone ? undefined : id === RUN.runId ? RUN : id === CARRIED.runId ? CARRIED : undefined }
   explain(id: string) {
-    if (id === CARRIED.runId) return { runId: id, nodes: [{ nodeId: 'develop:1', state: 'COMPLETED', decisions: [] }, { nodeId: 'review:m1:propose', state: 'COMPLETED', decisions: [{ id: 'sha256:44', type: 'recovery', outcome: 'resend', reasons: ['the site answered the sent prompt with its own error'] }] }] }
+    if (id === CARRIED.runId) return { runId: id, nodes: [{ nodeId: 'develop:1', state: 'COMPLETED', decisions: [] }, { nodeId: 'review:m1:propose', state: 'COMPLETED', decisions: [{ id: 'sha256:44', type: 'recovery', outcome: 'resend', reasons: ['the site answered the sent prompt with its own error'] },
+      // D89: it then ran on the family it should differ from, for want of another.
+      { id: 'sha256:45', type: 'admission', outcome: 'single-family', reasons: ['no Worker of another provider family is admitted'] }] }] }
     return id === RUN.runId ? { runId: id, nodes: [{ nodeId: 'plan:1', state: 'COMPLETED', decisions: [{ id: 'sha256:22', type: 'route', outcome: 'worker:a/standard', reasons: ['proves reason'] }] }] } : undefined
   }
   landing() { return undefined }
@@ -186,7 +191,7 @@ async function boot(options: { approvals?: boolean; roster?: boolean; pools?: bo
   const token = Buffer.alloc(32, 7).toString('base64url')
   const ctx = new Context()
   const fibers = [ctx.plugin(StubWorkflow), ...(options.approvals ? [ctx.plugin(StubApprovals)] : []), ...(options.roster ? [ctx.plugin(StubRouter), ctx.plugin(StubAccounts)] : []),
-    ...(options.pools ? [ctx.plugin(StubResources), ctx.plugin(StubAgentWorkers)] : []), ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 }), ctx.plugin(WebUi, { tokenDir: dir })]
+    ...(options.pools ? [ctx.plugin(StubResources), ctx.plugin(StubAgentWorkers)] : []), ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 }), ctx.plugin(WebUi, { tokenDir: dir, clientDir: builtClient() })]
   await Promise.all(fibers)
   onTestFinished(async () => { for (const f of [...fibers].reverse()) await f.dispose() })
   onTestFinished(() => rmSync(dir, { recursive: true, force: true }))
@@ -205,7 +210,7 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     await ctx.plugin(StubWorkflow)
     await ctx.plugin(LanWebServer)
     try {
-      await ctx.plugin(WebUi, { tokenDir: dir })
+      await ctx.plugin(WebUi, { tokenDir: dir, clientDir: builtClient() })
     } catch {
       // the refusal itself is the point
     }
@@ -222,6 +227,26 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     expect(html).toContain('<script src="/ui/app.js"></script>')
     expect(html).not.toContain('run_abc')
     expect((await fetch(`${origin}/ui/app.js`)).headers.get('content-type')).toContain('javascript')
+  })
+
+  it('serves the client\'s own files byte for byte, each with its content hash, and refuses to start without one', async () => {
+    const { origin } = await boot()
+    const files = [['', Buffer.from(PAGE_HTML), 'text/html'], ['app.css', Buffer.from(APP_CSS), 'text/css'], ['app.js', readFileSync(join(builtClient(), 'app.js')), 'javascript']] as const
+    for (const [path, bytes, type] of files) {
+      const served = await fetch(`${origin}/ui/${path}`)
+      expect(served.status).toBe(200)
+      expect(served.headers.get('content-type')).toContain(type)
+      expect(served.headers.get('cache-control')).toBe('no-store')
+      expect(served.headers.get('content-security-policy')).toContain("script-src 'self'")
+      expect(served.headers.get('etag')).toBe(`"sha256-${createHash('sha256').update(bytes).digest('hex')}"`)
+      expect(Buffer.from(await served.arrayBuffer()).equals(bytes)).toBe(true)
+    }
+    const empty = mkdtempSync(join(tmpdir(), 'system-ui-noclient-'))
+    onTestFinished(() => rmSync(empty, { recursive: true, force: true }))
+    const ctx = new Context()
+    await ctx.plugin(StubWorkflow)
+    await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 })
+    await expect(ctx.plugin(WebUi, { tokenDir: empty, clientDir: empty })).rejects.toThrow(/client file app\.js is not in/)
   })
 
   it('guards the API: token, own origin, and loopback host only', async () => {
@@ -359,22 +384,27 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     expect(none).toMatchObject({ workers: { unknown: 'the Worker registry (ctx.workers) is not mounted' } })
   })
 
-  it.runIf(canRunBrowser)('renders the Workers tab in a real browser: counts, the Workers by account under its header, each card calm (what it is for, its status, what it does now) with every unknown, derived, or technical fact folded under its details (T85, T119)', async () => {
+  headlessIt('renders the Workers tab in a real browser: counts, the Workers by account under its header, each card calm (what it is for, its status, what it does now) with every unknown, derived, or technical fact folded under its details (T85, T119)', async () => {
     const { origin, token } = await boot({ roster: true })
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await pinnedPage(browser)
     await page.goto(`${origin}/ui/#token=${token}`)
     await page.getByRole('link', { name: 'Workers', exact: true }).click()
     await expect.poll(() => page.getByRole('heading', { name: 'Workers', exact: true }).count()).toBe(1)
     expect(new URL(page.url()).search).toBe('?view=workers')
-    // The operator's words: free, and resting until a clock time.
-    expect(await page.getByLabel('Worker counts').innerText()).toBe('1 working · 0 free · 1 resting (the first until 11:00) · 0 unavailable')
-    // The account once, how many Workers in its header (their roles under its details), its rest said once for both.
+    // The operator's words as chips (T239): free always, the others when there are any, each with its symbol.
+    expect(await page.getByLabel('Worker counts').innerText()).toBe('○ 0 free\n◆ 1 working\n▲ 1 resting')
+    // The account once, how many Workers in its header (their roles under its details), its rest said once for both, as its chip.
     const account = page.getByRole('region', { name: 'Account Chatgpt · Studio Plus' })
     expect(await account.getByRole('heading', { level: 3 }).innerText()).toMatch(/^Chatgpt · Studio Plus · 2 Workers\b/)
-    expect(await account.innerText()).toContain('Its account is resting until 11:00 (in 2 h)')
+    expect(await account.innerText()).toContain('Resting until 11:00 (in 2 h)')
     expect(await account.locator('details.facts').first().textContent()).toContain('Rolesfrontier, standard')
+    // The earlier run that holds its session for want of a verdict (PROP-0013) is a line on the account, never folded; what frees it is under What to do.
+    const alarms = account.getByRole('list', { name: 'Needs a look' })
+    expect(await alarms.innerText()).toMatch(/^standard: ■ Not known to be gone open run/)
+    // Its Worker cards under one fold (T239), closed until opened.
+    await account.locator('details.workers-fold > summary').click()
     const busy = account.getByRole('article', { name: 'Chatgpt · Studio Plus · standard' })
     expect(await busy.getByRole('heading', { level: 4 }).innerText()).toBe('standard')
     const shown = await busy.innerText()
@@ -385,7 +415,7 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
       'agent run arun_00000000000000a2 of run run_old ended without being known to be gone, holding session ses_9; free it once its agent is gone (system free arun_00000000000000a2 --agent-gone)']) expect(shown, said).toContain(said)
     // Nothing technical or unknown up front: it is all under the card's details.
     for (const folded of ['Worker id', 'worker:plus/standard', 'unknown (', 'family', 'role none', 'Load']) expect(shown, folded).not.toContain(folded)
-    await busy.getByText('details', { exact: true }).click()
+    await busy.getByText('Details', { exact: true }).click()
     const opened = await busy.innerText()
     for (const said of ['Worker id', 'worker:plus/standard', 'plus · website account, ready', 'standard tier, subscription-chat, remote', '1 of 2 running',
       'Running review run run_xyz, step review:m1:propose, since an unknown time']) expect(opened, said).toContain(said)
@@ -395,19 +425,19 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     const rest = await resting.innerText()
     expect(rest).toContain('Resting until 11:00 (in 2 h)')
     expect(rest).not.toContain('derived')
-    await resting.getByText('details', { exact: true }).click()
+    await resting.getByText('Details', { exact: true }).click()
     expect(await resting.innerText()).toContain('chatgpt-web Worker, frontier tier, subscription-chat, remote (no description is configured)')
     // The account's quota that could not be read is folded under its own details.
     expect(await account.innerText()).not.toContain('the resource ledger (ctx.resources) is not mounted')
-    await account.getByText('details', { exact: true }).first().click()
+    await account.getByText('Details', { exact: true }).first().click()
     expect(await account.innerText()).toContain('unknown (the resource ledger (ctx.resources) is not mounted)')
     await busy.getByRole('link', { name: 'Open run run_xyz' }).focus()
     expect(await page.locator('main').innerText()).not.toContain('null')
   }, 60_000)
 
-  it.runIf(canRunBrowser)('shows each window of an account\'s pool as "5 h · used X % · resets HH:MM" with a small bar, when it was read under the account\'s details, at its limit first, and what its reading does not give as unknown, with why (ADR-0059, T116, T171)', async () => {
+  headlessIt('shows each window of an account\'s pool as "5 h · used X % · resets HH:MM" with a small bar, when it was read under the account\'s details, at its limit first, and what its reading does not give as unknown, with why (ADR-0059, T116, T171)', async () => {
     const { origin, token } = await boot({ roster: true, pools: true })
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await pinnedPage(browser)
     await page.goto(`${origin}/ui/?view=workers#token=${token}`)
@@ -415,6 +445,9 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     const busy = page.getByRole('region', { name: 'Account Chatgpt · Studio Plus' })
     const line = (window: string) => busy.getByLabel(`window ${window} of plan/plus`)
     await expect.poll(() => line('five-hour').count()).toBe(1)
+    // Its shortest window in sight, every window under its Details (T239).
+    expect(await busy.locator('.quota-line').innerText()).toMatch(/^5 h used 42 %, resets 09:45\b/)
+    await busy.getByText('Details', { exact: true }).first().click()
     // Read a minute before NOW; reset 15 min and 1 h after it: each on the page's day, so a clock time.
     expect(await line('five-hour').innerText()).toBe('5 h · used 42 % · resets 09:45')
     expect(await line('seven-day').innerText()).toBe('7 d · at its limit · used unknown (its latest reading gives no used share) · resets 10:30')
@@ -426,7 +459,7 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     expect(await line('credit').locator('meter').count()).toBe(0)
     expect(await busy.locator('.window').evaluateAll((lines) => lines.map((l) => l.getAttribute('aria-label')))).toEqual(['window seven-day of plan/plus', 'window five-hour of plan/plus', 'window credit of plan/plus'])
     // The pool at its limit rests: said once, by its account (its limitUntil), not again by the pool.
-    expect(await page.getByRole('region', { name: 'Account Chatgpt · Studio Plus' }).innerText()).toMatch(/Its account is resting until /)
+    expect(await page.getByRole('region', { name: 'Account Chatgpt · Studio Plus' }).innerText()).toMatch(/Resting until /)
     // Each account's capacity on Home in one line, its 5 h bar beside it (T119).
     await page.getByRole('link', { name: 'Home' }).click()
     const capacity = page.getByLabel('Capacity of Chatgpt · Studio Plus')
@@ -435,17 +468,24 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     expect(await capacity.locator('meter').getAttribute('value')).toBe('42')
     expect(await page.getByLabel('Capacity of Claude · slot 1').innerText()).toBe('Claude · slot 1: 5 h no reading yet')
     await page.getByRole('link', { name: 'Workers', exact: true }).click()
+    // Its Worker cards are under the account's fold (T239), closed until opened.
+    const slot = page.getByRole('region', { name: 'Account Claude · slot 1' })
+    await expect.poll(() => slot.locator('details.workers-fold').count()).toBe(1)
+    expect(await slot.locator('details.workers-fold').getAttribute('open')).toBeNull()
+    await slot.locator('details.workers-fold > summary').click()
     await expect.poll(() => page.getByRole('article', { name: 'agent:acc-a/develop' }).count()).toBe(1)
-    // No reading yet, with why its account's usage report could not be read, its time on the clock (T111).
-    const agent = page.getByRole('region', { name: 'Account Claude · slot 1' }).getByLabel('window five-hour of plan/agent')
+    // No reading yet in sight; why its account's usage report could not be read, its time on the clock, under its Details (T111, T239).
+    expect(await slot.locator('.quota-line').innerText()).toMatch(/^5 h no reading yet\b/)
+    await slot.locator('details.facts > summary').first().click()
+    const agent = slot.getByLabel('window five-hour of plan/agent')
     expect(await agent.innerText()).toBe('5 h · no reading yet: its account\'s usage report could not be read at 09:20: the runtime gave no answer within 30 s')
     expect(await agent.innerText()).not.toContain('2026-10-24T')
     expect(await page.locator('main').innerText()).not.toContain('null')
   }, 60_000)
 
-  it.runIf(canRunBrowser)('shows the approval queue in a real browser and approves a batch on the subjects it shows', async () => {
+  headlessIt('shows the approval queue in a real browser and approves a batch on the subjects it shows', async () => {
     const { origin, token, approvals } = await boot({ approvals: true })
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/#token=${token}`)
@@ -453,22 +493,26 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     // A batch by its size, its id folded behind its copy button (T171).
     const batch = queue.getByRole('region', { name: 'Batch batch-1' })
     await expect.poll(() => batch.getByRole('heading', { level: 3 }).first().innerText()).toMatch(/^2 related requests/)
-    expect(await batch.locator('button.copy', { hasText: 'Copy batch ID' }).getAttribute('data-copy')).toBe('batch-1')
+    expect(await batch.locator('button.copy[aria-label="Copy batch ID"]').getAttribute('data-copy')).toBe('batch-1')
     for (const text of ['merge apr-1', 'the branch lands on main', 'deploy', 'content board-task:apr-1:attempt:0 @ approval-needed', 'Decided one by one',
       'Allow a merge step: merge apr-1', 'batch-1']) {
       expect(await queue.getByText(text, { exact: true }).count(), text).toBeGreaterThan(0)
     }
-    expect(await queue.innerText()).toMatch(/3 approvals · next expiry /)
-    // Each card (T186): one line, what is asked, for which task, and until when, with what no response does; two short buttons;
-    // who asked, what it is about, its id, and its exact expiry under one closed Details.
+    // Their count is Home's tile (T239); the next expiry in sight once within the hour.
+    expect(await page.getByRole('region', { name: 'Needs your attention', exact: true }).innerText()).toContain('Approvals · 3')
+    expect(await queue.innerText()).toMatch(/Next expiry .+ ago/)
+    // Each card (T186, T239): its title, one line of context, until when; two short buttons; for which task, what no response
+    // does, who asked, what it is about, its id, and its exact expiry under one closed Details.
     const third = page.locator('#request-apr-3')
-    expect(await third.locator('.line').innerText()).toMatch(/^Allow a deploy step: merge apr-3\s+for task apr-3 · Expired .+ ago · No response: denied$/)
+    expect(await third.locator('.line').innerText()).toBe('Allow a deploy step: merge apr-3')
+    expect(await third.locator('.meta').innerText()).toMatch(/^Expired .+ ago$/)
     expect(await third.getByRole('button').allInnerTexts()).toEqual(['Approve', 'Deny'])
     expect(await third.locator('details.card-details').getAttribute('open')).toBeNull()
     expect(await third.innerText()).not.toContain('Asked by')
     expect(await third.innerText()).not.toContain('request apr-3')
     expect(await third.textContent()).toContain('request apr-3')
     await third.getByText('Details', { exact: true }).click()
+    expect(await third.innerText()).toMatch(/For\s+task apr-3\s+No response\s+denied/)
     expect(await third.innerText()).toContain('Asked by the board, for task task-apr-3 of project p1')
     expect(await third.innerText()).toContain('task apr-3 of project p1, attempt 1')
     expect(await third.innerText()).toContain('request apr-3')
@@ -482,8 +526,10 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     const thirdDeny = third.getByRole('button', { name: 'Deny', exact: true })
     expect(await descriptionOf(third.getByRole('button', { name: 'Approve', exact: true }))).toBe('allows this deploy')
     expect(await descriptionOf(thirdDeny)).toBe('holds the task')
-    // The effect is said beside each button too, for every reader, in sight with the buttons (never under Details).
-    expect(await third.locator('.actions').first().innerText()).toMatch(/Approve\s+allows this deploy\s+Deny\s+holds the task/)
+    // The effect is each button's tooltip (T239), not text beside it: out of sight until hovered or focused (layout.spec.ts), never under Details.
+    expect(await third.locator('.actions').first().innerText()).toMatch(/^Approve\s+Deny$/)
+    // The batch's note for all is under its Details (T239).
+    await batch.locator(':scope > details.card-details > summary').click()
     await queue.getByRole('textbox', { name: 'Note for all (optional)' }).fill('ship it')
     await queue.getByRole('button', { name: 'Approve all 2' }).click()
     await expect.poll(() => approvals().calls.length).toBe(1)
@@ -494,7 +540,8 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     // The result counted, what happens next for each; the records' ids folded.
     await expect.poll(() => page.locator('#outcome').innerText()).toContain('2 approved')
     expect(await page.locator('#outcome').innerText()).not.toContain('approval record')
-    expect(await page.locator('#outcome').textContent()).toContain('Recorded as your verdict on request apr-1 (approval record sha256:')
+    expect(await page.locator('#outcome').textContent()).toContain('Recorded as your verdict on request apr-1 (approval record ')
+    expect((await page.locator('#outcome button.copy').evaluateAll((list) => list.map((b) => b.getAttribute('data-copy')))).some((id) => id?.startsWith('sha256:'))).toBe(true)
     await thirdDeny.click()
     await expect.poll(() => approvals().calls.length).toBe(2)
     expect(approvals().calls[1]![0]).toEqual([{ requestId: 'apr-3', subject: QUEUE[2]!.subject, verdict: 'rejected' }])
@@ -503,9 +550,9 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     expect(await page.getByRole('alert').innerText()).toContain('what it asks about changed since the page showed it')
   }, 60_000)
 
-  it.runIf(canRunBrowser)('keeps a press on Approve when a refresh lands between pressing and releasing: the click is not lost (T84)', async () => {
+  headlessIt('keeps a press on Approve when a refresh lands between pressing and releasing: the click is not lost (T84)', async () => {
     const { origin, token, approvals } = await boot({ approvals: true })
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/#token=${token}`)
@@ -529,10 +576,10 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     expect(approvals().calls[0]![0]).toEqual([{ requestId: 'apr-3', subject: QUEUE[2]!.subject, verdict: 'approved' }])
   }, 60_000)
 
-  it.runIf(canRunBrowser)('shows a verdict that was not recorded as an alert that stays through refreshes until dismissed (INV-2, T84)', async () => {
+  headlessIt('shows a verdict that was not recorded as an alert that stays through refreshes until dismissed (INV-2, T84)', async () => {
     const { origin, token, approvals } = await boot({ approvals: true })
     approvals().failure = new Error('the store is busy')
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/#token=${token}`)
@@ -562,9 +609,9 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     nodes: [], error: { kind: 'timeout', disposition: 'NONE', message: `scripted timeout ${i + 1}` },
   }))
 
-  it.runIf(canRunBrowser)('keeps every fact of an approval card under its Details, closed by default, and reaches every button by keyboard, those inside Details once it is opened', async () => {
+  headlessIt('keeps every fact of an approval card under its Details, closed by default, and reaches every button by keyboard, those inside Details once it is opened', async () => {
     const { origin, token } = await boot({ approvals: true })
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/#token=${token}`)
@@ -579,7 +626,7 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
       const described = await decisionsIn(card)
       expect(described.map((d) => d.label), id).toEqual(['Approve', 'Deny'])
       for (const d of described) expect(d.description, `${id}: ${d.label}`).not.toBe('')
-      expect(await card.locator('.line').innerText(), id).toMatch(/·\s*(Expires|Expired) .+ · No response: denied$/)
+      expect(await card.locator('.meta').innerText(), id).toMatch(/^(Expires|Expired) .+$/)
       // Every other fact folded, never dropped: who asked, what it is about, its exact subject, what each verdict does, its id and expiry.
       const details = card.locator('details.card-details')
       expect(await details.count(), id).toBe(1)
@@ -587,7 +634,7 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
       const shown = await card.innerText()
       for (const folded of ['Asked by', 'About', 'Exact subject', `request ${id}`, 'expires ']) expect(shown, `${id}: ${folded}`).not.toContain(folded)
       const all = await card.textContent()
-      for (const fact of ['Asked by the board', `of project p1, attempt 1`, `content board-task:${id}:attempt:0 @ approval-needed`, `request ${id}`, 'expires ', 'Note (optional)']) expect(all, `${id}: ${fact}`).toContain(fact)
+      for (const fact of ['No responsedenied', 'Asked by the board', `of project p1, attempt 1`, `content board-task:${id}:attempt:0 @ approval-needed`, `request ${id}`, 'expires ', 'Note (optional)']) expect(all, `${id}: ${fact}`).toContain(fact)
     }
     // A merge's consequences as given; a task's step says what approving and denying do.
     expect(await page.locator('#request-apr-1').textContent()).toContain('the branch lands on main')
@@ -623,11 +670,11 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     expect(inside).toContain('Copy request ID')
   }, 60_000)
 
-  it.runIf(canRunBrowser)('shows at most 5 rows in Since you last looked and in Runs needing attention, each with a Show all that reaches every row and stays through the refresh', async () => {
+  headlessIt('shows at most 5 rows in Since you last looked and in Runs needing attention, each with a Show all that reaches every row and stays through the refresh', async () => {
     const { origin, token, workflow } = await boot({ approvals: true })
     const now = Date.now()
     workflow.extra = failedRuns(now)
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
     await page.goto(`${origin}/ui/#token=${token}`)
@@ -652,7 +699,7 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     expect(await runs.count()).toBe(5)
     await look.getByRole('button', { name: 'Show all 8' }).click()
     await expect.poll(() => runs.count()).toBe(8)
-    for (let i = 1; i <= 7; i++) expect(await look.locator('button.copy', { hasText: 'Copy run ID' }).evaluateAll((list) => list.map((b) => b.getAttribute('data-copy')))).toContain(`run_f${i}`)
+    for (let i = 1; i <= 7; i++) expect(await look.getByRole('button', { name: 'Copy run ID' }).evaluateAll((list) => list.map((b) => b.getAttribute('data-copy')))).toContain(`run_f${i}`)
 
     // A refresh keeps both lists as the operator left them.
     await page.evaluate(() => { (document.activeElement as HTMLElement | null)?.blur(); document.querySelector('main section[aria-label="Since you last looked"]')!.setAttribute('data-old', '1') })
@@ -663,26 +710,28 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     await expect.poll(() => runs.count()).toBe(5)
   }, 60_000)
 
-  it.runIf(canRunBrowser)('heads every page with its title and one short sentence at most', async () => {
+  headlessIt('heads every page with its title and one short sentence at most', async () => {
     const { origin, token } = await boot({ roster: true })
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/#token=${token}`)
     for (const path of ['/ui/', '/ui/?run=run_abc', '/ui/?view=board', '/ui/?view=workers', '/ui/?view=policy', '/ui/?view=help']) {
       if (path !== '/ui/') await page.goto(origin + path)
       await expect.poll(() => page.locator('main h2.page').count(), { message: path }).toBe(1)
+      // At most one sentence (T239: none where the title says what the page is for): a single full stop, at its end, and short.
       const leads = await page.locator('main h2.page ~ p.lead').allInnerTexts()
-      expect(leads, path).toHaveLength(1)
-      // One sentence: a single full stop, at its end, and short.
-      expect(leads[0], path).toMatch(/^[^.!?]+[.!?]$/)
-      expect(leads[0]!.length, path).toBeLessThanOrEqual(48)
+      expect(leads.length, path).toBe(path.endsWith('policy') || path.endsWith('help') ? 1 : 0)
+      for (const lead of leads) {
+        expect(lead, path).toMatch(/^[^.!?]+[.!?]$/)
+        expect(lead.length, path).toBeLessThanOrEqual(48)
+      }
     }
   }, 60_000)
 
-  it.runIf(canRunBrowser)('opens on a dashboard: what waits for you, each linked to its section, the Workers at a glance, the runs that need a look with their action, and the recent runs (T97)', async () => {
+  headlessIt('opens on a dashboard: what waits for you, each linked to its section, the Workers at a glance, the runs that need a look with their action, and the recent runs (T97)', async () => {
     const { origin, token } = await boot({ approvals: true, roster: true })
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/#token=${token}`)
@@ -690,11 +739,17 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     const waiting = page.getByRole('region', { name: 'Needs your attention', exact: true })
     await expect.poll(() => waiting.innerText()).toContain('Approvals · 3')
     expect(await waiting.innerText()).toContain('Runs needing attention · 1')
+    // The counts in sight, the names under each count folded (T239), kept open through the refresh once opened.
+    expect(await waiting.innerText()).not.toContain('Allow a merge step: merge apr-1')
+    for (const names of await waiting.locator('details > summary', { hasText: 'Names' }).all()) await names.click()
+    await expect.poll(() => waiting.locator('details[open]').count()).toBe(2)
     expect(await waiting.innerText()).toMatch(/Allow a merge step: merge apr-1 · expires /)
     expect(await waiting.innerText()).toContain('an investigate run · Plan awaiting approval')
     await waiting.getByRole('link', { name: 'Allow a deploy step: merge apr-3' }).click()
     await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe('request-apr-3')
-    expect(await page.getByRole('region', { name: 'Workers at a glance' }).innerText()).toContain('1 working · 0 free · 1 resting · 0 unavailable')
+    // The Workers' counts once, as chips at the top (T239), never again in the Workers' panel below.
+    expect(await page.getByRole('region', { name: 'Workers availability' }).getByLabel('Worker counts').innerText()).toBe('○ 0 free\n◆ 1 working\n▲ 1 resting')
+    expect(await page.getByRole('region', { name: 'Workers at a glance' }).innerText()).not.toMatch(/\d working/)
     // The blocked run is listed by its title, why as a chip, and one action; its id behind a copy button.
     const look = page.getByRole('region', { name: 'Runs needing attention' })
     expect(await look.innerText()).toContain('Plan awaiting approval')
@@ -703,8 +758,9 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     await look.getByRole('link', { name: 'Open run' }).click()
     await expect.poll(() => page.locator('h2.page[data-page="run:run_abc"]').count()).toBe(1)
     await page.goBack()
+    // Each count leads to its kind's cards in its project's group (T253).
     await waiting.getByRole('link', { name: 'Approvals · 3' }).click()
-    await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe('approvals')
+    await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe('approvals-p-p1')
     expect(await page.getByRole('heading', { name: 'Recent runs' }).count()).toBe(1)
     // A recent run: its title, its state as a chip (a word and a symbol, never colour alone), its progress; its steps' Workers and id folded.
     const row = page.locator('table tr', { hasText: 'investigate run' })
@@ -715,9 +771,9 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     expect(await row.textContent()).toContain('template investigate · run run_abc')
   }, 60_000)
 
-  it.runIf(canRunBrowser)('has one navigation on every page, the current page marked, and each page a title with a few words of what it is for (T97, T171)', async () => {
+  headlessIt('has one navigation on every page, the current page marked, and each page a title with a few words of what it is for (T97, T171)', async () => {
     const { origin, token } = await boot({ approvals: true, roster: true })
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/#token=${token}`)
@@ -725,12 +781,14 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     const current = () => nav.locator('[aria-current="page"]').innerText()
     await expect.poll(() => page.getByRole('heading', { name: 'Home', exact: true }).count()).toBe(1)
     expect(await current()).toBe('Home')
-    expect(await page.locator('p.lead').innerText()).toBe('Your next actions and recent activity.')
-    for (const [link, purpose] of [['Board', 'Projects and tasks.'], ['Workers', 'Availability, quota, and current work.'], ['Autonomy policy', 'Control which actions need approval.']] as const) {
+    // A sentence of what a page is for only where its title does not say it (T239).
+    expect(await page.locator('p.lead').count()).toBe(0)
+    for (const [link, purpose] of [['Board', null], ['Workers', null], ['Autonomy policy', 'Control which actions need approval.']] as const) {
       await nav.getByRole('link', { name: link }).click()
       await expect.poll(() => page.getByRole('heading', { name: link, exact: true }).count()).toBe(1)
       expect(await current()).toBe(link)
-      expect(await page.locator('p.lead').innerText()).toContain(purpose)
+      if (purpose) expect(await page.locator('p.lead').innerText()).toContain(purpose)
+      else expect(await page.locator('p.lead').count()).toBe(0)
       expect(await page.title()).toMatch(new RegExp(`^(\\(\\d+\\) )?system — ${link}$`))
     }
     // Keyboard: the navigation is links, reached and followed without a pointer.
@@ -740,35 +798,47 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     await page.getByRole('link', { name: 'investigate run' }).first().click()
     await expect.poll(() => page.locator('h2.page[data-page="run:run_abc"]').count()).toBe(1)
     expect(await page.getByRole('heading', { level: 2 }).first().innerText()).toBe('investigate run')
-    expect(await page.locator('p.lead').innerText()).toBe('Result and progress.')
+    expect(await page.locator('p.lead').count()).toBe(0)
     expect(await page.locator('main').innerText()).not.toContain('← ')
   }, 60_000)
 
-  it.runIf(canRunBrowser)('shows a run as a status chip and where it is, what you can do, the answer, and its steps as a timeline in words, the decisions, spec, and ids folded (T97, T171)', async () => {
+  headlessIt('shows a run as a status chip and where it is, what you can do, the answer, and its steps as a timeline in words, the decisions, spec, and ids folded (T97, T171)', async () => {
     const { origin, token, workflow } = await boot({ roster: true })
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/?run=run_abc#token=${token}`)
     await expect.poll(() => page.locator('h2.page[data-page="run:run_abc"]').count()).toBe(1)
     const text = await page.locator('main').innerText()
-    expect(await page.locator('p.status-line').innerText()).toMatch(/^▲ Needs your attention Plan awaiting approval · started .+ ago$/)
-    expect(text).toContain('Plan awaiting approval · plan:1:gate')
-    expect(text).toContain('No answer yet.')
-    // The run's id, its template, and its last change behind a copy button and under Technical details.
+    // Its state as a chip and when it started, Stop run under them (T240); what it waits on is the card below (T239), its step under its Details.
+    expect(await page.locator('.status-line').innerText()).toMatch(/^▲ Needs your attention\s+started .+ ago$/)
+    expect(await page.locator('.run-actions').getByRole('button').allInnerTexts()).toEqual(['Stop run'])
+    const plan = page.getByRole('region', { name: 'Plan awaiting approval' })
+    expect(await plan.getByRole('heading', { level: 3 }).innerText()).toBe('Plan awaiting approval')
+    expect(await plan.textContent()).toContain('step plan:1:gate')
+    // A running run with no answer yet says nothing of it.
+    expect(text).not.toContain('No answer')
+    // The run's id behind a copy button, its template and its last change, under Technical details.
     expect(text).not.toContain('run_abc')
-    expect(await page.getByRole('button', { name: 'Copy run ID' }).getAttribute('data-copy')).toBe('run_abc')
     expect(await page.locator('details', { hasText: 'Technical details' }).textContent()).toMatch(/Template investigate · last changed .+ · spec sha256:00/)
     const steps = page.locator('ol.timeline > li')
     expect(await steps.count()).toBe(2)
-    expect(await steps.nth(0).innerText()).toMatch(/^plan:1 done · worker:a\/standard · standard tier/)
-    expect(await steps.nth(1).innerText()).toContain('plan:1:gate waiting for you · needs an economy tier Worker')
-    // Decisions and the spec are folded until asked for.
+    expect(await steps.nth(0).innerText()).toMatch(/^plan:1 done · worker:a\/standard/)
+    expect(await steps.nth(1).innerText()).toMatch(/^plan:1:gate waiting for you/)
+    // What a step needs, how it was decided, and its id are folded under its Details until asked for.
+    expect(await steps.nth(1).textContent()).toContain('needs an economy tier Worker')
     expect(await page.locator('details', { hasText: 'How it was decided (1)' }).getAttribute('open')).toBeNull()
     expect(await page.getByText('proves reason').isVisible()).toBe(false)
-    await page.getByText('How it was decided (1)').click()
+    await steps.nth(0).locator('summary', { hasText: 'Details' }).click()
+    // One line a decision, its type and outcome (T256); its reasons open on a click of that line.
+    const decided = steps.nth(0).getByRole('list', { name: 'How it was decided' }).locator(':scope > li')
+    expect(await decided.allInnerTexts()).toEqual(['route · worker:a/standard'])
+    expect(await page.getByText('proves reason').isVisible()).toBe(false)
+    await decided.first().locator('summary').click()
     expect(await page.getByText('proves reason').isVisible()).toBe(true)
     expect(await page.getByText('sha256:00').isVisible()).toBe(false)
+    await page.getByText('Technical details', { exact: true }).click()
+    expect(await page.getByRole('button', { name: 'Copy run ID' }).getAttribute('data-copy')).toBe('run_abc')
     // The plan's verdicts are Approve / Deny, as every approval's, each described by its effect (T191).
     expect(await decisionsIn(page.locator('main .panel', { hasText: 'Plan awaiting approval' }))).toEqual([
       { label: 'Approve', description: 'the step goes on with this plan' }, { label: 'Deny', description: 'this plan does not run' }])
@@ -792,9 +862,9 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     await expect.poll(() => workflow.calls).toEqual([['stop', 'run_abc', 'stopped from the web UI']])
   }, 60_000)
 
-  it.runIf(canRunBrowser)('says on a run\'s page what happened to it in plain words: it started from the previous attempt\'s work, a team member\'s answer was sent again once, and its result was merged (ADR-0060, ADR-0061, ADR-0062, T141)', async () => {
+  headlessIt('says on a run\'s page what happened to it in plain words: it started from the previous attempt\'s work, a team member\'s answer was sent again once, and its result was merged (ADR-0060, ADR-0061, ADR-0062, T141)', async () => {
     const { origin, token } = await boot()
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/?run=run_carried#token=${token}`)
@@ -804,12 +874,15 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     const said = await happened.innerText()
     expect(said).toContain('Continued from attempt 1 (its run)')
     expect(said).toContain('Team member 1\'s answer: retried once after a service error.')
-    expect(said).toContain('Accepted and merged into main as eeeeeeeeeeee · not pushed')
+    expect(said).toContain('Accepted and merged into main as eeeeeeee… · not pushed')
     expect(said).not.toContain('worktree')
     const folded = await happened.textContent()
-    expect(folded).toContain('That change was already in its worktree, saved as cccccccccccc; its writing step built on it instead of starting over.')
+    expect(folded).toContain('That change was already in its worktree, saved as cccccccc…; its writing step built on it instead of starting over.')
     expect(folded).toContain('The site answered with its own error instead of an answer, so it was sent again once, in a new conversation on the same Worker; never a third time.')
     expect(await happened.getByRole('link', { name: 'its run' }).getAttribute('href')).toBe('?run=run_first')
+    // A step that ran on one provider family is a chip beside the run's state, never folded (D89); the run
+    // page shows it once its decisions are read, so the test waits for it.
+    await expect.poll(() => page.locator('.status-line .chip', { hasText: 'single family' }).count()).toBe(1)
     // Each new word has its "?" (T126); the run is headed by its template with no task; the step reads by member, its id folded.
     for (const word of ['continued from earlier work', 'retried after a service error']) expect(await happened.getByRole('button', { name: `What is ${word}?` }).count(), word).toBe(1)
     const steps = page.locator('ol.timeline > li')
@@ -823,34 +896,42 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     expect(await steps.nth(1).locator('.state.failed').count()).toBe(0)
   }, 60_000)
 
-  it.runIf(canRunBrowser)('says on a Worker\'s card that the operator keeps it out of teams, and folds an engine that cannot tell under its details (D58, T141)', async () => {
+  headlessIt('says on a Worker\'s card that the operator keeps it out of teams, and folds an engine that cannot tell under its details (D58, T141)', async () => {
     const { origin, token, workflow } = await boot({ roster: true })
     workflow.excluded = { entries: ['plus'], workers: ['worker:plus/frontier', 'worker:plus/standard'] }
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await pinnedPage(browser)
     await page.goto(`${origin}/ui/?view=workers#token=${token}`)
     const card = page.getByRole('article', { name: 'Chatgpt · Studio Plus · standard' })
-    // The operator's own choice as a chip, never folded; what it means behind its "?" (T171).
+    // The operator's own choice as a chip on its card, under its account's Workers (T239); what it means behind its "?" (T171).
+    const openWorkers = async () => {
+      const account = page.getByRole('region', { name: 'Account Chatgpt · Studio Plus' })
+      await expect.poll(() => account.locator('details.workers-fold').count()).toBe(1)
+      if (await account.locator('details.workers-fold').getAttribute('open') === null) await account.locator('details.workers-fold > summary').click()
+    }
+    await openWorkers()
     await expect.poll(() => card.innerText()).toContain('◆ Excluded from teams')
     expect(await card.getByRole('button', { name: 'What is team?' }).count()).toBe(1)
-    await card.getByText('details', { exact: true }).click()
+    await card.getByText('Details', { exact: true }).click()
     expect(await card.innerText()).toContain('Kept out of teams by the operator: its account is named in teams.excludeWorkers')
-    // Right now, by name: a count each, then who is free, who is stalled, and which account has no quota left (T141, T171).
+    // Right now, by name, folded on the Workers page (T239): a count each, then who is free, who is stalled, and which account has no quota left (T141, T171).
     const now = page.getByRole('region', { name: 'Right now' })
+    await now.locator('summary').click()
     expect(await now.innerText()).toContain('Free: 0')
     expect(await now.innerText()).toContain('Stalled: 0')
     expect(await now.innerText()).toContain('No quota left: 1 — Chatgpt · Studio Plus until 11:00 (in 2 h)')
     // An engine that cannot tell: no chip on the card, the unknown under its details (INV-2).
     workflow.excluded = new Error('the router is busy')
     await page.reload()
+    await openWorkers()
     await expect.poll(() => card.count()).toBe(1)
     expect(await card.innerText()).not.toContain('Excluded from teams')
-    await card.getByText('details', { exact: true }).click()
+    await card.getByText('Details', { exact: true }).click()
     expect(await card.innerText()).toContain('Teams\nunknown (it could not be read: the router is busy)')
   }, 60_000)
 
-  it.runIf(canRunBrowser)('names the same free, stalled, and no-quota Workers on Home as on the Workers page, from the one capacity summary, and never offers a Worker kept out of teams for team work (T152, D58, T160)', async () => {
+  headlessIt('names the same free, stalled, and no-quota Workers on Home as on the Workers page, from the one capacity summary, and never offers a Worker kept out of teams for team work (T152, D58, T160)', async () => {
     const { origin, token, ctx, workflow } = await boot({ roster: true })
     // A Worker of no account, free with no quota tracked, which the operator excludes from teams.
     const router = (ctx as unknown as { workers: StubRouter }).workers
@@ -859,13 +940,16 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     const roster = await (await fetch(`${origin}/ui/api/roster`, { headers: { authorization: `Bearer ${token}` } })).json() as { now: { free: { value: { items: Array<{ worker: string; name: string }> } } } }
     const free = roster.now.free.value.items
     expect(free.map((f) => f.worker)).toEqual(['worker:local/economy'])
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await pinnedPage(browser)
     await page.goto(`${origin}/ui/#token=${token}`)
     const lines = async () => {
       const now = page.getByRole('region', { name: 'Right now' })
       await expect.poll(() => now.count()).toBe(1)
+      // Folded on the Workers page (T239), open on Home.
+      const folded = now.locator('details.right-now:not([open]) > summary')
+      if (await folded.count()) await folded.click()
       const said = (await now.innerText()).split('\n')
       return Object.fromEntries(['Free', 'Stalled', 'No quota left'].map((head) => [head, said.find((l) => l.startsWith(`${head}: `))]))
     }
@@ -888,9 +972,9 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
     expect(await lines()).toEqual(workers)
   }, 60_000)
 
-  it.runIf(canRunBrowser)('renders runs, steps, and decisions in a real browser, and approves a waiting plan', async () => {
+  headlessIt('renders runs, steps, and decisions in a real browser, and approves a waiting plan', async () => {
     const { origin, token, workflow } = await boot()
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/#token=${token}`)
@@ -909,12 +993,78 @@ describe('web UI: the operator\'s view, loopback and token-gated', () => {
   }, 60_000)
 })
 
+describe('web UI: clearer at a glance (T239)', () => {
+  // Home, a run waiting on its plan, and Workers, over the queue's three requests and the roster's accounts with their quota,
+  // at one fixed instant in UTC: each first screen at most half the words it held before T239 (BEFORE_WORDS, glance.ts).
+  headlessIt('holds the first screen (1280×800) of Home, a run, and Workers to at most half the words each held before T239', async () => {
+    const { origin, token } = await boot({ approvals: true, roster: true, pools: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
+    onTestFinished(() => browser.close())
+    const words: Record<string, number> = {}
+    // At 1920 px too, for the design note's screenshots of the full-width grid (T256); the words are counted at 1280×800.
+    for (const width of [1920, 1280, 360]) {
+      const context = await browser.newContext({ viewport: { width, height: width === 1920 ? 1080 : width === 1280 ? 800 : 740 }, timezoneId: 'UTC', locale: 'en-GB' })
+      const page = await context.newPage()
+      await page.clock.setFixedTime(NOW)
+      await opened(page, `${origin}/ui/#token=${token}`)
+      for (const [name, path] of [['home', '/ui/'], ['run', '/ui/?run=run_abc'], ['workers', '/ui/?view=workers']] as const) {
+        await opened(page, origin + path)
+        if (width === 1280) noteWords(name, words[name] = await wordsInSight(page))
+        await shoot(page, `${name}-${width}`)
+        // Home in the dark theme too, for the design note (T256).
+        if (name === 'home' && width === 1920) { await page.emulateMedia({ colorScheme: 'dark' }); await shoot(page, 'home-1920-dark'); await page.emulateMedia({ colorScheme: 'light' }) }
+      }
+      await context.close()
+    }
+    for (const name of ['home', 'run', 'workers'] as const) {
+      expect(words[name], `${name}'s first screen: ${words[name]} words, ${BEFORE_WORDS[name]} before T239`).toBeLessThanOrEqual(Math.floor(BEFORE_WORDS[name] / 2))
+    }
+  }, 90_000)
+})
+
+describe('web UI: the operator\'s iPhone 16 Pro (T240)', () => {
+  // A run waiting on its plan, on the phone in Safari: 402×874 CSS px at 3 device pixels each, touch, and the safe areas of
+  // the Dynamic Island (62 px) and the home indicator (34 px).
+  headlessIt('puts a run\'s primary action in a bar at the bottom of the phone\'s screen, in reach of a thumb and above the home indicator, the page\'s last row clear of it', async () => {
+    const { origin, token } = await boot({ approvals: true, roster: true, pools: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
+    onTestFinished(() => browser.close())
+    const context = await browser.newContext({ viewport: { width: 402, height: 874 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true, timezoneId: 'UTC', locale: 'en-GB' })
+    const page = await context.newPage()
+    await (await context.newCDPSession(page)).send('Emulation.setSafeAreaInsetsOverride' as never, { insets: { top: 62, bottom: 34, left: 0, right: 0 } } as never)
+    await page.clock.setFixedTime(NOW)
+    await opened(page, `${origin}/ui/#token=${token}`)
+    for (const [name, path] of [['home', '/ui/'], ['run', '/ui/?run=run_abc'], ['workers', '/ui/?view=workers']] as const) {
+      await opened(page, origin + path)
+      await shoot(page, `${name}-402`)
+    }
+    // The plan's verdict is the page's primary action: Approve and Deny in the bar, at the screen's bottom edge, its
+    // padding clear of the home indicator; Stop run stays in the page.
+    await opened(page, origin + '/ui/?run=run_abc')
+    const bar = page.locator('main .actions.bar')
+    expect(await bar.count()).toBe(1)
+    expect(await bar.getByRole('button').allInnerTexts()).toEqual(['Approve', 'Deny', '?'])
+    const box = (await bar.boundingBox())!
+    expect(Math.round(box.y + box.height)).toBe(874)
+    expect(await bar.evaluate((b) => parseFloat(getComputedStyle(b).paddingBottom))).toBeGreaterThanOrEqual(34)
+    const approve = (await bar.getByRole('button', { name: 'Approve', exact: true }).boundingBox())!
+    expect(approve.y).toBeGreaterThan(874 * 2 / 3)
+    expect(approve.height).toBeGreaterThanOrEqual(44)
+    expect(await page.locator('main .run-actions').getAttribute('class')).not.toContain('bar')
+    // Scrolled to its end, the page's last row is above the bar, never under it.
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight))
+    const last = await page.locator('main > :last-child').evaluate((e) => e.getBoundingClientRect().bottom)
+    expect(last).toBeLessThanOrEqual((await bar.boundingBox())!.y)
+    await context.close()
+  }, 90_000)
+})
+
 describe('web UI: the shared building blocks and the production states (T172)', () => {
   const GLYPHS = ['●', '▲', '■', '◆', '○']
 
-  it.runIf(canRunBrowser)('builds every page from one status chip (a word and a symbol, never colour alone), one count with its unit, one relative time with its exact time on hover and focus, one fold closed by default, and one copy button for ids', async () => {
+  headlessIt('builds every page from one status chip (a word and a symbol, never colour alone), one count with its unit, one relative time with its exact time on hover and focus, one fold closed by default, and one copy button for ids', async () => {
     const { origin, token } = await boot({ approvals: true, roster: true })
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const context = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] })
     const page = await context.newPage()
@@ -954,8 +1104,8 @@ describe('web UI: the shared building blocks and the production states (T172)', 
     // The count with its unit.
     await page.goto(`${origin}/ui/`)
     const queue = page.getByRole('region', { name: 'Approval queue' })
-    await expect.poll(() => queue.locator('.qty').first().innerText()).toBe('3 approvals')
-    expect(await queue.locator('.qty .n').first().innerText()).toBe('3')
+    await expect.poll(() => queue.locator('.qty').first().innerText()).toBe('2 related requests')
+    expect(await queue.locator('.qty .n').first().innerText()).toBe('2')
     // The copy button: the id behind it, copied on a press (or shown, selected, where no clipboard is).
     const copy = page.getByRole('region', { name: 'Runs needing attention' }).getByRole('button', { name: 'Copy run ID' })
     expect(await copy.getAttribute('data-copy')).toBe('run_abc')
@@ -964,9 +1114,9 @@ describe('web UI: the shared building blocks and the production states (T172)', 
     if (await page.locator('code.copied').count()) expect(await page.locator('code.copied').innerText()).toBe('run_abc')
   }, 90_000)
 
-  it.runIf(canRunBrowser)('shows a skeleton while a page first loads, still under reduced motion, and puts the keyboard on Skip to content first (T170)', async () => {
+  headlessIt('shows a skeleton while a page first loads, still under reduced motion, and puts the keyboard on Skip to content first (T170)', async () => {
     const { origin, token, approvals } = await boot({ approvals: true })
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     let release!: () => void
     approvals().held = new Promise((resolve) => { release = resolve })
@@ -997,9 +1147,9 @@ describe('web UI: the shared building blocks and the production states (T172)', 
     expect(await page.evaluate(() => getComputedStyle(document.activeElement!).outlineStyle)).toBe('solid')
   }, 60_000)
 
-  it.runIf(canRunBrowser)('says the data is stale, and when it was read, when a refresh fails over a page already shown, and clears it once a refresh succeeds; a page that never loaded says so with Try again (T170)', async () => {
+  headlessIt('says the data is stale, and when it was read, when a refresh fails over a page already shown, and clears it once a refresh succeeds; a page that never loaded says so with Try again (T170)', async () => {
     const { origin, token, workflow } = await boot()
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/?run=run_abc#token=${token}`)

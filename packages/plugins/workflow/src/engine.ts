@@ -6,25 +6,34 @@
  * {@link Workflow} facade in `index.ts`.
  */
 import type { Context } from '@deepseek-ai/cordis'
-import type { Board, Subject } from '@tsuuanmi/system-board-core'
-import { type Lease, LeaseLost, StaleGeneration } from '@tsuuanmi/system-leases'
-import { canonicalJson, SchemaRegistry, sha256 } from '@tsuuanmi/system-libs'
+import { type Board, type Lease, LeaseLost, StaleGeneration, type Subject } from '@tsuuanmi/system-board-core'
+import { type BriefPointer, canonicalJson, type EnforceMode, enforceMode, type EnforceSource, SchemaRegistry, sha256, sleep } from '@tsuuanmi/system-libs'
 import { dispositionOf } from '@tsuuanmi/system-provider-core'
 import { AdmissionFailure, type AdmittedWorker, type ArtifactRef, type Classification, type RouteOptions, type WorkRequirement, type WorkerExecution } from '@tsuuanmi/system-workers-core'
 import { acceptPlain } from './acceptance.ts'
-import { checksFor } from './checks.ts'
-import { type Draft, draftOf, instructionsProblem, instructionsText, placeholderScope, recordBrief, refuseInstructions, renderedChars, type TaskFrame, unfilledProblem } from './briefs.ts'
-import { awaitCall, settleCalls, waitsOnCall } from './continuations.ts'
+import { checksFor, landingTargets } from './checks.ts'
+import { DOSSIER_CAPABILITY, type TaskDossiers } from './dossiers.ts'
+import { type Draft, draftOf, guidesFor, instructionsProblem, instructionsText, placeholderScope, recordBrief, refuseInstructions, renderedChars, type TaskFrame, unfilledProblem } from './briefs.ts'
+import { awaitCall, continueWithMessage, settleCalls, waitsOnCall } from './continuations.ts'
+import { applyHandbook, type Built, buildHandbook, fileRefusal } from './handbook.ts'
+import { authorDraft, commitFixed, commitReviewed, continued, waitForAuthor, waitForSelfReview } from './fix-sessions.ts'
 import { block, expireGate, gateDeadline, grow, grownSteps } from './growth.ts'
-import { admissionKind, assignmentOf, choiceHoldEnded, cutShort, escalate, executionKey, failAttempt, heldWorkers, inputHint, routedDecisions, waitForChoice, waitForLimit } from './recovery.ts'
+import { heldNow, release } from './hold.ts'
+import { admissionInfrastructure, executionInfrastructure, quotaLoss, sourceGone } from './infrastructure.ts'
+import { admissionKind, assignmentOf, choiceHoldEnded, cutShort, escalate, executionKey, failAttempt, heldWorkers, inputHint, routedDecisions, waitForChoice, waitForLimit, waitForRetry } from './recovery.ts'
 import { isRemediationGate, pollMs, queueOf, settleQueued } from './queue.ts'
-import { missingSubject, remediate, reviewSubject, subjectGate, wordingOf } from './review.ts'
+import { assessmentMisses, unboundGate, cycleOf, missingSubject, remediate, reviewSubject, settleReview, subjectGate, verificationGate, verificationSubject, wordingOf } from './review.ts'
+import { riskAtAcceptance, riskOf, settleRisk, tierAtRisk } from './risk.ts'
+import { leaveSession, type Moved, sessionGaps } from './session-moves.ts'
 import { recoverWakes, settleWake } from './sessions.ts'
+import { fallbackSpent, singleFamilyBrief, singleFamilyDecision, singleFamilyRecovery } from './single-family.ts'
 import { appended, compose, DEFAULT_TEMPLATES, type Instructions, literal, type NodeTemplate, recordExecutor, type ResolvedNode, type ResolvedSpec, resolve, schemaBlock, UnfilledPlaceholders, variantProblem, variantsOf } from './spec.ts'
 import { MATERIAL_REQUEST, runSnapshot, showsTextMaterial, sourceOf } from './sources.ts'
 import { TaskRuns } from './tasks.ts'
 import { decide, expireTie, proving, restriction, runtimeOf, tally, teamGroup, teamPrompt } from './teams.ts'
 import { Dispatcher } from './dispatch.ts'
+import { DailyChecks } from './daily-check.ts'
+import { ScheduledReviews } from './scheduled-review.ts'
 import { type Config, errorOf, LEASE_TTL_MS, newId, TASK_WAIT_MS, type NodeHelpers, type NodeRecord, type NodeRow, now, type RunRow, type RunView, type StartInput, type TaskBudget, type TaskCarry, type TaskDispatch, type WorkflowError, WorkflowFailure } from './types.ts'
 import { view } from './views.ts'
 
@@ -52,7 +61,13 @@ export class Engine {
   readonly tasks: TaskRuns = new TaskRuns(this)
   /** Dispatch (ADR-0064): ready tasks started on free Workers chosen by quota, its settings validated here. */
   readonly dispatch: Dispatcher
+  /** The scheduled review of one area a day (D93 item 8), off unless configured on; its settings validated here. */
+  readonly scheduledReviews: ScheduledReviews
+  /** The daily run of every browser spec on a ref's tip (T305b), off unless configured on; its settings validated here. */
+  readonly dailyChecks: DailyChecks
   readonly templates: Record<string, NodeTemplate[]>
+  /** The version of the package each contributed template came from (`Workflow.template`), for the playbook a handbook slice names. */
+  readonly templateVersions = new Map<string, string>()
   /** Configured templates refused at load, with why (health reports them). */
   readonly refused = new Map<string, string>()
   readonly waiters = new Map<string, Set<() => void>>()
@@ -71,10 +86,27 @@ export class Engine {
   readonly heldWakes = new Map<string, string>()
   /** Wakes whose held check is in flight: a stop waits for them. */
   readonly wakeChecks = new Set<Promise<void>>()
+  /**
+   * The runs that were running when this engine started: a holder of theirs found lapsed at their
+   * first renewal lapsed while the host was down (ADR-0069). An execution's failure is never the
+   * host's for this alone: only its source's `infrastructure` mark says the host's stop ended it.
+   */
+  readonly inheritedRuns = new Set<string>()
+
+  /**
+   * The mode a gate-like mechanism of the engine runs in now (ADR-0078): the plugin host's live
+   * override, else this row's `enforce.<key>`, else on; read at each use, so it moves without a restart.
+   */
+  enforce(mechanism: 'evidence-gate' | 'handbook-bound' | 'review-guides' | 'red-on-base'): EnforceMode {
+    const key = ({ 'evidence-gate': 'evidenceGate', 'handbook-bound': 'handbookBound', 'review-guides': 'reviewGuides', 'red-on-base': 'redOnBase' } as const)[mechanism]
+    return enforceMode(this.ctx.get('pluginHost' as never) as EnforceSource | undefined, mechanism, this.config.enforce?.[key])
+  }
 
   constructor(readonly ctx: Context, readonly config: Config) {
     // A dispatch setting out of its range refuses the row, with its path (INV-2).
     this.dispatch = new Dispatcher(this)
+    this.scheduledReviews = new ScheduledReviews(this)
+    this.dailyChecks = new DailyChecks(this)
     this.templates = { ...DEFAULT_TEMPLATES, ...config.templates }
     // Checked at load, not at the first call. A configured template that fails preflight is refused
     // alone, with why (INV-2): the engine and every other template keep working, and health names it.
@@ -92,7 +124,8 @@ export class Engine {
 
   /** The engine stops: runs stay as they are and resume on the next start (a stop is not a failure). */
   async close(): Promise<void> {
-    this.stopped.abort()
+    // The host stopping, as the reason says (T269): a check it kills is cut by the host, to run again after the restart.
+    this.stopped.abort(Object.assign(new Error('the host stopped'), { hostStopped: true }))
     for (const timer of this.retries) clearTimeout(timer)
     await this.dispatch.close()
     await Promise.allSettled(this.wakeChecks)
@@ -102,9 +135,23 @@ export class Engine {
     this.waiters.clear()
   }
 
-  /** On start: every running run is scheduled again, then unfinished wakes are settled (REQ-WF-4). */
+  /**
+   * At start, before anything is scheduled: the runs a stop or restart left running, so a holder of
+   * theirs that lapsed while the host was down is told apart as the host's, not the attempt's (ADR-0069).
+   */
+  noteInherited(): void {
+    const runs = this.ctx.store.db.prepare("SELECT run_id FROM workflow_runs WHERE status = 'running'").all() as Array<{ run_id: string }>
+    for (const { run_id } of runs) this.inheritedRuns.add(run_id)
+  }
+
+  /**
+   * On start: every running run is scheduled again, then unfinished wakes are settled (REQ-WF-4).
+   * A hold between steps left from before the start ends with it (./hold.ts): it lasts only while
+   * the process it was set in waits to stop.
+   */
   recover(): void {
     if (this.stopped.signal.aborted) return
+    release(this, 'restart')
     const rows = this.ctx.store.db.prepare("SELECT run_id FROM workflow_runs WHERE status = 'running' ORDER BY created_at").all() as Array<{ run_id: string }>
     for (const { run_id } of rows) this.schedule(run_id)
     this.tasks.recover()
@@ -134,7 +181,10 @@ export class Engine {
       throw new WorkflowFailure('invalid_input', refused ? `workflow template ${input.template} was refused at load: ${refused}` : `unknown workflow template ${input.template}`)
     }
     if (!input.input.trim()) throw new WorkflowFailure('invalid_input', 'the input must not be empty')
-    const requestKey = input.clientRequestId ? sha256(`workflow\0${input.clientRequestId}`) : null
+    // A retry key is the caller's within its project (T285): a lead's key names its project, so another
+    // project's lead (or the operator) sending the same key starts its own run and never gets this one back.
+    const requestKey = !input.clientRequestId ? null
+      : input.projectId !== undefined ? sha256(`workflow\0project\0${input.projectId}\0${input.clientRequestId}`) : sha256(`workflow\0${input.clientRequestId}`)
     const unknown = variantProblem(input.template, nodes, input.variant)
     if (unknown) throw new WorkflowFailure('invalid_input', unknown)
     const spec = resolve(input.template, nodes, input)
@@ -217,6 +267,7 @@ export class Engine {
             bound.dispatch ? 'dispatch' : bound.startedBy ?? 'lead', now(), now())
         return view(this, run)
       }
+      if (input.projectId !== undefined) db.prepare('UPDATE workflow_runs SET project_id = ? WHERE run_id = ?').run(input.projectId, run.run_id)
       this.open(run.run_id)
       this.ctx.store.afterCommit(() => this.schedule(run.run_id))
       return view(this, run)
@@ -234,8 +285,10 @@ export class Engine {
     for (const team of new Set(specs.flatMap((n) => (n.team ? [n.team.id] : [])))) {
       this.ctx.workerSessions.group(teamGroup(runId, team))
     }
-    const task = this.tasks.row(runId)?.task_id
-    this.ctx.eventLog.append({ type: 'workflow.run.started', runId, ...(run.session_id ? { sessionId: run.session_id } : {}), data: { template: run.template, specHash: run.spec_hash, ...(task ? { taskId: task } : {}) } })
+    // A board task's run names who started it (`startedBy`, PROP-0016 I4): the maturity metrics
+    // count a lead's start as a touch, and the event log is what they read (docs/design/maturity-metrics.md).
+    const task = this.tasks.row(runId)
+    this.ctx.eventLog.append({ type: 'workflow.run.started', runId, ...(run.session_id ? { sessionId: run.session_id } : {}), data: { template: run.template, specHash: run.spec_hash, ...(task ? { taskId: task.task_id, startedBy: task.started_by ?? (task.dispatch ? 'dispatch' : 'lead') } : {}) } })
   }
 
   get(runId: string): RunView | undefined {
@@ -274,14 +327,19 @@ export class Engine {
    * tier and where that came from; its acceptance contract. A review team member's step
    * (proposal, ballot, debate) names its kind of work, `scope: review-member` (`@1.1`), so offers
    * scoped to it count (ADR-0049); its capabilities stay the same. A step that names its kind of
-   * work carries it (`kind`, `@1.2`; ADR-0057), from the admitted spec only.
+   * work carries it (`kind`, `@1.2`; ADR-0057), from the admitted spec only. A step that prefers
+   * capabilities it does not need carries them (`prefers`, `@1.3`; T262), those it needs left out.
    */
   requirementOf(node: ResolvedNode, persistent: boolean, classification: Classification | undefined): WorkRequirement {
     const member = node.team?.kind === 'review' && node.team.member !== undefined
+    // A step that must show its checks' output in the task's dossier (T267) needs a Worker given the dossier tools.
+    const capabilities = [...new Set([...node.capabilities, ...(persistent ? ['persistent-conversation'] : []), ...(node.showsEvidence ? [DOSSIER_CAPABILITY] : [])])]
+    const prefers = (node.prefers ?? []).filter((c) => !capabilities.includes(c))
     return {
-      schema: node.kind !== undefined ? 'work-requirement@1.2' : member ? 'work-requirement@1.1' : 'work-requirement@1.0',
+      schema: prefers.length ? 'work-requirement@1.3' : node.kind !== undefined ? 'work-requirement@1.2' : member ? 'work-requirement@1.1' : 'work-requirement@1.0',
       objective: node.objective,
-      capabilities: [...new Set([...node.capabilities, ...(persistent ? ['persistent-conversation'] : [])])],
+      capabilities,
+      ...(prefers.length ? { prefers } : {}),
       ...(member ? { scope: 'review-member' as const } : {}),
       ...(node.kind !== undefined ? { kind: node.kind } : {}),
       data: { classification: classification ?? this.ctx.egress.defaultClassification, refs: [] },
@@ -355,6 +413,10 @@ export class Engine {
             }
             return this.finish(run, 'failed', { error: failed.error }, current)
           }
+          // A change a review approved gets its risk tier before anything after the review starts
+          // (./risk.ts, ADR-0071): a heavy one grows its second review, a light one may skip a step.
+          if (!this.tasks.lost(runId) && !this.tasks.budgetStopped(runId) && await settleRisk(this, run, nodes, current, signal)) continue
+          if (signal.aborted) return
           if (nodes.every((n) => n.state === 'COMPLETED')) {
             const final = (JSON.parse(nodes[nodes.length - 1]!.record) as NodeRecord).outputReceipt!.result
             // A board task's acceptance stored before a crash stands (INV-4): the run finishes on it, its
@@ -364,10 +426,16 @@ export class Engine {
             // The checks the policy requires of a written result run on its exact tree first (./checks.ts).
             // The source stores each check's outcome on the subject, so a restart before the run finished
             // gets the same outcomes back, never a check run again in place of one that ended.
-            const ran = await checksFor(this, run, nodes, signal)
+            const ran = await checksFor(this, run, nodes, signal, riskOf(this, runId)?.tier)
+            if (signal.aborted) return
+            // Where a task's result would land, for the board's auto-accept rule (D80): read before its acceptance is decided.
+            const targets = this.tasks.bound(runId) ? await landingTargets(this, runId) : []
+            if (signal.aborted) return
+            // The final change's risk tier, recorded on the run; a heavy result needs two families' approvals (ADR-0071).
+            const risk = await riskAtAcceptance(this, run, nodes, signal)
             if (signal.aborted) return
             // A board task's result binds to the exact subject it writes (INV-5), or the run fails.
-            const unbound = this.tasks.complete(run, nodes, final, ran)
+            const unbound = this.tasks.complete(run, nodes, final, ran, targets, risk)
             if (unbound) return this.finish(run, 'failed', { error: JSON.stringify(unbound) }, current)
             // A plain run that wrote records the policy's checks still pending; it applies nothing, so they never block it.
             if (!this.tasks.bound(runId)) await acceptPlain(this, run, nodes, final, ran)
@@ -380,11 +448,15 @@ export class Engine {
           // finish and their results are taken, then the run blocks its task or fails (ADR-0047).
           const budgetStopped = !holderLost && this.tasks.budgetStopped(runId)
           const windingDown = holderLost || budgetStopped
+          // While the operator holds steps (a live update waits to stop the host, ./hold.ts), the
+          // steps already sent finish and nothing new starts: the release, or the next start,
+          // schedules the run again from its recorded state.
+          const holding = !windingDown && heldNow(this) !== undefined
           // A node that must differ from others is promoted with or after them, never before: it then
           // waits for their Workers while they run beside it (ADR-0027).
           const promoted = new Set(nodes.filter((n) => n.state !== 'WAITING').map((n) => n.node_id))
           // Until nothing more can be promoted, so the order nodes are listed in never serializes branches.
-          for (let more = !windingDown; more;) {
+          for (let more = !windingDown && !holding; more;) {
             more = false
             for (const node of nodes) {
               const differs = (JSON.parse(node.spec) as ResolvedNode).differentFrom ?? []
@@ -403,7 +475,7 @@ export class Engine {
           // A node that must differ from a peer with no Worker yet runs only beside that peer, so
           // it can wait for the peer's routing; otherwise it is parked until the peer is routed.
           const ids = new Set(runnable.map((n) => n.node_id))
-          const active = windingDown ? runnable.filter((n) => n.state === 'RUNNING' && n.execution_id) : runnable.filter((n) => !((JSON.parse(n.spec) as ResolvedNode).differentFrom ?? []).some((peer) => {
+          const active = windingDown || holding ? runnable.filter((n) => n.state === 'RUNNING' && n.execution_id) : runnable.filter((n) => !((JSON.parse(n.spec) as ResolvedNode).differentFrom ?? []).some((peer) => {
             const row = current_.find((r) => r.node_id === peer)
             return !row?.worker && row?.state !== 'FAILED' && !ids.has(peer)
           }))
@@ -412,6 +484,7 @@ export class Engine {
             if (await this.tasks.budgetEnd(runId) === 'wait') this.retryLater(runId, TASK_WAIT_MS)
             return
           }
+          if (!active.length && holding) return
           if (!active.length) {
             // A tie waits a bounded time for a deciding vote, and a plan's gate for its verdict (INV-9):
             // a tie then completes inconclusive, a gate closes and fails the run.
@@ -474,7 +547,7 @@ export class Engine {
             return
           }
           // Every node deferred to a peer that is not running (it backs off): look again shortly.
-          if (outcomes.every((o) => o === 'deferred') && !(await sleep(250, signal))) return
+          if (outcomes.every((o) => o === 'deferred') && !(await slept(250, signal))) return
         }
       } catch (error) {
         if (this.stopped.signal.aborted || operator.signal.aborted) return
@@ -526,9 +599,17 @@ export class Engine {
     // A re-review an earlier engine grew says literal while its review is a template: its spec says what it is composed from now.
     const { literal: _literal, ...worded } = spec
     const composed: ResolvedNode = !!spec.literal === wording.literal ? spec : { ...worded, ...(wording.literal ? { literal: true } : {}) }
+    // A step built on one that ran on a single family is told so, before any reply format (./single-family.ts).
+    const single = singleFamilyBrief(this, spec, nodes)
+    if (single) parts = appended(parts, `\n\n${single}`)
     if (spec.resultSchema) parts = appended(parts, `\n\n${schemaBlock(spec.resultSchema, this.schemas.schemaOf(spec.resultSchema))}`)
     // A review of an agent's change binds to the workspace's exact subject now (REQ-TEAM-5, REQ-WF-5).
-    const found = spec.capabilities.includes('review') ? reviewSubject(this, results, run.input) : undefined
+    // A re-review reads the change since the subject the last review read, and the whole change (review cycles).
+    // A verification step is bound to the very tree the review it verifies read (ADR-0075). An author's
+    // self-review (T267) is told the task's goal as the requested change, never the caller's input (the author's orders).
+    const request = spec.selfReview !== undefined ? this.tasks.frame(run.run_id)?.goal ?? 'the task\'s goal, in the brief above' : run.input
+    const found = spec.verifies ? verificationSubject(this, spec, nodes, run.input)
+      : spec.capabilities.includes('review') && !spec.unbound ? reviewSubject(this, results, request, (workspace, now) => cycleOf(this, run.run_id, spec, nodes, workspace, now)) : undefined
     if (found && 'missing' in found) {
       const decision = missingSubject(this, run, node, found.missing)
       const error: WorkflowError = { kind: 'stale_subject', disposition: 'NONE', message: `exact-subject gate: the agent's working tree ${found.missing} can no longer be captured` }
@@ -544,7 +625,9 @@ export class Engine {
     this.writeNode(node, {
       state: 'READY', prompt, brief_parts: JSON.stringify(parts), ...(composed === spec ? {} : { spec: JSON.stringify(composed) }),
       ...(bound ? { subject: JSON.stringify({ workspace: bound.workspace, subject: bound.subject }) } : {}),
-    }, (record) => ({ ...record, inputReceipt: { inputHash, bundle: results } }), lease)
+    // A bundle is a set: two dependencies whose results are one artifact (a heavy change's two
+    // reviews that answered alike, ADR-0071) name it once.
+    }, (record) => ({ ...record, inputReceipt: { inputHash, bundle: [...new Set(results)] } }), lease)
   }
 
   /**
@@ -563,13 +646,14 @@ export class Engine {
       // A peer that is not running now (backing off before a retry) will not be routed while this
       // waits: give the turn back to the run loop, which runs both again.
       if (rows.some((n) => !n.worker && !this.executing.has(`${run.run_id}\0${n.node_id}`))) return 'deferred'
-      if (!(await sleep(250, signal))) return 'stopped'
+      if (!(await slept(250, signal))) return 'stopped'
     }
   }
 
   /** The routed nodes that name this one in their `differentFrom`: the relation holds both ways. */
   private namers(run: RunRow, spec: ResolvedNode): NodeRow[] {
-    return this.nodeRows(run.run_id).filter((n) => n.worker && ((JSON.parse(n.spec) as ResolvedNode).differentFrom ?? []).includes(spec.nodeId))
+    // A retired step (a verification of a review that runs again) constrains nothing.
+    return this.nodeRows(run.run_id).filter((n) => n.worker && n.state !== 'RETIRED' && ((JSON.parse(n.spec) as ResolvedNode).differentFrom ?? []).includes(spec.nodeId))
   }
 
   /**
@@ -591,6 +675,9 @@ export class Engine {
       if (!row.worker) continue
       const family = listed.get(row.worker)
       if (family === undefined) {
+        // A verification prefers another family, never requires one (ADR-0075): with the review's
+        // family unknown it runs on any reviewer, in a session of its own, rather than failing the run.
+        if (spec.verifies) return undefined
         return { problem: `node ${row.node_id}'s Worker ${row.worker} ${listed.has(row.worker) ? 'declares no provider family' : 'is no longer listed'}, so no Worker can be shown to differ from it (ADR-0027)` }
       }
       families.add(family)
@@ -608,7 +695,9 @@ export class Engine {
     const spec = JSON.parse(node.spec) as ResolvedNode
     if (!node.execution_id) {
       const delay = node.not_before ? Date.parse(node.not_before) - Date.now() : 0
-      if (delay > 0 && !(await sleep(delay, signal))) return
+      if (delay > 0 && !(await slept(delay, signal))) return
+      // Held between steps (./hold.ts): nothing new starts; the release schedules the run again.
+      if (heldNow(this)) return
       // A review's source is read by the engine, not a Worker.
       if (spec.executor === 'snapshot') return runSnapshot(this, run, node, spec, lease, signal)
       // No Worker execution starts on instructions that are not what the node's wording composes
@@ -617,16 +706,50 @@ export class Engine {
       if (unsafe) return refuseInstructions(this, run, node, unsafe, lease)
       const record = JSON.parse(node.record) as NodeRecord
       const attempt = node.attempt + 1
+      // A board task's step takes the tier its policy gives it at its task's risk tier (ADR-0073), recorded.
+      const atRisk = await tierAtRisk(this, run, node, spec, record.requirement)
+      if (signal.aborted) return
+      // Its task or policy unreadable, its tier is unknown: never routed at its template's tier, it
+      // fails unsent and is retried with back-off, so a heavy step never runs below its minimum (INV-2).
+      if (atRisk && 'problem' in atRisk) {
+        return failAttempt(this, run, { ...node, attempt }, { kind: 'internal', disposition: 'BACKOFF', message: `${atRisk.problem}; the step is held, not routed at its template's tier` }, { sent: false, decisions: [] }, lease)
+      }
+      if (atRisk) record.requirement = atRisk.requirement
       // A node that must differ from others routes once they have Workers (ADR-0027).
       const differs = await this.diversity(run, spec, signal)
       if (differs === 'stopped') return
       if (differs === 'deferred') return 'deferred'
       // The brief this execution is given, but for the routed Worker's sandbox (docs/design/workflow-engine.md#briefs).
       let draft: Draft
+      let guides: BriefPointer | undefined
       try {
-        draft = draftOf(this, run, node, spec, record.requirement)
+        // A review is given the REVIEW.md guides of the areas its change touches (./review-guides.ts).
+        guides = await guidesFor(this, run, node, spec)
+        if (signal.aborted) return
+        draft = draftOf(this, run, node, spec, record.requirement, guides)
+        // On its session after an earlier step ran off it: handed what that step's turn added (session-moves.ts).
+        draft = sessionGaps(this, run, spec, draft)
+        // A review's fix continues its author's session; a lost one is handed off, recorded (./fix-sessions.ts).
+        draft = authorDraft(this, run, node, spec, draft)
       } catch (error) {
         return failAttempt(this, run, { ...node, attempt }, errorOf(error), { sent: false, decisions: [] }, lease)
+      }
+      // A board task's step is given its handbook slice, within its bound or refused here, before
+      // anything is reserved, routed, or sent (docs/design/handbook.md).
+      let built: Built | undefined
+      try {
+        built = await buildHandbook(this, run, node, spec, guides)
+      } catch (error) {
+        return failAttempt(this, run, { ...node, attempt }, errorOf(error), { sent: false, decisions: [] }, lease)
+      }
+      if (signal.aborted) return
+      if (built) {
+        const applied = applyHandbook(this, run, node, draft, built, lease)
+        if (applied === 'refused') {
+          await fileRefusal(this, built, node)
+          return
+        }
+        draft = applied
       }
       // A board task's step reserves its task's budget before it is routed or sent (ADR-0047, step 1):
       // refused, it stays as it is and the run starts nothing new.
@@ -635,6 +758,9 @@ export class Engine {
       if (budget === 'stop' || signal.aborted) return
       // Its brief states what the task may still draw at this step, not when the run was admitted.
       if (this.tasks.bound(run.run_id)) draft = { ...draft, budget: { remaining: await this.tasks.budgetAt(run.run_id) } }
+      // A review's fix is a commit of its own: the tree its review read is committed first (./fix-sessions.ts).
+      await commitReviewed(this, run, node, spec)
+      if (signal.aborted) return
       // Members of one team route one at a time, so each sees which accounts the others hold.
       const release = await this.routingTurn(run.run_id)
       const exclude = differs ? await this.families(run, spec) : undefined
@@ -666,6 +792,8 @@ export class Engine {
       const input = { chars: renderedChars(this, draft) }
       // Recorded when the node runs on the same provider family for want of another (ADR-0029).
       let sameFamily: ArtifactRef | undefined
+      // Set when the node runs off its session, its session's Workers unable to take it (session-moves.ts).
+      let moved: Moved | undefined
       // The Workers it failed over from, unsent (ADR-0034); with none left but them, it routes as before.
       const failed = node.excluded ? (JSON.parse(node.excluded) as string[]) : []
       const away = failed.length ? { excludeWorkers: { workers: failed, reason: `an earlier attempt of ${node.node_id} failed here before anything was sent` } } : {}
@@ -705,42 +833,95 @@ export class Engine {
         }
         admitted = got
       } else {
+        // A step that prefers another family, whose Worker of that family failed it: the prompt is never sent there again (./single-family.ts).
+        const recovered = spec.diversity === 'preferred' ? singleFamilyRecovery(this, run.run_id, node.node_id) : undefined
+        const routing = recovered ? (options: RouteOptions): Promise<AdmittedWorker> => this.ctx.workers.route(record.requirement, { producer: 'workflow', input, ...options, ...pinned, ...away }) : route
         try {
           try {
-            admitted = await route({ ...restricted, ...(exclude ? { exclude } : {}) })
+            admitted = await routing({ ...restricted, ...(exclude ? { exclude } : {}) })
           } catch (error) {
-            if (!(error instanceof AdmissionFailure) || !this.config.allowSameFamily || (!exclude && !distinctAccounts)) throw error
-            // Opt-in only: with no Worker of another family (or account), route without that rule, and say so.
-            // A session's own Worker still binds it; only the family and distinct-account rules are
-            // lifted, so a Worker refused for its quota, sign-in, tier, or capability stays refused, and
-            // so does one the operator's teams.excludeWorkers leaves out of teams.
-            // First the family rule alone: a team on one provider keeps distinct accounts while it can
-            // (ADR-0035); then the distinct-account rule too, members sharing an account (ADR-0029).
-            // When nothing passes even then, the first refusal, with what the team needs, stands.
-            const kept = exclude && distinctAccounts ? await route(restricted).catch(() => undefined) : undefined
-            if (kept) {
-              admitted = kept
-              sameFamily = this.sameFamilyDecision(run, node, error.decision, [exclude!.reason], admitted, 'same-family', { family: true, accounts: true })
-            } else {
-              admitted = await route(distinctAccounts ? (teams ? { restrict: teams } : {}) : restricted).catch(() => {
+            // A step that prefers another family runs on the family it differs from, once no Worker of
+            // another is admitted, in a conversation of its own, and says so (./single-family.ts, D89).
+            // Once per step: after a fallback was admitted, at any escalation, the rule is never lifted again; the refusal stands.
+            if (error instanceof AdmissionFailure && exclude && spec.diversity === 'preferred' && !spec.secondReview && !distinctAccounts) {
+              // A step asked once more for the JSON it lacked (T349b) is no escalation: it runs again where its first answer ran.
+              if (fallbackSpent(this, run.run_id, node) && !assessmentMisses(this, run, node)) throw error
+              admitted = await routing(restricted).catch(() => {
                 throw error
               })
-              const rules = [exclude?.reason, distinctAccounts].filter((r): r is string => !!r)
-              sameFamily = this.sameFamilyDecision(run, node, error.decision, rules, admitted, distinctAccounts ? 'same-family-shared-account' : 'same-family', { family: !!exclude, accounts: !!distinctAccounts })
+              sameFamily = singleFamilyDecision(this, run, node, spec, error, admitted, recovered)
+            } else {
+              // A heavy change's second review is the other family's judgement, or nothing (ADR-0071): never lifted.
+              if (!(error instanceof AdmissionFailure) || !this.config.allowSameFamily || (!exclude && !distinctAccounts) || spec.secondReview) throw error
+              // Opt-in only: with no Worker of another family (or account), route without that rule, and say so.
+              // A session's own Worker still binds it; only the family and distinct-account rules are
+              // lifted, so a Worker refused for its quota, sign-in, tier, or capability stays refused, and
+              // so does one the operator's teams.excludeWorkers leaves out of teams.
+              // First the family rule alone: a team on one provider keeps distinct accounts while it can
+              // (ADR-0035); then the distinct-account rule too, members sharing an account (ADR-0029).
+              // When nothing passes even then, the first refusal, with what the team needs, stands.
+              const kept = exclude && distinctAccounts ? await route(restricted).catch(() => undefined) : undefined
+              if (kept) {
+                admitted = kept
+                sameFamily = this.sameFamilyDecision(run, node, error.decision, [exclude!.reason], admitted, 'same-family', { family: true, accounts: true })
+              } else {
+                admitted = await route(distinctAccounts ? (teams ? { restrict: teams } : {}) : restricted).catch(() => {
+                  throw error
+                })
+                const rules = [exclude?.reason, distinctAccounts].filter((r): r is string => !!r)
+                sameFamily = this.sameFamilyDecision(run, node, error.decision, rules, admitted, distinctAccounts ? 'same-family-shared-account' : 'same-family', { family: !!exclude, accounts: !!distinctAccounts })
+              }
             }
           }
         } catch (error) {
-          done()
-          if (!(error instanceof AdmissionFailure)) throw error
-          const hint = error.rejections.length ? inputHint(this, spec, error, input.chars, sourceOf(this, this.nodeRows(run.run_id), spec.dependsOn)) : ': no Worker is configured (for website Workers, map tiers to modes in the account catalog, then sign the account in)'
-          // A team member short of provider families: say what the team needs, beside why this one failed.
-          const team = spec.team?.member && exclude ? await this.familyShortage(spec, record.requirement, leftOut) : ''
-          // Refused only for assigned accounts' limits: it waits for the reset, bounded, spending no attempt (ADR-0052).
-          const waiting = error.limitUntil ? waitForLimit(this, run, node, error, `${team}${error.message}`, lease) : undefined
-          if (waiting && 'waited' in waiting) return
-          const unwaited = waiting ? `; it does not wait: ${waiting.why}` : ''
-          return failAttempt(this, run, { ...node, attempt }, { kind: admissionKind(error), disposition: dispositionOf(admissionKind(error)), message: `${team}${error.message}${hint}${unwaited}` },
-            { sent: false, decisions: [error.decision] }, lease)
+          // Its session's Workers cannot take it for a reason no wait changes: it runs off the
+          // session on another Worker, handed what the conversation held, or fails with both refusals.
+          const own = spec.session.sessionId && restricted.restrict ? this.ctx.workers.affinity(spec.session.sessionId) : undefined
+          const keep = { ...(exclude ? { exclude } : {}), ...pinned }
+          let off = error instanceof AdmissionFailure && own?.length
+            ? await leaveSession(this, run, node, spec, draft, record.requirement, own, error, keep, failed)
+            : undefined
+          // A review's fix whose author's Worker cannot take it now waits for it, bounded, then is handed off (./fix-sessions.ts).
+          if (!off && spec.author && error instanceof AdmissionFailure && own?.length) {
+            const waiting = waitForAuthor(this, run, node, spec, error, lease)
+            if ('waited' in waiting) {
+              done()
+              return
+            }
+            off = await leaveSession(this, run, node, spec, draft, record.requirement, own, error, keep, failed, waiting.handoff)
+          }
+          // A self-review whose author's account cannot take it now waits for it, bounded, spending no attempt.
+          let selfWait = ''
+          if (!off && spec.selfReview !== undefined && error instanceof AdmissionFailure) {
+            const waiting = waitForSelfReview(this, run, node, spec, error, lease)
+            if ('waited' in waiting) {
+              done()
+              return
+            }
+            selfWait = `; ${waiting.why}`
+          }
+          if (off && 'admitted' in off) {
+            admitted = off.admitted
+            moved = off
+          } else {
+            done()
+            if (!(error instanceof AdmissionFailure)) throw error
+            const hint = error.rejections.length ? inputHint(this, spec, error, input.chars, sourceOf(this, this.nodeRows(run.run_id), spec.dependsOn)) : ': no Worker is configured (for website Workers, map tiers to modes in the account catalog, then sign the account in)'
+            // A team member short of provider families: say what the team needs, beside why this one failed.
+            const team = spec.team?.member && exclude ? await this.familyShortage(spec, record.requirement, leftOut) : ''
+            // Refused only for assigned accounts' limits: it waits for the reset, bounded, spending no attempt (ADR-0052).
+            // A Worker that proves it is refused only for a while that passes by itself (out of quota, at a
+            // limit no reset of which is assigned, its probe late): it waits to be routed again, bounded (T282).
+            const waiting = error.limitUntil ? waitForLimit(this, run, node, error, `${team}${error.message}`, lease)
+              : error.retryAt ? waitForRetry(this, run, node, error, `${team}${error.message}`, lease) : undefined
+            if (waiting && 'waited' in waiting) return
+            const unwaited = waiting ? `; it does not wait: ${waiting.why}` : ''
+            // A Worker that would otherwise take it is unavailable: the infrastructure's failure, not the attempt's (ADR-0069).
+            const down = admissionInfrastructure(node, error)
+            const unmoved = off && 'why' in off ? off.why : ''
+            return failAttempt(this, run, { ...node, attempt }, { kind: admissionKind(error), disposition: dispositionOf(admissionKind(error)), message: `${team}${error.message}${hint}${unwaited}${unmoved}${selfWait}` },
+              { sent: false, decisions: [error.decision], ...(down ? { infrastructure: down } : {}) }, lease)
+          }
         }
       }
       // A stop while routing starts nothing: the node is routed again on the next start.
@@ -749,8 +930,9 @@ export class Engine {
         return
       }
       // A run that lost its board task's holder while this node routed starts nothing (INV-15), nor
-      // one whose task's budget refused a step beside it (ADR-0047).
-      if (this.tasks.lost(run.run_id) || this.tasks.budgetStopped(run.run_id)) {
+      // one whose task's budget refused a step beside it (ADR-0047), nor one held between steps
+      // while it routed (./hold.ts): the node stays READY and routes again after the release.
+      if (this.tasks.lost(run.run_id) || this.tasks.budgetStopped(run.run_id) || heldNow(this)) {
         done()
         return
       }
@@ -759,12 +941,16 @@ export class Engine {
         done()
         throw new Error(`Worker source ${admitted.source} is gone`)
       }
+      // A review's fix on its author's session, resuming it: which path it took is recorded (./fix-sessions.ts).
+      if (!moved) continued(this, run, node, spec, admitted, draft)
+      // The tier routing served it at: of a Worker that offers several, the one its run runs (ADR-0073).
+      const servedTier = admitted.tier ?? admitted.worker.tier
       const routed = {
-        worker: admitted.worker.worker, source: admitted.source, served_tier: admitted.worker.tier, quota_class: admitted.worker.quotaClass,
+        worker: admitted.worker.worker, source: admitted.source, served_tier: servedTier, quota_class: admitted.worker.quotaClass,
         // The account it runs on, so a failure of it is recovered by its group's mode (ADR-0052).
         account: admitted.worker.account ? JSON.stringify(admitted.worker.account) : null,
-        // The same-family decision first: the last two stay the tier and route decisions.
-        decisions: JSON.stringify([...(sameFamily ? [sameFamily] : []), admitted.decisions.tier, admitted.decisions.route]),
+        // The tier-by-risk, same-family, or session-move decision first: the last two stay the tier and route decisions.
+        decisions: JSON.stringify([...(atRisk ? [atRisk.decision] : []), ...(sameFamily ? [sameFamily] : []), ...(moved ? [moved.decision] : []), admitted.decisions.tier, admitted.decisions.route]),
       }
       try {
         this.ctx.store.transaction(() => {
@@ -779,13 +965,19 @@ export class Engine {
           }
           // The brief is recorded before the execution starts, and the execution names it; its
           // source renders the prompt from it (INV-13, INV-12).
-          const brief = recordBrief(this, run, node, draft, source.sandbox?.(admitted.worker.worker, run.run_id))
+          // Off its session (session-moves.ts), it starts without one, on the brief that carries the handoff.
+          // A Worker that offers tiers is told in its brief the one it runs at, and the model its source runs there (ADR-0073).
+          const tiered = !!admitted.worker.tiers?.length
+          const brief = recordBrief(this, run, node, moved ? moved.draft : draft, source.sandbox?.(admitted.worker.worker, run.run_id),
+            tiered ? servedTier : undefined, tiered ? source.model?.(admitted.worker.worker, servedTier) : undefined)
           const started = source.start({
             key: executionKey(run.run_id, node, attempt),
-            worker: admitted.worker.worker, brief, sessionId: spec.session.sessionId, runId: run.run_id,
+            worker: admitted.worker.worker, brief, sessionId: moved ? undefined : spec.session.sessionId, runId: run.run_id,
             // The template step it serves, from the engine's own record: a source may record it with what the run drew (PROP-0015 E2).
             step: { template: run.template, node: node.node_id },
-            requirement: record.requirement, decisions: admitted.decisions,
+            // The tier it was routed at, so its source runs that tier's model (ADR-0073).
+            tier: servedTier,
+            requirement: moved ? moved.requirement : record.requirement, decisions: admitted.decisions,
           })
           this.writeNode(node, { state: 'RUNNING', execution_id: started.id, attempt, not_before: null, ...routed }, (r) => ({
             ...r, schema: 'workflow-node@1.2', execution: { executionId: started.id, attempt, owner: admitted.source, generation: lease().generation, route: admitted.decisions.route, brief },
@@ -793,7 +985,7 @@ export class Engine {
           }), lease)
           this.ctx.eventLog.append({
             type: 'workflow.node.started', runId: run.run_id, nodeId: node.node_id, decision: admitted.decisions.route,
-            data: { executionId: started.id, source: admitted.source, worker: admitted.worker.worker, minTier: spec.tier, attempt, brief },
+            data: { executionId: started.id, source: admitted.source, worker: admitted.worker.worker, minTier: spec.tier, tier: servedTier, attempt, brief },
           })
         })
       } catch (error) {
@@ -809,7 +1001,7 @@ export class Engine {
       // The Worker's runtime is not loaded now (its row is off): the node fails for the operator.
       // Its execution is never guessed at; `continue` runs the node again as a new attempt.
       return failAttempt(this, run, node, { kind: 'config_error', disposition: dispositionOf('config_error'),
-        message: `Worker source ${node.source ?? '(none)'} of node ${node.node_id} is not registered (its row is off); turn it back on, then continue the run to run the node again as a new attempt` }, { sent: true }, lease)
+        message: `Worker source ${node.source ?? '(none)'} of node ${node.node_id} is not registered (its row is off); turn it back on, then continue the run to run the node again as a new attempt` }, { sent: true, infrastructure: sourceGone(node) }, lease)
     }
     let current = source.get(node.execution_id!)
     const stop = aborted(signal)
@@ -819,7 +1011,7 @@ export class Engine {
       await Promise.race([source.wait(current.id, 30_000), stop])
       if (signal.aborted) return
       // A runtime that is stopping returns at once; never spin on it.
-      if (Date.now() - waited < 50 && !(await sleep(1000, signal))) return
+      if (Date.now() - waited < 50 && !(await slept(1000, signal))) return
       current = source.get(current.id)
     }
     if (!current) return failAttempt(this, run, node, { kind: 'internal', disposition: 'CODE_FIX', message: `execution ${node.execution_id} is gone` }, { sent: true }, lease)
@@ -828,12 +1020,22 @@ export class Engine {
       if (await awaitCall(this, run, node, current, lease)) return
       // The node keeps the failure's kind, disposition, and message; a site's own error is read from the execution (ADR-0062).
       const failed = current.error ? { kind: current.error.kind, disposition: current.error.disposition, message: current.error.message } : { kind: 'internal', disposition: 'CODE_FIX', message: 'the execution failed without an error' }
-      return failAttempt(this, run, node, failed, { sent: current.submitted, execution: current }, lease)
+      // Its source says the host's stop or its Worker going away alone ended it, or it is unsent on a Worker that became unavailable: the infrastructure's (ADR-0069).
+      // Its Worker's quota ran out before the step landed anything: a Worker-unavailable outcome, no attempt (T272b), and dispatch keeps that account's window closed until its reset.
+      const loss = await quotaLoss(this, node, current, failed)
+      if (loss) {
+        const task = this.ctx.store.db.prepare('SELECT task_id FROM workflow_tasks WHERE run_id = ?').get(run.run_id) as { task_id: string } | undefined
+        this.dispatch.exhaust({ until: loss.until, basis: loss.basis, ...(loss.account ? { account: loss.account } : {}), ...(loss.window ? { window: loss.window } : {}), ...(task ? { taskId: task.task_id } : {}) })
+      }
+      const mark = loss?.mark ?? await executionInfrastructure(this, node, current, failed)
+      return failAttempt(this, run, node, failed, { sent: current.submitted, execution: current, ...(mark ? { infrastructure: mark } : {}) }, lease)
     }
     if (!current.result) {
       return failAttempt(this, run, node, { kind: 'internal', disposition: 'CODE_FIX', message: `${node.source} reported execution ${current.id} completed without a result` }, { sent: true, execution: current }, lease)
     }
     await this.complete(run, node, spec, current, lease)
+    // A review's fix that completed keeps its result as its own commit, before the re-review reads it (./fix-sessions.ts).
+    if (spec.fixOf && !signal.aborted && this.nodeRow(run.run_id, node.node_id)?.state === 'COMPLETED') await commitFixed(this, run, node, spec, current.result)
   }
 
   /**
@@ -915,24 +1117,63 @@ export class Engine {
     const rejected = [...acceptance.reasons, ...(cut ? [cut] : [])]
     const decisions = { decisions: JSON.stringify([...execution.decisions, ...routedDecisions(node, this)]) }
     const data = { executionId: execution.id, source: node.source, worker: node.worker, tier: node.served_tier, quotaClass: node.quota_class, accepted: acceptance.accepted }
-    let gate: ReturnType<typeof subjectGate> | undefined
+    let gate: ReturnType<typeof verificationGate> | undefined
+    let lacking: ReturnType<typeof unboundGate>
+    let unverified: ReturnType<TaskDossiers['evidenceGate']>
+    // Whether the gate already refused this step's evidence once (T284): its second refusal fails the step.
+    const refusedBefore = acceptance.accepted && spec.showsEvidence ? this.tasks.dossiers.refusals(run, node) > 0 : false
     this.ctx.store.transaction(() => {
       const refused = acceptance.accepted && spec.grows ? grow(this, run, node, spec, result, lease) : undefined
       if (refused) {
         const error: WorkflowError = { kind: 'plan_rejected', disposition: 'NONE', message: refused.message }
         this.writeNode(node, { state: 'FAILED', error: JSON.stringify(error), ...decisions }, (r) => ({ ...r, lastDecision: refused.decision }), lease)
         this.ctx.eventLog.append({ type: 'workflow.node.failed', runId: run.run_id, nodeId: node.node_id, decision: refused.decision, data: { ...data, kind: error.kind, disposition: error.disposition } })
-      } else if (acceptance.accepted && node.subject && !(gate = subjectGate(this, run, node, result)).passed) {
-        const error: WorkflowError = { kind: 'stale_subject', disposition: 'NONE', message: `exact-subject gate: ${gate.reason}` }
+      } else if (acceptance.accepted && spec.showsEvidence && (unverified = this.tasks.dossiers.evidenceGate(run, node))) {
+        if (!refusedBefore) {
+          // The first refusal is answered, not ended on (T284): the step continues its own session once, with the refusal's message.
+          continueWithMessage(this, node, unverified.decision, unverified.message, lease)
+          this.ctx.eventLog.append({ type: 'workflow.node.evidence-refused', runId: run.run_id, nodeId: node.node_id, decision: unverified.decision, data: { ...data, continued: true } })
+          return
+        }
+        // A writing step that still shows no checks after its one answer ends here, before anything reviews it (T267, T284).
+        this.tasks.dossiers.settleCommands(run, node)
+        const error: WorkflowError = { kind: 'acceptance_rejected', disposition: 'NONE', message: `evidence_missing: evidence refused twice: ${unverified.message}` }
+        this.writeNode(node, { state: 'FAILED', error: JSON.stringify(error), ...decisions }, (r) => ({ ...r, lastDecision: unverified!.decision }), lease)
+        this.ctx.eventLog.append({ type: 'workflow.node.failed', runId: run.run_id, nodeId: node.node_id, decision: unverified.decision, data: { ...data, kind: error.kind, disposition: error.disposition } })
+      } else if (acceptance.accepted && spec.unbound && (lacking = unboundGate(this, run, node, result, spec.unbound))) {
+        // A step bound to no subject, whose caller reads its JSON, is asked once for the JSON it lacks too (T349b).
+        if (assessmentMisses(this, run, node) === 1) {
+          continueWithMessage(this, node, lacking.decision, lacking.request, lease, Object.keys(spec.session).length > 0)
+          this.ctx.eventLog.append({ type: 'workflow.node.assessment-refused', runId: run.run_id, nodeId: node.node_id, decision: lacking.decision, data: { ...data, continued: true } })
+          return
+        }
+        const error: WorkflowError = { kind: 'assessment_missing', disposition: 'NONE', message: `assessment_missing: ${lacking.reason} (asked twice)` }
+        this.writeNode(node, { state: 'FAILED', error: JSON.stringify(error), ...decisions }, (r) => ({ ...r, lastDecision: lacking!.decision }), lease)
+        this.ctx.eventLog.append({ type: 'workflow.node.failed', runId: run.run_id, nodeId: node.node_id, decision: lacking.decision, data: { ...data, kind: error.kind, disposition: error.disposition } })
+      } else if (acceptance.accepted && node.subject && !(gate = spec.verifies ? verificationGate(this, run, node, result, lease) : subjectGate(this, run, node, result)).passed) {
+        // An answer that lacks its JSON is asked for it once, on the step's own session (T349b); a second miss, or a subject that moved, fails the step.
+        if (gate.missing && assessmentMisses(this, run, node) === 1) {
+          continueWithMessage(this, node, gate.decision, gate.missing.request, lease, Object.keys(spec.session).length > 0)
+          this.ctx.eventLog.append({ type: 'workflow.node.assessment-refused', runId: run.run_id, nodeId: node.node_id, decision: gate.decision, data: { ...data, continued: true } })
+          return
+        }
+        const error: WorkflowError = gate.missing
+          ? { kind: 'assessment_missing', disposition: 'NONE', message: `assessment_missing: ${gate.reason} (asked twice)` }
+          : { kind: 'stale_subject', disposition: 'NONE', message: `exact-subject gate: ${gate.reason}` }
         this.writeNode(node, { state: 'FAILED', error: JSON.stringify(error), ...decisions }, (r) => ({ ...r, lastDecision: gate!.decision }), lease)
         this.ctx.eventLog.append({ type: 'workflow.node.failed', runId: run.run_id, nodeId: node.node_id, decision: gate.decision, data: { ...data, kind: error.kind, disposition: error.disposition } })
       } else if (acceptance.accepted) {
         if (gate?.passed) {
           decisions.decisions = JSON.stringify([...JSON.parse(decisions.decisions) as string[], gate.decision])
-          remediate(this, run, node, spec, gate.assessment, gate.subject, lease)
+          // A review's findings are settled by severity: important ones go to a verification step
+          // first; only those it confirmed grow a fix, after it (ADR-0075).
+          if (spec.verifies && gate.review) remediate(this, run, gate.review, JSON.parse(gate.review.spec) as ResolvedNode, gate.assessment, gate.subject, lease, node)
+          else if (!spec.verifies) settleReview(this, run, node, spec, gate.assessment, gate.ref, lease)
         }
         this.writeNode(node, { state: 'COMPLETED', error: null, ...decisions }, (r) => ({ ...r, outputReceipt: { result, acceptance: acceptance.decision }, lastDecision: acceptance.decision }), lease)
         this.ctx.eventLog.append({ type: 'workflow.node.completed', runId: run.run_id, nodeId: node.node_id, decision: acceptance.decision, data })
+        // A board task's step leaves its entry in the task's dossier, unless it appended its own (ADR-0070).
+        this.tasks.dossiers.safely(`step ${node.node_id}'s entry`, () => this.tasks.dossiers.stepSettled(run, node, spec, result, gate?.passed ? { decision: gate.decision } : undefined))
       } else {
         const escalation = escalate(this, run, node, spec, result, acceptance.decision, rejected, decisions, lease, held)
         if (escalation.escalated) return
@@ -974,7 +1215,9 @@ export class Engine {
       const previous = JSON.parse(stored.record) as NodeRecord
       const record: NodeRecord = { ...change(previous), state: fields.state ?? stored.state, revision: previous.revision + 1 }
       this.schemas.assertRecord(record)
-      const entries = Object.entries({ ...fields, record: JSON.stringify(record), updated_at: now() })
+      // A failure is the infrastructure's only when the step that failed says so (ADR-0069): any other clears the mark.
+      const marked = fields.state === 'FAILED' && fields.infrastructure === undefined ? { ...fields, infrastructure: null } : fields
+      const entries = Object.entries({ ...marked, record: JSON.stringify(record), updated_at: now() })
       db.prepare(`UPDATE workflow_nodes SET ${entries.map(([k]) => `${k} = ?`).join(', ')} WHERE run_id = ? AND node_id = ?`)
         .run(...entries.map(([, v]) => v as string | number | null), node.run_id, node.node_id)
     })
@@ -1018,17 +1261,4 @@ function aborted(signal: AbortSignal): Promise<void> {
 }
 
 /** Sleep unless aborted; true when the full delay passed. */
-async function sleep(ms: number, signal: AbortSignal): Promise<boolean> {
-  if (signal.aborted) return false
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      signal.removeEventListener('abort', stop)
-      resolve(true)
-    }, ms)
-    const stop = (): void => {
-      clearTimeout(timer)
-      resolve(false)
-    }
-    signal.addEventListener('abort', stop, { once: true })
-  })
-}
+const slept = (ms: number, signal: AbortSignal): Promise<boolean> => sleep(ms, signal).then(() => true, () => false)

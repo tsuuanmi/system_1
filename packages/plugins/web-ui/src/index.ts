@@ -14,34 +14,63 @@
  * - the API accepts a loopback host only, no foreign Origin, and the operator token in constant time.
  * @module @tsuuanmi/system-web-ui
  */
+import { createHash } from 'node:crypto'
+import { readdirSync, readFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import z from '@deepseek-ai/schemastery'
-import { assertSafeBind, canTakeStep, guardRequest, LOOPBACK_HOSTS, readJsonBody, readRoster, type RosterServices, scopeToken, tokenFile } from '@tsuuanmi/system-gateway-core'
+import { assertSafeBind, canTakeStep, guardRequest, leadId, leadMayDecide, leadTokenFile, leadTokens, LOOPBACK_HOSTS, readJsonBody, readRoster, type RosterServices, scopeToken, tokenFile } from '@tsuuanmi/system-gateway-core'
 import { ALWAYS_ASK, type ApprovalRequest, ApprovalsError, applyingPolicies, type AutonomyPolicy, type Check, type Subject, type Verdict } from '@tsuuanmi/system-approvals-core'
-import type {} from '@tsuuanmi/system-artifacts'
+import type {} from '@tsuuanmi/system-ledger-core'
 import { type ArtifactRef, BoardError, type BoardTask, type Project, type TaskState } from '@tsuuanmi/system-board-core'
-import { dshHome, registerSecretPath } from '@tsuuanmi/system-libs'
+import { dshHome, isRecord, registerSecretPath } from '@tsuuanmi/system-libs'
 import type { TaskLanding, TemplateStep } from '@tsuuanmi/system-workflow'
 import type { CapabilityDescriptor } from '@tsuuanmi/system-workers-core'
-import { APP_CSS, APP_JS, PAGE } from './assets.ts'
+import type { ActivityResponse, ApprovalsResponse, DailyResponse, DispatchResponse, LeadResponse, Landing, LiveResponse, ProjectCard, ProjectsResponse, RosterResponse, RunsResponse, TaskCard, WaitingResponse } from './api.js'
+import { renderShell } from './ui/shell.ts'
+import { APP_CSS } from './ui/styles/index.ts'
 
 export interface Config {
   /** Directory of the scope token files (default `<DSH_HOME>/system`); the UI takes `operator.token` (ADR-0023). */
   tokenDir?: string
   allowedHosts?: string[]
+  /** Directory of the compiled client script `app.js` (default `lib/client/` of this package, which `pnpm build` writes); the page and the stylesheet are rendered from `src/ui/`. */
+  clientDir?: string
 }
 
 export const name = 'web-ui'
 export const inject = ['webServer', 'workflow']
 export const Config: z<Config> = z.object({
   tokenDir: z.string().description('Directory of the scope token files (default <DSH_HOME>/system); the UI takes operator.token'),
+  clientDir: z.string().description('Directory of the compiled client script app.js (default lib/client/ of the package)'),
   allowedHosts: z.array(z.string()).default([...LOOPBACK_HOSTS]).description('Host names the UI answers'),
 }) as unknown as z<Config>
 
-const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+/** `lib/client/` of this package, from `src/` or from `lib/` alike. */
+const DEFAULT_CLIENT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'client')
+/**
+ * The page's files as bytes with their sha256 content hash, by the path under `/ui/` that serves each: the shell and the
+ * stylesheet rendered from their TypeScript modules, and the compiled script read from `dir`; a missing script is refused
+ * at start (INV-2), never served empty.
+ */
+function clientAssets(dir: string): ReadonlyMap<string, { body: Buffer; type: string; etag: string }> {
+  let script: Buffer
+  try { script = readFileSync(join(dir, 'app.js')) } catch (error) { throw new Error(`the web UI's client file app.js is not in ${dir} (run the package's build): ${(error as Error).message}`) }
+  // `app.js` loads the page's other modules (`import('./boot.js')`): every compiled `.js` file beside it is served under its own name.
+  const modules = readdirSync(dir).filter((file) => /^[A-Za-z0-9-]+\.js$/.test(file) && file !== 'app.js').sort()
+  const files: ReadonlyArray<readonly [path: string, body: Buffer, type: string]> = [
+    ['', Buffer.from(renderShell({ stylesheets: [{ src: '/ui/app.css' }], scripts: [{ src: '/ui/app.js' }] })), 'text/html; charset=utf-8'],
+    ['app.js', script, 'text/javascript; charset=utf-8'],
+    ...modules.map((file): readonly [string, Buffer, string] => [file, readFileSync(join(dir, file)), 'text/javascript; charset=utf-8']),
+    ['app.css', Buffer.from(APP_CSS), 'text/css; charset=utf-8'],
+  ]
+  return new Map(files.map(([path, body, type]) => [path, { body, type, etag: `"sha256-${createHash('sha256').update(body).digest('hex')}"` }]))
+}
+
+const CSP ="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 const MAX_BODY = 16_384
 /** A proposed policy record is larger than a verdict: up to 64 rules and 200 commands of 200 characters. */
 const MAX_POLICY_BODY = 131_072
@@ -56,6 +85,10 @@ export const LIVE_RUNS = 50
  */
 export const WAITING_RUNS = 50
 const WAITING_READ = 100
+/** Steps of one run whose start and end a run's page reads from the event log at most (T256); a team run has a few dozen. */
+export const STEPS_TIMED = 200
+/** When a step's current attempt started, and, once it is done or failed, when it ended (T256). */
+export interface StepTiming { startedAt: string; endedAt?: string }
 /** Workers named per step of a start's preview, free and busy each. */
 export const LIKELY_WORKERS = 8
 /** Accepted results on their way into the repository that the reviews list, the latest first. */
@@ -89,7 +122,6 @@ function newestFirst<E extends { seq: number }>(entries: E[]): E[] {
   return entries
 }
 
-const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 const noteOf = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value.trim().slice(0, 2000) : undefined
 
 /**
@@ -97,7 +129,7 @@ const noteOf = (value: unknown): string | undefined => typeof value === 'string'
  * refused. A verdict with no note of its own takes the call's `note`.
  */
 function verdictOf(value: unknown, note: string | undefined): Verdict | string {
-  if (!isObject(value)) return 'a verdict is {requestId, subject, verdict, note?}'
+  if (!isRecord(value)) return 'a verdict is {requestId, subject, verdict, note?}'
   const { requestId, verdict } = value
   if (typeof requestId !== 'string' || !ID.test(requestId)) return 'requestId is not a request id'
   if (verdict !== 'approved' && verdict !== 'rejected') return 'verdict must be approved or rejected'
@@ -107,14 +139,59 @@ function verdictOf(value: unknown, note: string | undefined): Verdict | string {
   return { requestId, subject, verdict, ...(own ? { note: own } : {}) }
 }
 
+/**
+ * The command checks an acceptance names as not run, each with why (T293: only the operator's may), as
+ * the page sent them: check (tests, typecheck, lint) → a note of 1 to 500 characters. Undefined when
+ * none is named; a string saying why when it is malformed (the call is refused, nothing decided).
+ */
+function checksNotRunOf(value: unknown): Record<string, string> | undefined | string {
+  if (value === undefined) return undefined
+  if (!isRecord(value)) return 'checksNotRun must name each check not run (tests, typecheck, lint) with why'
+  const named: Record<string, string> = {}
+  for (const [check, note] of Object.entries(value)) {
+    if (!['tests', 'typecheck', 'lint'].includes(check)) return `checksNotRun names ${check}, not a command check (tests, typecheck, lint)`
+    if (typeof note !== 'string' || !note.trim() || note.trim().length > 500) return `checksNotRun.${check} must say why it did not run, in 1 to 500 characters`
+    named[check] = note.trim()
+  }
+  return Object.keys(named).length ? named : undefined
+}
+
 /** A subject as the page sent it back, or undefined when it is not one. */
 function subjectOf(subject: unknown): Subject | undefined {
-  if (!isObject(subject) || !SUBJECT_TYPES.includes(subject.type as Subject['type']) || typeof subject.ref !== 'string' || !subject.ref || subject.ref.length > 512
+  if (!isRecord(subject) || !SUBJECT_TYPES.includes(subject.type as Subject['type']) || typeof subject.ref !== 'string' || !subject.ref || subject.ref.length > 512
     || (subject.version !== undefined && (typeof subject.version !== 'string' || subject.version.length > 128))) return undefined
   return { type: subject.type as Subject['type'], ref: subject.ref, ...(subject.version !== undefined ? { version: subject.version as string } : {}) }
 }
 
 const sameSubject = (a: Subject, b: Subject): boolean => a.type === b.type && a.ref === b.ref && a.version === b.version
+
+/** Who decided, as the page shows it (ADR-0076): the operator, a project's lead, or System. */
+export interface Decided {
+  kind: 'operator' | 'lead' | 'system'
+  /** The decider's id as recorded (`operator`, `lead:<project>`, a rule or policy id). */
+  id: string
+  /** In words, for the page. */
+  label: string
+  /** True for a record made before the lead principal: the lead's scripts then used the operator's token, so it names the operator or a client token without a project. */
+  beforeLeadPrincipal?: true
+}
+
+/**
+ * The decider of a `decision` artifact's body, or undefined when it names none. A decider of type
+ * `operator` at version 1 and a `client` without a `lead:<project>` id were recorded before the
+ * lead principal and are marked so; they are not migrated (ADR-0076).
+ */
+export function decidedBy(body: unknown): Decided | undefined {
+  const decider = isRecord(body) && isRecord(body.decider) ? body.decider : undefined
+  if (!decider || typeof decider.type !== 'string' || typeof decider.id !== 'string') return undefined
+  const { type, id } = decider
+  if (type === 'client' && id.startsWith('lead:')) return { kind: 'lead', id, label: id }
+  if (type === 'client') return { kind: 'lead', id, label: 'the lead (before the lead principal)', beforeLeadPrincipal: true }
+  if (type === 'operator') return decider.version === '1'
+    ? { kind: 'operator', id, label: 'the operator (before the lead principal)', beforeLeadPrincipal: true }
+    : { kind: 'operator', id, label: 'the operator' }
+  return { kind: 'system', id, label: 'System' }
+}
 
 /** A task in review as the page shows it: what it is, its exact result, what is still pending, and until when the operator has it. */
 export function reviewOf(task: BoardTask, project: { projectId: string; title: string } | undefined): Record<string, unknown> {
@@ -132,9 +209,11 @@ export function reviewOf(task: BoardTask, project: { projectId: string; title: s
 /**
  * A required check as a review card shows it (ADR-0063, T160): `passed` or `failed` (with its exit
  * code when a command ran) only on a record of it in the run's acceptance; `not-run` when the run asked
- * for it and it did not run to an exit code, with why; `pending` when nothing recorded it.
+ * for it and it did not run to an exit code, with why; `pending` when nothing recorded it. A passed
+ * check whose command reported tests it did not run (T247) names them in `notRun`: "checks passed,
+ * browser tests not run", which the board's auto-accept rule holds (T255).
  */
-export interface CheckState { check: Check; state: 'passed' | 'failed' | 'pending' | 'not-run'; exitCode?: number; why?: string }
+export interface CheckState { check: Check; state: 'passed' | 'failed' | 'pending' | 'not-run'; exitCode?: number; why?: string; notRun?: string }
 
 /** The checks in the order a card lists them. */
 const CHECK_ORDER: readonly Check[] = ['tests', 'typecheck', 'lint', 'schema', 'quote-check', 'review']
@@ -150,13 +229,51 @@ export function acceptanceOf(task: Pick<BoardTask, 'lastDecision'>, read: (ref: 
   const body = (ref: unknown): DecisionBody | undefined => {
     if (typeof ref !== 'string') return undefined
     const value = read(ref as ArtifactRef)
-    return isObject(value) ? value as DecisionBody : undefined
+    return isRecord(value) ? value as DecisionBody : undefined
   }
   const last = body(task.lastDecision)
   const found = [last, ...(Array.isArray(last?.inputs) ? last.inputs.map(body) : [])].find((b) => b?.decisionType === 'acceptance')
   if (!found) return undefined
   const detail = found.outcome?.detail
-  return isObject(detail) ? detail : {}
+  return isRecord(detail) ? detail : {}
+}
+
+/**
+ * Why a review is held for the operator, in the words the board's hold decision recorded
+ * (`outcome.detail.holdReason`, T330: heavy with its risk decision, the auto-accept rule's reasons, the
+ * checks pending or failed, or forbid). Undefined when it is not held, or the hold named none (an older record).
+ */
+export function holdReasonOf(task: Pick<BoardTask, 'lastDecision' | 'waiting'>, read: (ref: ArtifactRef) => unknown): string | undefined {
+  if (task.waiting?.reason !== 'operator-review' || !task.lastDecision) return undefined
+  const value = read(task.lastDecision)
+  const detail = isRecord(value) && isRecord(value.outcome) ? value.outcome.detail : undefined
+  return isRecord(detail) && typeof detail.holdReason === 'string' ? detail.holdReason : undefined
+}
+
+/** What a lead's acceptance carries over from the run's own (ADR-0076): the facts System recorded of the result. */
+const RECORDED_FACTS = ['checks', 'checkRun', 'risk', 'review', 'landing'] as const
+
+/**
+ * The run's own acceptance a task in review was judged on (as {@link acceptanceOf} finds it), with its
+ * ref and inputs: what a lead's acceptance builds on, so the board judges it on the facts System
+ * recorded of the result (its checks, check run, risk tier, review, and landing), never the lead's word
+ * (ADR-0076). Undefined when none can be read.
+ */
+export function runAcceptanceOf(task: Pick<BoardTask, 'lastDecision'>, read: (ref: ArtifactRef) => unknown): { ref: ArtifactRef; inputs: ArtifactRef[]; facts: Record<string, unknown> } | undefined {
+  const body = (ref: unknown): DecisionBody | undefined => {
+    if (typeof ref !== 'string') return undefined
+    const value = read(ref as ArtifactRef)
+    return isRecord(value) ? value as DecisionBody : undefined
+  }
+  const last = body(task.lastDecision)
+  const refs = [task.lastDecision, ...(Array.isArray(last?.inputs) ? last.inputs : [])]
+  const ref = refs.find((r) => body(r)?.decisionType === 'acceptance') as ArtifactRef | undefined
+  if (!ref) return undefined
+  const found = body(ref)!
+  const outcome = found.outcome?.detail
+  const detail: Record<string, unknown> = isRecord(outcome) ? outcome : {}
+  const inputs = (Array.isArray(found.inputs) ? found.inputs : []).filter((i): i is ArtifactRef => typeof i === 'string')
+  return { ref, inputs, facts: Object.fromEntries(RECORDED_FACTS.filter((k) => detail[k] !== undefined).map((k) => [k, detail[k]])) }
 }
 
 /**
@@ -168,19 +285,22 @@ export function acceptanceOf(task: Pick<BoardTask, 'lastDecision'>, read: (ref: 
  */
 export function checkStates(required: readonly Check[], pending: readonly Check[], acceptance: Record<string, unknown> | undefined): CheckState[] {
   const checks = acceptance?.['checks']
-  const recorded: Record<string, unknown> = isObject(checks) ? checks : {}
+  const recorded: Record<string, unknown> = isRecord(checks) ? checks : {}
   const ran = acceptance?.['checkRun']
-  const run: Record<string, unknown> | undefined = isObject(ran) ? ran : undefined
+  const run: Record<string, unknown> | undefined = isRecord(ran) ? ran : undefined
   const askedList = run?.['asked']
   const asked: unknown[] = Array.isArray(askedList) ? askedList : []
   const resultList = run?.['results']
-  const results: Array<Record<string, unknown>> = Array.isArray(resultList) ? resultList.filter(isObject) : []
+  const results: Array<Record<string, unknown>> = Array.isArray(resultList) ? resultList.filter(isRecord) : []
   return CHECK_ORDER.filter((c) => required.includes(c) || pending.includes(c)).map((check): CheckState => {
     const result = results.find((r) => r['check'] === check)
     const code = result?.['exitCode']
     const exit = typeof code === 'number' ? { exitCode: code } : {}
     if (recorded[check] === false) return { check, state: 'failed', ...exit }
-    if (recorded[check] === true && !pending.includes(check)) return { check, state: 'passed', ...exit }
+    if (recorded[check] === true && !pending.includes(check)) {
+      const notRun = result?.['notRun']
+      return { check, state: 'passed', ...exit, ...(typeof notRun === 'string' ? { notRun } : {}) }
+    }
     if (asked.includes(check)) {
       const outcome = run?.['outcome']
       const source = run?.['source']
@@ -208,7 +328,7 @@ export function requiredChecks(policies: readonly AutonomyPolicy[], actionClass:
  * and a pending amendment, its open tasks per state (what a close would cancel, or what refuses
  * it), and its closure.
  */
-export function projectOf(project: Project, open: readonly BoardTask[]): Record<string, unknown> {
+export function projectOf(project: Project, open: readonly BoardTask[]): Omit<ProjectCard, 'tasks' | 'more' | 'autoAcceptBreakers'> & Record<string, unknown> {
   const counts = Object.fromEntries(OPEN_STATES.map((s) => [s, 0])) as Record<TaskState, number>
   for (const task of open) counts[task.state] += 1
   return {
@@ -228,8 +348,8 @@ const ALL_STATES: readonly TaskState[] = [...OPEN_STATES, 'done', 'cancelled']
  * most {@link CARDS_PER_STATE} each (`more` counts the rest): what it is, its run, its lease's
  * holder, and what it waits on (an approval request the page links to its card).
  */
-export function cardsOf(tasks: readonly BoardTask[], landingOf: (runId: string) => TaskLanding | undefined = () => undefined): { tasks: Array<Record<string, unknown>>; more: Partial<Record<TaskState, number>> } {
-  const out: Array<Record<string, unknown>> = []
+export function cardsOf(tasks: readonly BoardTask[], landingOf: (runId: string) => TaskLanding | undefined = () => undefined, by?: (ref: string) => Decided | undefined): { tasks: Array<TaskCard & Record<string, unknown>>; more: Partial<Record<TaskState, number>> } {
+  const out: Array<TaskCard & Record<string, unknown>> = []
   const more: Partial<Record<TaskState, number>> = {}
   const changed = (t: BoardTask): string => t.updatedAt ?? t.createdAt
   for (const state of ALL_STATES) {
@@ -242,7 +362,7 @@ export function cardsOf(tasks: readonly BoardTask[], landingOf: (runId: string) 
         ...(t.run ? { run: { runId: t.run.runId, startedAt: t.run.startedAt } } : {}),
         ...(t.holder ? { holder: { owner: t.holder.owner, leaseExpiresAt: t.holder.leaseExpiresAt } } : {}),
         ...(t.waiting ? { waiting: { reason: t.waiting.reason, ...(t.waiting.approvalRequest ? { approvalRequest: t.waiting.approvalRequest } : {}), since: t.waiting.since, expiresAt: t.waiting.expiresAt } } : {}),
-        ...(t.state === 'done' && t.run ? landingCard(landingOf(t.run.runId)) : {}),
+        ...(t.state === 'done' && t.run ? landingCard(landingOf(t.run.runId), by) : {}),
       })
     }
   }
@@ -254,13 +374,15 @@ export function cardsOf(tasks: readonly BoardTask[], landingOf: (runId: string) 
  * shows it: the merge request it waits on, the merge commit, or why it was not merged. Nothing when
  * there is nothing to land.
  */
-function landingCard(landing: TaskLanding | undefined): Record<string, unknown> {
+function landingCard(landing: TaskLanding | undefined, by: (ref: string) => Decided | undefined = () => undefined): { landing?: Landing & Record<string, unknown> } {
   if (!landing || landing.state === 'none') return {}
+  const accepted = landing.acceptance ? by(landing.acceptance) : undefined
+  const approved = landing.approval ? by(landing.approval) : undefined
   return {
     landing: {
-      state: landing.state, ...(landing.branch ? { branch: landing.branch } : {}), ...(landing.base ? { base: landing.base.branch } : {}),
+      state: landing.state, ...(accepted ? { acceptedBy: accepted } : {}), ...(approved ? { approvedBy: approved } : {}), ...(landing.branch ? { branch: landing.branch } : {}), ...(landing.base ? { base: landing.base.branch } : {}),
       ...(landing.head ? { head: landing.head } : {}), ...(landing.requestId ? { requestId: landing.requestId } : {}), ...(landing.commit ? { commit: landing.commit } : {}),
-      ...(landing.reason && (landing.state === 'refused' || landing.state === 'rejected') ? { reason: landing.reason } : {}),
+      ...(landing.reason && (landing.state === 'refused' || landing.state === 'rejected' || landing.state === 'returned') ? { reason: landing.reason } : {}),
     },
   }
 }
@@ -281,19 +403,40 @@ export function apply(ctx: Context, config: Config = {}): void {
   // Agent Workers never read the operator token, wherever tokenDir puts it (ADR-0024).
   ctx.effect(() => registerSecretPath(tokenFile(config.tokenDir ?? join(dshHome(), 'system'), 'operator')))
   const hosts = config.allowedHosts ?? LOOPBACK_HOSTS
+  const tokenDir = config.tokenDir ?? join(dshHome(), 'system')
+  // A lead token's file is as secret as the operator's: registered when seen (the CLI issues them while the host runs).
+  const leadFiles = new Map<string, () => void>()
+  ctx.effect(() => () => {
+    for (const u of leadFiles.values()) u()
+    leadFiles.clear()
+  })
+  const seeLeads = (): ReadonlyMap<string, string> => {
+    const found = leadTokens(tokenDir)
+    for (const project of found.keys()) if (!leadFiles.has(project)) leadFiles.set(project, registerSecretPath(leadTokenFile(tokenDir, project)))
+    return found
+  }
+  /** Who decides what the caller of a request decides: a decision as a decision artifact's body names it (ADR-0076). */
+  const decider = (ref: string): Decided | undefined => decidedBy(ctx.get('artifacts')?.get(ref as ArtifactRef)?.body)
 
-  const send = (res: ServerResponse, status: number, body: string, type: string): void => {
+  const send = (res: ServerResponse, status: number, body: string | Buffer, type: string, etag?: string): void => {
     res.writeHead(status, {
       'content-type': type, 'cache-control': 'no-store', 'content-security-policy': CSP,
-      'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
+      'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', ...(etag ? { etag } : {}),
     }).end(body)
   }
+  // The page's own files, read once from the compiled client (`pnpm build`), each served with its content hash as its ETag.
+  const assets = clientAssets(config.clientDir ?? DEFAULT_CLIENT_DIR)
   const json = (res: ServerResponse, status: number, value: unknown): void => send(res, status, JSON.stringify(value), 'application/json; charset=utf-8')
 
-  /** Loopback host, no foreign Origin, the bearer token: or the reason it is refused. */
-  const refuse = (req: IncomingMessage): [number, string] | undefined => {
-    const verdict = guardRequest(req, { tokens: { operator }, allowedHosts: hosts, sameOrigin: true })
-    return verdict.ok ? undefined : [verdict.status, verdict.reason]
+  /**
+   * Loopback host, no foreign Origin, the bearer token: or the reason it is refused. A project's lead
+   * token is accepted too (ADR-0076), and the caller is then that lead: `api` serves it the lead's
+   * closed list of routes only.
+   */
+  const authenticate = (req: IncomingMessage): { refused: [number, string] } | { lead?: string } => {
+    const verdict = guardRequest(req, { tokens: { operator }, allowedHosts: hosts, sameOrigin: true, leads: seeLeads })
+    if (!verdict.ok) return { refused: [verdict.status, verdict.reason] }
+    return verdict.lead !== undefined ? { lead: verdict.lead } : {}
   }
 
   const readJson = async (req: IncomingMessage, maxBytes: number = MAX_BODY): Promise<Record<string, unknown>> => {
@@ -310,10 +453,17 @@ export function apply(ctx: Context, config: Config = {}): void {
    * batch, or nothing is decided. The UI is the operator's channel (ADR-0023): its verdicts go to
    * `ctx.approvals.decide` as the operator's (INV-6), at the wall clock.
    */
-  const queue = async (req: IncomingMessage, res: ServerResponse, path: string): Promise<void> => {
+  const queue = async (req: IncomingMessage, res: ServerResponse, path: string, lead?: string): Promise<void> => {
     const approvals = ctx.get('approvals')
     if (!approvals) return json(res, 503, { error: 'the approval queue is not running' })
-    if (path === 'approvals') return req.method === 'GET' ? json(res, 200, { batches: byBatch(await approvals.list()) }) : json(res, 405, { error: 'method not allowed' })
+    if (path === 'approvals') {
+      if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' })
+      if (lead === undefined) return json(res, 200, { batches: byBatch(await approvals.list()) } satisfies ApprovalsResponse)
+      // A lead lists its project's requests: those its requester names, and a Worker's command whose board task is the project's (ADR-0076).
+      const mine: ApprovalRequest[] = []
+      for (const r of await approvals.list()) if ((approvals.projectOfRequest ? await approvals.projectOfRequest(r) : r.requester.projectId) === lead) mine.push(r)
+      return json(res, 200, { batches: byBatch(mine) } satisfies ApprovalsResponse)
+    }
     if (path !== 'approvals/decide') return json(res, 404, { error: 'not found' })
     if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' })
     try {
@@ -334,9 +484,14 @@ export function apply(ctx: Context, config: Config = {}): void {
           if ((await approvals.get(v.requestId))?.batchId !== body.batchId) return json(res, 409, { error: `${v.requestId} is not in batch ${body.batchId}; nothing was decided` })
         }
       }
+      if (lead !== undefined) {
+        // A project's lead gives verdicts on its own token, held to the closed list of its rights (ADR-0076); recorded as lead:<project>.
+        if (!approvals.decideAsLead) return json(res, 501, { error: 'this approval queue takes no lead verdicts' })
+        return json(res, 200, { results: await approvals.decideAsLead(lead, verdicts, new Date()) })
+      }
       return json(res, 200, { results: await approvals.decide(verdicts, new Date()) })
     } catch (error) {
-      const status = error instanceof ApprovalsError ? 400 : (error as { status?: number }).status ?? 409
+      const status = error instanceof ApprovalsError ? (error.failure === 'forbidden' ? 403 : 400) : (error as { status?: number }).status ?? 409
       return json(res, status, { error: (error as Error).message })
     }
   }
@@ -389,10 +544,12 @@ export function apply(ctx: Context, config: Config = {}): void {
    * and producer are the operator's, it names the task and the result's subject, and every result
    * artifact is among its inputs, as the board requires; then `ctx.board.accept` applies it.
    */
-  const reviews = async (req: IncomingMessage, res: ServerResponse, path: string): Promise<void> => {
+  const reviews = async (req: IncomingMessage, res: ServerResponse, path: string, lead?: string): Promise<void> => {
     const board = ctx.get('board')
     const artifacts = ctx.get('artifacts')
     if (!board || !artifacts) return json(res, 503, { error: 'the board is not running' })
+    // A project's lead sees and decides its own project's results only (ADR-0076).
+    const projectsOf = async (): Promise<Project[]> => (await board.projects()).filter((p) => lead === undefined || p.projectId === lead)
     if (path === 'reviews') {
       if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' })
       const listed: Array<Record<string, unknown>> = []
@@ -404,13 +561,17 @@ export function apply(ctx: Context, config: Config = {}): void {
         if (!policies.has(projectId)) policies.set(projectId, approvals.policy(projectId).then((p) => p.policies, (error: unknown) => `the policy could not be read: ${(error as Error).message.slice(0, 200)}`))
         return policies.get(projectId)!
       }
-      for (const project of await board.projects()) {
+      for (const project of await projectsOf()) {
         for (const task of await board.tasks({ projectId: project.projectId, states: ['review'] })) {
+          // An accepted result that waits for its landing is no review to decide (T293b): it is listed as accepted below.
+          if (task.waiting?.reason === 'landing') continue
           const read = await policiesOf(project.projectId)
           const pending = task.waiting?.pendingChecks ?? []
           const acceptance = acceptanceOf(task, (ref) => artifacts.get(ref)?.body)
+          const holdReason = holdReasonOf(task, (ref) => artifacts.get(ref)?.body)
           listed.push({
             ...reviewOf(task, { projectId: project.projectId, title: project.title }),
+            ...(holdReason ? { holdReason } : {}),
             checks: typeof read === 'string'
               ? { value: checkStates(pending, pending, acceptance), requiredUnknown: read }
               : { value: checkStates(requiredChecks(read, task.actionClass), pending, acceptance) },
@@ -420,16 +581,53 @@ export function apply(ctx: Context, config: Config = {}): void {
       listed.sort((a, b) => (a.heldFor === b.heldFor ? String(a.expiresAt ?? '').localeCompare(String(b.expiresAt ?? '')) : a.heldFor === 'operator' ? -1 : 1))
       // The results accepted and still on their way into the repository (ADR-0060), the latest first: a verdict's consequence stays in sight.
       const accepted: Array<{ at: string; entry: Record<string, unknown> }> = []
-      for (const project of await board.projects()) {
-        for (const task of await board.tasks({ projectId: project.projectId, states: ['done'] })) {
+      for (const project of await projectsOf()) {
+        for (const task of await board.tasks({ projectId: project.projectId, states: ['review', 'done'] })) {
+          if (task.state === 'review' && task.waiting?.reason !== 'landing') continue
           const landing = task.run ? ctx.workflow.landing(task.run.runId) : undefined
-          if (landing && LANDING_OPEN.has(landing.state)) accepted.push({ at: task.updatedAt ?? task.createdAt, entry: { taskId: task.taskId, title: task.title, project: { projectId: project.projectId, title: project.title }, run: task.run, landing: landingCard(landing).landing } })
+          if (landing && LANDING_OPEN.has(landing.state)) accepted.push({ at: task.updatedAt ?? task.createdAt, entry: { taskId: task.taskId, title: task.title, project: { projectId: project.projectId, title: project.title }, run: task.run, landing: landingCard(landing, decider).landing } })
         }
       }
       accepted.sort((a, b) => b.at.localeCompare(a.at))
-      return json(res, 200, { reviews: listed, accepted: accepted.slice(0, ACCEPTED_SHOWN).map((a) => a.entry) })
+      // The results whose review expired unseen, while their wait for input lasts (T350): the latest to expire first; past it the sweep cancels them and they are not listed.
+      // Only the operator reopens one, so a lead is shown none.
+      const now = Date.now(), expired: Array<Record<string, unknown>> = []
+      for (const project of lead === undefined ? await projectsOf() : []) {
+        for (const task of await board.tasks({ projectId: project.projectId, states: ['waiting-for-input'] })) {
+          if (task.waiting?.reason !== 'review-expired' || !task.result || !task.run || Date.parse(task.waiting.expiresAt) <= now) continue
+          expired.push({ ...reviewOf(task, { projectId: project.projectId, title: project.title }), heldFor: 'expired', expiredAt: task.waiting.since })
+        }
+      }
+      expired.sort((a, b) => String(b.expiredAt).localeCompare(String(a.expiredAt)))
+      return json(res, 200, { reviews: listed, accepted: accepted.slice(0, ACCEPTED_SHOWN).map((a) => a.entry), expired })
     }
-    const match = /^reviews\/([A-Za-z0-9][A-Za-z0-9._:-]{0,199})\/decide$/.exec(path)
+    const reopening = /^reviews\/([A-Za-z0-9][A-Za-z0-9._:-]{0,199})\/reopen$/.exec(path)
+    if (reopening) {
+      if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' })
+      // As for a held heavy result, only the operator decides (ADR-0071, ADR-0076): a lead's token reopens nothing here.
+      if (lead !== undefined) return json(res, 403, { error: `${leadId(lead)} may not reopen an expired review: only the operator does; nothing was decided` })
+      const id = reopening[1]!
+      try {
+        const body = await readJson(req)
+        const subject = subjectOf(body.subject)
+        if (!subject) return json(res, 400, { error: 'subject must be the exact subject of the result the page showed' })
+        const why = typeof body.reason === 'string' && body.reason.trim() ? body.reason.trim().slice(0, 500) : 'reopened by the operator from Held for you'
+        const task = await board.task(id)
+        if (!task) return json(res, 404, { error: `unknown task ${id}` })
+        if (task.state !== 'waiting-for-input' || task.waiting?.reason !== 'review-expired' || !task.result || !task.run) return json(res, 409, { error: `task ${id} is ${task.state}, not a review-expired wait; nothing was reopened` })
+        if (!sameSubject(subject, task.result.subject)) return json(res, 409, { error: `task ${id}'s result is on another subject than the page showed; nothing was reopened` })
+        // The board cannot see worktrees itself (as board_reopen_review): the run's must still be recorded and on disk.
+        const worktrees = (board as { runWorktrees?: (runId: string) => string[] }).runWorktrees
+        if (typeof worktrees !== 'function' || !worktrees.call(board, task.run.runId).length) return json(res, 409, { error: `invalid-transition: ${id}'s run ${task.run.runId} has no worktree left (removed, or never made): its result is not re-opened` })
+        if (typeof board.reopenReview !== 'function') return json(res, 409, { error: 'the board cannot reopen an expired review' })
+        const back = await board.reopenReview(id, 'operator', why, new Date())
+        return json(res, 200, { task: back, decision: back.lastDecision })
+      } catch (error) {
+        if (error instanceof BoardError) return json(res, error.failure === 'unknown-task' ? 404 : 409, { error: `${error.failure}: ${error.message}` })
+        return json(res, (error as { status?: number }).status ?? 409, { error: (error as Error).message })
+      }
+    }
+    const match =/^reviews\/([A-Za-z0-9][A-Za-z0-9._:-]{0,199})\/decide$/.exec(path)
     if (!match) return json(res, 404, { error: 'not found' })
     if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' })
     const taskId = match[1]!
@@ -439,26 +637,45 @@ export function apply(ctx: Context, config: Config = {}): void {
       const subject = subjectOf(body.subject)
       if (!subject) return json(res, 400, { error: 'subject must be the exact subject of the result the page showed' })
       const note = noteOf(body.note)
+      // Only the operator accepts past a required check that did not run, naming each with why (T293); a lead never does.
+      const checksNotRun = checksNotRunOf(body.checksNotRun)
+      if (typeof checksNotRun === 'string') return json(res, 400, { error: checksNotRun })
+      if (checksNotRun && (lead !== undefined || body.verdict !== 'accept')) return json(res, 400, { error: 'only the operator\'s acceptance names checks not run; nothing was decided' })
       const task = await board.task(taskId)
       if (!task) return json(res, 404, { error: `unknown task ${taskId}` })
       if (task.state !== 'review' || !task.result) return json(res, 409, { error: `task ${taskId} is ${task.state}, not in review; nothing was decided` })
       // The verdict binds to the result the operator was shown: a result changed since is refused (INV-5).
       if (!sameSubject(subject, task.result.subject)) return json(res, 409, { error: `task ${taskId}'s result is on another subject than the page showed; nothing was decided` })
+      // A project's lead accepts or rejects a result of its own project that lands on one of its listed dev branches, and no other (ADR-0076):
+      // the branch is the one System recorded in the run's own acceptance (`landing.branch`), never the lead's word.
+      const recorded = lead !== undefined ? runAcceptanceOf(task, (ref) => artifacts.get(ref)?.body) : undefined
+      if (lead !== undefined) {
+        const landing = recorded?.facts['landing']
+        const branch = isRecord(landing) && typeof landing['branch'] === 'string' ? landing['branch'] : undefined
+        const may = leadMayDecide({ project: lead, of: task.projectId, action: 'acceptance', branch, devBranches: ctx.get('approvals')?.devBranches?.(lead) ?? [] })
+        if (!may.ok) return json(res, 403, { error: `${may.reason}; nothing was decided` })
+      }
       const option = body.verdict
       const other = option === 'accept' ? 'reject' : 'accept'
+      const who = lead !== undefined ? leadId(lead) : 'the operator'
       const decision = artifacts.recordDecision({
+        // A lead's acceptance has a `client` decider that is no vote: decision@1.10 (ADR-0076).
+        ...(lead !== undefined ? { schema: 'decision@1.10' as const } : {}),
         decisionType: 'acceptance',
-        question: `Does the operator accept the result of board task ${taskId}, attempt ${task.attempts.count}?`,
-        inputs: [...task.result.artifacts, ...(task.result.digest ? [task.result.digest] : [])],
+        question: `Does ${who} accept the result of board task ${taskId}, attempt ${task.attempts.count}?`,
+        // A lead's acceptance builds on the run's own: that acceptance and what it stood on (its check run, review, risk decision) are its inputs too.
+        inputs: [...task.result.artifacts, ...(task.result.digest ? [task.result.digest] : []), ...(recorded ? [recorded.ref, ...recorded.inputs] : [])],
         candidates: [
-          { option, selected: true, reasons: [`the operator ${option}s the result on ${task.result.subject.type} ${task.result.subject.ref}${task.result.subject.version ? ` at ${task.result.subject.version}` : ''}, on the web UI${note ? `: ${note}` : ''}`] },
-          { option: other, selected: false, reasons: [`not ${other}: the operator chose ${option}`] },
+          { option, selected: true, reasons: [`${who} ${option}s the result on ${task.result.subject.type} ${task.result.subject.ref}${task.result.subject.version ? ` at ${task.result.subject.version}` : ''}, on the web UI${note ? `: ${note}` : ''}`] },
+          { option: other, selected: false, reasons: [`not ${other}: ${who} chose ${option}`] },
         ],
-        decider: { type: 'operator', id: 'operator.review', version: '1' },
-        outcome: { option, detail: { taskId, subject: task.result.subject } },
+        // The operator's decider is version 2 from the lead principal on: a record at version 1 is from before it, when the lead used the operator's token.
+        decider: lead !== undefined ? { type: 'client', id: leadId(lead), version: '1' } : { type: 'operator', id: 'operator.review', version: '2' },
+        // The facts System recorded of the result, carried over whole, so the board judges a lead's acceptance on its checks and risk tier (ADR-0076).
+        outcome: { option, detail: { taskId, subject: task.result.subject, ...(recorded ? { ...recorded.facts, acceptance: recorded.ref } : {}), ...(checksNotRun ? { checksNotRun } : {}) } },
         ...(note ? { rationale: note } : {}),
         deterministic: false,
-      }, { producer: { type: 'operator', ref: 'operator' } }).id as ArtifactRef
+      }, { producer: lead !== undefined ? { type: 'system', ref: leadId(lead) } : { type: 'operator', ref: 'operator' } }).id as ArtifactRef
       return json(res, 200, { task: await board.accept(taskId, decision, new Date()), decision })
     } catch (error) {
       if (error instanceof BoardError) return json(res, error.failure === 'unknown-task' ? 404 : 409, { error: `${error.failure}: ${error.message}` })
@@ -480,14 +697,19 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (!board) return json(res, 503, { error: 'the board is not running' })
     if (path === 'projects') {
       if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' })
-      const listed: Array<Record<string, unknown>> = []
+      const listed: ProjectsResponse['projects'] = []
       for (const project of await board.projects()) {
         const tasks = await board.tasks({ projectId: project.projectId, states: [...ALL_STATES] })
-        listed.push({ ...projectOf(project, tasks.filter((t) => OPEN_STATES.includes(t.state))), ...cardsOf(tasks, (runId) => ctx.workflow.landing(runId)) })
+        // Where the auto-accept circuit breaker has turned auto-accept off for the project (D93): shown on Home, turned on by the operator or the lead only.
+        const tripped = board.breakers ? await board.breakers(project.projectId, new Date()) : []
+        listed.push({
+          ...projectOf(project, tasks.filter((t) => OPEN_STATES.includes(t.state))), ...cardsOf(tasks, (runId) => ctx.workflow.landing(runId), decider),
+          autoAcceptBreakers: tripped.map((b) => ({ branch: b.branch, trippedAt: b.trippedAt, decision: b.decision, line: b.line, escapes: b.escapes.map((e) => ({ taskId: e.taskId, foundAt: e.foundAt, note: e.note })), ...(b.now ? { now: b.now } : {}) })),
+        })
       }
       // A stable sort: in creation order, the closed ones last.
       listed.sort((a, b) => Number(a.state === 'closed') - Number(b.state === 'closed'))
-      return json(res, 200, { projects: listed })
+      return json(res, 200, { projects: listed } satisfies ProjectsResponse)
     }
     const match = /^projects\/([^/]+)\/(pause|resume|close)$/.exec(path)
     if (!match) return json(res, 404, { error: 'not found' })
@@ -605,7 +827,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (!raw || Number.isNaN(since.getTime())) return json(res, 400, { error: 'since must be an ISO time' })
     const at = since.toISOString()
     const shown = <T>(list: T[], more = false): { value: T[]; more?: true } => ({ value: list.slice(0, ACTIVITY_SHOWN), ...(more || list.length > ACTIVITY_SHOWN ? { more: true as const } : {}) })
-    let runs: Record<string, unknown>
+    let runs: ActivityResponse['runs']
     try {
       // By state and when it changed, not among the latest started: a long run that ended since is found.
       runs = shown(ctx.workflow.usage(ACTIVITY_SHOWN + 1, { status: ['completed', 'failed'], changedSince: at }).map((r) => ({
@@ -617,11 +839,11 @@ export function apply(ctx: Context, config: Config = {}): void {
       runs = { unknown: `the runs could not be read: ${(error as Error).message.slice(0, 200)}` }
     }
     const board = ctx.get('board')
-    let tasks: Record<string, unknown>
+    let tasks: ActivityResponse['tasks']
     if (!board) tasks = { unknown: 'the board is not running' }
     else {
       try {
-        const moved: Array<Record<string, unknown> & { at: string }> = []
+        const moved: Array<Extract<ActivityResponse['tasks'], { value: unknown }>['value'][number]> = []
         for (const project of await board.projects()) {
           for (const task of await board.tasks({ projectId: project.projectId, states: ACTIVITY_STATES })) {
             const landing = task.state === 'done' && task.run ? ctx.workflow.landing(task.run.runId) : undefined
@@ -630,7 +852,7 @@ export function apply(ctx: Context, config: Config = {}): void {
             if (changed <= at && !landed) continue
             moved.push({ taskId: task.taskId, title: task.title, project: { projectId: project.projectId, title: project.title }, state: task.state, at: landed && landed > changed ? landed : changed,
               ...(task.waiting ? { waiting: { reason: task.waiting.reason, ...(task.waiting.approvalRequest ? { approvalRequest: task.waiting.approvalRequest } : {}) } } : {}),
-              ...(task.run ? { run: { runId: task.run.runId } } : {}), ...landingCard(landing) })
+              ...(task.run ? { run: { runId: task.run.runId } } : {}), ...landingCard(landing, decider) })
           }
         }
         tasks = shown(moved.sort((a, b) => b.at.localeCompare(a.at)))
@@ -640,7 +862,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
     const eventLog = ctx.get('eventLog' as never) as EventReads | undefined
     const approvals = ctx.get('approvals')
-    let expired: Record<string, unknown>
+    let expired: ActivityResponse['expired']
     if (!eventLog) expired = { unknown: 'the event log (ctx.eventLog) is not mounted' }
     else {
       try {
@@ -668,7 +890,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         expired = { unknown: `the event log could not be read: ${(error as Error).message.slice(0, 200)}` }
       }
     }
-    return json(res, 200, { since: at, asOf: new Date().toISOString(), runs, tasks, expired })
+    return json(res, 200, { since: at, asOf: new Date().toISOString(), runs, tasks, expired } satisfies ActivityResponse)
   }
 
   /**
@@ -695,7 +917,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       // By state, not among the latest started: a run that has been running for hours is still live.
       running = ctx.workflow.usage(LIVE_RUNS + 1, { status: ['running'] })
     } catch (error) {
-      return json(res, 200, { asOf: new Date().toISOString(), runs: { unknown: `the running runs could not be read: ${(error as Error).message.slice(0, 200)}` } })
+      return json(res, 200, { asOf: new Date().toISOString(), runs: { unknown: `the running runs could not be read: ${(error as Error).message.slice(0, 200)}` } } satisfies LiveResponse)
     }
     /** The newest entry a read gives, or why there is none to give. */
     const newest = (filter: Omit<Parameters<EventReads['query']>[0], 'order' | 'limit'>): { entry?: ReturnType<EventReads['query']>[number] } | { unknown: string } => {
@@ -721,7 +943,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         stalled: typeof stalled === 'string' ? { unknown: stalled } : { value: stalled.has(r.runId) ? { since: stalled.get(r.runId)! } : null },
       }
     })
-    return json(res, 200, { asOf: new Date().toISOString(), runs: { value: runs, ...(running.length > LIVE_RUNS ? { more: true } : {}) } })
+    return json(res, 200, { asOf: new Date().toISOString(), runs: { value: runs, ...(running.length > LIVE_RUNS ? { more: true } : {}) } } satisfies LiveResponse)
   }
 
   /**
@@ -745,7 +967,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (since && Number.isNaN(since.getTime())) return json(res, 400, { error: 'since must be an ISO time' })
     const why = (what: string, error: unknown): { unknown: string } => ({ unknown: `${what} could not be read: ${(error as Error).message.slice(0, 200)}` })
     const approvals = ctx.get('approvals')
-    let requests: { value: number } | { unknown: string }
+    let requests: WaitingResponse['requests']
     try {
       // A queue the composition does not mount holds no request (the page shows it as not running).
       requests = { value: approvals ? (await approvals.list()).length : 0 }
@@ -753,7 +975,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       requests = why('the approval queue', error)
     }
     const board = ctx.get('board')
-    let reviews: { value: number; firstExpires?: string } | { unknown: string }
+    let reviews: WaitingResponse['reviews']
     // A board the composition does not mount holds no review.
     if (!board) reviews = { value: 0 }
     else {
@@ -768,7 +990,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         reviews = why('the board', error)
       }
     }
-    let runs: { value: unknown[]; more?: true } | { unknown: string }
+    let runs: WaitingResponse['runs']
     try {
       const running = ctx.workflow.usage(WAITING_READ, { status: ['running'] })
       const failed = ctx.workflow.usage(WAITING_READ, { status: ['failed'], ...(since ? { changedSince: since.toISOString() } : {}) })
@@ -780,7 +1002,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     const parts = [requests, reviews, runs]
     const count = (('value' in requests) ? requests.value : 0) + (('value' in reviews) ? reviews.value : 0) + (('value' in runs) ? runs.value.length : 0)
     const partial = parts.some((p) => 'unknown' in p) || ('more' in runs && runs.more === true)
-    return json(res, 200, { asOf: new Date().toISOString(), ...(since ? { since: since.toISOString() } : {}), requests, reviews, runs, count, ...(partial ? { partial: true } : {}) })
+    return json(res, 200, { asOf: new Date().toISOString(), ...(since ? { since: since.toISOString() } : {}), requests, reviews, runs, count,...(partial ? { partial: true } : {}) } satisfies WaitingResponse)
   }
 
   /**
@@ -801,7 +1023,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       board: ctx.get('board') as RosterServices['board'],
     }
     try {
-      return json(res, 200, await readRoster(services, { scope: 'operator' }))
+      return json(res, 200, await readRoster(services, { scope: 'operator' }) satisfies RosterResponse)
     } catch (error) {
       return json(res, 500, { error: `the roster could not be made: ${(error as Error).message.slice(0, 500)}` })
     }
@@ -847,8 +1069,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       const listed = artifacts.list({ kind: 'assessment', runId, newest: true, limit: REVIEW_VERDICTS_COUNTED })
       assessments = {
         value: listed.slice(0, REVIEW_VERDICTS).map((a) => {
-          const body = a.body as { verdict: string; findings: unknown[]; reviewer?: string }
-          return { nodeId: a.nodeId, createdAt: a.createdAt, verdict: body.verdict, findings: body.findings, ...(body.reviewer ? { reviewer: body.reviewer } : {}) }
+          // assessment@1.1 (ADR-0075) adds the summary that opens with the count, and each finding's vote.
+          const body = a.body as { verdict: string; findings: unknown[]; reviewer?: string; summary?: string }
+          return { nodeId: a.nodeId, createdAt: a.createdAt, verdict: body.verdict, findings: body.findings, ...(body.reviewer ? { reviewer: body.reviewer } : {}), ...(body.summary ? { summary: body.summary } : {}) }
         }),
         more: Math.max(0, listed.length - REVIEW_VERDICTS),
         ...(listed.length === REVIEW_VERDICTS_COUNTED ? { moreAtLeast: true } : {}),
@@ -858,12 +1081,75 @@ export function apply(ctx: Context, config: Config = {}): void {
     const text = run.answer
     const report = text !== undefined && last ? { nodeId: last.nodeId, text: text.slice(0, REVIEW_REPORT_CHARS), ...(text.length > REVIEW_REPORT_CHARS ? { truncated: true } : {}) } : undefined
     const landing = ctx.workflow.landing(runId)
-    return json(res, 200, { runId, change, assessments, ...(report ? { report } : {}), ...(landing && landing.state !== 'none' ? { landing: landingCard(landing).landing } : {}) })
+    return json(res, 200, { runId, change, assessments, ...(report ? { report } : {}), ...(landing && landing.state !== 'none' ? { landing: landingCard(landing, decider).landing } : {}) })
+  }
+
+  /**
+   * When each step of a run started and ended (T256), for its page's timings: the step's latest
+   * `workflow.node.started` (its current attempt's), and, for a step that is done or failed, its latest
+   * `workflow.node.completed` or `workflow.node.failed` at or after that start. Read newest first, one
+   * entry per type and step (bounded, T127); a log that is not mounted or cannot be read is `{unknown}`
+   * with why, never a run with no timings (INV-2).
+   */
+  const stepTimings = (run: { runId: string; nodes: Array<{ nodeId: string; state: string }> }): { value: Record<string, StepTiming> } | { unknown: string } => {
+    const eventLog = ctx.get('eventLog' as never) as EventReads | undefined
+    if (!eventLog) return { unknown: 'the event log (ctx.eventLog) is not mounted' }
+    try {
+      const latest = (type: string, nodeId: string): string | undefined => newestFirst(eventLog.query({ type, runId: run.runId, nodeId, order: 'desc', limit: 1 }))[0]?.at
+      const value: Record<string, StepTiming> = {}
+      for (const node of run.nodes.slice(0, STEPS_TIMED)) {
+        const startedAt = latest('workflow.node.started', node.nodeId)
+        if (!startedAt) continue
+        const ended = node.state === 'COMPLETED' ? latest('workflow.node.completed', node.nodeId) : node.state === 'FAILED' ? latest('workflow.node.failed', node.nodeId) : undefined
+        value[node.nodeId] = { startedAt, ...(ended && ended >= startedAt ? { endedAt: ended } : {}) }
+      }
+      return { value }
+    } catch (error) {
+      return { unknown: `the event log could not be read: ${(error as Error).message.slice(0, 200)}` }
+    }
+  }
+
+  /** Each decision of a run's explanation with when it was made (its artifact's `createdAt`), when the artifact store is mounted (T256). */
+  const decisionTimes = <E extends { nodes: Array<{ decisions: Array<{ id: string }> }> }>(explain: E): E => {
+    const artifacts = ctx.get('artifacts')
+    if (!artifacts) return explain
+    return {
+      ...explain,
+      nodes: explain.nodes.map((n) => ({ ...n, decisions: n.decisions.map((d) => {
+        const at = (artifacts.get(d.id as ArtifactRef) as { createdAt?: unknown } | undefined)?.createdAt
+        return typeof at === 'string' ? { ...d, at } : d
+      }) })),
+    }
+  }
+
+  /**
+   * A project's lead inbox (D107): `GET lead?project=<id>` gives the unread notices, the recent digests,
+   * and the inbox's stats, as the lead-inbox plugin keeps them (503 when it is not mounted). A project's
+   * lead token reads its own project only; the operator names the project.
+   */
+  const leadPanel = (req: IncomingMessage, res: ServerResponse, lead?: string): void => {
+    if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' })
+    const inbox = ctx.get('leadInbox' as never) as { unread(project?: string, limit?: number): LeadResponse['unread']; digests(project: string, limit?: number): LeadResponse['digests']; stats(project?: string): LeadResponse['stats'] } | undefined
+    if (!inbox) return json(res, 503, { error: 'the lead inbox is not running' })
+    const asked = new URL(req.url ?? '/', 'http://localhost').searchParams.get('project') ?? undefined
+    if (lead !== undefined && asked !== undefined && asked !== lead) return json(res, 403, { error: `the lead token of project ${lead} reaches only project ${lead}'s inbox` })
+    const project = lead ?? asked
+    if (project === undefined) return json(res, 400, { error: 'name the project: ?project=<id>' })
+    return json(res, 200, { project, unread: inbox.unread(project, 50), digests: inbox.digests(project, 5), stats: inbox.stats(project) } satisfies LeadResponse)
   }
 
   const api = async (req: IncomingMessage, res: ServerResponse, path: string): Promise<void> => {
-    const refused = refuse(req)
-    if (refused) return json(res, refused[0], { error: refused[1] })
+    const caller = authenticate(req)
+    if ('refused' in caller) return json(res, caller.refused[0], { error: caller.refused[1] })
+    const { lead } = caller
+    if (path === 'lead') return leadPanel(req, res, lead)
+    // A project's lead token reaches the approval queue and the reviews, held to the closed list of its rights (ADR-0076), and nothing else here:
+    // policy, projects, starts, runs, and the roster are the operator's.
+    if (lead !== undefined) {
+      if (path === 'approvals' || path.startsWith('approvals/')) return queue(req, res, path, lead)
+      if (path === 'reviews' || path.startsWith('reviews/')) return reviews(req, res, path, lead)
+      return json(res, 403, { error: `the lead token of project ${lead} (decider ${leadId(lead)}) reaches the approval queue and the reviews of its project only; ${path} is the operator's` })
+    }
     if (path === 'roster') return roster(req, res)
     if (path === 'approvals' || path.startsWith('approvals/')) return queue(req, res, path)
     if (path === 'policy' || path.startsWith('policy/')) return policy(req, res, path)
@@ -873,17 +1159,21 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (path === 'activity') return activity(req, res)
     if (path === 'waiting') return waiting(req, res)
     if (path === 'runs/live') return req.method === 'GET' ? live(res) : json(res, 405, { error: 'method not allowed' })
+    // The last daily run of every browser spec (T305b), for Home.
+    if (path === 'daily-check') return req.method === 'GET' ? json(res, 200, ctx.workflow.dailyCheckReport(1) satisfies DailyResponse) : json(res, 405, { error: 'method not allowed' })
     // Dispatch (ADR-0064): the starts System proposes, for Home's "Starts awaiting approval"; their verdicts go
     // through the approval queue (approvals/decide), each on its request's exact subject.
-    if (path === 'dispatch') return req.method === 'GET' ? json(res, 200, ctx.workflow.dispatchStatus()) : json(res, 405, { error: 'method not allowed' })
+    if (path === 'dispatch') return req.method === 'GET' ? json(res, 200, ctx.workflow.dispatchStatus() satisfies DispatchResponse) : json(res, 405, { error: 'method not allowed' })
     const workflow = ctx.workflow
-    if (req.method === 'GET' && path === 'runs') return json(res, 200, { runs: workflow.usage(100) })
+    if (req.method === 'GET' && path === 'runs') return json(res, 200, { runs: workflow.usage(100) } satisfies RunsResponse)
     const match = /^runs\/([A-Za-z0-9_-]{1,100})(?:\/(approve|vote|stop|continue|review))?$/.exec(path)
     if (!match) return json(res, 404, { error: 'not found' })
     const [, runId, action] = match as unknown as [string, string, string | undefined]
     if (!action && req.method === 'GET') {
       const run = workflow.get(runId)
-      return run ? json(res, 200, { run, explain: workflow.explain(runId) }) : json(res, 404, { error: `unknown run ${runId}` })
+      if (!run) return json(res, 404, { error: `unknown run ${runId}` })
+      const explain = workflow.explain(runId)
+      return json(res, 200, { run, explain: explain ? decisionTimes(explain) : explain, timings: stepTimings(run) })
     }
     if (action === 'review') return req.method === 'GET' ? review(res, runId) : json(res, 405, { error: 'method not allowed' })
     if (!action || req.method !== 'POST') return json(res, 405, { error: 'method not allowed' })
@@ -917,9 +1207,8 @@ export function apply(ctx: Context, config: Config = {}): void {
     const path = url.pathname.replace(/^\/ui\/?/, '')
     if (path.startsWith('api/')) return api(req, res, path.slice(4))
     if (req.method !== 'GET') return send(res, 405, 'method not allowed', 'text/plain')
-    if (path === '' ) return send(res, 200, PAGE, 'text/html; charset=utf-8')
-    if (path === 'app.js') return send(res, 200, APP_JS, 'text/javascript; charset=utf-8')
-    if (path === 'app.css') return send(res, 200, APP_CSS, 'text/css; charset=utf-8')
+    const asset = assets.get(path)
+    if (asset) return send(res, 200, asset.body, asset.type, asset.etag)
     return send(res, 404, 'not found', 'text/plain')
   }
 

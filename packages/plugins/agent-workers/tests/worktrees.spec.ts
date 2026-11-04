@@ -12,7 +12,7 @@ import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { createdMode } from '../../../agent-runtime-core/tests/host.ts'
 import AgentWorkers from '../src/index.ts'
 import { registerRunTools } from '../src/tools.ts'
-import { openDirectory } from '../src/worktrees.ts'
+import { openDirectory, Worktrees } from '../src/worktrees.ts'
 import { ScriptedAgent, worker, boot, requirement, chatWorker } from './stack.ts'
 
 // Real git repositories, worktrees, and a workflow run end to end: slower than the 5 s default on CI runners.
@@ -60,6 +60,31 @@ describe('agents source: a git worktree per workflow run (worktreePerRun; PROP-0
     return source.wait(source.start({ key, worker: id, prompt: key, ...(runId ? { runId } : {}), requirement: requirement({ capabilities }), decisions: { tier: 'sha256:0', route: 'sha256:0' } as never }).id, 30_000)
   }
   const LATER = (): number => Date.now() + 169 * 60 * 60_000
+
+  it('never retires the worktree of a check on a tip while the check holds it, and counts its retention from the check\'s end (T305b)', async () => {
+    const repo = repository()
+    const commit = git(repo, 'rev-parse', 'HEAD')
+    const root = temp('system-worktrees-')
+    const { ctx } = await boot(developer(), { workers: [writer(repo)], worktreeRoot: root })
+    const worktrees = new Worktrees(ctx, root)
+    const repository_ = realpathSync(repo)
+    const stopped = new AbortController().signal
+    const hours = (n: number): number => Date.now() + n * 60 * 60_000
+    // Held from before its cut, as a check on a tip holds it, through its setup, its queue, and its command.
+    const release = worktrees.use(repository_, 'daily-tip')
+    const path = await worktrees.acquire(repository_, 'daily-tip', commit)
+    expect(git(path, 'rev-parse', 'HEAD')).toBe(commit)
+    // Long past a one-hour retention while it is held: neither the retention nor the operator's removal takes it.
+    expect(await worktrees.sweep(1, hours(5), stopped)).toEqual({ removed: [], kept: [path] })
+    expect((await worktrees.planRemoval('daily-tip', true)).plans).toEqual([expect.objectContaining({ path, outcome: 'kept', why: expect.stringContaining('a check on a tip runs in it now') })])
+    expect((await worktrees.list(1, 10)).worktrees).toEqual([expect.objectContaining({ runId: 'daily-tip', state: 'in-use' })])
+    expect(existsSync(path)).toBe(true)
+    // Released at the check's end: its retention counts from then, so it stays within it, and goes after it.
+    release()
+    expect(await worktrees.sweep(1, hours(0.5), stopped)).toEqual({ removed: [], kept: [] })
+    expect(await worktrees.sweep(1, hours(2), stopped)).toEqual({ removed: [path], kept: [] })
+    expect(existsSync(path)).toBe(false)
+  })
 
   it('runs a writing run of a workflow run in that run\'s own worktree, on branch system/run/<runId>, and never touches the main working tree (INV-15, REQ-WF-5)', async () => {
     const repo = repository()
@@ -208,7 +233,10 @@ describe('agents source: a git worktree per workflow run (worktreePerRun; PROP-0
     expect((await run(after.ctx, 'agent:dev', 'k-2', 'run_keep')).status).toBe('completed')
     expect(second.runs[0]!.workspace).toBe(first.runs[0]!.workspace)
     expect(readFileSync(join(second.runs[0]!.workspace, 'note-run_keep.txt'), 'utf8')).toBe('k-1\n')
-    expect(readdirSync(elsewhere)).toEqual([])
+    // No worktree is made there: only the source's private directory, where the run's report file
+    // was made beside the worktrees (T265), and removed once the run ended.
+    expect(readdirSync(elsewhere)).toEqual(['.setup'])
+    expect(readdirSync(join(elsewhere, '.setup'))).toEqual([])
   })
 
   /** A board task's brief whose files hold `text` as the board's TASKS.md (brief@1.2 files). */
@@ -296,6 +324,47 @@ describe('agents source: a git worktree per workflow run (worktreePerRun; PROP-0
     expect(agent.runs).toHaveLength(2)
     // No temporary file is left beside the brief's files.
     expect(readdirSync(join(agent.runs[0]!.workspace, '.system')).sort()).toEqual(['.gitignore', 'TASKS.md'])
+  })
+
+  it('leaves in the run\'s worktree only the files of the brief of the run starting: one an earlier run\'s brief placed is gone before the agent starts, so a step given none (a self-review) reads none (T267)', async () => {
+    const repo = repository()
+    const seen: Array<{ files: string[]; read: string }> = []
+    const agent = developer({
+      act: (spec) => {
+        const dir = join(spec.workspace, '.system')
+        // An actual read attempt of what the step before was given, as the agent would make it.
+        const dossier = join(dir, 'DOSSIER.md')
+        seen.push({ files: existsSync(dir) ? readdirSync(dir).sort() : [], read: existsSync(dossier) ? readFileSync(dossier, 'utf8') : 'absent' })
+        return writes(spec)
+      },
+    })
+    const { ctx } = await boot(agent, { workers: [writer(repo)], worktreeRoot: temp('system-worktrees-') })
+    // The author's step is given the board and the dossier.
+    const dossier = ctx.artifacts.put({
+      kind: 'report', bodySchema: 'task-dossier@1.0', classification: 'operator-shared', producer: { type: 'system', ref: 'workflow' },
+      body: { schema: 'task-dossier@1.0', projectId: 'p1', taskId: 'task-1', entries: 1, head: `sha256:${'1'.repeat(64)}`, shown: [], maxChars: 6000, text: 'Plan: the author\'s plan.' },
+    }).id
+    const withDossier = (base: `sha256:${string}`): `sha256:${string}` => {
+      const body = ctx.artifacts.get(base)!.body as { files: unknown[] }
+      return ctx.artifacts.put({
+        kind: 'objective', bodySchema: 'brief@1.2', classification: 'operator-shared', producer: { type: 'system', ref: 'workflow' }, inputs: [dossier],
+        body: { ...body, files: [...body.files, { path: '.system/DOSSIER.md', ref: dossier, note: 'the task\'s whole dossier' }] },
+      }).id as `sha256:${string}`
+    }
+    const bare = (base: `sha256:${string}`): `sha256:${string}` => {
+      const { files: _files, ...body } = ctx.artifacts.get(base)!.body as { files: unknown[] }
+      return ctx.artifacts.put({ kind: 'objective', bodySchema: 'brief@1.2', classification: 'operator-shared', producer: { type: 'system', ref: 'workflow' }, body }).id as `sha256:${string}`
+    }
+    expect(await briefed(ctx, 'k-author', withDossier(taskBrief(ctx, '# p1\n')), 'run_fresh')).toMatchObject({ status: 'completed' })
+    // The next step of the same workflow run is given no file: the dossier and the board left by the author's step are gone.
+    expect(await briefed(ctx, 'k-self', bare(taskBrief(ctx, '# p1\n')), 'run_fresh')).toMatchObject({ status: 'completed' })
+    // A later step given the board only finds the board, never the dossier.
+    expect(await briefed(ctx, 'k-review', taskBrief(ctx, '# p1\n'), 'run_fresh')).toMatchObject({ status: 'completed' })
+    expect(seen).toEqual([
+      { files: ['.gitignore', 'DOSSIER.md', 'TASKS.md'], read: 'Plan: the author\'s plan.' },
+      { files: ['.gitignore'], read: 'absent' },
+      { files: ['.gitignore', 'TASKS.md'], read: 'absent' },
+    ])
   })
 
   it('refuses a .system the agent replaced with a link, writing nothing through it, and its retirement leaves what the link points to (INV-15)', async () => {
@@ -520,6 +589,85 @@ describe('agents source: a git worktree per workflow run (worktreePerRun; PROP-0
     expect(existsSync(agent.runs[0]!.workspace)).toBe(true)
   })
 
+  it('removes the worktree of a landed run at once, its branch kept and the removal recorded; one that holds an uncommitted change, or that an agent run still holds, stays; a landing step repeated after it finds its work done (T345, INV-4, INV-13, INV-15)', async () => {
+    const repo = repository()
+    const agent = developer()
+    const { ctx } = await boot(agent, { workers: [writer(repo)], worktreeRoot: temp('system-worktrees-') })
+    for (const runId of ['run_landed', 'run_dirty', 'run_busy']) expect((await run(ctx, 'agent:dev', `k-${runId}`, runId)).status).toBe('completed')
+    const path = (runId: string): string => agent.runs.find((r) => basename(r.workspace) === runId)!.workspace
+    const subject = captureGitSubject(path('run_landed'))!.subject
+    const step = { step: 'commit' as const, runId: 'run_landed', workspace: path('run_landed'), subject: { ref: subject.ref, version: subject.version }, message: 'system: land run_landed' }
+    // Landed as the engine's steps do: the change committed on its branch, then the worktree released.
+    const committed = await ctx.workers.land!(step)
+    expect(committed).toMatchObject({ outcome: 'committed', committed: true })
+    const head = (committed as { head: string }).head
+    const released = await ctx.workers.land!({ step: 'release', runId: 'run_landed', workspace: path('run_landed') })
+    expect(released).toMatchObject({ outcome: 'released', branch: 'system/run/run_landed', path: path('run_landed'), source: 'agents' })
+    expect(existsSync(path('run_landed'))).toBe(false)
+    // The branch keeps the work.
+    expect(git(repo, 'show', 'system/run/run_landed:calc.py')).toBe(FIXED.trim())
+    const decision = ctx.artifacts.get((released as { decision: string }).decision)!
+    expect(decision.body).toMatchObject({ decisionType: 'retention', decider: { id: 'agent-workers.worktree-release' }, outcome: { option: 'remove', detail: { runId: 'run_landed', branch: 'system/run/run_landed' } } })
+    expect((await ctx.agentWorkers.runWorktrees()).worktrees.map((w) => w.runId)).toEqual(['run_dirty', 'run_busy'])
+    // Asked again (a restart): nothing is removed twice, and the commit step finds its work on the branch (INV-4).
+    expect(await ctx.workers.land!({ step: 'release', runId: 'run_landed', workspace: path('run_landed') })).toMatchObject({ outcome: 'refused', cause: 'gone' })
+    expect(await ctx.workers.land!({ ...step, message: 'again' })).toMatchObject({ outcome: 'committed', committed: false, head, branch: 'system/run/run_landed' })
+    // Not committed after its landing: it stays, for the retention to commit.
+    expect(await ctx.workers.land!({ step: 'release', runId: 'run_dirty', workspace: path('run_dirty') })).toMatchObject({ outcome: 'refused', cause: 'dirty' })
+    expect(existsSync(path('run_dirty'))).toBe(true)
+    // An agent run of it ended without being known to be gone: it stays, held.
+    git(path('run_busy'), 'add', '--all')
+    git(path('run_busy'), 'commit', '-q', '-m', 'kept by hand')
+    ctx.store.db.prepare("UPDATE agent_runs SET status = 'failed', liveness_verdict = 'unknown', liveness_decision = ? WHERE workflow_run_id = 'run_busy'").run(`sha256:${'1'.repeat(64)}`)
+    expect(await ctx.workers.land!({ step: 'release', runId: 'run_busy', workspace: path('run_busy') })).toMatchObject({ outcome: 'refused', cause: 'busy' })
+    expect(existsSync(path('run_busy'))).toBe(true)
+    // A workspace no worktree of this source is asked for is no one's.
+    expect(await ctx.workers.land!({ step: 'release', runId: 'run_other', workspace: repo })).toBeUndefined()
+  })
+
+  describe('the disk floor (T345)', () => {
+    // A floor no disk has free: under it on any host. Without one, no floor is set.
+    const HUGE = 1_000_000_000
+    const floorOf = (ctx: Context) => ctx.artifacts.list({ kind: 'decision', decisionType: 'gate' }).filter((a) => (a.body as { decider?: { id?: string } }).decider?.id === 'agent-workers.disk-floor')
+
+    it('refuses a run that needs a new worktree while the worktrees\' filesystem has less free than the floor, when the mechanism is on, and says why', async () => {
+      const repo = repository()
+      const agent = developer()
+      const root = temp('system-worktrees-')
+      const { ctx } = await boot(agent, { workers: [writer(repo)], worktreeRoot: root, diskFloorGb: HUGE, enforce: { diskFloor: 'on' } })
+      const refusal = ctx.agentWorkers.diskFloorRefusal()
+      expect(refusal).toMatch(new RegExp(`^the disk under the worktrees \\(${root}\\) has [\\d.]+ GB free of [\\d.]+ GB \\(\\d+ %\\), under the floor of ${HUGE} GB \\(agent-workers diskFloorGb\\): no run is started$`))
+      const refused = await run(ctx, 'agent:dev', 'k-1', 'run_low')
+      // A transient host condition, nothing sent: `overloaded`, which the engine waits on and never counts as the task's attempt.
+      expect(refused).toMatchObject({ status: 'failed', submitted: false, error: { kind: 'overloaded', message: expect.stringMatching(/under the floor .*no run is started/) } })
+      expect(agent.runs).toEqual([])
+      expect(existsSync(join(root, 'run_low'))).toBe(false)
+      expect(ctx.agentWorkers.diskStatus()).toMatchObject({ mode: 'on', floorBytes: HUGE * 1024 ** 3, worktrees: { freeBytes: expect.any(Number), totalBytes: expect.any(Number) }, store: { freeBytes: expect.any(Number) } })
+      // The refusal is recorded once while it stands, not at every look.
+      expect(floorOf(ctx)).toHaveLength(1)
+      expect(floorOf(ctx)[0]!.body).toMatchObject({ outcome: { option: 'refuse' } })
+    })
+
+    it('records the refusal it would make, and refuses nothing, in warn, the start mode; and does not look when off', async () => {
+      const repo = repository()
+      const agent = developer()
+      const { ctx } = await boot(agent, { workers: [writer(repo)], worktreeRoot: temp('system-worktrees-'), diskFloorGb: HUGE })
+      expect(ctx.agentWorkers.diskStatus().mode).toBe('warn')
+      expect(ctx.agentWorkers.diskFloorRefusal()).toBeUndefined()
+      expect((await run(ctx, 'agent:dev', 'k-1', 'run_warned')).status).toBe('completed')
+      expect(agent.runs).toHaveLength(1)
+      expect(floorOf(ctx)).toHaveLength(1)
+      expect(floorOf(ctx)[0]!.body).toMatchObject({ outcome: { option: 'start', detail: { mode: 'warn' } } })
+
+      const off = await boot(developer(), { workers: [writer(repo)], worktreeRoot: temp('system-worktrees-'), diskFloorGb: HUGE, enforce: { diskFloor: 'off' } })
+      expect(off.ctx.agentWorkers.diskFloorRefusal()).toBeUndefined()
+      expect(floorOf(off.ctx)).toEqual([])
+      // A floor of 0 sets none, whatever the mode.
+      const none = await boot(developer(), { workers: [writer(repo)], worktreeRoot: temp('system-worktrees-'), diskFloorGb: 0, enforce: { diskFloor: 'on' } })
+      expect(none.ctx.agentWorkers.diskFloorRefusal()).toBeUndefined()
+    })
+  })
+
   it('lists each run worktree with its state, what it holds, and when it retires, and removes the finished ones on the operator\'s recorded word: a clean one, a dirty one only with its changes committed on its branch, never one held; the branch stays (D12, INV-13, INV-15)', async () => {
     const repo = repository()
     const head = git(repo, 'rev-parse', 'HEAD')
@@ -570,6 +718,77 @@ describe('agents source: a git worktree per workflow run (worktreePerRun; PROP-0
     untouched(repo, head)
   })
 
+  /** Worktrees of finished workflow runs, added as a run's are and recorded at fixed instants, oldest first, with no agent run. */
+  const finished = (ctx: Context, repo: string, root: string, runIds: string[]): string[] => runIds.map((runId, i) => {
+    const path = join(root, runId)
+    git(repo, 'worktree', 'add', '-q', '-b', `system/run/${runId}`, path)
+    ctx.store.db.prepare('INSERT INTO agent_worktrees (repository, workflow_run_id, path, branch, gitdir, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(repo, runId, path, `system/run/${runId}`, realpathSync(git(path, 'rev-parse', '--absolute-git-dir')), new Date(Date.UTC(2026, 9, 1, 0, 0, i)).toISOString())
+    return path
+  })
+
+  it('counts every worktree for the health table, past the 100 its listing shows: how many are in use, held, or hold something uncommitted (T345)', async () => {
+    const repo = realpathSync(repository())
+    const root = realpathSync(temp('system-worktrees-'))
+    const { ctx } = await boot(developer(), { workers: [writer(repo)], worktreeRoot: root })
+    const runIds = Array.from({ length: 105 }, (_, i) => `run_count${String(i).padStart(3, '0')}`)
+    const paths = finished(ctx, repo, root, runIds)
+    writeFileSync(join(paths[3]!, 'scratch.txt'), 'not committed\n')
+    const at = '2026-10-01T00:00:00.000Z'
+    ctx.store.db.prepare(`INSERT INTO agent_runs (run_id, request_key, worker, session_id, prompt, classification, status, workflow_run_id, liveness_verdict, liveness_decision, created_at, updated_at)
+      VALUES ('arun_held', 'key-held', 'agent:dev', NULL, 'p', 'operator-shared', 'failed', 'run_count005', 'unknown', ?, ?, ?)`).run(`sha256:${'1'.repeat(64)}`, at, at)
+    await expect(ctx.agentWorkers.runWorktrees({ limit: 101 })).rejects.toThrow(/limit is a whole number from 1 to 100/)
+    expect((await ctx.agentWorkers.runWorktrees()).worktrees).toHaveLength(100)
+    expect(await ctx.agentWorkers.worktreeCounts()).toEqual({ total: 105, inUse: 0, held: 1, uncommitted: 1 })
+  })
+
+  it('removes 40 finished worktrees in one call, recorded as one decision its schema accepts: the reasons counted by why, every worktree named in its outcome (T250, INV-13)', async () => {
+    const repo = realpathSync(repository())
+    const head = git(repo, 'rev-parse', 'HEAD')
+    const root = realpathSync(temp('system-worktrees-'))
+    const { ctx } = await boot(developer(), { workers: [writer(repo)], worktreeRoot: root })
+    const runIds = Array.from({ length: 40 }, (_, i) => `run_many${String(i).padStart(2, '0')}`)
+    const paths = finished(ctx, repo, root, runIds)
+    // One removed by hand: only its record is closed, for a reason of its own.
+    git(repo, 'worktree', 'remove', paths[7]!)
+    const removed = await ctx.agentWorkers.removeWorktrees({ note: 'merged' })
+    expect(removed.more).toBe(0)
+    expect(removed.worktrees.map((w) => [w.runId, w.outcome])).toEqual(runIds.map((runId) => [runId, 'removed']))
+    for (const path of paths) expect(existsSync(path)).toBe(false)
+    expect(ctx.artifacts.list({ kind: 'decision', decisionType: 'retention' })).toHaveLength(1)
+    const decision = ctx.artifacts.get(removed.decision!)!
+    new SchemaRegistry().assertRecord(decision.body as { schema: string })
+    const body = decision.body as { candidates: Array<{ option: string; reasons: string[] }>; outcome: { detail: { worktrees: Array<{ runId: string; path: string }> } } }
+    expect(body.candidates[0]!.reasons).toEqual([
+      '40 worktrees, each named in the outcome\'s detail; the operator asked to remove the finished worktrees: merged',
+      '39 worktree(s): it holds nothing uncommitted: it is removed, and its branch stays',
+      '1 worktree(s): it is gone from disk already: only its record is closed',
+    ])
+    expect(body.outcome.detail.worktrees.map((w) => [w.runId, w.path])).toEqual(runIds.map((runId, i) => [runId, paths[i]]))
+    expect(ctx.store.db.prepare('SELECT DISTINCT decision FROM agent_worktrees').all()).toEqual([{ decision: removed.decision }])
+    // The branches stay; the main working tree is as the operator left it.
+    expect(git(repo, 'branch', '--list', 'system/run/*', '--format=%(refname:short)').split('\n')).toEqual(runIds.map((runId) => `system/run/${runId}`))
+    untouched(repo, head)
+  })
+
+  it('goes on with the other worktrees when git cannot look at one or cannot remove another: each stays, and says why (T250)', async () => {
+    const repo = realpathSync(repository())
+    const root = realpathSync(temp('system-worktrees-'))
+    const { ctx } = await boot(developer(), { workers: [writer(repo)], worktreeRoot: root })
+    const runIds = ['run_one0', 'run_one1', 'run_one2', 'run_one3', 'run_one4']
+    const paths = finished(ctx, repo, root, runIds)
+    // Locked: git refuses to remove it. A broken index: git cannot say what it holds.
+    git(repo, 'worktree', 'lock', paths[1]!)
+    writeFileSync(join(git(paths[3]!, 'rev-parse', '--absolute-git-dir'), 'index'), 'broken')
+    const removed = await ctx.agentWorkers.removeWorktrees({})
+    expect(removed.worktrees.map((w) => [w.runId, w.outcome])).toEqual([['run_one0', 'removed'], ['run_one1', 'kept'], ['run_one2', 'removed'], ['run_one3', 'kept'], ['run_one4', 'removed']])
+    expect(removed.worktrees[1]!.why).toMatch(/^git could not remove it, so it stays for the retention: /)
+    expect(removed.worktrees[3]!.why).toMatch(/^git could not look at it, so it stays: /)
+    expect(runIds.map((_, i) => existsSync(paths[i]!))).toEqual([false, true, false, true, false])
+    new SchemaRegistry().assertRecord(ctx.artifacts.get(removed.decision!)!.body as { schema: string })
+    expect(ctx.store.db.prepare('SELECT workflow_run_id AS runId FROM agent_worktrees WHERE removed_at IS NULL ORDER BY workflow_run_id').all()).toEqual([{ runId: 'run_one1' }, { runId: 'run_one3' }])
+  })
+
   it('serves the run worktree tools to the operator, each output as its schema says, and checks the removal\'s output on its plan before anything is decided: a defect removes nothing (D12, INV-2, INV-14)', async () => {
     const repo = repository()
     const agent = developer()
@@ -616,6 +835,8 @@ describe('agents source: a git worktree per workflow run (worktreePerRun; PROP-0
     const { ctx } = await boot(agent, { workers: [writer(repo)], worktreeRoot: temp('system-worktrees-') })
     const done = await run(ctx, 'agent:dev', 'k-1', 'run_moved')
     expect(done).toMatchObject({ status: 'failed', submitted: true, error: { kind: 'reconciliation_failed', message: expect.stringContaining('.git file') } })
+    // Its own violation, not the infrastructure's: never marked so (ADR-0069).
+    expect(done.error).not.toHaveProperty('infrastructure')
     // A later run of the workflow run and the sweep both refuse it, and leave it for the operator.
     expect(await run(ctx, 'agent:dev', 'k-2', 'run_moved')).toMatchObject({ status: 'failed', submitted: false, error: { kind: 'config_error', message: expect.stringContaining('no longer points') } })
     expect(await ctx.agentWorkers.sweepWorktrees(LATER())).toEqual({ removed: [], kept: [agent.runs[0]!.workspace] })
@@ -682,6 +903,35 @@ describe('agents source: a git worktree per workflow run (worktreePerRun; PROP-0
     }
     const carry = (ctx: Context, runId: string, from: Tree) => ctx.workers.carry!({ runId, from, message: `system: carry into ${runId}\n\nWhy it is carried.` })
     const rowOf = (ctx: Context, runId: string) => ctx.store.db.prepare('SELECT carried_from, carried_commit FROM agent_worktrees WHERE workflow_run_id = ?').get(runId)
+
+    it('cuts no worktree for a carried retry under the disk floor when the mechanism is on, and records it in warn, where the retry is carried (T345)', async () => {
+      const floorOf = (ctx: Context) => ctx.artifacts.list({ kind: 'decision', decisionType: 'gate' }).filter((a) => (a.body as { decider?: { id?: string } }).decider?.id === 'agent-workers.disk-floor')
+      /** A source under a floor no disk has free, its disk-floor mode moved live as the plugin host's override does; off while the earlier attempt writes. */
+      const booted = async () => {
+        const repo = repository()
+        const agent = developer()
+        const modes = new Map<string, string>([['disk-floor', 'off']])
+        const { ctx } = await boot(agent, { workers: [writer(repo)], worktreeRoot: temp('system-worktrees-'), diskFloorGb: 1_000_000_000 })
+        await ctx.plugin({ name: 'live-switch', apply: (c: { provide: (key: string, value: unknown) => void }) => c.provide('pluginHost', { enforced: (m: string) => modes.get(m) }) } as never, {} as never)
+        const earlier = await wrote(ctx, agent, 'run_p')
+        return { ctx, modes, earlier }
+      }
+      const on = await booted()
+      on.modes.set('disk-floor', 'on')
+      const refused = await carry(on.ctx, 'run_r', on.earlier)
+      // Refused for room, a cause the engine waits on: the carry stays due, never settled fresh.
+      expect(refused).toMatchObject({ outcome: 'refused', cause: 'no-room', reason: expect.stringMatching(/under the floor of 1000000000 GB .*: no run is started$/) })
+      // Nothing was cut, and the earlier tree is as its attempt left it.
+      expect(existsSync(join(dirname(on.earlier.workspace), 'run_r'))).toBe(false)
+      expect(rowOf(on.ctx, 'run_r')).toBeUndefined()
+      expect(captureGitSubject(on.earlier.workspace)!.subject).toMatchObject(on.earlier.subject)
+      expect(floorOf(on.ctx).map((d) => (d.body as { outcome: { option: string } }).outcome.option)).toEqual(['refuse'])
+
+      const warn = await booted()
+      warn.modes.set('disk-floor', 'warn')
+      expect(await carry(warn.ctx, 'run_r', warn.earlier)).toMatchObject({ outcome: 'carried', carried: true })
+      expect(floorOf(warn.ctx).map((d) => (d.body as { outcome: { option: string; detail: { mode: string } } }).outcome)).toEqual([{ option: 'start', detail: expect.objectContaining({ mode: 'warn' }) }])
+    })
 
     it('commits the earlier tree on its branch and cuts the new run\'s worktree at its base holding it, staged; a carry asked again finds it done, and the new run works there on that change (INV-4, INV-5, INV-15)', async () => {
       const repo = repository()
@@ -763,7 +1013,8 @@ describe('agents source: a git worktree per workflow run (worktreePerRun; PROP-0
       writeFileSync(join(repo, 'README.md'), 'calc\n')
       git(repo, 'add', 'README.md')
       git(repo, 'commit', '-q', '-m', 'operator: a readme')
-      expect(await carry(ctx, 'run_based_next', based)).toMatchObject({ outcome: 'refused', cause: 'base-moved', reason: expect.stringMatching(new RegExp(`now, not ${head}, the commit the tree .* is on`)) })
+      // The task still writes the commit the repository moved past (T271): a fresh worktree starts at the HEAD, so nothing is carried.
+      expect(await ctx.workers.carry!({ runId: 'run_based_next', from: based, onto: head, message: 'system: carry' })).toMatchObject({ outcome: 'refused', cause: 'base-moved', reason: expect.stringMatching(new RegExp(`now, not ${head}, the commit the task writes`)) })
       expect(git(based.workspace, 'status', '--porcelain')).toContain('calc.py')
 
       // None of them cut a worktree or a branch for the run that would have started from it.
@@ -773,6 +1024,80 @@ describe('agents source: a git worktree per workflow run (worktreePerRun; PROP-0
       }
       // And no earlier branch moved but the removed one's, which the operator's removal committed.
       for (const runId of ['run_moved', 'run_empty', 'run_tampered', 'run_taken', 'run_branched', 'run_based']) expect(git(repo, 'rev-parse', `system/run/${runId}`)).toBe(head)
+    })
+
+    it('carries the earlier change onto the repository\'s HEAD that moved since, replayed without conflict: the new worktree starts at the HEAD holding the change, and the earlier branch keeps it on its own base (T271)', async () => {
+      const repo = repository()
+      const head = git(repo, 'rev-parse', 'HEAD')
+      const agent = developer()
+      const { ctx } = await boot(agent, { workers: [writer(repo)], worktreeRoot: temp('system-worktrees-') })
+      const earlier = await wrote(ctx, agent, 'run_p')
+      // Dev moves on meanwhile, by a change the earlier one does not touch.
+      writeFileSync(join(repo, 'README.md'), 'calc\n')
+      git(repo, 'add', 'README.md')
+      git(repo, 'commit', '-q', '-m', 'operator: a readme')
+      const moved = git(repo, 'rev-parse', 'HEAD')
+      const step = { runId: 'run_r', from: earlier, onto: moved, message: 'system: carry into run_r' }
+      const carried = await ctx.workers.carry!(step)
+      expect(carried).toMatchObject({ outcome: 'carried', base: moved, rebase: { outcome: 'rebased', from: head, onto: moved }, branch: 'system/run/run_r', carried: true })
+      const commit = (carried as { from: { commit: string } }).from.commit
+      // The attempt's change stays on its own branch, on its own base.
+      expect(git(repo, 'rev-parse', 'system/run/run_p')).toBe(commit)
+      expect(git(repo, 'rev-parse', `${commit}^`)).toBe(head)
+      // The new worktree: at the moved HEAD, holding the earlier change and the move both.
+      const worktree = join(dirname(earlier.workspace), 'run_r')
+      expect(git(worktree, 'rev-parse', 'HEAD')).toBe(moved)
+      expect(git(worktree, 'diff', '--cached', '--name-only')).toBe('calc.py\nnote-run_p.txt')
+      expect(readFileSync(join(worktree, 'calc.py'), 'utf8')).toBe(FIXED)
+      expect(readFileSync(join(worktree, 'README.md'), 'utf8')).toBe('calc\n')
+      expect(captureGitSubject(worktree)!.subject.ref).toBe(moved)
+      // Asked again (a restart before the engine recorded it): found done, at the HEAD it was cut at, the replay said again (INV-4).
+      expect(await ctx.workers.carry!(step)).toMatchObject({ outcome: 'carried', base: moved, carried: false, rebase: { outcome: 'rebased', from: head, onto: moved } })
+    })
+
+    it('carries the earlier change at its own base when the HEAD that moved conflicts with it, naming the conflict for the Worker to resolve (T271)', async () => {
+      const repo = repository()
+      const head = git(repo, 'rev-parse', 'HEAD')
+      const agent = developer()
+      const { ctx } = await boot(agent, { workers: [writer(repo)], worktreeRoot: temp('system-worktrees-') })
+      const earlier = await wrote(ctx, agent, 'run_p')
+      // Dev changes the very file the earlier change changed.
+      writeFileSync(join(repo, 'calc.py'), 'def add(a, b):\n    return b + a\n')
+      git(repo, 'commit', '-q', '-am', 'operator: calc another way')
+      const moved = git(repo, 'rev-parse', 'HEAD')
+      const step = { runId: 'run_r', from: earlier, onto: moved, message: 'system: carry into run_r' }
+      const carried = await ctx.workers.carry!(step)
+      expect(carried).toMatchObject({ outcome: 'carried', base: head, rebase: { outcome: 'conflict', from: head, onto: moved, files: ['calc.py'] }, carried: true })
+      // Still the earlier change, on its own base: nothing of the move is mixed in.
+      const worktree = join(dirname(earlier.workspace), 'run_r')
+      expect(git(worktree, 'rev-parse', 'HEAD')).toBe(head)
+      expect(readFileSync(join(worktree, 'calc.py'), 'utf8')).toBe(FIXED)
+      expect(git(worktree, 'diff', '--cached', '--name-only')).toBe('calc.py\nnote-run_p.txt')
+      // Asked again (a restart before the engine recorded it): found done, the conflict said again with its files (INV-4).
+      expect(await ctx.workers.carry!(step)).toMatchObject({ outcome: 'carried', base: head, carried: false, rebase: { outcome: 'conflict', from: head, onto: moved, files: ['calc.py'] } })
+      expect(git(worktree, 'rev-parse', 'HEAD')).toBe(head)
+      // Cut before a restart and never given the tree: given it when asked again, and the conflict said again (INV-4).
+      ctx.store.db.prepare("UPDATE agent_worktrees SET carried_commit = NULL WHERE workflow_run_id = 'run_r'").run()
+      git(worktree, 'read-tree', '-u', '--reset', head)
+      expect(await ctx.workers.carry!(step)).toMatchObject({ outcome: 'carried', base: head, carried: true, rebase: { outcome: 'conflict', from: head, onto: moved, files: ['calc.py'] } })
+      expect(readFileSync(join(worktree, 'calc.py'), 'utf8')).toBe(FIXED)
+    })
+
+    it('takes the earlier tree as the system kept it when its attempt ended: a commit of exactly that subject on its base, committed by the landing\'s commit step (T271)', async () => {
+      const repo = repository()
+      const head = git(repo, 'rev-parse', 'HEAD')
+      const agent = developer()
+      const { ctx } = await boot(agent, { workers: [writer(repo)], worktreeRoot: temp('system-worktrees-') })
+      const earlier = await wrote(ctx, agent, 'run_p')
+      // The attempt ended unaccepted: its change is kept on its branch, as the landing's commit step commits it.
+      const kept = await ctx.workers.land!({ step: 'commit', runId: 'run_p', workspace: earlier.workspace, subject: earlier.subject, message: 'system: keep the change of attempt 1' })
+      expect(kept).toMatchObject({ outcome: 'committed', committed: true })
+      const commit = (kept as { head: string }).head
+      expect(git(repo, 'rev-parse', `${commit}^`)).toBe(head)
+      const carried = await carry(ctx, 'run_r', earlier)
+      expect(carried).toMatchObject({ outcome: 'carried', from: { branch: 'system/run/run_p', commit }, base: head, carried: true })
+      expect(git(repo, 'rev-parse', 'system/run/run_p')).toBe(commit)
+      expect(git(join(dirname(earlier.workspace), 'run_r'), 'diff', '--cached', '--name-only')).toBe('calc.py\nnote-run_p.txt')
     })
 
     it('carries nothing while an agent run of the earlier workflow run is unfinished: it may still write the tree (INV-15)', async () => {

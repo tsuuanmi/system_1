@@ -121,30 +121,20 @@ drift and does not silently break.
   `ui.drift` of kind `readback`. Its `readback` field gives the lengths, lines, and the first
   difference (line, offset, character class), and its outline shows the composer. A punctuation
   mark named there, such as a backtick, points at a composer that formats what is pasted.
-- **A stalled turn** (`provider_stalled`) is outlined the same way: event
-  `provider.stall` (`system events --type provider.stall`) carries the page's
-  outline as evidence, with its `visibilityState`, focus, and path, so a stall
-  can be read without the operator's browser. Phase `research-start` (ChatGPT)
-  is a Deep research reply returned as a clarifying question because no run
-  showed in time: when the reply was an acknowledgement, the outline shows where
-  the run's progress stood.
-- **A conversation loaded once more** (Gemini): event `provider.reload` (phase
-  `research-plan`) marks a Deep research plan the page never rendered; the
-  `provider.stall` just before it outlines the page as it hung. Nothing is sent
-  again. Repeated reloads point at the site, not the map.
-- **A Copy not kept**: event `provider.copy-refused` says an answer was read as
-  rendered text (tables come out cell by cell, citation chips as loose lines)
-  because its Copy was empty, failed, or its words were not the page's. For
-  `words` it gives counts only: the Markdown's prose words, the rendered words,
-  how many prose words were found in order (`matched`), its links and their
-  words, and the extra rendered words allowed. `matched` below `prose` means
-  the Markdown has words the page lacks; `shown − prose` above `allowance` means
-  the page shows words the Markdown lacks (chips, say).
-- **A Deep research report as read** (ChatGPT): event `provider.report-read` gives
-  its path (`frame` or `inline`), its length, and the source links it carries,
-  counts only. A report refused for citing no source with `links: 0` was read
-  without its citations: compare with a read-only `system conversation inspect`,
-  whose outline records each link's target as a kind (`external`, `site`, `none`).
+- **A stalled turn** (`provider_stalled`) is outlined the same way: event `provider.stall` carries the
+  page's outline as evidence, so a stall can be read without the operator's browser. Phase
+  `research-start` (ChatGPT) is a Deep research reply returned as a clarifying question because no run
+  showed in time.
+- **A conversation loaded once more** (Gemini): event `provider.reload` (phase `research-plan`) marks a
+  Deep research plan the page never rendered. Nothing is sent again. Repeated reloads point at the site,
+  not the map.
+- **A Copy not kept**: event `provider.copy-refused` says an answer was read as rendered text, because
+  its Copy was empty, failed, or its words were not the page's. Its `words` counts show the gap:
+  `matched` below `prose` means the Markdown has words the page lacks; `shown − prose` above
+  `allowance` means the page shows words the Markdown lacks (chips, say).
+- **A Deep research report as read** (ChatGPT): event `provider.report-read` gives its path, length,
+  and source-link counts. A report with `links: 0` was read without its citations: compare with
+  `system conversation inspect`.
 - **Read the evidence.** A `ui.drift` event's `outline` names a local-private
   `evidence` artifact: the structure of the region around the element, never
   its text ([drift evidence](../design/ui-operations.md#drift-evidence)).

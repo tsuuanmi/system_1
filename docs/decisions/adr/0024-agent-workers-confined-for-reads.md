@@ -2,7 +2,7 @@
 
 - **Status:** Accepted; superseded in part by [ADR-0038](0038-confined-commands-for-claude-code-workers.md) (Claude Code also runs under the read confinement, and proves `readsConfined` on the host)
 - **Date:** 2026-10-14
-- **Related:** [PROP-0003](../../proposals/0003-production-readiness.md#m6a-security-hardening),
+- **Related:** PROP-0003 (removed; in Git history),
   REQ-WRK-6, QA-6,
   [INV-2](../../architecture/invariants.md#inv-2-fail-closed),
   [INV-8](../../architecture/invariants.md#inv-8-credentials-never-cross-upward),

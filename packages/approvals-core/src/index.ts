@@ -7,6 +7,13 @@
  * @module @tsuuanmi/system-approvals-core
  */
 import { type Context, Service } from '@deepseek-ai/cordis'
+import type { MapOf, RiskTierMap } from './risk-tiers.ts'
+import type { TierByRisk, TierByRiskOf } from './tier-by-risk.ts'
+import type { WebAccessGrants } from './web-access.ts'
+
+export * from './risk-tiers.ts'
+export * from './tier-by-risk.ts'
+export * from './web-access.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -50,16 +57,18 @@ export const ALWAYS_ASK: readonly ActionClass[] = ['merge', 'external-send', 'de
 
 /**
  * A shell metacharacter, or a character a shell or a naive split treats specially: `; & | $` and
- * the backquote, `< > ( )`, `{ } [ ]`, `* ? ~`, quotes, backslash, and newline, carriage return,
- * tab, and NUL. An argv word holding one is forbidden at `check`, and a commands-list entry holding
- * one is refused when its policy loads: argv is matched word for word, never through a shell.
+ * the backquote, `< > ( )`, `{ } [ ]`, `* ?`, a `~` where a shell expands it (at the start of a
+ * word, or after a `=` or a `:`, as bash does in `--prefix=~/x`; so `HEAD~1` holds none), quotes,
+ * backslash, and newline, carriage return, tab, and NUL. An argv word holding one is forbidden at
+ * `check`, and a commands-list entry holding one is refused when its policy loads: argv is matched
+ * word for word, never through a shell.
  */
-export const SHELL_METACHARACTER = /[;&|$`<>(){}[\]*?~'"\\\n\r\t\0]/
+export const SHELL_METACHARACTER = /[;&|$`<>(){}[\]*?'"\\\n\r\t\0]|(^|[=:])~/
 
 export type Mode = 'auto' | 'notify' | 'ask' | 'forbid'
 /** Modes from least to most strict; the effective mode is the strictest of the policies. */
 export const MODES: readonly Mode[] = ['auto', 'notify', 'ask', 'forbid']
-export type Check = 'tests' | 'typecheck' | 'lint' | 'schema' | 'quote-check' | 'review'
+export type Check = 'tests' | 'typecheck' | 'lint' | 'schema' | 'quote-check' | 'review' | 'red-on-base'
 
 /**
  * The policies of a set (the studio's, then the project's) that apply to a class: a project policy
@@ -85,9 +94,9 @@ export function waitSeconds(policies: readonly AutonomyPolicy[], actionClass: Ac
   return Math.min(seconds, ...policies.map((p) => p.expiry.maxSeconds))
 }
 
-/** `autonomy-policy@1.0`. */
+/** `autonomy-policy@1.x`: `@1.1` adds the optional path map `riskTiers` (ADR-0071); `@1.2` the tier a step takes at its task's risk tier, `tierByRisk` (ADR-0073); `@1.3` the optional `webAccess` grants (ADR-0074); `@1.5` the check `red-on-base` a rule may require (ADR-0079); `@1.6` a command rule's `enforce` and an option's path `scope` (T326); `@1.7` the sandboxed-command rule `sandboxedCommands` (ADR-0080). */
 export interface AutonomyPolicy {
-  schema: 'autonomy-policy@1.0'
+  schema: 'autonomy-policy@1.0' | 'autonomy-policy@1.1' | 'autonomy-policy@1.2' | 'autonomy-policy@1.3' | 'autonomy-policy@1.4' | 'autonomy-policy@1.5' | 'autonomy-policy@1.6' | 'autonomy-policy@1.7'
   id: string
   version: number
   scope: 'studio' | 'project'
@@ -98,6 +107,162 @@ export interface AutonomyPolicy {
   commands?: string[]
   expiry: { defaultSeconds: number; maxSeconds: number }
   batch?: { maxSize: number; maxWaitSeconds: number }
+  /**
+   * `@1.1`, optional: the path map that gives each path a change touches a risk tier
+   * (./risk-tiers.ts, ADR-0071). With no applying policy carrying one, tiering is off.
+   */
+  riskTiers?: RiskTierMap
+  /**
+   * `@1.2`, optional: the intelligence tier a board task's step takes at its task's risk tier
+   * (./tier-by-risk.ts, ADR-0073). With no applying policy carrying one, steps keep their templates' tiers.
+   */
+  tierByRisk?: TierByRisk
+  /**
+   * `@1.3`, optional: web calls a research role's Workers make unasked when the egress check passes,
+   * bounded per run (./web-access.ts, ADR-0074). `external-send` still always asks; the agent gate
+   * applies a grant only to a call the policy said `ask` for. With none, every web call asks.
+   */
+  webAccess?: WebAccessGrants
+  /**
+   * `@1.4`, optional: structured command rules (./command-rules.ts). A command the gate's matcher
+   * says one allows is judged as `workspace-write`, as a listed command is; the decision names the rule.
+   * `@1.6`: a rule may be `enforce: warn` (it grants nothing, {@link warnedCommandRulesOf}) and an
+   * option may take a path.
+   */
+  commandRules?: CommandRule[]
+  /**
+   * `@1.7`, optional: the sandboxed-command rule (ADR-0080, {@link sandboxedCommandOf}). Only the
+   * studio policy's grants; a project policy's only adds `forbid` and `ask` shapes.
+   */
+  sandboxedCommands?: SandboxedCommands
+}
+
+/** What a `forbid` or `ask` entry of the sandboxed-command rule matches (the schema's `commandShape`). */
+export interface CommandShape {
+  id: string
+  /** The first word's base name. */
+  program?: string
+  /** Literal words right after the program. */
+  words?: string[]
+  /** A regular expression that at least one word after the program matches. */
+  anyWord?: string
+  note: string
+}
+
+/** `autonomy-policy@1.7`'s `sandboxedCommands`: a Bash call no shape names is `auto` in a proved sandbox. */
+export interface SandboxedCommands {
+  id: string
+  forbid?: CommandShape[]
+  ask?: CommandShape[]
+  note: string
+}
+
+/** What the sandboxed-command rule gives a command: `forbid` or `ask` by the shape named, else `auto`. */
+export type SandboxedOutcome = { rule: string; outcome: 'auto' } | { rule: string; outcome: 'ask' | 'forbid'; by: string }
+
+/** Whether `shape` matches `argv`: its program (by base name), its literal words, and any word. */
+function shapeMatches(shape: CommandShape, argv: readonly string[]): boolean {
+  if (shape.program !== undefined && argv[0]?.split('/').pop() !== shape.program) return false
+  const rest = shape.program !== undefined ? argv.slice(1) : argv
+  if (!(shape.words ?? []).every((word, i) => rest[i] === word)) return false
+  if (shape.anyWord === undefined) return true
+  try {
+    const pattern = new RegExp(shape.anyWord)
+    return rest.slice((shape.words ?? []).length).some((word) => pattern.test(word))
+  } catch {
+    // A pattern that is no regular expression matches nothing (the policy does not load with one).
+    return false
+  }
+}
+
+/**
+ * The sandboxed-command rule (ADR-0080) for an argv, over a policy set (the studio's, then the
+ * project's): undefined when the studio policy holds no rule. Else the order is forbid, then ask
+ * (the shapes of every policy of the set, so a project only adds), then the rule itself, `auto`.
+ * Pure: the caller says the run's confinements are proved; this only reads the policies.
+ */
+export function sandboxedCommandOf(policies: readonly AutonomyPolicy[], argv: readonly string[]): SandboxedOutcome | undefined {
+  const grant = policies[0]?.sandboxedCommands
+  if (!grant || argv.length === 0) return undefined
+  for (const kind of ['forbid', 'ask'] as const) {
+    const hit = policies.flatMap((p) => p.sandboxedCommands?.[kind] ?? []).find((shape) => shapeMatches(shape, argv))
+    if (hit) return { rule: grant.id, outcome: kind, by: hit.id }
+  }
+  return { rule: grant.id, outcome: 'auto' }
+}
+
+/**
+ * The command rules in force for a policy set (the studio's, then the project's), as the commands
+ * list is judged: only the studio policy grants, and a project policy only narrows. A rule is in
+ * force when the studio policy holds it and every other policy that carries `commandRules` holds a
+ * rule of the same id with the same definition; a project policy can drop a rule, never add or widen one.
+ */
+export function commandRulesOf(policies: readonly AutonomyPolicy[]): CommandRule[] {
+  const [studio, ...rest] = policies
+  const same = (a: CommandRule, b: CommandRule): boolean => canonical(a) === canonical(b)
+  return (studio?.commandRules ?? []).filter((rule) => rule.enforce !== 'warn' && rest.every((p) => p.commandRules === undefined || p.commandRules.some((r) => r.id === rule.id && same(r, rule))))
+}
+
+/**
+ * The command rules of `enforce: warn` (`autonomy-policy@1.6`) a policy set carries, the studio's
+ * and every project's, each id once (the first): rules that grant nothing. The gate matches a
+ * command against them only to record that a rule would have allowed it; the command still asks.
+ * The studio need not hold them: a warning widens nothing. A project policy's `warn` copy of a rule
+ * also differs from the studio's, so {@link commandRulesOf} keeps that rule out of force for it.
+ */
+export function warnedCommandRulesOf(policies: readonly AutonomyPolicy[]): CommandRule[] {
+  const seen = new Set<string>()
+  const warned: CommandRule[] = []
+  for (const policy of policies) {
+    for (const rule of policy.commandRules ?? []) {
+      if (rule.enforce !== 'warn' || seen.has(rule.id)) continue
+      seen.add(rule.id)
+      warned.push(rule)
+    }
+  }
+  return warned
+}
+
+/** A JSON value's text with its object keys sorted: two rules written in another key order are the same rule. */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
+  if (value !== null && typeof value === 'object') return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${canonical((value as Record<string, unknown>)[k])}`).join(',')}}`
+  return JSON.stringify(value)
+}
+
+/** What a command-rule word is: `path` is judged by the rule's scope; see the schema's `commandValueKind`. */
+export type CommandValueKind = 'any' | 'word' | 'number' | 'revision' | 'revision-path' | 'path'
+/** Where a path word may be (see the schema's `positionals.scope`). */
+export type CommandPathScope = 'run-worktree' | 'repository-read' | 'scratch-file' | 'test-target'
+
+/** One command rule of `autonomy-policy@1.4`: its shape is the schema's `commandRule`. */
+export interface CommandRule {
+  id: string
+  program: string
+  words?: string[]
+  flags?: string[]
+  flagLetters?: string
+  countFlag?: boolean
+  required?: string[]
+  options?: Array<{ name: string; kind: CommandValueKind; oneOf?: string[]; pattern?: string; scope?: CommandPathScope; atMost?: number }>
+  positionals?: Array<{ kind: CommandValueKind; min?: number; max?: number; oneOf?: string[]; pattern?: string; scope?: CommandPathScope; atMost?: number }>
+  /**
+   * `@1.6`, optional: `on` (the default) grants the rule; `warn` grants nothing: the gate records
+   * that the rule would have allowed a command, and the command still asks. It is on only once
+   * every policy of the set that holds it holds it without `warn` (each an approved policy change).
+   */
+  enforce?: 'on' | 'warn'
+  note: string
+}
+
+/** The path maps of a policy set (the studio's, then the project's), each with the policy that carries it. */
+export function riskTierMaps(policies: readonly AutonomyPolicy[]): MapOf[] {
+  return policies.filter((p) => p.riskTiers !== undefined).map((p) => ({ policy: { id: p.id, version: p.version }, map: p.riskTiers! }))
+}
+
+/** The tier-by-risk maps of a policy set (the studio's, then the project's), each with the policy that carries it. */
+export function tierByRiskMaps(policies: readonly AutonomyPolicy[]): TierByRiskOf[] {
+  return policies.filter((p) => p.tierByRisk !== undefined).map((p) => ({ policy: { id: p.id, version: p.version }, map: p.tierByRisk! }))
 }
 
 /** An action a core component wants to take, as the policy classifies it. */
@@ -111,6 +276,20 @@ export interface Action {
    * {@link SHELL_METACHARACTER} is forbidden, whatever its class.
    */
   command?: string[]
+  /**
+   * For `command`: the id of the command rule (`autonomy-policy@1.4`) the caller's matcher says
+   * allows the argv. The policy accepts it only when the rules in force for the action
+   * ({@link commandRulesOf}: the studio's, narrowed by the project's) hold a rule of that id; the argv is then judged as `workspace-write`
+   * (unless the `command` class is forbidden), and the decision names the rule.
+   */
+  commandRule?: string
+  /**
+   * For `command`: the caller's word that the run's confinements are proved (a `workspace-write`
+   * run whose runtime proved the host read confinement and a sandbox with writes to the worktree
+   * only, no network, no unsandboxed command), so the sandboxed-command rule
+   * ({@link sandboxedCommandOf}) applies to an argv no list line or command rule allows.
+   */
+  sandboxed?: boolean
   /** For auto and notify rules: which of their required checks passed. */
   checks?: Partial<Record<Check, boolean>>
 }
@@ -175,6 +354,14 @@ export interface Verdict {
   verdict: 'approved' | 'rejected'
   note?: string
 }
+
+/**
+ * The subject version of the board's `remediation` request for a lost run whose lease lapsed while
+ * the host was stopped (still live at the board's recorded clean stop, expired by its next start): the
+ * structured host-stopped mark a lead's rights read (ADR-0076, amended by T302). A lost run without it
+ * is `reconciliation-failed`.
+ */
+export const HOST_STOPPED_RECONCILIATION = 'reconciliation-failed:host-stopped'
 
 /** The subject ref of a `policy-change` request; its version is the proposed set's hash (INV-5). */
 export const POLICY_SET_REF = 'autonomy-policy-set'
@@ -252,7 +439,7 @@ export type Refusal = 'unknown-request' | 'already-resolved' | 'expired' | 'subj
 export interface VerdictResult { requestId: string; state: RequestState; approval?: ArtifactRef; refused?: Refusal }
 
 /** Why an approvals call was refused. Nothing changed. */
-export type ApprovalsFailure = 'not-asked' | 'unknown-request' | 'invalid'
+export type ApprovalsFailure = 'not-asked' | 'unknown-request' | 'invalid' | 'forbidden'
 export class ApprovalsError extends Error {
   constructor(readonly failure: ApprovalsFailure, message: string) {
     super(message)
@@ -306,6 +493,22 @@ export abstract class Approvals extends Service {
    * its own: one result per verdict, in order. Only an operator channel calls it (INV-6).
    */
   abstract decide(verdicts: Verdict[], at?: Date): Promise<VerdictResult[]>
+
+  /**
+   * Optional (ADR-0076): a project's lead gives verdicts on its own token, not the operator's. The
+   * rights are a closed list the provider enforces: the commands and dispatch starts of the lead's
+   * project, and merges into the project's listed dev branches; any verdict outside it refuses the
+   * whole call (`forbidden`, with the reason), and nothing is decided. What is decided is recorded
+   * with the decider `lead:<project>` (a `client` decider), never as the operator's. A provider
+   * without it takes no lead's verdict.
+   */
+  decideAsLead?(project: string, verdicts: Verdict[], at?: Date): Promise<VerdictResult[]>
+
+  /** Optional (ADR-0076): the branches a project lists as dev branches, where its lead decides merges and results. */
+  devBranches?(project: string): string[]
+
+  /** Optional (ADR-0076): the project a request belongs to, for a lead's rights: its requester's, else its requester's board task's. */
+  projectOfRequest?(request: ApprovalRequest): Promise<string | undefined>
 
   /** Close a request whose waiting work ended first: it is rejected with cause `withdrawn`. */
   abstract withdraw(requestId: string, at?: Date): Promise<ApprovalRequest>

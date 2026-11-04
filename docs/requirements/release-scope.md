@@ -67,10 +67,8 @@ for free. The Responses and Messages gateways, which make `system` look like a
 
 The MVP research flow is a **static two-node DAG** that runs on the real engine.
 It is a subset of the engine, not separate code
-([ADR-0012](../decisions/adr/0012-dag-execution-model.md), INV-1). It was the
-built-in `deep-research` template, which PROP-0004 removed; the name `research` went to the
-scientific-research procedure (production-ready), whose `deep` variant reviews with Deep
-research:
+([ADR-0012](../decisions/adr/0012-dag-execution-model.md), INV-1). The name `research` now belongs
+to the scientific-research procedure, whose `deep` variant reviews with Deep research:
 
 ```mermaid
 flowchart LR
@@ -83,7 +81,7 @@ restarts never resend or recompute a completed step.
 ### Delivery order: slice 1 first
 
 The MVP ships in two slices. **Slice 1 (`ask` + `research`)** is the first
-usable build, delivered at milestone M1.5:
+usable build:
 
 | Slice 1 includes | Detail |
 |---|---|
@@ -178,8 +176,8 @@ Beta exit criteria:
 
 ## Base (v0.8)
 
-Proposed in [PROP-0010](../proposals/0010-base-version.md), which gives the design. Base is the
-version after which `system` evolves by plugins only.
+Design: [PROP-0010](../proposals/0010-base-version.md). Base is the version after which `system`
+evolves by plugins only.
 
 ### Goal
 
@@ -213,12 +211,10 @@ default (the agent rows, `board`, `approvals`, `resources`, `digest`, `report`).
 digest provider `digest-extractive` is off too, and the pilot does not need it; exit criterion 6
 swaps it in on its own.
 
-Base ships `profile-software-development` **off by default** (the operator's decision of
-2026-10-24, D30). Off, no install offers a writing template until the operator names a repository;
+Base ships `profile-software-development` **off by default**. Off, no install offers a writing template until the operator names a repository;
 on, every install would offer templates that need an agent Worker configured on a repository, and
-their runs would fail at the first step until one is. The pilot's patch turns it on, and so does the live install, for
-the pilot and the live checks; the live install also puts its Claude Code Worker first in the
-`workers` row's `priority` ([pilot runbook](../operations/pilot.md#name-the-repository-and-the-workers)).
+their runs would fail at the first step until one is. The pilot's patch turns it on
+([pilot runbook](../operations/pilot.md#name-the-repository-and-the-workers)).
 
 ### Not in Base
 
@@ -237,8 +233,7 @@ knowledge family; RTK, Serena, context-mode; automated shadow and canary runs.
 3. **Pilot.** One algorithm-development project chosen by the operator runs from charter to
    close over at least five working days, through at least one restart. Claude Code Workers write
    every change; other agent Workers (Codex) may validate and review. The board shows progress
-   without reading a transcript. (Amended on 2026-10-25, operator decision D69: before, "on Claude
-   Code Workers only".)
+   without reading a transcript.
 4. **Attention.** Every approval goes through the queue, in batches, and interruptions stay
    under the threshold set in the charter.
 5. **Resources.** Every run has a usage record taken from the runtime's own usage fields. The

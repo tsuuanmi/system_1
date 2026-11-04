@@ -10,9 +10,10 @@ import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import StoreApprovals from '@tsuuanmi/system-approvals'
 import Artifacts from '@tsuuanmi/system-artifacts'
+import type { NewEvent, SystemEvent } from '@tsuuanmi/system-ledger-core'
 import Vault from '@tsuuanmi/system-credentials-vault'
 import Egress from '@tsuuanmi/system-egress'
-import EventLog, { type NewEvent, type SystemEvent } from '@tsuuanmi/system-event-log'
+import EventLog from '@tsuuanmi/system-event-log'
 import { McpTools, type ToolHandler, type ToolSpec } from '@tsuuanmi/system-gateway-core'
 import { SchemaRegistry } from '@tsuuanmi/system-libs'
 import Store from '@tsuuanmi/system-store'
@@ -120,7 +121,7 @@ describe('each event kind is read into its notice (REQ-HOST-9)', () => {
     expect(read({ type: 'board.review.held', data: { taskId: 'not an id', expiresAt } })).toEqual({})
     const notice = notify.reminderNotice(held.remind!, Date.parse(expiresAt) - 45 * 60_000, { leadMs: 3600_000 })!
     expect(notice).toMatchObject({ schema: 'notification@1.1', kind: 'review.expiring', subject: 'task-9', title: 'A review expires soon: board task task-9', act: ['system ui', 'MCP board_task {"taskId":"task-9"}'] })
-    expect(notice.text).toBe(`Board task task-9 of project p1 waits for your Accept or Reject, held for you until ${expiresAt}, in about 45 min. Unanswered by then, the review expires: the task waits for input (review-expired), which nothing revives.`)
+    expect(notice.text).toBe(`Board task task-9 of project p1 waits for your Accept or Reject, held for you until ${expiresAt}, in about 45 min. Unanswered by then, the review expires: the task waits for input (review-expired), which only a re-opening revives (board_reopen_review).`)
     schemas.assert('notification@1.1', notice)
     // Its kind is refused under the earlier record.
     expect(() => schemas.assert('notification@1.1', { ...notice, schema: 'notification@1.0' })).toThrow()
@@ -517,6 +518,6 @@ describe('the plugin, end to end', () => {
     // Every kind the notifier makes is one its record declares, in the same order (review.expiring since 1.1, dispatch.started since 1.2).
     const record = JSON.parse(readFileSync(new URL('../../../../schemas/notification.v1.json', import.meta.url), 'utf8')) as { properties: { kind: { enum: string[] } } }
     expect([...KINDS]).toEqual(record.properties.kind.enum)
-    expect(KINDS).toHaveLength(9)
+    expect(KINDS).toHaveLength(10)
   })
 })

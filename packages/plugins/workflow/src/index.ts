@@ -13,31 +13,45 @@ import { type Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@tsuuanmi/system-approvals-core'
 import type {} from '@tsuuanmi/system-board-core'
-import type {} from '@tsuuanmi/system-egress'
-import type {} from '@tsuuanmi/system-event-log'
+import type {} from '@tsuuanmi/system-ledger-core'
 import type {} from '@tsuuanmi/system-gateway-core'
-import type {} from '@tsuuanmi/system-store'
 import { SchemaRegistry } from '@tsuuanmi/system-libs'
+import type {} from '@tsuuanmi/system-workers-core'
+import { type Advisor, MAX_TRAINING } from './advisor.ts'
 import { sweepDeferrals } from './continuations.ts'
 import { dispatchProblems, type DispatchPass, type DispatchStatus } from './dispatch.ts'
+import type { CommandRecord, DossierAppendInput, DossierCaller, DossierPage } from './dossiers.ts'
 import { checkTemplate, Engine } from './engine.ts'
+import { hold, type HoldView, holdView, release } from './hold.ts'
 import { MIGRATIONS } from './migrations.ts'
 import { approve, continueRun, stop, supersede } from './operator.ts'
 import { pollMs } from './queue.ts'
 import { deleteRun, purge } from './retention.ts'
+import { type DailyCheckReport, type DailyCheckRow, dailyCheckProblems, renderDailyReport } from './daily-check.ts'
+import { renderReport, type ScheduledReviewReport, type ScheduledReviewRow, scheduledReviewProblems } from './scheduled-review.ts'
 import { retryHeldWakes, wake, wakeSafely } from './sessions.ts'
 import type { NodeTemplate } from './spec.ts'
 import { leftOutOfTeams, teamContracts, vote } from './teams.ts'
 import { registerTools } from './tools.ts'
 import type { Config, Explanation, NodeRecord, RunStatus, RunView, StartInput, TaskLanding, TaskStartInput, TemplateStep, UsageDraws, UsageFilter } from './types.ts'
+import { type OpenLanding, openLandings } from './landing-queue.ts'
 import { draws, explain, usage } from './views.ts'
 
+export { renderReport as renderScheduledReviewReport, SCHEDULED_REVIEW, SCHEDULED_REVIEW_NODES, scheduledReviewProblems, scheduledReviewSettings } from './scheduled-review.ts'
+export { dailyCheckProblems, dailyCheckSettings, renderDailyReport as renderDailyCheckReport } from './daily-check.ts'
+export type { DailyCheckReport, DailyCheckRow, DailyCheckSettings } from './daily-check.ts'
+export type { AreaTotals, FiledTask, ScheduledReviewReport, ScheduledReviewRow, ScheduledReviewSettings } from './scheduled-review.ts'
 export { compose, DEFAULT_TEMPLATES, preflight, resolve } from './spec.ts'
 export type { Instructions, NodeTemplate, ResolvedNode, ResolvedSpec } from './spec.ts'
 export { WorkflowFailure } from './types.ts'
 export { dispatchProblems, dispatchSettings, MAX_LOOKED } from './dispatch.ts'
+export { DOSSIER_FILE, DOSSIER_KINDS, DOSSIER_LIMITS, renderDossier, ROLE_KINDS } from './dossiers.ts'
+export type { CommandRecord, DossierAppendInput, DossierCaller, DossierEntry, DossierEntryView, DossierKind, DossierPage, DossierView } from './dossiers.ts'
+export { adviceProblem, adviseInShadow, advisorStop, ANSWER_SCHEMA, brierScores, featuresOf, fitLogistic, LocalAdvisor, modelPrompt, OUTCOME_EVENT, QUESTION_SET, QUESTIONS, SHADOW_ATTEMPTS, vectorOf } from './advisor.ts'
+export type { Advice, AdviceDetail, Advisor, AdvisorCandidate, AdvisorConfig, AdvisorCounts, AdvisorFeatures, AdvisorSettings, AdvisorSignal, CandidateAdvice, OutcomeData, Question, QuestionScore } from './advisor.ts'
+export type { HoldView, StepHold, StepInFlight } from './hold.ts'
 export type { DispatchPass, DispatchPassView, DispatchPause, DispatchSettings, DispatchStarted, DispatchStatus, DispatchWindow } from './dispatch.ts'
-export type { Config, DispatchConfig, ExplainedDecision, Explanation, NodeRecord, NodeState, NodeView, RunStatus, RunView, StartedBy, StartInput, TaskCarry, TaskClaim, TaskDispatch, TaskLanding, TaskOutcome, TaskStartInput, TaskView, TemplateStep, UsageDraws, UsageFilter, UsageRunView, WorkflowError } from './types.ts'
+export type { Config, DailyCheckConfig, DispatchConfig, ScheduledReviewConfig, ExplainedDecision, Explanation, LandingQueueView, NodeRecord, NodeState, NodeView, RunStatus, RunView, StartedBy, StartInput, TaskCarry, TaskClaim, TaskDispatch, TaskLanding, TaskOutcome, TaskQueue, TaskRebase, TaskStartInput, TaskView, TemplateStep, UsageDraws, UsageFilter, UsageRunView, WorkflowError } from './types.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -90,7 +104,7 @@ export function checkConfig(config: Config = {}): string[] {
       return [`template ${name}: ${(error as Error).message}`]
     }
   })
-  return [...templates, ...checkTeams(config.teams), ...dispatchProblems(config)]
+  return [...templates, ...checkTeams(config.teams), ...dispatchProblems(config), ...scheduledReviewProblems(config), ...dailyCheckProblems(config)]
 }
 
 export class Workflow extends Service {
@@ -113,6 +127,9 @@ export class Workflow extends Service {
       grows: z.any().description('Planner policy {maxNodes, capabilities, approvalRequired}; checked by preflight'),
       resultSchema: z.string().description('Schema tag the answer\'s JSON must be valid against (REQ-ART-5)'),
       differentFrom: z.array(z.string()).description('Nodes whose Workers this node\'s Worker must differ from in provider family (ADR-0027)'),
+      // Not z.array: an omitted array would come back as [], which preflight refuses (a list of 1 to 8).
+      prefers: z.any().description('Capabilities the step prefers but does not need, such as [web-search]: an admitted Worker that proves them ranks before one that does not, never a refusal (T262); checked by preflight'),
+      diversity: z.union(['required', 'preferred']).description('With differentFrom: required (default) fails closed with no Worker of another family; preferred runs once on their family in a conversation of its own, recorded as a single-family decision its later steps and the answer state (D89)'),
       // Not z.object, for the same reason as grows.
       team: z.any().description('Team policy {kind: brainstorm | review, members, debateRounds}; checked by preflight'),
     }))).default({}).description('Workflow templates by name, added to the built-in ones (a same-named one replaces it)'),
@@ -126,14 +143,28 @@ export class Workflow extends Service {
       excludeWorkers: z.array(z.string().pattern(EXCLUDED_ENTRY)).max(MAX_EXCLUDED).default([]).description('Worker ids and accounts (as system roster lists them: an account as group/id, or its bare id when only one group has it) that no team member joins on, the first member included: a Worker id leaves out that Worker, an account every Worker naming it, each with every other Worker on its account. They still take every other node. A team they leave fewer provider families than members fails config_error before anything is sent, allowSameFamily or not; a member already in its team\'s conversation in that run keeps it, recorded; an entry that matches nothing is recorded as a workflow.team.unmatched-exclusions event'),
     }).description('Team membership (docs/design/teams.md#workers-left-out-of-teams)'),
     retainRunsDays: z.natural().default(30).description('Days a finished run is kept, then deleted with the artifacts only it needed and the website chats only it used (0: every run is kept); a session\'s latest run always stays'),
-    maxLimitWaitHours: z.number().min(0).max(720).default(24).description('Hours a node refused only because the assigned accounts that could take it are at their limit may wait for the earliest reset, in all from its first wait, spending no attempt; past it, or with no known reset, it fails quota_exhausted (ADR-0052, INV-9); 0 never waits'),
+    maxLimitWaitHours: z.number().min(0).max(720).default(24).description('Hours a node may wait, in all from its first wait, spending no attempt: refused only because the assigned accounts that could take it are at their limit, for the earliest reset (ADR-0052); refused while a Worker that proves it is out of quota, at a limit, or its probe late, to be routed again when routing says it is worth a look (T282). Past it, it fails with the refusal\'s kind (INV-9); 0 never waits. It bounds too a board task\'s run waiting for room on the host\'s disk to carry its previous attempt\'s work (T345): past it, the run starts fresh'),
     autoApprovePlans: z.boolean().default(false).description('Approve a high-confidence plan by policy instead of waiting for the operator'),
+    handbook: z.object({
+      enabled: z.boolean().default(true).description('Give every step of a board task\'s run its handbook slice (layers 1 to 4 by the engine, the gate view and the lessons by its Worker source), recorded in its brief'),
+      warnTasks: z.natural().max(1000).default(30).description('Distinct board tasks whose slice is built in warn mode: a slice over the 6,000-token bound is sent whole with a handbook.bound decision; past them, such a slice is refused and the step fails config_error'),
+      root: z.string().description('The System repository the handbook\'s homes are read from: the invariants and the ADR index (layer 1) and the rule inventory, docs/design/handbook.md (layer 4); default, the repository this package sits in. Unread, each version says so'),
+    }).description('The per-Worker handbook slice and its bound (docs/design/handbook.md)'),
+    enforce: z.object({
+      evidenceGate: z.union(['off', 'warn', 'on']).default('on').description('The evidence gate at the end of a writing step of a board task\'s run: on refuses a step that shows no output of its required checks, warn records that refusal and lets the step end, off does not look'),
+      handbookBound: z.union(['warn', 'on']).default('on').description('The handbook slice\'s bound: on refuses a slice over it once the warn period (handbook.warnTasks) is over, warn always sends it whole and records it; handbook.enabled false gives no slice'),
+      reviewGuides: z.union(['off', 'on']).default('on').description('The selection of the REVIEW.md guides of the areas a review\'s change touches: off gives a review none'),
+      redOnBase: z.union(['off', 'warn', 'on']).default('warn').description('The red-on-base check a policy rule requires of a result of the normal or heavy tier (its new tests must fail on its base tree): on holds the result to it, warn runs it, records what it would refuse, and judges the result as if it passed (the start value), off does not ask it'),
+    }).description('Each gate-like mechanism\'s start mode (ADR-0078); the plugin host\'s live override (system enforce set) wins, read at each use'),
     maxReviewCycles: z.natural().min(1).max(5).default(3).description('Reviews of one change, the first included, before remediation stops'),
+    fixSessionWaitMinutes: z.number().min(0).max(1440).default(60).description('Minutes a review\'s fix that continues its author\'s session waits for that session\'s Worker while it cannot take the fix now (out of quota, signed out, not listed), from the fix\'s first wait, spending no attempt; past it, the session is handed off to another Worker with its earlier turns, recorded (INV-9); 0 hands off at once'),
     tieTimeoutHours: z.number().min(0.0001).max(720).default(24).description('Hours a tied team waits for a deciding vote, then completes inconclusive (INV-9)'),
     gateTimeoutHours: z.number().min(0.0001).max(720).default(24).description('Hours a plan\'s gate waits for the operator\'s approval, then closes and fails the run, by rule (INV-9); continue the run to wait again'),
     approvalPollSeconds: z.natural().min(1).max(300).default(15).description('Seconds between the engine\'s reads of the approval queue: a remediation fix\'s request while its run waits on it, and the requests a Worker\'s deferred tool calls wait on (INV-9)'),
+    landingBatch: z.natural().min(1).max(8).default(1).description('Accepted results the head of a target branch\'s landing queue lands at once, as a stack rebased in order and checked once (a merge train); a stack that fails is bisected to the failing result, which goes back alone. 1 lands one at a time, no batching'),
     deferredCommandMinutes: z.number().min(0).max(1440).default(10).description('Minutes a board task\'s step waits on the operator for a Worker\'s deferred tool call of class command (from its request\'s creation), then treats that call as denied, for it alone: the request is withdrawn, recorded as a recovery decision deny, and the session continues once, told the call was denied (INV-9); 0 waits until the request expires'),
     maxSessionRuns: z.natural().min(1).max(50).default(5).description('Runs one session may serve when a board task\'s next attempt, or the next task of a chain, resumes the session of the work before it (INV-9); past it, the run starts a fresh session given its brief'),
+    resumeAcrossAttempts: z.boolean().default(true).description('Whether a board task\'s next attempt resumes the session of its previous attempt (T369, PROP-0022 change 4); false: it starts a fresh session given its brief and the task\'s dossier (the previous diff, checks, and open findings), so a long session is not re-read on every turn of the next attempt'),
     tasksFile: z.object({
       maxTasks: z.natural().max(10_000).default(200).description('Tasks it lists at most, open ones first, the rest counted; 0 writes no file'),
       maxChars: z.natural().min(1024).max(1_048_576).default(65_536).description('Characters it holds at most; past it, it is cut at a line with a note'),
@@ -146,13 +177,48 @@ export class Workflow extends Service {
       maxRunning: z.natural().min(1).max(10_000).description('Dispatched runs not finished, with the asks open or approved, at most (at most maxActiveRuns less leaveRunsFree; default 8, or that when less)'),
       maxRunningPerProject: z.natural().min(1).max(16).default(2).description('The same, per project'),
       maxRunningPerAccount: z.natural().min(1).max(16).default(1).description('The same, per account of the chosen Worker; and the most its account\'s load may be for it to be free'),
+      maxRunningUnreadPerAccount: z.natural().min(1).max(16).default(1).description('Dispatched runs or asks at most on an account none of whose windows has a reading yet (its pool is configured unknown: available); it is ordered after every account with headroom, and a reading replaces this bound (T294)'),
       maxRunningPerRepository: z.natural().min(1).max(16).default(4).description('The same, per repository (the chosen writing Worker\'s workspace): tasks without a write subject on one repository run in parallel up to this (D64)'),
       leaveRunsFree: z.natural().max(10_000).description('Active runs dispatch leaves for the lead\'s and your own starts (at most maxActiveRuns less 1; default 4, or that when less)'),
       maxOpenAsks: z.natural().min(1).max(32).default(4).description('Dispatch requests open at once, waiting for your go'),
       approvedHoldMinutes: z.natural().min(1).max(240).default(30).description('Minutes an approved start waits for its Worker to be free; past it the approval is used for nothing and dispatch chooses again'),
       maxPerHour: z.natural().max(120).default(6).description('Starts dispatch makes in any rolling hour, counted from its rows (PROP-0014 D2); 0 starts nothing'),
       maxPerHourPerProject: z.natural().max(120).description('The same, per project (at most maxPerHour; default 3, or maxPerHour when less)'),
+      advisor: z.object({
+        provider: z.union(['none', 'local', 'model']).default('none').description('Who advises each dispatch choice, in shadow (PROP-0015 J1): none (the default), no advisor; local, a logistic regression fitted on this host\'s own recorded outcomes (no data leaves the host); model, the model Worker named by model.worker (metered; off unless set). The advice is recorded as an input of the choice and never changes it'),
+        timeoutMs: z.natural().min(100).max(120_000).default(2000).description('Milliseconds one advice may take; past it, it is recorded unavailable and the choice stands'),
+        maxPerHour: z.natural().min(1).max(10_000).default(120).description('Advisor calls in any hour at most (INV-9); past it, unavailable'),
+        minLabelled: z.natural().min(10).max(MAX_TRAINING).default(30).description('Labelled dispatched attempts the local adapter needs before it answers (at most the examples it keeps); until then, insufficient data'),
+        l2: z.number().min(0.001).max(1000).default(1).description('The local adapter\'s L2 penalty'),
+        // Not z.object: an omitted object would come back as {} and read as a model with no Worker.
+        model: z.any().description('The model adapter {worker, maxTokens}: worker, the model Worker asked (model:<id> of the models row); maxTokens, its output bound (64 to 8192, default 1024). Features only (no task text) are sent, through the Worker\'s own egress check; checked when the row loads'),
+      }).description('The dispatch advisor in shadow (PROP-0015 J1; docs/design/workflow-engine.md#the-dispatch-advisor-in-shadow)'),
     }).description('Dispatch: System starts ready board tasks on free Workers chosen by quota, under the action class dispatch (docs/design/workflow-engine.md#dispatch-starting-ready-work-by-itself)'),
+    scheduledReview: z.object({
+      enabled: z.boolean().default(false).description('Review one area of the repository a day, round robin among the areas its review guides name, and propose each confirmed important finding as a board task (D93 item 8; docs/design/handbook.md#scheduled-review). Off by default: the operator turns it on, with projectId and repository'),
+      projectId: z.string().description('The board project the findings are proposed in (required when enabled)'),
+      repository: z.string().description('Absolute path of the git repository whose review guides name the areas, read at the tip of ref and never from its working tree (required when enabled)'),
+      ref: z.string().default('dev').description('The branch or ref reviewed, at its tip (default dev)'),
+      hourUtc: z.natural().max(23).default(3).description('The UTC hour from which the day\'s review may start; one scheduled review a day at most (default 3)'),
+      maxTasksPerRun: z.natural().min(1).max(20).default(5).description('The most tasks one review proposes (INV-9); the rest of its confirmed findings are counted as capped, not filed (default 5)'),
+      maxFiles: z.natural().min(1).max(400).description('Files of the area one review reads at most (default 80); an area that does not fit is read as consecutive windows, each round starting where the last ended, so every file is read in turn; the files left named'),
+      maxBytes: z.natural().min(10_000).max(4_000_000).description('Bytes of the area one review reads in all (default 400,000)'),
+      maxFileBytes: z.natural().min(1000).max(500_000).description('A larger file is listed as not read (default 60,000)'),
+      timeoutMinutes: z.natural().min(1).max(1440).description('Minutes a review run may take before the review is recorded as unfinished (default 120)'),
+      actionClass: z.string().description('The action class the proposed tasks carry (default workspace-write)'),
+      taskTemplate: z.string().description('The board task template the proposed tasks name, when the project uses one (default none)'),
+      template: z.string().description('The workflow template a review runs (default scheduled-review, which the software-development profile provides)'),
+    }).description('The scheduled review of existing code, one area a day, filing confirmed findings as proposed board tasks (docs/design/handbook.md#scheduled-review)'),
+    dailyCheck: z.object({
+      enabled: z.boolean().default(false).description('Run the whole suite, every browser spec with it, on the tip of ref once a day, and propose a failure as one board task (T305b; docs/engineering/testing.md). Off by default: the operator turns it on, with projectId and repository, and a worktreeSetup of that repository (agent-workers) with a tests check'),
+      projectId: z.string().description('The board project a failure is proposed in (required when enabled)'),
+      repository: z.string().description('Absolute path of the git repository whose tip is checked, in a worktree of its own and never its working tree (required when enabled)'),
+      ref: z.string().default('dev').description('The branch or ref checked, at its tip (default dev)'),
+      hourUtc: z.natural().max(23).default(4).description('The UTC hour from which the day\'s run may start; one scheduled run a day at most (default 4)'),
+      timeoutMinutes: z.natural().min(1).max(1440).description('Minutes a run may take before it is recorded as an error (default 180)'),
+      actionClass: z.string().description('The action class the proposed task carries (default workspace-write)'),
+      taskTemplate: z.string().description('The board task template the proposed task names, when the project uses one (default none)'),
+    }).description('The daily run of every browser spec on the tip of a ref, filing a failure as one board task (docs/engineering/testing.md)'),
     repositories: z.object({
       hosts: z.array(z.string()).default(['github.com']).description('Hosts a review may read a public repository from'),
       maxFiles: z.natural().min(1).max(200).description('Files a review reads from a repository (default 40)'),
@@ -169,6 +235,8 @@ export class Workflow extends Service {
     const engine = new Engine(ctx, config)
     this.engine = engine
     ctx.store.migrate('workflow', MIGRATIONS)
+    // What a stop or restart left in flight, read before the board's attach or the recovery schedules anything (ADR-0069).
+    engine.noteInherited()
     ctx.effect(() => {
       queueMicrotask(() => {
         purge(engine)
@@ -178,7 +246,13 @@ export class Workflow extends Service {
         // A restart is a pass (INV-4): dispatch looks once its runs are reconciled.
         void engine.dispatch.sweep()
       })
-      const daily = setInterval(() => purge(engine), 24 * 60 * 60_000)
+      // The day's scheduled review, when the operator turned it on and it has not run today: the first
+      // pass is one interval after start, so a restart never starts a review on the board's first moments.
+      const reviewing = engine.scheduledReviews.enabled ? setInterval(() => void engine.scheduledReviews.tick(), 15 * 60_000) : undefined
+      reviewing?.unref()
+      const checking = engine.dailyChecks.enabled ? setInterval(() => void engine.dailyChecks.tick(), 15 * 60_000) : undefined
+      checking?.unref()
+      const daily =setInterval(() => purge(engine), 24 * 60 * 60_000)
       daily.unref()
       // Dispatch (ADR-0064): every dispatch.sweepSeconds; with dispatch.enabled false, no timer runs.
       const dispatching = engine.dispatch.settings.enabled ? setInterval(() => void engine.dispatch.sweep(), engine.dispatch.settings.sweepSeconds * 1000) : undefined
@@ -193,6 +267,8 @@ export class Workflow extends Service {
       deferrals.unref()
       return async () => {
         clearInterval(daily)
+        clearInterval(reviewing)
+        clearInterval(checking)
         clearInterval(deferrals)
         clearInterval(dispatching)
         await engine.close()
@@ -204,6 +280,10 @@ export class Workflow extends Service {
       const board = c.board
       engine.tasks.attach(board)
       c.effect(() => () => engine.tasks.detach(board))
+      // A scheduled review a stop or restart cut is settled from its durable run (INV-4), schedule on or not.
+      queueMicrotask(() => void engine.scheduledReviews.reconcile().catch((error: unknown) => ctx.logger.warn(`workflow: scheduled reviews were not reconciled: ${(error as Error)?.message ?? String(error)}`)))
+      // A daily run a stop or restart cut resumes its own stored check (INV-4), schedule on or not.
+      queueMicrotask(() => void engine.dailyChecks.reconcile().catch((error: unknown) => ctx.logger.warn(`workflow: daily checks were not reconciled: ${(error as Error)?.message ?? String(error)}`)))
     })
     ctx.on('worker-sessions/delivered', (sessionIds) => {
       for (const id of sessionIds) wakeSafely(engine, id)
@@ -227,19 +307,45 @@ export class Workflow extends Service {
   }
 
   /**
+   * Hold steps (the operator's, while a live update waits to stop the host; T257): each running run
+   * finishes the step it is in and starts no next one until {@link releaseSteps}, or the next start
+   * of the host, which ends a hold left over. Returns the hold and the steps still in flight.
+   * Holding a held engine changes nothing; dispatch's pause is a separate thing.
+   */
+  holdSteps(reason?: string): HoldView {
+    return hold(this.engine, reason)
+  }
+
+  /** Release the hold between steps: every running run is scheduled again and goes on from its recorded state. */
+  releaseSteps(): HoldView {
+    return release(this.engine, 'operator')
+  }
+
+  /** The hold between steps, if one is set, and the steps in flight. A read only. */
+  stepHold(): HoldView {
+    return holdView(this.engine)
+  }
+
+  /**
    * A profile contributes a procedure (REQ-WF-9; the `profiles` seam in
    * docs/architecture/plugin-model.md). The template is checked like a configured one (preflight)
    * and served until the returned disposer runs; admitted runs keep their resolved spec, so
    * withdrawing a template never touches them. Its acceptance contracts come from `ctx.workers`.
    */
-  template(name: string, nodes: NodeTemplate[]): () => void {
+  template(name: string, nodes: NodeTemplate[], options: { version?: string } = {}): () => void {
     const templates = this.engine.templates
     if (!/^[a-z][a-z0-9-]{0,63}$/.test(name)) throw new TypeError(`template name ${name} must be lowercase letters, digits, and hyphens`)
     if (templates[name]) throw new Error(`template ${name} already exists`)
+    if (options.version !== undefined && !/^[0-9A-Za-z.+-]{1,64}$/.test(options.version)) throw new TypeError(`template ${name}'s version ${options.version} must be a package version`)
     this.engine.check(name, nodes)
     templates[name] = nodes
+    // The version of the package that contributes it: a step's handbook slice names its playbook by it (docs/design/handbook.md).
+    if (options.version !== undefined) this.engine.templateVersions.set(name, options.version)
     return () => {
-      if (templates[name] === nodes) delete templates[name]
+      if (templates[name] === nodes) {
+        delete templates[name]
+        this.engine.templateVersions.delete(name)
+      }
     }
   }
 
@@ -281,6 +387,48 @@ export class Workflow extends Service {
     return this.engine.start(input)
   }
 
+  /**
+   * The project a run belongs to (T285, ADR-0076): its board task's project, else the project a lead
+   * tagged it with when it started it, else, for a run derived from a session (a Worker's wake on a
+   * message, a compaction, a continued conversation), the project of the run that session came from.
+   * Undefined for a run of none of these (an operator's ask, say) and for an unknown run: no lead reaches it.
+   */
+  async projectOfRun(runId: string): Promise<string | undefined> {
+    return this.projectOf(runId, new Set())
+  }
+
+  /**
+   * The project a session belongs to: that of the run it was made for, else of its first run.
+   * Undefined for a session of no project and for an unknown one: no lead reaches it.
+   */
+  async projectOfSession(sessionId: string): Promise<string | undefined> {
+    const origin = this.engine.ctx.workerSessions.session(sessionId)?.runId
+      ?? (this.engine.ctx.store.db.prepare('SELECT run_id FROM workflow_runs WHERE session_id = ? ORDER BY created_at, run_id LIMIT 1').get(sessionId) as { run_id: string } | undefined)?.run_id
+    return origin === undefined ? undefined : this.projectOfRun(origin)
+  }
+
+  /** The project of a board task, as the board holds it; undefined when there is no board or no such task. */
+  async projectOfTask(taskId: string): Promise<string | undefined> {
+    return (await this.engine.board?.task(taskId))?.projectId
+  }
+
+  /** {@link projectOfRun}, following a session to the run it came from; `seen` ends a cycle. */
+  private async projectOf(runId: string, seen: Set<string>): Promise<string | undefined> {
+    if (seen.has(runId)) return undefined
+    seen.add(runId)
+    const row = this.engine.tasks.row(runId)
+    if (row) return (await this.engine.board?.task(row.task_id))?.projectId
+    const db = this.engine.ctx.store.db
+    const run = db.prepare('SELECT project_id, session_id FROM workflow_runs WHERE run_id = ?').get(runId) as { project_id: string | null; session_id: string | null } | undefined
+    if (!run) return undefined
+    if (run.project_id !== null) return run.project_id
+    if (run.session_id === null) return undefined
+    // The run the Worker session was made for, else the session's first run.
+    const origin = this.engine.ctx.workerSessions.session(run.session_id)?.runId
+      ?? (db.prepare('SELECT run_id FROM workflow_runs WHERE session_id = ? ORDER BY created_at, run_id LIMIT 1').get(run.session_id) as { run_id: string } | undefined)?.run_id
+    return origin === undefined || origin === runId ? undefined : this.projectOf(origin, seen)
+  }
+
   get(runId: string): RunView | undefined {
     return this.engine.get(runId)
   }
@@ -293,6 +441,45 @@ export class Workflow extends Service {
   landing(runId: string): TaskLanding | undefined {
     const row = this.engine.tasks.row(runId)
     return row ? this.engine.tasks.landings.view(row) : undefined
+  }
+
+  /** Every open landing of every target's queue, queue by queue in order (the lead brief's landing queue, PROP-0019); at most 500, `more` when there are more. */
+  openLandings(): { landings: OpenLanding[]; more: boolean } {
+    return openLandings(this.engine)
+  }
+
+  /**
+   * A page of a board task's dossier (ADR-0070), by the task or by a run that serves it: every entry
+   * whole, as appended, oldest first from `from`, at most 50; `next` names the next page's `from`.
+   */
+  dossier(input: { taskId?: string | undefined; runId?: string | undefined; from?: number | undefined; limit?: number | undefined }): DossierPage {
+    return this.engine.tasks.dossiers.read(input)
+  }
+
+  /**
+   * Append a Worker's entry to its task's dossier for the step it runs (ADR-0070): the `dossier_append`
+   * a Worker source gives its run, bound to `caller` (the workflow run, step, and execution from the
+   * source's own record, never from the agent's input), whose Worker is the entry's author. Refused
+   * unless `caller.execution` is the one the step runs now, the kind is one its role writes (never
+   * `evidence`), and the text is 1 to 4000 characters. Not a tool of System's own MCP surface: there a
+   * caller would name the step. The entry never changes once appended.
+   */
+  appendToDossier(caller: DossierCaller, input: DossierAppendInput): { id: string; seq: number } {
+    return this.engine.tasks.dossiers.appendByWorker(caller, input)
+  }
+
+  /**
+   * Keep a command a step's Worker ran (T284): the command, its exit code as its runtime reports it,
+   * whether the tool reported an error, and a bounded tail of its output, which the step's evidence
+   * gate reads. Bound to `caller` as {@link appendToDossier} is; refused unless the step runs now.
+   */
+  recordCommand(caller: DossierCaller, report: CommandRecord): void {
+    this.engine.tasks.dossiers.recordCommand(caller, report)
+  }
+
+  /** `dossier_read` for a step's Worker, bound to `caller` as {@link appendToDossier} is: a page of its own task's dossier. */
+  readDossier(caller: DossierCaller, page: { from?: number | undefined; limit?: number | undefined } = {}): DossierPage {
+    return this.engine.tasks.dossiers.readByWorker(caller, page)
   }
 
   /**
@@ -331,6 +518,61 @@ export class Workflow extends Service {
    */
   sweepDispatch(at?: Date): Promise<DispatchPass> {
     return this.engine.dispatch.sweep(at)
+  }
+
+  /**
+   * The scheduled review's pass at `at` (D93 item 8): when `scheduledReview.enabled`, from its UTC hour,
+   * and none is recorded for the day, the day's area (one per day, round robin among the review guides
+   * at the tip of the configured ref) is read whole, reviewed at the frontier tier, each important
+   * finding verified by a second reviewer, and each confirmed one proposed as a board task, at most
+   * `maxTasksPerRun`, none that duplicates an open task. A test seam as `sweepDispatch(at)` is; the
+   * engine's own timer calls it every 15 minutes. Undefined when nothing was due.
+   */
+  scheduledReviewTick(at?: Date): Promise<ScheduledReviewRow | undefined> {
+    return this.engine.scheduledReviews.tick(at)
+  }
+
+  /**
+   * The daily check's pass at `at` (T305b): when `dailyCheck.enabled`, from its UTC hour, and none is
+   * recorded for the day, the whole suite with every browser spec runs on the tip of the configured ref,
+   * and a failure is proposed as one board task (none while an earlier one is open). A test seam as
+   * `scheduledReviewTick(at)` is; the engine's own timer calls it every 15 minutes. Undefined when nothing was due.
+   */
+  dailyCheckTick(at?: Date): Promise<DailyCheckRow | undefined> {
+    return this.engine.dailyChecks.tick(at)
+  }
+
+  /** A daily run now, outside the schedule: the operator's own run. Recorded as a manual run. */
+  dailyCheckNow(at?: Date): Promise<DailyCheckRow | undefined> {
+    return this.engine.dailyChecks.now(at)
+  }
+
+  /** The daily runs: the latest, the latest green, and the latest `limit` runs (default 30); a read of the engine's rows only. */
+  dailyCheckReport(limit?: number): DailyCheckReport & { text: string } {
+    const report = this.engine.dailyChecks.report(limit)
+    return { ...report, text: renderDailyReport(report) }
+  }
+
+  /** A scheduled review now, outside the schedule (`area` names a guide's area; else the day's): the operator's own run. Recorded as a manual review. */
+  scheduledReviewNow(at?: Date, area?: string): Promise<ScheduledReviewRow | undefined> {
+    return this.engine.scheduledReviews.now(at, area)
+  }
+
+  /** The scheduled reviews counted per area over time, and the latest `limit` reviews (default 60); a read of the engine's rows only. */
+  scheduledReviewReport(limit?: number): ScheduledReviewReport & { text: string } {
+    const report = this.engine.scheduledReviews.report(limit)
+    return { ...report, text: renderReport(report) }
+  }
+
+  /**
+   * A thin path to the dispatch advisor seam (PROP-0015 J1; the seam is `ctx.dispatchAdvisor`, defined
+   * in `@tsuuanmi/system-decision-core`): `advisor` answers every dispatch choice in place of the
+   * seam's provider and of the one `dispatch.advisor.provider` names, until set back with undefined.
+   * Its advice is recorded in shadow, as an input of the choice, and never changes it; its failures
+   * are recorded and ignored.
+   */
+  setDispatchAdvisor(advisor: Advisor | undefined): void {
+    this.engine.dispatch.setAdvisor(advisor)
   }
 
   /**
@@ -447,7 +689,7 @@ export class Workflow extends Service {
    * the exact tie decision the caller read, recorded with the caller (`client`) or the operator
    * as the decider. `inconclusive` ends the team without forcing a choice.
    */
-  vote(runId: string, input: { decision: string; option: string; rationale: string; by: 'client' | 'operator' }): RunView {
+  vote(runId: string, input: { decision: string; option: string; rationale: string; by: 'client' | 'operator'; lead?: string }): RunView {
     return vote(this.engine, runId, input)
   }
 }

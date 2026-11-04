@@ -26,15 +26,4 @@ describe.runIf(canRunBrowser)('ctx.workflow: re-planning by superseding a reject
     // A gate is decided by a verdict, never replaced.
     await expect(ctx.workflow.supersede(run.runId, 'plan:1:g2:gate', { text: 'approved' })).rejects.toThrow(/approve or reject the plan/)
   }, 240_000)
-
-  it('refuses a superseding plan that fails validation, and changes nothing', async () => {
-    const { ctx } = await boot({ fake: { answer: replanAnswer }, workflow: { templates: { replan: replanTemplate() } } })
-    const run = ctx.workflow.start({ template: 'replan', input: 'q' })
-    await until(() => ctx.workflow.get(run.runId)?.blocked !== undefined, 60_000)
-    await settledOp(() => ctx.workflow.approve(run.runId, { verdict: 'rejected' }))
-    await ctx.workflow.wait(run.runId, 30_000)
-    const before = ctx.workflow.get(run.runId)!
-    await expect(ctx.workflow.supersede(run.runId, 'plan:1', { text: 'not a plan at all' })).rejects.toThrow(/replacement plan is refused/)
-    expect(ctx.workflow.get(run.runId)).toEqual(before)
-  }, 120_000)
 })

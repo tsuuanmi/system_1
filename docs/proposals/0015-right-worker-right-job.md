@@ -15,9 +15,7 @@ implementation: []
 ## Problem
 
 On 2026-10-25 the operator asked how System should change to work efficiently, on five fronts, and
-how the Jev decision model could help. What System does today
-([T179 audit](../research/efficient-system-inputs-2026-10-25.md#t179-audit-codex-what-system-does-today),
-checked against this branch for this proposal):
+how the Jev decision model could help. What System does today:
 
 1. **Quota is read in two ways, and only one start path reads it.**
    - Dispatch (PROP-0014 D1, [ADR-0064](../decisions/adr/0064-system-starts-ready-work-under-the-dispatch-action-class.md))
@@ -26,20 +24,16 @@ checked against this branch for this proposal):
      `staleReadingSeconds` old, reads `ok`, and gives a used share. Headroom is
      `100 − used − reservePercent`, and a Worker is free only when every window is known with
      headroom above the reserve. With the default 20 % reserve (D63), dispatch starts nothing on an
-     account at 80 % or more of any window (`packages/libs/tests/quota.spec.ts` checks 79 % and
-     80 %).
-   - The roster's capacity summary (T152, `packages/gateway-core/src/capacity.ts`,
-     [capacity now](../design/roster.md#capacity-now)) computes its own `quotaOf`. It takes
-     `100 − used` with no reserve, ignores a window with no reset, has no staleness bound, and orders
-     free Workers by a per-minute urgency (`left / minutes to reset`). An account at 85 % is listed
-     free there (its tests do so on purpose) and is not free for dispatch. The lead reads that list
-     through MCP `roster` and `system capacity` to give work. The `libs` README says a capacity
-     summary reads `accountQuotaOf`, but `capacity.ts` does not import it. Two rules answer
-     "how much is left" differently.
+     account at 80 % or more of any window.
+   - The roster's capacity summary ([capacity now](../design/roster.md#capacity-now),
+     `packages/gateway-core/src/capacity.ts`) computes its own `quotaOf`: `100 − used` with no
+     reserve, no staleness bound, and a per-minute urgency (`left / minutes to reset`) for ordering.
+     An account at 85 % is listed free there (its tests do so on purpose) and is not free for
+     dispatch. The lead gives work from that list through MCP `roster` and `system capacity`.
    - Ordinary routing (a lead's or the operator's start, and every step after the first) orders by
      tier, quota class, load, priority, and id ([algorithm](../design/routing.md#algorithm)). It
-     reads whether a pool is available, not how full it is. PROP-0014's D3 (the score in every route)
-     is accepted and not started.
+     reads whether a pool is available, not how full it is. PROP-0014's D3 (the score in every
+     route) is accepted.
    - Nothing forecasts whether a task fits the quota left. A start with 1 % of headroom is
      admitted, and a window can close mid-run. The run then stops at its next step boundary
      ([fail-closed rules](../design/resources.md#fail-closed-rules)), and the attempt is spent.
@@ -91,43 +85,16 @@ checked against this branch for this proposal):
   start or a step.
 - **Rotating around limits.** Assigned accounts keep D24: a limit never moves work to a sibling
   account.
-- **Replacing the engine.** The research found no case for a new workflow framework
-  ([T177 H4](../research/efficient-system-inputs-2026-10-25.md#t177-research-quota-capabilities-operator-similar-systems-handoffs)).
+- **Replacing the engine.** No case was found for a new workflow framework.
 - **Worker-to-worker chat.** Handoffs are board tasks and artifacts, never messages that carry
-  authority (session messages grant none today).
+  authority (session messages grant none).
 - **A fixed number not yet measured.** No task-cost multiplier, no 30–50 % review gain, and no
-  routing saving from another workload is written into a rule. T177 and T181 found none of them
-  supported for System.
+  routing saving from another workload is written into a rule. None is supported for System.
 - **Changing an invariant.**
 
 ## Evidence and research
 
-The inputs are in [efficient-system-inputs-2026-10-25.md](../research/efficient-system-inputs-2026-10-25.md),
-whose summary condenses them, and in [jev-decision-model.md](../research/jev-decision-model.md).
-
-| Run | What it found | What this proposal takes |
-|---|---|---|
-| [Operator guidance](../research/efficient-system-inputs-2026-10-25.md#operator-guidance-on-jev) | One Jev call per decision point asks several questions, each a distribution; record all of it; hard gates before and after | J1's question set and record |
-| [T177 research](../research/efficient-system-inputs-2026-10-25.md#t177-research-quota-capabilities-operator-similar-systems-handoffs) | Hard eligibility and quota admission first; an 80 % ceiling and learned routing are unproven, so test them against simple baselines; an evidence-first inbox; provenance at every handoff; selective fresh-context review | E1 to E6; the 80 % band as an open question; shadow before effect |
-| [T178 brainstorm](../research/efficient-system-inputs-2026-10-25.md#t178-brainstorm-team-the-five-fronts) | O1 by majority: hard gates before scoring, per-window feasibility, typed handoff artifacts, one inbox, scorecards, then adaptive routing against a pinned baseline. O2's bands (65 % / 80 %) and fixed roles were not chosen | the order of the increments; bands only as configuration |
-| [T179 audit](../research/efficient-system-inputs-2026-10-25.md#t179-audit-codex-what-system-does-today) | Two quota rules (`quota.ts` and `capacity.ts`); no quality record; question waits outside Home; no in-step delegation | E1, E4, E5, E6 |
-| [T181 research](../research/efficient-system-inputs-2026-10-25.md#t181-research-jev-as-a-decision-model) | Jev exists (announced 2026-09-15, listed by a gateway). Its probabilities are not System's acceptance probabilities until calibrated on System's outcomes. Data permissions are unverified. Stages: feasibility, shadow, visible, bounded, monitored | J0 to J3 |
-| [T182 brainstorm](../research/efficient-system-inputs-2026-10-25.md#t182-brainstorm-team-jev-as-an-advisor) | O1: a provider-neutral advisor seam with Jev as an untrusted adapter; Worker ranking and quota forecast first; every candidate's score recorded; fallback to the deterministic score | J1's seam and fallback |
-| [jev-decision-model.md](../research/jev-decision-model.md) | Choice, score, and yes/no questions; many in one request; a 32k state bound; English first; not a security boundary; [where a model must not decide](../research/jev-decision-model.md#where-a-decision-model-must-not-be-used) | the question types, the bounds, the deny list |
-
-**What to borrow from similar systems** (front 4, from T177's sources):
-
-| From | Idea | In System |
-|---|---|---|
-| Kubernetes scheduler | filter, then score | already: routing's checks, then `quota-score` (E1 makes it one order) |
-| Slurm multifactor priority | several explicit factors, shown | already lexicographic keys with a reason per candidate; task priority is PROP-0014 D2 |
-| LiteLLM routing, AWS backoff | cooldowns per entitlement, bounded retries | already cooldowns per account and feature, and assigned accounts that wait |
-| Temporal | durable history, idempotent effects | already INV-4 and the crash suite; handoffs (E6) reuse the board's fenced moves |
-| SLSA, in-toto, GitHub artifacts | content-bound provenance checked at each consumer | artifacts have content ids and lineage; E6 makes a handoff a typed, hashed contract |
-| Elephant–goldfish model | an informed author, fresh-context critics, a human accountable | E6's child task gets the spec and evidence, never the author's transcript; merge stays the operator's |
-| GitHub review, SRE alerting | an inbox of actionable items; alert only on what needs a person | E5 |
-| RouteLLM, FrugalGPT | learned routing can trade cost for quality | J1 to J3, in shadow first, against `quota-score` |
-| Vibe Kanban, Copilot coding agent | task-centric, reviewable runs | already the board and a worktree per run; a design reference, not a dependency |
+Its research is in [efficient-system-inputs-2026-10-25.md](../research/efficient-system-inputs-2026-10-25.md) and [jev-decision-model.md](../research/jev-decision-model.md).
 
 ## Proposed design
 
@@ -156,24 +123,22 @@ flowchart TD
 **E1: one quota rule.** `accountQuotaOf` (in `libs`) becomes the only reading of an account's
 windows. The roster's capacity summary drops its own `quotaOf` and `urgency`:
 
-- Capacity is made with the ledger's quota settings (`quota()`) beside the pools it reads now. A
-  Worker is in `free` only when its account is free by `accountQuotaOf`: every window known (fresh,
-  `ok`, a used share), with headroom above the reserve. That is dispatch's meaning. Without
-  `quota()`, as for dispatch, no Worker is free by quota.
+- Capacity uses the ledger's quota settings (`quota()`) beside the pools it reads now. A Worker is in
+  `free` only when `accountQuotaOf` finds its account free: every window known (fresh, `ok`, a used
+  share), with headroom above the reserve, as for dispatch. Without `quota()`, no Worker is free by quota.
 - A new list, `inReserve`, shows the Workers that are ready and known but whose account has a window
   at or past the reserve. Their quota is the operator's own; the lead may still start them by hand,
   as routing allows.
 - `free` is ordered by the quota score's account keys, exported from `libs` as one function: known
   first, a window about to reset with enough headroom first, headroom in buckets, then load and id.
   The per-minute urgency goes: it is a weighted ratio, which PROP-0014 rejected for being hard to
-  explain (alternative 5), and the use-soon key already says "use it before it resets".
+  explain, and the use-soon key already says "use it before it resets".
 - `likely` (the Worker a start would most likely go to) is read in that order. It stays a forecast:
   routing decides at the start.
 - `mcp-roster@1.8` adds `inReserve`, each free Worker's binding window and its headroom, and the
   reserve. It is additive. `quota-score@1` does not change: dispatch's behaviour is the same.
-- After E1, the `libs` README's statement that capacity reads `accountQuotaOf` is true.
 
-**E2: what an attempt drew.** ADR-0059 already reads an account's usage report after every run of a
+**E2: what an attempt drew.** ADR-0059 reads an account's usage report after every run of a
 derived Worker on a declared pool. E2 records, per agent run, each window's used share in the last
 reading before the run and the first reading after it, as a `quota-draw@1.0` evidence record. The
 record holds the run, Worker, account, step, kind, and template, and how many other runs on the
@@ -186,18 +151,15 @@ time, or when the used share decreased; it never enters the figures. It is marke
 overlapped. Nothing is estimated (resources rule 3): a missing reading leaves no draw, and a draw is
 never negative.
 
-**One unit: percentage points of the window's allowance.** A draw is always the rise in the
-window's used share, in percentage points, so it compares directly with headroom (also percentage
-points, `100 − used − reserve`). When the provider reports authoritative consumption for the run
+**One unit: percentage points.** A draw is the rise in the window's used share, so it compares
+directly with headroom (`100 − used − reserve`). When the provider reports authoritative consumption for the run
 (tokens or units drawn, not a share), that figure becomes the draw only if the provider also reports
 that window's authoritative allowance in the same unit for the same epoch: the draw is then
 `100 × consumed ÷ allowance` percentage points, and the entry records the raw figure, the allowance,
 and their source. Without such an allowance the entry is marked `units-only`: the raw figure is
 kept for the report and never enters the percentiles or a fit forecast. A run whose authoritative
-figure spans a reset stays `reset-crossing`, since no single epoch's allowance applies to it. The
-report and `system usage` give, per kind, template step, and window, the count of clean draws (all
-in percentage points) and their median and 90th percentile, and the count of excluded entries by
-reason (`reset-crossing`, `confounded`, `units-only`, missing reading).
+figure spans a reset stays `reset-crossing`, since no single epoch's allowance applies to it. The report and `system usage` give, per kind, template step, and window, the clean-draw count, median,
+and 90th percentile, and the excluded count by reason (`reset-crossing`, `confounded`, `units-only`, missing reading).
 
 **E3: fit before start, and the light band.** A dispatched start, and with PROP-0014's D3 every
 route, also needs the step to **fit**, and fit holds **independently for every window** of the
@@ -211,11 +173,11 @@ the start wait. Between the reserve and `reserve + quota.lightBandPercent` (defa
 65 % to 80 % used with the defaults), a window takes only steps whose draw in that window is
 measured and fits. Unmeasured work does not go there. The decision records every window's headroom,
 forecast, and draw count, and names each window that failed. This is the operator's "lighter or no work above ~80 %",
-given as configuration and not hard-coded (T177 found no evidence for a fixed band).
+given as configuration and not hard-coded.
 
-- E3 ships in **shadow** first: the `dispatch.choice` decision says "would not fit: 5 h headroom 6,
-  p90 draw of docs work 9 (n 14); weekly headroom 40, p90 3 (n 14), fits", and nothing is refused. The gate is turned on per configuration
-  after the shadow period ([open question 4](#open-questions-answered)).
+- E3 ships in **shadow** first: the `dispatch.choice` decision says "would not fit" and names the
+  window, and nothing is refused. The gate is turned on per configuration
+  after the shadow period ([D74](#decision)).
 - A fit is a forecast from recorded draws, so it lowers the risk of a limit mid-task and does not
   remove it. The measure is limit interruptions per 100 dispatched attempts, before and after.
 - Unknown is never capacity. An unknown window is still not free, and a missing draw history takes
@@ -223,8 +185,8 @@ given as configuration and not hard-coded (T177 found no evidence for a fixed ba
 
 ### Front 2. Right Worker, right job
 
-**Declared** strengths stay configuration, as ADR-0057 decided, and no template names a vendor
-(INV-11). The operator's split maps onto what exists:
+**Declared** strengths stay configuration (ADR-0057), and no template names a vendor (INV-11).
+The operator's split:
 
 | Work | Kind or capability | Who, by configuration |
 |---|---|---|
@@ -232,7 +194,7 @@ given as configuration and not hard-coded (T177 found no evidence for a fixed ba
 | docs and tests writing | kinds `docs`, `tests` | the operator's choice, by kinds |
 | validation (`validate:1`) | kind `validation` (ADR-0057 amendment) | Codex Workers given `validation` |
 | review | a read-only `review` step; team review members | Codex review members (ADR-0049) |
-| test running on the Antigravity CLI | `validate` needs `executes` | not possible yet: the roadmap records that the Antigravity CLI writes no docs or tests (no commands for `validate:1`); it takes the kind once it proves `validate` |
+| test running on the Antigravity CLI | `validate` needs `executes` | not possible yet: the CLI has no commands for `validate:1`; it takes the kind once it proves `validate` |
 | research over many outside sources | `web-search` or `deep-research` | website Workers, the only ones that prove them |
 
 **E4: measured strengths.** A read model, like the report, over decisions already recorded. It
@@ -248,8 +210,7 @@ and kind of each step, taken from that step's `route` decision:
 
 - Each figure is shown with its count, never as a bare rate. Fewer than `strengths.minCount`
   (default 10) reads "too few". The roster's Worker card and the report show it per kind.
-- Untried pairs are not failures. A Worker never routed a kind has no figure for it, which keeps
-  T181's selective-observation caveat.
+- Untried pairs are not failures: a Worker never routed a kind has no figure for it.
 - E4 changes no route. Measured strengths reach routing only through an evaluation (J3, or a
   PROP-0011 experiment) that compares them with the declared split.
 
@@ -271,16 +232,14 @@ digest, the diff), and its direct control:
 - The report's weekly view gains a "decided for you" section: what started by itself, what was
   accepted without the operator, and why. The operator reads it rather than being interrupted.
 - **Talking.** The operator talks to the lead in plain language, and the lead acts through MCP.
-  Consequential changes stay typed, previewed, and confirmed (approvals, policy changes). A run's
-  questions are batched already (1 to 8 per attempt, answered together). A run should ask the
+  Consequential changes stay typed, previewed, and confirmed (approvals, policy changes). A run's questions are batched (1 to 8 per attempt, answered together). A run should ask the
   operator only what the lead cannot answer; the brief says so, and nothing classifies it by model.
 
 ### Front 5. Handoffs between Workers
 
 **E6: a step may hand work off.** A board task's Worker step may end its result with
 `{"handoffs": [...]}`, the way it may end with `{"questions": [...]}`
-([a question from a run](../design/workflow-engine.md#a-question-from-a-run)). Each handoff is a
-`handoff@1.0` body:
+([a question from a run](../design/workflow-engine.md#a-question-from-a-run)). Each handoff is a `handoff@1.0` body:
 
 ```ts
 Handoff {                      // handoff@1.0
@@ -299,7 +258,7 @@ Handoff {                      // handoff@1.0
   board's gate on its action class applies). The parent task waits under a new wait reason,
   `handoff`, which names the child tasks.
 - **Back to the author.** When every child is `done`, the parent's next attempt goes through the
-  gate as after an answered question. Its brief already adds accepted predecessor results by
+  gate as after an answered question. Its brief adds accepted predecessor results by
   pointer, digest first ([a board task's brief](../design/workflow-engine.md#a-board-tasks-brief)),
   so the author builds on the children's accepted results. A cancelled or expired child leaves the
   parent waiting for input, with the reason.
@@ -320,8 +279,7 @@ up for routing advice. `decisions-rules` is the baseline provider: historical ra
 from E2. `decisions-jev` is the vendor adapter, version-pinned. The seam's caller is the core.
 Advice is an input, never authority.
 
-**One query per decision point.** For a dispatch choice (J1's first and only point), after the hard
-gates, the engine sends one request. Its state is features, not text, by default ([open question 3](#open-questions-answered)):
+**One query per decision point.** For a dispatch choice after the hard gates, the engine sends one request. Its state is features, not text, by default ([D73](#decision)):
 the template and step, the kind, each free candidate under an alias (`A`, `B`, …) with its quota
 line from `quota-score`, its E4 figures, and its kind's E2 draws. The questions
 (`dispatch-advice@1`) are:
@@ -354,12 +312,12 @@ line from `quota-score`, its E4 figures, and its kind's E2 draws. The questions
 - **Calibration.** When an attempt's outcome is known (its acceptance, a limit hit or not, a wait on
   the operator), a scoring pass computes the Brier score and log loss of each question, against the
   `decisions-rules` baseline. It scores the chosen candidate's per-candidate questions only, since
-  untried candidates have no outcome (T181).
-- **Egress** (INV-12). The state sent to the vendor is egress, checked on the actual payload under
+  untried candidates have no outcome.
+- **Egress** (INV-12). The state sent to a vendor is checked on the actual payload under
   the adapter's declared class. Task text, file names, and source code are not sent unless the
   operator decides otherwise.
 
-**Stages** (from T181): J0 feasibility on synthetic requests (contract, latency, price, data terms);
+**Stages**: J0 feasibility on synthetic requests (contract, latency, price, data terms);
 J1 shadow (advice recorded, no effect); J2 visible (the advice shown beside each dispatch ask on Home,
 the deterministic choice still authoritative); J3 bounded (advice may reorder free candidates of equal
 tier and quota class, only after a preregistered evaluation under PROP-0011 shows non-inferior
@@ -385,41 +343,20 @@ the operator's go-ahead.
 
 | Increment | Delivers | Depends on |
 |---|---|---|
-| **E1** One quota rule (buildable now, no new vendor) | capacity reads `accountQuotaOf` with the reserve and the staleness bound; `free` in the quota score's account order; `inReserve`; `mcp-roster@1.8`; the urgency ratio retired; a test proving capacity's free set equals the set dispatch reads as free by quota on the same pools | — |
-| **E2** Quota drawn per attempt | `quota-draw@1.0` from the readings before and after each agent run, per account and window; same window epoch required, reset-crossing and decreasing readings excluded; confounded marked; draws by kind and window in the report and `system usage` | — |
-| **E3** Fit before start | the fit key (every window must fit) and the light band in `dispatch.choice`, shadow first, then a gate by configuration; in every route once PROP-0014 D3 is built | E1, E2 |
-| **E4** Measured strengths | the outcome projection by Worker and kind, with counts; on the Worker card and in the report | — |
-| **E5** Needs you | Home's single list with controls; `board.question` notifications; the report's "decided for you" | — |
-| **E6** Handoffs | `handoff@1.0`; the `handoffs` result; child tasks; the `handoff` wait; fresh-context briefs; its ADR | E5 (questions on the same surface) |
-| **J0** Jev feasibility | synthetic calls only: the request and response contract, latency, price, and data terms checked; no System data sent | — (the operator answered [open question 3](#open-questions-answered): features only, D73) |
-| **J1** Advisor in shadow | the `decisions` seam, `decisions-rules`, `decisions-jev`; one query per dispatch choice; the full distribution recorded; calibration scored | J0, E2, E4 |
-| **J2** Visible advice | the advice beside each dispatch ask on Home; calibration per question in the report | J1 and its shadow period |
-| **J3** Bounded advice | reorder among equal tier and quota class, after a preregistered evaluation; its ADR | J2, PROP-0011 F4 |
+| **E1** One quota rule | capacity reads `accountQuotaOf`; `free` in the quota score's order; `inReserve`; `mcp-roster@1.8`; the urgency ratio retired | — |
+| **E2** Quota drawn per attempt | `quota-draw@1.0` per account and window; draws in the report and `system usage` | — |
+| **E3** Fit before start | the fit key and the light band in `dispatch.choice`, shadow first, then a gate by configuration | E1, E2 |
+| **E4** Measured strengths | the outcome projection by Worker and kind, with counts | — |
+| **E5** Needs you | Home's single list with controls; `board.question` notifications; the "decided for you" section | — |
+| **E6** Handoffs | `handoff@1.0`; the `handoffs` result; child tasks; the `handoff` wait; fresh-context briefs | E5 |
+| **J0** Jev feasibility | synthetic calls only; no System data sent | — |
+| **J1** Advisor in shadow | the `decisions` seam and its providers; one query per dispatch choice; calibration scored | J0, E2, E4 |
+| **J2** Visible advice | the advice beside each dispatch ask on Home, calibration per question in the report | J1 and its shadow period |
+| **J3** Bounded advice | reorder among equal tier and quota class, after a preregistered evaluation | J2, PROP-0011 F4 |
 
 **ADRs on acceptance:** one quota rule for capacity and dispatch (E1, amending ADR-0064's
 consequences); fit before start (E3); handoffs and the `handoff` wait (E6); a decision advisor seam
 whose advice never widens a gate (J1).
-
-## Alternatives considered
-
-1. **Keep two quota rules, documented.** Capacity would stay a "use it or lose it" view and
-   dispatch a gate. Rejected: the lead gives work from capacity's list, so two meanings of "free"
-   send the lead to accounts dispatch keeps for the operator. The research asked for one meaning.
-2. **Fixed bands** (O2: under 65 % normal, 65 % to 80 % light only, over 80 % drain). Rejected as
-   hard-coded numbers with no measurement behind them. E3 keeps the shape as configuration, fed by
-   E2's draws.
-3. **Jev decides now.** It would put an unmeasured, uncalibrated model between the gates and a start.
-   T181 found its probabilities unvalidated for System and its data terms unverified. Rejected for
-   staged advice.
-4. **A weighted score** of headroom, urgency, and quality. Rejected as in PROP-0014: a weight is a
-   hidden constant. Every key stays shown in the decision.
-5. **Strengths as fixed roles per vendor** (O2: Claude Code only implements, web agents only
-   research). Rejected: kinds already express it as configuration without naming a vendor (INV-11),
-   and measurement can then confirm or correct it.
-6. **Handoffs by session messages** (`session_send`). Messages carry no authority, no contract, and
-   no exact subject. Rejected for board tasks with typed, hashed inputs.
-7. **A learned router service** (RouteLLM or similar) instead of a seam. It would bind System to one
-   method and vendor. Rejected for `ctx.decisions` with replaceable providers.
 
 ## Validation plan
 
@@ -450,7 +387,7 @@ whose advice never widens a gate (J1).
   `advice unavailable` and the deterministic choice; every answer kept in `modelAnswers`; advice
   never changes the chosen Worker in shadow; calibration over a fixture.
 - **Live:** E1 on the live host, the lead's capacity read beside dispatch for a working day, no
-  disagreement. The shadow periods of E3 and J1 run on one project ([open question 4](#open-questions-answered)).
+  disagreement. The shadow periods of E3 and J1 run on one project ([D74](#decision)).
 
 ## Rollout and rollback
 
@@ -483,78 +420,35 @@ whose advice never widens a gate (J1).
 
 ## Compatibility and migration
 
-`mcp-roster@1.8`, `quota-draw@1.0`, `handoff@1.0`, and the new settings are additive. The board's
-`handoff` wait reason and the `decisions` seam come with their ADRs. No migration: E2 starts
+`mcp-roster@1.8`, `quota-draw@1.0`, `handoff@1.0`, and the new settings are additive. No migration: E2 starts
 recording from its first run, and nothing is back-filled.
-
-## Open questions (answered)
-
-The operator answered every question on 2026-10-25, each as proposed. The answer follows each
-question, with its decision number.
-
-1. **The 80 % threshold.** Keep D63's 20 % reserve as the hard line for starts, and add a light band
-   (proposed: 15 points, so 65 % to 80 %, measured work only)? Or change the reserve itself, or keep
-   one line only?
-   **Answered (D71):** the 20 % reserve stays the hard line for starts, and a light band of 15
-   points (65 % to 80 % used with the defaults) takes only light work whose draw is measured and
-   fits (E3).
-2. **The reserve beyond dispatch.** Once PROP-0014's D3 puts the score in every route, should the
-   reserve also keep the lead's starts and a run's later steps out of the operator's share
-   (proposed: no for a start the operator or lead makes by hand, yes for later steps of a dispatched
-   run)?
-   **Answered (D72):** yes for the later steps of a dispatched run, which the reserve keeps out of
-   the operator's share; no for a start the operator or the lead makes by hand.
-3. **What Jev may see.** Features only (proposed: kind, template, step, candidates by alias, quota
-   lines, counts), or also the task's title and goal, which may be in Vietnamese and may be private?
-   **Answered (D73):** features only. Jev never sees a task's title or goal.
-4. **Shadow length.** How long do E3's fit and J1's advice run in shadow before J2 or the gate:
-   a number of decisions (proposed: 100 dispatched attempts with outcomes) or a number of days?
-   **Answered (D74):** a number of decisions: 100 dispatched attempts with outcomes.
-5. **Which fronts first.** Proposed: E1, then E2 and E5, then E4 and E3, then E6; J0 in parallel
-   once question 3 is answered.
-   **Answered (D75):** E1, then E2 and E5, then E4 and E3, then E6; J0 in parallel (question 3 is
-   answered by D73).
-6. **Handoffs without the lead.** May a Worker's step propose child tasks itself, under the board's
-   gate (proposed: yes, depth 1, at most 3 per attempt), or should the lead approve each?
-   **Answered (D76):** yes. A Worker's step may propose child tasks itself under the board's gate,
-   depth 1, at most 3 per attempt.
-7. **The declared split.** Confirm the mapping in front 2. What should the Antigravity CLI take when
-   it is back: `validation` only once it proves `validate`, or also `tests` writing?
-   **Answered (D77):** the mapping is confirmed. Claude Code writes code, docs, and tests; Codex
-   validates and reviews; website Workers research; the Antigravity CLI takes `validation` only,
-   and only once it proves `validate`.
-8. **Fresh-context review.** Use the goldfish review (spec and evidence, no transcript) on every
-   task, or selectively, as T177 suggests (proposed: selectively, on tasks the lead marks, measured
-   against today's review)?
-   **Answered (D78):** selectively, on tasks the lead marks, measured against today's review.
 
 ## Decision
 
-Accepted by the operator on 2026-10-25, each answer as the proposal recommends. Each increment
-starts on the operator's go-ahead; none is built yet.
+Accepted by the operator on 2026-10-25, each as recommended. Each increment starts on the operator's go-ahead.
 
-- **D71** (open question 1): D63's 20 % reserve stays the hard line for starts. A light band of
+- **D71**:  D63's 20 % reserve stays the hard line for starts. A light band of
   `quota.lightBandPercent` (default 15, so 65 % to 80 % used with the defaults) takes only light
   work, that is a step whose draw in that window is measured (E2) and fits (E3). Unmeasured work
   does not go there. The band is configuration, not a hard-coded number.
-- **D72** (open question 2): once PROP-0014's D3 puts the quota score in every route, the reserve
+- **D72**:  once PROP-0014's D3 puts the quota score in every route, the reserve
   also keeps the later steps of a dispatched run out of the operator's share. It does not hold back
   a start the operator or the lead makes by hand. A running step is never moved (as D63, the reserve
   decides at a start or a step boundary only).
-- **D73** (open question 3): Jev sees features only (kind, template, step, candidates by alias,
+- **D73**:  Jev sees features only (kind, template, step, candidates by alias,
   quota lines, counts), never a task's title or goal.
-- **D74** (open question 4): E3's fit and J1's advice each run in shadow for 100 dispatched
+- **D74**:  E3's fit and J1's advice each run in shadow for 100 dispatched
   attempts with outcomes before the gate or J2.
-- **D75** (open question 5): the order is E1, then E2 and E5, then E4 and E3, then E6; J0 runs in
+- **D75**:  the order is E1, then E2 and E5, then E4 and E3, then E6; J0 runs in
   parallel.
-- **D76** (open question 6): a Worker's step may propose child tasks itself under the board's gate
+- **D76**:  a Worker's step may propose child tasks itself under the board's gate
   (`board_propose`), depth 1, at most 3 per attempt (`handoffs.maxPerAttempt`).
-- **D77** (open question 7): the declared split is confirmed: Claude Code writes code, docs, and
+- **D77**:  the declared split is confirmed: Claude Code writes code, docs, and
   tests; Codex validates and reviews; website Workers research; the Antigravity CLI takes
   `validation` only, once it proves `validate`.
-- **D78** (open question 8): fresh-context (goldfish) review is selective, on tasks the lead marks,
+- **D78**: fresh-context (goldfish) review is selective, on tasks the lead marks,
   and measured against today's review.
 
 ## Implementation
 
-None yet.
+The shadow advisor is narrower than the design above: per-candidate questions only, no `decisions-jev`, no log loss. Its design is in [the dispatch advisor in shadow](../design/workflow-engine.md#the-dispatch-advisor-in-shadow).

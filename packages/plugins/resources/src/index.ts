@@ -12,16 +12,61 @@ import { randomUUID } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type {} from '@tsuuanmi/system-artifacts'
-import type {} from '@tsuuanmi/system-event-log'
+import type { Migration } from '@tsuuanmi/system-ledger-core'
 import { outline, reply } from '@tsuuanmi/system-gateway-core'
-import { MAX_UNKNOWN_ENTRIES, QUOTA_DEFAULTS, QUOTA_RANGES, quotaSettingsProblems, SchemaRegistry, unknownUsageOf, USAGE_UNKNOWN_EVENT } from '@tsuuanmi/system-libs'
+import { isRecord, MAX_UNKNOWN_ENTRIES, QUOTA_DEFAULTS, QUOTA_RANGES, quotaSettingsProblems, SchemaRegistry, unknownUsageOf, USAGE_UNKNOWN_EVENT } from '@tsuuanmi/system-libs'
 import {
   type ArtifactRef, type BudgetLine, type DeclaredAccount, type LimitState, type PoolConfig, type PoolState, type PoolTemplate, type QuotaSettings, type Reservation, type ReservationRequest, Resources, ResourcesError,
   templatePool, type TokenUsage, type Unit, type UsageFilter, type UsageRecord, type UsageTotal,
 } from '@tsuuanmi/system-resources-core'
-import type {} from '@tsuuanmi/system-store'
 import { z as zod } from 'zod'
+import { countedOf, ownOf, recomputeOwnSpend, totalsSession, type UnrecordedFacts, whole } from './own-spend.ts'
+
+export { recomputeOwnSpend }
+
+/** The ledger's first store migration: its tables. */
+export const MIGRATION_1: Migration = {
+  version: 1,
+  sql: `CREATE TABLE resource_usage (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, request_id TEXT NOT NULL, observed_ms INTEGER NOT NULL,
+    account TEXT NOT NULL, pool TEXT NOT NULL, run_id TEXT, project_id TEXT, task_id TEXT,
+    input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_creation_tokens INTEGER, reasoning_tokens INTEGER,
+    turns INTEGER, duration_ms INTEGER, cost_usd REAL, record TEXT NOT NULL, artifact TEXT NOT NULL, recorded_at TEXT NOT NULL,
+    UNIQUE (source, request_id)
+  );
+  CREATE INDEX resource_usage_time ON resource_usage (observed_ms, seq);
+  CREATE INDEX resource_usage_run ON resource_usage (run_id, source);
+  CREATE INDEX resource_usage_project ON resource_usage (project_id, pool);
+  CREATE INDEX resource_usage_task ON resource_usage (task_id, pool);
+  CREATE INDEX resource_usage_account ON resource_usage (account, observed_ms);
+  CREATE INDEX resource_usage_pool ON resource_usage (pool, observed_ms);
+  CREATE TABLE resource_readings (
+    pool TEXT NOT NULL, window_id TEXT NOT NULL, account TEXT NOT NULL, observed_ms INTEGER NOT NULL,
+    reading TEXT NOT NULL, artifact TEXT NOT NULL, PRIMARY KEY (pool, window_id)
+  );
+  CREATE TABLE resource_reservations (
+    reservation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, project_id TEXT, task_id TEXT,
+    request TEXT NOT NULL, decision TEXT NOT NULL, reserved_at TEXT NOT NULL, expires_at TEXT NOT NULL, released_at TEXT
+  );
+  CREATE INDEX resource_reservations_run ON resource_reservations (run_id);
+  CREATE TABLE resource_holds (
+    reservation_id TEXT NOT NULL REFERENCES resource_reservations (reservation_id), pool TEXT NOT NULL, unit TEXT NOT NULL,
+    amount REAL NOT NULL, project_id TEXT, task_id TEXT, expires_ms INTEGER NOT NULL
+  );
+  CREATE INDEX resource_holds_reservation ON resource_holds (reservation_id);
+  CREATE INDEX resource_holds_task ON resource_holds (task_id, pool, unit);
+  CREATE INDEX resource_holds_project ON resource_holds (project_id, pool, unit);`,
+}
+/**
+ * The second (a run's own spend, PROP-0022): the columns that find a session's latest result and its
+ * lower bounds, and `own`, the record as it is read; its step recomputes every stored record from the
+ * original in `record`, which stays as it was.
+ */
+const MIGRATION_2_SQL = `ALTER TABLE resource_usage ADD COLUMN session_id TEXT;
+  ALTER TABLE resource_usage ADD COLUMN totals_session TEXT;
+  ALTER TABLE resource_usage ADD COLUMN own TEXT;
+  CREATE INDEX resource_usage_totals_session ON resource_usage (totals_session, seq);
+  CREATE INDEX resource_usage_session ON resource_usage (session_id, seq);`
 
 /** An id as `common@1` defines it: what a pool, account, window, run, project, or task id must be. */
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/
@@ -30,6 +75,21 @@ const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 /** The bounds `mcp-resources@1` puts on `resources_pools`: pools per answer, readings per pool. */
 export const MAX_POOLS = 64
 export const MAX_WINDOWS = 8
+/**
+ * Whether a budget line on `line` counts pool `pool` (ADR-0083): the pool itself, and every pool a
+ * template makes of it for an account, `<line>/<account>`, so one line caps a task whichever account
+ * serves it. A line on a concrete pool counts that pool only: no pool is named under it.
+ */
+export const covers = (line: string, pool: string): boolean => pool === line || pool.startsWith(`${line}/`)
+/**
+ * The pools a cap on `line` counts, as SQL over `column` with its parameters: `line` itself, and, for a
+ * line on a group (a name that is no pool of its own, `group`), every pool named under it, matched by
+ * prefix with `substr` (no LIKE wildcards). A line on a pool that exists counts that pool only, as
+ * before ADR-0083.
+ */
+const poolsOf = (line: string, group: boolean, column = 'pool'): { sql: string; params: Array<string | number> } =>
+  group ? { sql: `(${column} = ? OR substr(${column}, 1, ?) = ?)`, params: [line, line.length + 1, `${line}/`] } : { sql: `${column} = ?`, params: [line] }
+
 /** Lines and caps one reservation may name (INV-9). */
 export const MAX_LINES = 64
 /** How far in the future a reading's time may be (clock skew) before it is refused. */
@@ -131,8 +191,6 @@ export function validateQuota(quota: Partial<QuotaSettings> | undefined): Readon
 }
 
 const invalid = (message: string): ResourcesError => new ResourcesError('invalid', message)
-/** SQL: the stored record (of the table `alias`, with its dot) is a whole count, not a lower bound (`usage-record@1.1`'s `partial`, ADR-0065). */
-const whole = (alias = ''): string => `json_extract(${alias}record, '$.partial') IS NULL`
 /** Runs with only a lower bound counted a refused reservation names at most (INV-9); past it, it says so. */
 export const MAX_LOWER_BOUND_RUNS = 100
 /** Milliseconds since the epoch of an RFC 3339 timestamp; refused (`invalid`) when it does not parse. */
@@ -152,7 +210,6 @@ const limitedUntil = (reading: LimitState): number | undefined => {
 }
 /** At most {@link MAX_REASONS} reasons, the last one saying how many more there were. */
 const bounded = (reasons: string[]): string[] => reasons.length <= MAX_REASONS ? reasons : [...reasons.slice(0, MAX_REASONS - 1), `and ${reasons.length - MAX_REASONS + 1} more`]
-const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 const byPool = (a: PoolConfig, b: PoolConfig): number => (a.pool < b.pool ? -1 : a.pool > b.pool ? 1 : 0)
 
 const TOKEN_KEYS = ['inputTokens', 'outputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens', 'reasoningOutputTokens'] as const
@@ -222,6 +279,8 @@ export class StoreResources extends Resources {
   private readonly maxRecords: number
   private readonly holdSeconds: number
   private readonly settings: Readonly<QuotaSettings>
+  /** Whether the missing event log was logged (once). */
+  private saidNoEventLog = false
 
   constructor(ctx: Context, config: Config = {}) {
     super(ctx)
@@ -232,38 +291,7 @@ export class StoreResources extends Resources {
     this.maxRecords = config.maxRecords ?? 10_000
     this.holdSeconds = config.holdSeconds ?? 14_400
     this.settings = validateQuota(config.quota)
-    ctx.store.migrate('resources', [{
-      version: 1,
-      sql: `CREATE TABLE resource_usage (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, request_id TEXT NOT NULL, observed_ms INTEGER NOT NULL,
-        account TEXT NOT NULL, pool TEXT NOT NULL, run_id TEXT, project_id TEXT, task_id TEXT,
-        input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_creation_tokens INTEGER, reasoning_tokens INTEGER,
-        turns INTEGER, duration_ms INTEGER, cost_usd REAL, record TEXT NOT NULL, artifact TEXT NOT NULL, recorded_at TEXT NOT NULL,
-        UNIQUE (source, request_id)
-      );
-      CREATE INDEX resource_usage_time ON resource_usage (observed_ms, seq);
-      CREATE INDEX resource_usage_run ON resource_usage (run_id, source);
-      CREATE INDEX resource_usage_project ON resource_usage (project_id, pool);
-      CREATE INDEX resource_usage_task ON resource_usage (task_id, pool);
-      CREATE INDEX resource_usage_account ON resource_usage (account, observed_ms);
-      CREATE INDEX resource_usage_pool ON resource_usage (pool, observed_ms);
-      CREATE TABLE resource_readings (
-        pool TEXT NOT NULL, window_id TEXT NOT NULL, account TEXT NOT NULL, observed_ms INTEGER NOT NULL,
-        reading TEXT NOT NULL, artifact TEXT NOT NULL, PRIMARY KEY (pool, window_id)
-      );
-      CREATE TABLE resource_reservations (
-        reservation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, project_id TEXT, task_id TEXT,
-        request TEXT NOT NULL, decision TEXT NOT NULL, reserved_at TEXT NOT NULL, expires_at TEXT NOT NULL, released_at TEXT
-      );
-      CREATE INDEX resource_reservations_run ON resource_reservations (run_id);
-      CREATE TABLE resource_holds (
-        reservation_id TEXT NOT NULL REFERENCES resource_reservations (reservation_id), pool TEXT NOT NULL, unit TEXT NOT NULL,
-        amount REAL NOT NULL, project_id TEXT, task_id TEXT, expires_ms INTEGER NOT NULL
-      );
-      CREATE INDEX resource_holds_reservation ON resource_holds (reservation_id);
-      CREATE INDEX resource_holds_task ON resource_holds (task_id, pool, unit);
-      CREATE INDEX resource_holds_project ON resource_holds (project_id, pool, unit);`,
-    }])
+    ctx.store.migrate('resources', [MIGRATION_1, { version: 2, sql: MIGRATION_2_SQL, run: (db) => recomputeOwnSpend(db, this.unrecordedFacts()) }])
     ctx.inject(['mcp'], (c) => {
       const json = (value: object) => reply(value, outline(value))
       const failed = (error: unknown) => {
@@ -294,9 +322,16 @@ export class StoreResources extends Resources {
           limit: zod.number().int().min(1).max(100).optional().describe(`Page size (default ${this.pageSize})`),
           after: zod.string().min(1).max(200).optional().describe('The next cursor of the previous page'),
         },
-      }, async (args) => {
+      }, async (args, context) => {
         const filter: UsageFilter = {}
         for (const key of ['runId', 'projectId', 'taskId', 'account', 'pool', 'since', 'until'] as const) if (args[key] !== undefined) filter[key] = String(args[key])
+        const lead = context?.lead
+        if (lead !== undefined) {
+          // A lead reads its own project's usage only (T285, ADR-0076): the run and task it names are its project's, and with neither, the project's records.
+          const outside = await this.outsideProject(lead, filter)
+          if (outside !== undefined) return { isError: true, content: [{ type: 'text' as const, text: outside }] }
+          if (filter.runId === undefined && filter.taskId === undefined) filter.projectId = lead
+        }
         try {
           return json(this.page(filter, { ...(args.limit !== undefined ? { limit: Number(args.limit) } : {}), ...(args.after !== undefined ? { after: String(args.after) } : {}) }))
         } catch (error) {
@@ -304,6 +339,27 @@ export class StoreResources extends Resources {
         }
       })
     })
+  }
+
+  /**
+   * Why a lead of `project` may not read usage by `filter`; undefined when it may (T285). The project
+   * it names must be its own, the task its project's (as the board holds it), and the run its project's
+   * (as the workflow engine tells it); one that cannot be told is not the lead's (INV-2).
+   */
+  private async outsideProject(project: string, filter: UsageFilter): Promise<string | undefined> {
+    const refuse = (what: string, of: string | undefined) => `forbidden: the lead token of project ${project} reaches only project ${project}; ${what} belongs to ${of === undefined ? 'no project (or is unknown)' : `project ${of}`}, so nothing was read`
+    if (filter.projectId !== undefined && filter.projectId !== project) return refuse(`project ${filter.projectId}`, filter.projectId)
+    if (filter.taskId !== undefined) {
+      const board = this.ctx.get('board' as never) as { task?: (taskId: string) => Promise<{ projectId?: string } | undefined> } | undefined
+      const of = (await board?.task?.(filter.taskId))?.projectId
+      if (of !== project) return refuse(`task ${filter.taskId}`, of)
+    }
+    if (filter.runId !== undefined) {
+      const workflow = this.ctx.get('workflow' as never) as { projectOfRun?: (runId: string) => Promise<string | undefined> } | undefined
+      const of = typeof workflow?.projectOfRun === 'function' ? await workflow.projectOfRun(filter.runId) : undefined
+      if (of !== project) return refuse(`run ${filter.runId}`, of)
+    }
+    return undefined
   }
 
   async pools(filter: { account?: string } = {}, at: Date = new Date()): Promise<PoolState[]> {
@@ -321,7 +377,7 @@ export class StoreResources extends Resources {
     const taken = new Set([...this.fixed, ...others].map((p) => p.pool))
     const made: PoolConfig[] = []
     for (const declared of accounts as unknown[]) {
-      if (!isObject(declared) || typeof declared.account !== 'string' || !ID.test(declared.account) || typeof declared.group !== 'string' || !NAME.test(declared.group)) {
+      if (!isRecord(declared) || typeof declared.account !== 'string' || !ID.test(declared.account) || typeof declared.group !== 'string' || !NAME.test(declared.group)) {
         throw invalid(`${JSON.stringify(declared)} is not an account (an id) with its group (a name)`)
       }
       for (const t of this.templates.filter((t) => t.group === declared.group)) {
@@ -394,21 +450,29 @@ export class StoreResources extends Resources {
       const fine: string[] = []
       for (const pool of new Set(request.lines.map((l) => l.pool))) {
         const state = pools.find((p) => p.pool === pool)
-        if (!state) faults.push(`pool ${pool} is not configured`)
-        else if (!state.available) faults.push(`pool ${pool} is unavailable${state.until ? ` until ${state.until}` : `: ${this.unknownWindows(state).join(', ')} without a reading that says ok`}`)
+        const group = state ? [] : pools.filter((p) => covers(pool, p.pool))
+        if (!state && !group.length) faults.push(`pool ${pool} is not configured`)
+        else if (!state) {
+          // A line on a template's pools (ADR-0083): the run draws on one of them, so one available is enough.
+          const open = group.filter((p) => p.available)
+          if (!open.length) faults.push(`no pool of ${pool} is available (${group.map((p) => p.pool).join(', ')})`)
+          else fine.push(`${open.length} of ${group.length} pool(s) of ${pool} are available`)
+        } else if (!state.available) faults.push(`pool ${pool} is unavailable${state.until ? ` until ${state.until}` : `: ${this.unknownWindows(state).join(', ')} without a reading that says ok`}`)
         else fine.push(`pool ${pool} is available`)
       }
+      // A cap's name is a group when no pool has it (ADR-0083): then it counts every pool named under it.
+      const group = (name: string): boolean => !pools.some((p) => p.pool === name)
       for (const cap of request.caps ?? []) {
-        const used = this.used(db, request, cap)
-        const held = this.held(db, request, cap, at)
-        const wanted = round6(request.lines.filter((l) => l.pool === cap.pool && l.unit === cap.unit).reduce((n, l) => n + l.amount, 0))
+        const used = this.used(db, request, cap, group(cap.pool))
+        const held = this.held(db, request, cap, at, group(cap.pool))
+        const wanted = round6(request.lines.filter((l) => (l.pool === cap.pool || (group(cap.pool) && covers(cap.pool, l.pool))) && l.unit === cap.unit).reduce((n, l) => n + l.amount, 0))
         const total = round6(used + held + wanted)
         const sum = `${used} used, ${held} held, ${wanted} wanted`
         if (total > cap.amount) faults.push(`cap ${cap.amount} ${cap.unit} of ${cap.pool} would be exceeded: ${sum}`)
         else fine.push(`cap ${cap.amount} ${cap.unit} of ${cap.pool} holds: ${sum}`)
       }
       // A cap never counts usage it cannot see as 0 (INV-2, ADR-0065).
-      faults.push(...this.uncountable(db, request))
+      faults.push(...this.uncountable(db, request, group))
       const state = faults.length ? 'refused' : 'reserved'
       const reservationId = `res-${randomUUID()}`
       const inputs = [...new Set(request.lines.flatMap((l) => pools.some((p) => p.pool === l.pool) ? this.readingArtifacts(db, l.pool) : []))]
@@ -474,23 +538,47 @@ export class StoreResources extends Resources {
           : undefined
         const projectId = usage.projectId ?? reserved?.project_id ?? null
         const taskId = usage.taskId ?? reserved?.task_id ?? null
-        const u = usage.usage
+        // A result of a session's running totals counts as the run's own spend (`usage-record@1.2`):
+        // its difference from the session's latest result (the first's from zero), less the lower bounds
+        // counted since. `record` keeps it as given.
+        const session = totalsSession(usage)
+        const own = session === undefined ? undefined : ownOf(db, usage, session, Number.MAX_SAFE_INTEGER, this.unrecordedFacts())
+        const [input, output, cacheRead, cacheCreation, reasoning, turns, cost] = countedOf(own ?? usage)
         db.prepare(`INSERT INTO resource_usage (source, request_id, observed_ms, account, pool, run_id, project_id, task_id, input_tokens, output_tokens,
-          cache_read_tokens, cache_creation_tokens, reasoning_tokens, turns, duration_ms, cost_usd, record, artifact, recorded_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          cache_read_tokens, cache_creation_tokens, reasoning_tokens, turns, duration_ms, cost_usd, record, artifact, recorded_at, session_id, totals_session, own)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
           usage.source, usage.requestId, observed, usage.account, usage.pool, usage.runId ?? null, projectId, taskId,
-          u?.inputTokens ?? null, u?.outputTokens ?? null, u?.cacheReadInputTokens ?? null, u?.cacheCreationInputTokens ?? null, u?.reasoningOutputTokens ?? null,
-          usage.turns ?? null, usage.durationMs ?? null, usage.cost?.amount ?? null, JSON.stringify(usage), ref, new Date().toISOString(),
+          input!, output!, cacheRead!, cacheCreation!, reasoning!, turns!, usage.durationMs ?? null, cost!, JSON.stringify(usage), ref, new Date().toISOString(),
+          usage.sessionId ?? null, session ?? null, own ? JSON.stringify(own) : null,
         )
       }
       return { ref, duplicate }
     })
   }
 
+  /**
+   * Whether a run of an agent session ended with no record between two instants, as its `usage.unknown`
+   * fact says (the event log's first such fact of the session since then). Without an event log loaded,
+   * no fact can be read: the difference is the same, and only its `includesUnrecorded` is not known.
+   */
+  private unrecordedFacts(): UnrecordedFacts {
+    return (sessionId, sinceMs, untilMs) => {
+      const eventLog = this.ctx.get('eventLog')
+      if (!eventLog) {
+        // Said once, not once per record (a migration reads every stored one).
+        if (!this.saidNoEventLog) this.ctx.logger.warn('resources: no event log is loaded, so whether a run of a session ended with no record is not read; a difference is right, but may not say includesUnrecorded')
+        this.saidNoEventLog = true
+        return false
+      }
+      const [first] = eventLog.query({ type: USAGE_UNKNOWN_EVENT, sessionId, since: new Date(sinceMs).toISOString(), limit: 1 })
+      return first !== undefined && Date.parse(first.at) <= untilMs
+    }
+  }
+
   async usage(filter: UsageFilter = {}): Promise<{ records: UsageRecord[]; totals: UsageTotal[] }> {
     const { where, params } = this.where(filter)
     const db = this.ctx.store.db
-    const rows = db.prepare(`SELECT record FROM resource_usage ${where} ORDER BY observed_ms, seq LIMIT ${this.maxRecords + 1}`).all(...params) as Array<{ record: string }>
+    const rows = db.prepare(`SELECT COALESCE(own, record) AS record FROM resource_usage ${where} ORDER BY observed_ms, seq LIMIT ${this.maxRecords + 1}`).all(...params) as Array<{ record: string }>
     if (rows.length > this.maxRecords) throw invalid(`more than ${this.maxRecords} records match: narrow the filter, or page through resources_usage`)
     return { records: rows.map((r) => JSON.parse(r.record) as UsageRecord), totals: this.totals(where, params) }
   }
@@ -512,7 +600,7 @@ export class StoreResources extends Resources {
       clause = `${where ? `${where} AND` : 'WHERE'} (observed_ms > ? OR (observed_ms = ? AND seq > ?))`
       page.push(Number(cursor[1]), Number(cursor[1]), Number(cursor[2]))
     }
-    const rows = this.ctx.store.db.prepare(`SELECT seq, observed_ms, record FROM resource_usage ${clause} ORDER BY observed_ms, seq LIMIT ${limit + 1}`).all(...page) as unknown as CursorRow[]
+    const rows = this.ctx.store.db.prepare(`SELECT seq, observed_ms, COALESCE(own, record) AS record FROM resource_usage ${clause} ORDER BY observed_ms, seq LIMIT ${limit + 1}`).all(...page) as unknown as CursorRow[]
     const shown = rows.slice(0, limit)
     const last = shown.at(-1)
     return {
@@ -572,14 +660,15 @@ export class StoreResources extends Resources {
     return undefined
   }
 
-  private used(db: DatabaseSync, request: ReservationRequest, cap: BudgetLine): number {
+  private used(db: DatabaseSync, request: ReservationRequest, cap: BudgetLine, group = false): number {
     const scope = this.scope(request)
     if (!scope) return 0
     const amount = {
       tokens: 'SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))', usd: 'SUM(COALESCE(cost_usd, 0))', turns: 'SUM(COALESCE(turns, 0))',
       runs: 'COUNT(*)', minutes: 'SUM(COALESCE(duration_ms, 0)) / 60000.0',
     }[cap.unit]
-    const row = db.prepare(`SELECT ${amount} AS n FROM resource_usage WHERE ${scope.column} = ? AND pool = ?`).get(scope.value, cap.pool) as { n: number | null }
+    const pools = poolsOf(cap.pool, group)
+    const row = db.prepare(`SELECT ${amount} AS n FROM resource_usage WHERE ${scope.column} = ? AND ${pools.sql}`).get(scope.value, ...pools.params) as { n: number | null }
     return round6(row.n ?? 0)
   }
 
@@ -595,11 +684,14 @@ export class StoreResources extends Resources {
    * there is one is unknown, and the caps are refused as well. A request without caps, or without a
    * scope (its caps bound its own lines only), is not concerned.
    */
-  private uncountable(db: DatabaseSync, request: ReservationRequest): string[] {
+  private uncountable(db: DatabaseSync, request: ReservationRequest, group: (name: string) => boolean): string[] {
     const scope = this.scope(request)
     if (!scope || !request.caps?.length) return []
-    const pools = new Set(request.caps.map((c) => c.pool))
-    const named = [...pools].sort().join(', ')
+    const capped = [...new Set(request.caps.map((c) => c.pool))]
+    const named = [...capped].sort().join(', ')
+    // Each pool a cap counts (ADR-0083): its own, and for a group every pool named under it, whether
+    // or not that pool is configured or declared now, so a removed account's usage still counts (INV-2).
+    const pools = { has: (pool: string) => capped.some((c) => pool === c || (group(c) && covers(c, pool))) }
     const eventLog = this.ctx.get('eventLog')
     if (!eventLog) return [`the caps of ${named} cannot be held: no event log (ctx.eventLog) is loaded, so whether a run of ${scope.value} has usage the ledger could not count is unknown, and a cap never counts unknown usage as 0 (INV-2)`]
     const reservedFor = db.prepare('SELECT project_id, task_id FROM resource_reservations WHERE run_id = ? ORDER BY reserved_at DESC LIMIT 1')
@@ -619,7 +711,7 @@ export class StoreResources extends Resources {
     // A run of the scope whose only records in a capped pool are lower bounds, whether or not a fact
     // names it (a crash, or a failed append, between its record and its fact): the record says it.
     const facts = new Set(found.runs.map((r) => `${r.pool}\0${r.runId}`))
-    const lower = this.lowerBounds(db, scope, [...pools])
+    const lower = this.lowerBounds(db, scope, capped.map((c) => poolsOf(c, group(c), 'u.pool')))
     for (const r of lower.runs) {
       if (facts.has(`${r.pool}\0${r.runId}`)) continue
       faults.push(`cap of ${r.pool} cannot be held: run ${r.runId}${r.worker ? ` on ${r.worker}` : ''} of ${scope.value} has usage the ledger could not count (only a lower bound counted: ${r.partial})`)
@@ -633,12 +725,12 @@ export class StoreResources extends Resources {
    * and no whole record there, the first {@link MAX_LOWER_BOUND_RUNS} by when they were recorded
    * (INV-9); `more` when there were more.
    */
-  private lowerBounds(db: DatabaseSync, scope: { column: 'task_id' | 'project_id'; value: string }, pools: string[]): { runs: Array<{ pool: string; runId: string; worker?: string; partial: string }>; more: boolean } {
+  private lowerBounds(db: DatabaseSync, scope: { column: 'task_id' | 'project_id'; value: string }, pools: Array<{ sql: string; params: Array<string | number> }>): { runs: Array<{ pool: string; runId: string; worker?: string; partial: string }>; more: boolean } {
     if (!pools.length) return { runs: [], more: false }
     const rows = db.prepare(`SELECT u.pool AS pool, u.run_id AS run_id, MIN(u.seq) AS first, json_extract(u.record, '$.worker') AS worker, json_extract(u.record, '$.partial') AS partial
-      FROM resource_usage u WHERE u.${scope.column} = ? AND u.pool IN (${pools.map(() => '?').join(', ')}) AND u.run_id IS NOT NULL AND NOT ${whole('u.')}
+      FROM resource_usage u WHERE u.${scope.column} = ? AND (${pools.map((p) => p.sql).join(' OR ')}) AND u.run_id IS NOT NULL AND NOT ${whole('u.')}
         AND NOT EXISTS (SELECT 1 FROM resource_usage w WHERE w.run_id = u.run_id AND w.pool = u.pool AND ${whole('w.')})
-      GROUP BY u.pool, u.run_id ORDER BY first LIMIT ${MAX_LOWER_BOUND_RUNS + 1}`).all(scope.value, ...pools) as Array<{ pool: string; run_id: string; worker: string | null; partial: string }>
+      GROUP BY u.pool, u.run_id ORDER BY first LIMIT ${MAX_LOWER_BOUND_RUNS + 1}`).all(scope.value, ...pools.flatMap((p) => p.params)) as Array<{ pool: string; run_id: string; worker: string | null; partial: string }>
     return {
       runs: rows.slice(0, MAX_LOWER_BOUND_RUNS).map((r) => ({ pool: r.pool, runId: r.run_id, ...(r.worker !== null ? { worker: r.worker } : {}), partial: r.partial })),
       more: rows.length > MAX_LOWER_BOUND_RUNS,
@@ -646,16 +738,17 @@ export class StoreResources extends Resources {
   }
 
   /** What unexpired holds of the request's scope keep of a cap: a hold nobody released stops counting when it expires (INV-9). */
-  private held(db: DatabaseSync, request: ReservationRequest, cap: BudgetLine, at: Date): number {
+  private held(db: DatabaseSync, request: ReservationRequest, cap: BudgetLine, at: Date, group = false): number {
     const scope = this.scope(request)
     if (!scope) return 0
-    const row = db.prepare(`SELECT SUM(amount) AS n FROM resource_holds WHERE ${scope.column} = ? AND pool = ? AND unit = ? AND expires_ms > ?`)
-      .get(scope.value, cap.pool, cap.unit, at.getTime()) as { n: number | null }
+    const pools = poolsOf(cap.pool, group)
+    const row = db.prepare(`SELECT SUM(amount) AS n FROM resource_holds WHERE ${scope.column} = ? AND ${pools.sql} AND unit = ? AND expires_ms > ?`)
+      .get(scope.value, ...pools.params, cap.unit, at.getTime()) as { n: number | null }
     return round6(row.n ?? 0)
   }
 
   private where(filter: UsageFilter): { where: string; params: Array<string | number> } {
-    if (!isObject(filter)) throw invalid('the filter is not an object')
+    if (!isRecord(filter)) throw invalid('the filter is not an object')
     const clauses: string[] = []
     const params: Array<string | number> = []
     for (const [key, column] of [['runId', 'run_id'], ['projectId', 'project_id'], ['taskId', 'task_id'], ['account', 'account'], ['pool', 'pool']] as const) {
@@ -706,7 +799,7 @@ export class StoreResources extends Resources {
 
   /** A reservation request's shape (no schema names it): ids, one to {@link MAX_LINES} lines, budget lines as `common@1` bounds them. */
   private assertRequest(request: ReservationRequest): void {
-    if (!isObject(request)) throw invalid('the reservation request is not an object')
+    if (!isRecord(request)) throw invalid('the reservation request is not an object')
     if (typeof request.runId !== 'string' || !ID.test(request.runId)) throw invalid(`runId ${JSON.stringify(request.runId)} is not an id`)
     for (const key of ['projectId', 'taskId'] as const) {
       if (request[key] !== undefined && (typeof request[key] !== 'string' || !ID.test(request[key]))) throw invalid(`${key} ${JSON.stringify(request[key])} is not an id`)
@@ -714,7 +807,7 @@ export class StoreResources extends Resources {
     const lines = (name: string, value: unknown, min: number): void => {
       if (!Array.isArray(value) || value.length < min || value.length > MAX_LINES) throw invalid(`${name} must hold ${min} to ${MAX_LINES} budget lines`)
       for (const line of value as unknown[]) {
-        if (!isObject(line) || typeof line.pool !== 'string' || !ID.test(line.pool) || !UNITS.includes(line.unit as Unit) || typeof line.amount !== 'number' || !Number.isFinite(line.amount) || line.amount < 0 || line.amount > 1e12) {
+        if (!isRecord(line) || typeof line.pool !== 'string' || !ID.test(line.pool) || !UNITS.includes(line.unit as Unit) || typeof line.amount !== 'number' || !Number.isFinite(line.amount) || line.amount < 0 || line.amount > 1e12) {
           throw invalid(`${name}: ${JSON.stringify(line)} is not a budget line (pool, unit of ${UNITS.join(', ')}, amount 0 to 1e12)`)
         }
       }

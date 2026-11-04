@@ -9,9 +9,8 @@
  * A bound chat is deleted from its own menu, only once it opens as itself (PROP-0004 Phase 5).
  */
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
 import { type AskOptions, type AskResult, type AuthState, bindingReporter, completionOptions, type DeleteOptions, modePresets, ProviderError, type ProviderDriver, type ProviderFeature, type ProviderMode, type ResearchState, type TurnSnapshot, splitAfterLastFence, waitForReport, waitForStableCompletion, withSources } from '@tsuuanmi/system-provider-core'
-import { type Condition, copiedMarkdown, type CopyRefusedEvent, type DriftEvent, outlineOf, preWrapText, type StallEvent, toLocator, UiEngine, type UiMap, type UiOutline, loadUiMap, unverifiedEntries } from '@tsuuanmi/system-ui-ops'
+import { type Condition, copiedMarkdown, type CopyRefusedEvent, type DriftEvent, deletionUnverified, inspectConversationMenu, pageIdle, preWrapText, shippedMapOf, type StallEvent, toLocator, UiEngine, type UiMap, type UiOutline } from '@tsuuanmi/system-ui-ops'
 import type { Locator, Page, Route } from 'patchright-core'
 
 const MAP_URL = new URL('../ui/gemini-web.ui.yaml', import.meta.url)
@@ -19,7 +18,7 @@ const CONVERSATION = /^\/app\/([0-9a-f]{16})$/
 
 /** The shipped map, with an optional local overlay merged after it. */
 export function shippedMap(overlay?: string): UiMap {
-  return loadUiMap(readFileSync(MAP_URL, 'utf8'), overlay)
+  return shippedMapOf(MAP_URL, overlay)
 }
 
 export interface DriverTimeouts {
@@ -49,8 +48,6 @@ export interface DriverTimeouts {
   planHangMs?: number
 }
 
-/** The map entries the deletion depends on: each must be checked on the live site before anything is deleted. */
-const DELETION_ENTRIES = ['conversation.pane', 'conversation.options', 'conversation.delete', 'conversation.delete-dialog', 'conversation.delete-confirm', 'conversation.missing', 'conversation.open-options', 'conversation.choose-delete', 'conversation.confirm-delete']
 /** The site's RPC endpoint, which a deletion goes through. */
 const RPC_REQUEST = /\/_\/BardChatUi\/data\/batchexecute/
 
@@ -111,8 +108,12 @@ const nameOf = (shown: string, wanted: string): string => shown.slice(0, shown.i
 /** The longest answer read for the site's own error: its errors are a sentence or two. */
 const SITE_ERROR_MAX_CHARS = 300
 
-/** How long a page may take to settle (its Stop control gone) before it counts as busy and is not kept. */
-const PAGE_IDLE_WAIT_MS = 3000
+/** The name of the account's own button: "Google Account:", then the account ("Name (address)"). */
+const ACCOUNT_LABEL = /^Google Account:\s*/
+/** The account a button's name names ("Name (address)"), or undefined when it is not the account's button. */
+const accountOf = (label: string | null): string | undefined => (label && ACCOUNT_LABEL.test(label) ? label.replace(ACCOUNT_LABEL, '').trim() || undefined : undefined)
+/** How often the account's button is looked for again while it is neither shown nor hidden. */
+const ACCOUNT_POLL_MS = 250
 
 export class GeminiWebDriver implements ProviderDriver<Page> {
   readonly provider = 'gemini-web'
@@ -166,8 +167,13 @@ export class GeminiWebDriver implements ProviderDriver<Page> {
     this.timeouts = { turnMs: 15 * 60_000, stallMs: 3 * 60_000, stableMs: 1500, pollMs: 250, readyMs: 60_000, accountMs: 15_000, snapshotMs: 20_000, reportReadMs: 30_000, planHangMs: 3 * 60_000, ...options.timeouts }
   }
 
-  async checkAuth(page: Page): Promise<AuthState> {
-    return (await this.readiness(page)).state
+  /**
+   * Whether the page is signed in (Readiness, below). For a Save (`save`), an account the page
+   * names on its own button while hiding it (a collapsed side panel, live 2026-10-26) is signed in
+   * too: the Save reads who that is from the hidden button. A turn still needs the button shown.
+   */
+  async checkAuth(page: Page, options: { save?: boolean } = {}): Promise<AuthState> {
+    return (await this.readiness(page, options.save ?? false)).state
   }
 
   /**
@@ -176,9 +182,10 @@ export class GeminiWebDriver implements ProviderDriver<Page> {
    * traffic check, a terms notice (which can show while the account does not: live 2026-10-16), or
    * the app. Once the app has rendered, the account has `accountMs` more, never the whole
    * readiness bound. The site's own stops come before the account: a challenge or a terms notice
-   * is the operator's whether or not the account shows beside it.
+   * is the operator's whether or not the account shows beside it. With `hiddenAccount` (a Save),
+   * an account button the page hides but names ("Google Account: …") is signed in as well.
    */
-  private async readiness(page: Page): Promise<{ state: AuthState; why?: string }> {
+  private async readiness(page: Page, hiddenAccount = false): Promise<{ state: AuthState; why?: string }> {
     if (!page.url().startsWith(this.origin)) await page.goto(this.loginUrl, { waitUntil: 'domcontentloaded' })
     const engine = this.engine(page)
     const told: Condition[] = [{ state: 'auth.signed-in' }, { state: 'auth.signed-out' }, { state: 'auth.challenge' }, { state: 'site.terms-notice' }]
@@ -186,9 +193,14 @@ export class GeminiWebDriver implements ProviderDriver<Page> {
     if (rendered) await engine.waitFor({ anyOf: told }, this.timeouts.accountMs).catch(() => undefined)
     // Google's unusual-traffic check: only the operator can pass it, and loading again deepens it.
     if (await engine.state('auth.challenge')) throw new ProviderError('challenge', 'gemini-web: Google shows its unusual-traffic check (a CAPTCHA); solve it in the login profile (system account login) and Save')
-    if (await engine.state('auth.signed-out')) return { state: 'signed-out' }
+    // A Save's account named on its hidden button, read before the signed-out state: that state
+    // counts a "Sign in" offer as signed out whenever the account's button is not shown, so beside
+    // a hidden button it would refuse the account the page names. Only on Gemini's own pages: on
+    // Google's sign-in page nothing is signed in.
+    const hiddenSignedIn = hiddenAccount && page.url().startsWith(this.origin) && !(await engine.state('auth.signed-in')) && (await this.accountLabel(page, 0)) !== undefined
+    if (!hiddenSignedIn && (await engine.state('auth.signed-out'))) return { state: 'signed-out' }
     termsNotice(await engine.state('site.terms-notice'))
-    if (await engine.state('auth.signed-in')) return { state: 'signed-in' }
+    if (hiddenSignedIn || (await engine.state('auth.signed-in'))) return { state: 'signed-in' }
     // Neither: what the page shows instead is outlined as drift evidence, so it can be read without
     // opening the operator's browser, with what each of the account's candidates found.
     const why = await this.whatShowed(engine, rendered)
@@ -210,29 +222,70 @@ export class GeminiWebDriver implements ProviderDriver<Page> {
     ].filter(Boolean).join('; ')
   }
 
-  /** The account named on its own Google Account button; only a hash of it is ever stored. */
+  /**
+   * The account named on its own Google Account button, shown or hidden (`accountLabel`); only a
+   * hash of it is ever stored. With neither, or with more than one account named, the button is
+   * outlined as a `ui.drift` of `auth.account` and the identity fails as `ui_drift`.
+   */
   async identity(page: Page): Promise<string> {
-    const label = await (await this.engine(page).resolve('auth.account', this.timeouts.readyMs)).locator.first().getAttribute('aria-label')
-    if (!label) throw new ProviderError('session_broken', 'gemini-web: the account button has no name')
-    return label.replace(/^Google Account:\s*/, '').trim()
+    const account = await this.accountLabel(page, this.timeouts.readyMs)
+    if (account !== undefined) return account
+    await this.engine(page).drift('auth.account').catch(() => undefined)
+    throw new ProviderError('ui_drift', 'gemini-web: no candidate of auth.account found exactly one account\'s button named "Google Account: …", shown or hidden (outlined as a ui.drift of auth.account)')
   }
 
   /**
-   * The account's name and address as the page shows them ("Name (address)"), for a drift outline
-   * to mask. Read from the button even while the page hides it (live 2026-10-24), since that is
-   * when an outline is taken; never used for anything but masking.
+   * Every button the map's `auth.account` candidates find, shown or hidden (a collapsed side panel:
+   * live 2026-10-24 and 2026-10-26), with the account each names ("Name (address)", after "Google
+   * Account:"; undefined for any other name). The one reading of them that the identity, a Save's
+   * sign-in check, and a drift outline's masking share.
    */
-  private async accountNames(page: Page): Promise<string[]> {
-    let label = await this.engine(page).resolve('auth.account', 1000).then((found) => found.locator.first().getAttribute('aria-label'), () => null)
-    if (!label) {
-      for (const candidate of this.map.elements['auth.account']!.candidates) {
-        const hidden = toLocator(page, candidate, this.map.locales, { includeHidden: true }).first()
-        if (await hidden.count()) label = await hidden.getAttribute('aria-label')
-        if (label) break
+  private async accountButtons(page: Page): Promise<{ name: string | undefined; shown: boolean }[]> {
+    const buttons: { name: string | undefined; shown: boolean }[] = []
+    for (const candidate of this.map.elements['auth.account']!.candidates) {
+      const found = toLocator(page, candidate, this.map.locales, { includeHidden: true })
+      const count = await found.count().catch(() => 0)
+      for (let i = 0; i < count; i++) {
+        const button = found.nth(i)
+        buttons.push({ name: accountOf(await button.getAttribute('aria-label').catch(() => null)), shown: await button.isVisible().catch(() => false) })
       }
     }
-    const shown = (label ?? '').replace(/^Google Account:\s*/, '').trim()
-    return [shown, ...shown.split(/[()]/).map((part) => part.trim())].filter(Boolean)
+    return buttons
+  }
+
+  /**
+   * The one account its button names, for authentication (the identity and a Save's sign-in
+   * check). The button shown is read first; when none of the map's candidates shows it, the
+   * buttons found (`accountButtons`) are read with hidden ones included, but only when none of
+   * them shows at all: shown buttons that do not resolve (two shown account buttons, say) are
+   * ambiguous and name no one, never read past to a hidden one. Hidden buttons that name more than
+   * one account name no one either. Looked for until `waitMs` has passed (0: once); undefined when
+   * no single account is named.
+   */
+  private async accountLabel(page: Page, waitMs: number): Promise<string | undefined> {
+    const deadline = Date.now() + waitMs
+    for (;;) {
+      const resolved = await this.engine(page).resolve('auth.account', 0).then((found) => found.locator.first().getAttribute('aria-label'), () => undefined)
+      let account = resolved === undefined ? undefined : accountOf(resolved)
+      if (resolved === undefined) {
+        const buttons = await this.accountButtons(page)
+        const names = new Set(buttons.flatMap((button) => (button.name === undefined ? [] : [button.name])))
+        if (!buttons.some((button) => button.shown) && names.size === 1) account = [...names][0]
+      }
+      if (account !== undefined || Date.now() >= deadline) return account
+      await new Promise((resolve) => setTimeout(resolve, ACCOUNT_POLL_MS))
+    }
+  }
+
+  /**
+   * Every account's name and address ("Name (address)") that a button names, shown or hidden
+   * (`accountButtons`), for a drift outline to mask: all of them, even when they are ambiguous and
+   * name no one for authentication, since that is when an outline is taken; never used for
+   * anything but masking.
+   */
+  private async accountNames(page: Page): Promise<string[]> {
+    const names = new Set((await this.accountButtons(page)).flatMap((button) => (button.name === undefined ? [] : [button.name])))
+    return [...names].flatMap((name) => [name, ...name.split(/[()]/).map((part) => part.trim())]).filter(Boolean)
   }
 
   /**
@@ -411,7 +464,7 @@ export class GeminiWebDriver implements ProviderDriver<Page> {
 
   /** The deletion's map entries not yet checked on the live site: while any is, nothing is deleted. */
   deletionUnverified(): string[] {
-    return unverifiedEntries(this.map, DELETION_ENTRIES)
+    return deletionUnverified(this.map)
   }
 
   /**
@@ -419,13 +472,7 @@ export class GeminiWebDriver implements ProviderDriver<Page> {
    * deletion's map entries without opening the operator's browser. The menu is closed with Escape.
    */
   async inspectConversation(page: Page, binding: string): Promise<UiOutline[]> {
-    const shown = await this.openConversation(page, binding)
-    const outlines = [await outlineOf(page, `conversation page (${shown})`)]
-    if (shown !== 'shown') return outlines
-    const opened = await this.engine(page).act('conversation.open-options').then(() => true, () => false)
-    outlines.push(await outlineOf(page, opened ? 'conversation menu' : 'conversation menu (not opened)'))
-    await page.keyboard.press('Escape')
-    return outlines
+    return inspectConversationMenu(page, this.engine(page), await this.openConversation(page, binding))
   }
 
   /** Open a bound conversation: shown as itself (its own path, its turns), positively missing, or neither. */
@@ -495,13 +542,9 @@ export class GeminiWebDriver implements ProviderDriver<Page> {
     return this.bindingOf(page) === binding && (await this.engine(page).count('turn.user')) > 0
   }
 
-  /**
-   * Nothing generating, no dialog or menu open: a session-bound account keeps the page for the
-   * session's next turn. Right after an answer the Stop control may linger a moment, so it waits
-   * briefly (`PAGE_IDLE_WAIT_MS`) before calling the page busy.
-   */
+  /** Nothing generating, no dialog or menu open: a session-bound account keeps the page for the session's next turn. */
   async pageIdle(page: Page): Promise<boolean> {
-    return this.engine(page).waitFor({ state: 'page.idle' }, PAGE_IDLE_WAIT_MS).then(() => true, () => false)
+    return pageIdle(this.engine(page))
   }
 
   /** Where the tabs are shown, Chat must be the active one. */
@@ -771,7 +814,7 @@ function termsNotice(shown: boolean): void {
 }
 
 /** What the operator does about a terms notice ("Account re-auth" in the runbook). */
-export const TERMS_NOTICE_MESSAGE = 'gemini-web: a notice of updated terms ("Keep in mind") covers the input; system never acknowledges it: press the notice\'s own button in the login profile (system account login), then Save'
+const TERMS_NOTICE_MESSAGE = 'gemini-web: a notice of updated terms ("Keep in mind") covers the input; system never acknowledges it: press the notice\'s own button in the login profile (system account login), then Save'
 
 /** Rethrow anything but UI drift, which the caller then refuses with its own reason. */
 function driftOnly(error: unknown): void {

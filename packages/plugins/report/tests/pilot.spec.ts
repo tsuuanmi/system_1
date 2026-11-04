@@ -14,7 +14,7 @@ import type { PoolConfig } from '@tsuuanmi/system-resources-core'
 import Store from '@tsuuanmi/system-store'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { FakeDigests } from '../../../digest-core/conformance/digests.ts'
-import { attempt, bootPilot, charter, decide, operatorAccepts, type Pilot, POLICY, propose, queued, reported, until } from '../../profile-software-development/tests/pilot.ts'
+import { attempt, bootPilot, charter, decide, type Pilot, POLICY, propose, queued, reported, until } from '../../profile-software-development/tests/pilot.ts'
 import * as Report from '../src/index.ts'
 
 // The report over a pilot in miniature (PROP-0010 B8): the algorithm-development template run on
@@ -39,7 +39,11 @@ const call = async (ctx: Context, args: Record<string, unknown>): Promise<Called
   return { ...(result.isError ? { isError: true } : {}), text, ...(result.structuredContent ? { report: result.structuredContent as unknown as Report.Report } : {}) }
 }
 
-/** A project of two tasks: one accepted by the operator after a fix through the queue, its merge asked and left open; one held for the operator. */
+/**
+ * A project of two tasks, each accepted on the checks its run ran on its tree (the pilot's scripted
+ * check source): one after a fix through the queue, done once its merge, asked in the queue, is
+ * approved and lands (T293); one, on the head that merge left, waiting for its landing.
+ */
 async function pilotWeek(): Promise<Pilot> {
   const pilot = await bootPilot({ changes: 1 }, [RecordingMcp, Report])
   onTestFinished(() => pilot.dispose())
@@ -52,10 +56,13 @@ async function pilotWeek(): Promise<Pilot> {
   await decide(ctx, (await queued(ctx, one.runId)).approvalRequest)
   await reported(ctx, one.runId)
   await digested(first.taskId)
-  expect((await operatorAccepts(ctx, first.taskId)).state).toBe('done')
-  // The accepted result is committed on its run's branch and its merge asked in the queue (ADR-0060), left open.
-  await until(() => ctx.workflow.get(one.runId)?.task?.landing?.state === 'asked', 'the merge of the accepted result to be asked')
-  const second = await propose(pilot, 'p1', 'keep add() fast')
+  // Accepted on its recorded checks, it waits for its landing (T293): committed on its run's branch, its merge asked in the queue (ADR-0060).
+  expect(await ctx.board.task(first.taskId)).toMatchObject({ state: 'review', waiting: { reason: 'landing' } })
+  const asked = await until(() => { const l = ctx.workflow.get(one.runId)?.task?.landing; return l?.state === 'asked' ? l : undefined }, 'the merge of the accepted result to be asked')
+  // The operator approves the merge: it lands, and only then is the task done.
+  await decide(ctx, asked.requestId!)
+  await until(async () => (await ctx.board.task(first.taskId))?.state === 'done', `task ${first.taskId} to be done once merged`)
+  const second = await propose(pilot, 'p1', 'keep add() fast', { writes: { type: 'git-head', ref: pilot.git(pilot.repo, 'rev-parse', 'HEAD') } })
   await reported(ctx, (await attempt(ctx, second.taskId, 'Keep add() fast')).runId)
   await digested(second.taskId)
   return pilot
@@ -69,21 +76,23 @@ describe('the report tool over a pilot (PROP-0010 B8)', () => {
     expect(isError).toBeUndefined()
     expect(() => schemas.assertDef('mcp-report@1.0', 'report-output', report)).not.toThrow()
     expect(report!.projects.map((p) => [p.projectId, p.state, p.milestones.map((m) => m.id)])).toEqual([['p1', 'active', ['m1']]])
-    expect(report!.tasks).toMatchObject({ created: 2, done: 1, doneByOperator: 1, cancelled: 0, now: { done: 1, review: 1 } })
-    expect(report!.attempts).toEqual({ reported: 2, accepted: 0, rejected: 0, heldForOperator: 2, reconciled: 0, other: 0, review: { passed: 2, failed: 0, none: 0 } })
+    // Both accepted on the checks their runs recorded (T293), not by the operator: one done once merged, one waiting for its landing.
+    expect(report!.tasks).toMatchObject({ created: 2, done: 1, doneByOperator: 0, cancelled: 0, now: { done: 1, review: 1 } })
+    expect(report!.attempts).toEqual({ reported: 2, accepted: 2, rejected: 0, heldForOperator: 0, reconciled: 0, other: 0, review: { passed: 2, failed: 0, none: 0 } })
     expect(report!.remediation).toEqual({ cycles: 1, fixesOpened: 1, fixesClosed: 0 })
-    // The project's own requests: its charter, the fix, and the accepted result's merge, still open; another project's charter is not its.
-    expect(report!.approvals).toMatchObject({ asked: 3, approved: 2, rejected: 0, expired: 0, withdrawn: 0, openNow: 1, wait: { answered: 2 } })
+    // The project's own requests: its charter, the fix, and the accepted result's merge, approved so it is done (T293); another project's charter is not its.
+    expect(report!.approvals).toMatchObject({ asked: 3, approved: 3, rejected: 0, expired: 0, withdrawn: 0, openNow: 0, wait: { answered: 3 } })
     expect(report!.approvals.byClass.map((c) => [c.actionClass, c.asked])).toEqual([['charter', 1], ['merge', 1], ['remediation', 1]])
-    expect(report!.attention).toMatchObject({ interruptions: 5, batches: 2, threshold: { maxBatchesPerDay: 4, maxInterruptionsPerDay: 10 }, daysOver: 0 })
+    // Three batches: the charter's, the fix's, and the merge's verdict; their three interruptions, and no review held for the operator.
+    expect(report!.attention).toMatchObject({ interruptions: 3, batches: 3, threshold: { maxBatchesPerDay: 4, maxInterruptionsPerDay: 10 }, daysOver: 0 })
     // Every agent run the project's tasks took, the digests of their results included, from the runtime's own numbers.
     expect(agent.runs.filter((r) => r.role === 'digest')).toHaveLength(2)
     expect(report!.usage.total).toEqual({ records: agent.runs.length, inputTokens: 1000 * agent.runs.length, outputTokens: 100 * agent.runs.length, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, turns: 2 * agent.runs.length, costUsd: 0.25 * agent.runs.length })
     expect(report!.usage.pools.map((p) => p.pool)).toEqual(['plan.agents'])
     expect(report!.digests).toEqual({ attached: 2, bypassed: 0, claimsKept: 2, claimsDropped: 0, escalated: 0 })
     expect(report!.baseline).toEqual({
-      acceptedResults: 1, interruptions: 5, attempts: 2,
-      perAcceptedResult: { tokens: 1100 * agent.runs.length, costUsd: 0.25 * agent.runs.length, turns: 2 * agent.runs.length, interruptions: 5, attempts: 2 },
+      acceptedResults: 1, interruptions: 3, attempts: 2,
+      perAcceptedResult: { tokens: 1100 * agent.runs.length, costUsd: 0.25 * agent.runs.length, turns: 2 * agent.runs.length, interruptions: 3, attempts: 2 },
     })
     expect(report!.notes).toEqual([])
     expect(text).toBe(Report.renderReport(report!))
@@ -99,7 +108,10 @@ describe('the report tool over a pilot (PROP-0010 B8)', () => {
 
   it('gives the same report for the same period every time, and counts nothing outside it', async () => {
     const { ctx } = await pilotWeek()
-    const period = { since: new Date(Date.now() - 3_600_000).toISOString(), until: new Date(Date.now() + 1000).toISOString() }
+    // The period ends at an instant already past (its end is exclusive): an entry the pilot records
+    // after it, a batch or a request still settling, falls outside both reads, whichever UTC day it is.
+    const end = Date.now()
+    const period = { since: new Date(end - 3_600_000).toISOString(), until: new Date(end).toISOString() }
     const a = await call(ctx, { projectId: 'p1', ...period })
     const b = await call(ctx, { projectId: 'p1', ...period })
     const { asOf: _a, ...first } = a.report!
@@ -109,6 +121,53 @@ describe('the report tool over a pilot (PROP-0010 B8)', () => {
     expect(withoutAsOf(b.text)).toBe(withoutAsOf(a.text))
     const before = (await call(ctx, { projectId: 'p1', until: period.since, days: 30 })).report!
     expect(before).toMatchObject({ tasks: { created: 0, done: 0 }, attempts: { reported: 0 }, approvals: { asked: 0 }, attention: { interruptions: 0 }, usage: { total: { records: 0 } }, digests: { attached: 0 }, baseline: { acceptedResults: 0 } })
+  })
+
+  it('reads the maturity metrics from what the pilot recorded, through the metrics tool and in the report (PROP-0016 I4)', async () => {
+    const { ctx } = await pilotWeek()
+    const tool = (ctx.get('mcp') as RecordingMcp).tools.get('metrics')!
+    expect(tool.spec.scope).toBe('client')
+    const result = await tool.handler({ projectId: 'p1' }, { scope: 'client' })
+    expect(result.isError).toBeUndefined()
+    const read = result.structuredContent as unknown as Report.Metrics
+    expect(() => schemas.assertDef('mcp-report@1.6', 'metrics-output', read)).not.toThrow()
+    expect(read.metrics.map((m) => m.id)).toEqual(Report.METRIC_IDS)
+    // The one finished task's run was started by the lead, and its started entry says so: a touch at least.
+    const lead = read.metrics.find((m) => m.id === 'lead-touches')!
+    expect(lead).toMatchObject({ state: 'measured', sample: 1, bound: 'lower' })
+    expect(lead.value).toBeGreaterThanOrEqual(1)
+    expect(read.level).toMatchObject({ l3: 'not-shown', finishedTasks: 1, days: 30 })
+    expect((result.content as Array<{ text: string }>)[0]!.text).toMatch(/^# Maturity metrics: project p1\n/)
+    // The weekly report carries the same reading over the 30 days to its end; when it was read is the report's asOf.
+    const { report, text } = await call(ctx, { projectId: 'p1' })
+    expect(report!.maturity).toMatchObject({ projectId: 'p1', days: 30, level: { finishedTasks: 1 } })
+    expect(report!.maturity).not.toHaveProperty('asOf')
+    expect(text).toContain('## Maturity metrics: project p1')
+    const refused = await tool.handler({ days: 0 }, { scope: 'client' })
+    expect(refused).toMatchObject({ isError: true, content: [{ text: expect.stringMatching(/^invalid input, nothing read/) }] })
+  })
+
+  it('holds a lead token to its own project: another project\'s report or metrics is refused, and with none named it reads its own (T285)', async () => {
+    const pilot = await bootPilot({ changes: 1 }, [RecordingMcp, Report])
+    onTestFinished(() => pilot.dispose())
+    const { ctx } = pilot
+    await charter(ctx, 'p1')
+    await charter(ctx, 'p2')
+    const mcp = ctx.get('mcp') as RecordingMcp
+    const asLead = { scope: 'client' as const, lead: 'p1' }
+    for (const name of ['report', 'metrics']) {
+      const refused = await mcp.tools.get(name)!.handler({ projectId: 'p2' }, asLead)
+      expect(refused, name).toMatchObject({ isError: true, content: [{ text: expect.stringMatching(/^forbidden: the lead token of project p1 reaches only project p1; project p2 is another project's, so nothing was read/) }] })
+      for (const args of [{}, { projectId: 'p1' }]) {
+        const own = await mcp.tools.get(name)!.handler(args, asLead)
+        expect(own.isError, `${name} ${JSON.stringify(args)}`).toBeUndefined()
+      }
+    }
+    // With no project named, a lead's report is its own project's; the operator's (and a client token's) is every project's.
+    const own = (await mcp.tools.get('report')!.handler({}, asLead)).structuredContent as unknown as Report.Report
+    expect(own.projects.map((p) => p.projectId)).toEqual(['p1'])
+    expect((await call(ctx, {})).report!.projects.map((p) => p.projectId)).toEqual(['p1', 'p2'])
+    expect(((await mcp.tools.get('metrics')!.handler({}, asLead)).content as Array<{ text: string }>)[0]!.text).toMatch(/^# Maturity metrics: project p1\n/)
   })
 
   it('refuses an input outside its schema, an unknown project, and a period it cannot name, reading nothing', async () => {
@@ -181,6 +240,22 @@ describe('the report tool without its sources', () => {
     expect(report!.usage.pools).toMatchObject([{ pool: 'max.agents', records: 1, turns: 2, unknownRuns: 1, withoutTokens: 1, withoutCost: 1 }])
     expect(report!.notes).toContain('1 usage.unknown entry is not a valid usage-unknown@1.0 record: not counted')
     expect(text).toContain('- Usage the ledger could not count: 2 runs (1 not reported, 1 refused by the ledger), 1 of them counted since; a cap counts the others as 0.')
+  })
+
+  it('reads the operator\'s decision on a run whose task is not finished and whose start is not in the window, from the run\'s own entry in it (PROP-0016 I4)', async () => {
+    const ctx = await boot()
+    // No started entry and no task: only the run's own entry in the window, and the decision on it, name it.
+    ctx.eventLog.append({ type: 'workflow.run.continued', runId: 'run-old', data: { by: 'operator' } })
+    ctx.artifacts.recordDecision({
+      decisionType: 'recovery', question: 'Does the operator continue run run-old?', inputs: [],
+      candidates: [{ option: 'continue', selected: true, reasons: ['the operator continues it'] }, { option: 'stop', selected: false, reasons: ['not stop: the operator chose continue'] }],
+      decider: { type: 'operator', id: 'operator.continue', version: '1' }, outcome: { option: 'continue' }, deterministic: false,
+    }, { producer: { type: 'operator', ref: 'operator' }, runId: 'run-old' })
+    const result = await (ctx.get('mcp') as RecordingMcp).tools.get('metrics')!.handler(afterNow(), { scope: 'client' })
+    expect(result.isError).toBeUndefined()
+    const operator = (result.structuredContent as unknown as Report.Metrics).metrics.find((m) => m.id === 'operator-decisions')!
+    expect(operator).toMatchObject({ state: 'measured', figures: { decisions: 1, onRuns: 1 } })
+    expect(operator.bound).toBeUndefined()
   })
 
   it('says when the digest provider loaded does not know a digest attached in the period, which another provider settled before a swap, rather than count it as no claim (Base exit criterion 6)', async () => {

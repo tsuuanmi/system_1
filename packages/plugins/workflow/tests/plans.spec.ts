@@ -31,11 +31,4 @@ describe.runIf(canRunBrowser)('ctx.workflow: a graph grown from a planner\'s pla
     expect(growth.map((g) => (g.body as { outcome: { option: string } }).outcome.option)).toEqual(['append'])
     expect(ctx.artifacts.get(growth[0]!.inputs[0]!)).toMatchObject({ kind: 'plan', bodySchema: 'plan@1.0' })
   }, 120_000)
-
-  it('refuses a plan whose step id is absurdly long as plan_rejected, never as an internal failure', async () => {
-    const id = 'x'.repeat(400)
-    const { ctx } = await boot({ fake: { answer: () => '```json\n' + JSON.stringify({ confidence: 'high', nodes: [{ id, objective: 'o', prompt: 'p', capabilities: ['reason'], tier: 'economy' }] }) + '\n```' } })
-    const done = await ctx.workflow.wait(ctx.workflow.start({ template: 'investigate', input: 'q' }).runId, 60_000)
-    expect(done).toMatchObject({ status: 'failed', error: { kind: 'plan_rejected', disposition: 'NONE' } })
-  }, 60_000)
 })

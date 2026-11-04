@@ -264,6 +264,13 @@ describe('the roster: every Worker in one read model, projected on read (REQ-HOS
     expect(roster.counts).toEqual({ ready: 2, busy: 3, resting: 3, unavailable: 2, quarantined: 1 })
   })
 
+  it('says why an unavailable Worker takes no work as its source says it (capability-descriptor@1.9, T214)', async () => {
+    const why = 'its codex probe failed: the workspace reads server cannot start its sandbox'
+    const roster = await readRoster(services({}, [descriptor('l:probe-failed', { state: 'unavailable', unavailableReason: why })]), { scope: 'operator', now: NOW })
+    valid(roster)
+    expect(entry(roster, 'l:probe-failed').availability).toEqual({ state: 'unavailable', summary: `unavailable: ${why}`, reason: { value: why } })
+  })
+
   it('reads an unavailable Worker\'s reason from its account: signed out, enrolled and not verified, or one person on two website accounts', async () => {
     const workers = [
       descriptor(`agent:${CLAUDE}/review`, { state: 'unavailable', account: agentAccount(CLAUDE) }),
@@ -487,6 +494,28 @@ describe('the roster: every Worker in one read model, projected on read (REQ-HOS
     const failed = await readRoster(services({ workflow: { usage: () => runs, teamExclusion: async () => { throw new Error('the router is busy') } } }), { scope: 'operator', now: NOW })
     valid(failed)
     for (const e of entries(failed)) expect(e.teams, e.worker).toEqual({ unknown: 'it could not be read: the router is busy' })
+  })
+
+  it('lists every tier a tiered Worker offers, each with its model\'s label and turn limit, in the text and the record (mcp-roster@1.10)', async () => {
+    const tiered = `agent:${CLAUDE}/develop`
+    const offers = [
+      { tier: 'frontier' as const, label: 'Frontier Model', maxTurns: 60 },
+      { tier: 'economy' as const, label: 'Economy Model', maxTurns: 12 },
+      { tier: 'standard' as const, label: 'Standard Model', maxTurns: 30, closed: true as const, until: '2026-10-24T11:00:00Z' },
+    ]
+    const workers = [descriptor(tiered, { account: agentAccount(CLAUDE), tier: 'economy', tiers: offers }), descriptor(`agent:${CLAUDE}/review`, { account: agentAccount(CLAUDE) })]
+    const roster = await readRoster(services({}, workers), { scope: 'operator', now: NOW })
+    valid(roster)
+    const e = entry(roster, tiered)
+    expect(e.tiers).toEqual([
+      { tier: 'economy', label: 'Economy Model', maxTurns: 12 },
+      { tier: 'standard', label: 'Standard Model', maxTurns: 30, closed: true, until: '2026-10-24T11:00:00Z' },
+      { tier: 'frontier', label: 'Frontier Model', maxTurns: 60 },
+    ])
+    expect(e.tier).toBe('economy')
+    expect(entry(roster, `agent:${CLAUDE}/review`)).not.toHaveProperty('tiers')
+    const text = formatRoster(roster)
+    expect(text).toContain("  serves     economy (Economy Model, max 12 turns); standard (Standard Model, max 30 turns, at its model's limit until 2026-10-24T11:00:00Z); frontier (Frontier Model, max 60 turns), agent-plan")
   })
 
   it('the example validates against mcp-roster@1.7, its now included, and a record that is not one is refused', async () => {

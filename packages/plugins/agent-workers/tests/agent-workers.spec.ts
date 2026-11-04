@@ -5,9 +5,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { workspaceReadBounds } from '@tsuuanmi/system-agent-runtime-core'
+import type { RunSpec } from '@tsuuanmi/system-agent-runtimes'
 import { ProviderError } from '@tsuuanmi/system-provider-core'
 import { AdmissionFailure, type WorkRequirement } from '@tsuuanmi/system-workers'
-import { describe, expect, it, onTestFinished } from 'vitest'
+import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { ScriptedAgent, SlowProbeAgent, WORKSPACE, worker, boot, requirement, chatWorker } from './stack.ts'
 import { checkConfig } from '../src/index.ts'
 
@@ -40,6 +41,20 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
     expect((await ctx.workers.list())[0]).toMatchObject({ state: 'unavailable', capabilities: [] })
   })
 
+  it('says why an unavailable Worker takes no work on its descriptor, at most 300 characters on one line, and nothing on a ready one (capability-descriptor@1.9, T214)', async () => {
+    const { ctx } = await boot(new ScriptedAgent({ resume: true }), {
+      workers: [worker(), worker({ id: 'writer', sandbox: 'workspace-write' }), worker({ id: 'ghost', runtime: 'missing' })],
+    })
+    const workers = Object.fromEntries((await ctx.workers.list()).map((w) => [w.worker, w]))
+    expect(workers['agent:reviewer']).not.toHaveProperty('unavailableReason')
+    expect(workers['agent:writer']).toMatchObject({ schema: 'capability-descriptor@1.9', state: 'unavailable', unavailableReason: expect.stringContaining('cannot enforce its workspace-write sandbox') })
+    expect(workers['agent:ghost']).toMatchObject({ schema: 'capability-descriptor@1.9', state: 'unavailable', unavailableReason: expect.stringContaining('no missing runtime is registered') })
+    const unconfined = await boot(new ScriptedAgent({ readsConfined: false }), { workers: [worker()] })
+    const [refused] = await unconfined.ctx.workers.list()
+    expect(refused).toMatchObject({ state: 'unavailable', unavailableReason: expect.stringContaining('cannot keep host state unreadable') })
+    for (const w of Object.values(workers)) expect([...(w.unavailableReason ?? '')].length).toBeLessThanOrEqual(300)
+  })
+
   it('never admits a Worker whose runtime cannot ask the run\'s gate before each tool call (docs/design/approvals.md)', async () => {
     const { ctx } = await boot(new ScriptedAgent({ gatesToolCalls: false }), { workers: [worker()] })
     expect((await ctx.workers.list())[0]).toMatchObject({ state: 'unavailable', capabilities: [] })
@@ -56,6 +71,37 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
     const done = await source.wait(started.id, 10_000)
     expect(done).toMatchObject({ status: 'failed', error: { kind: 'config_error' } })
     expect(agent.runs).toEqual([])
+  })
+
+  it('marks a sent run whose Worker became unavailable while it ran worker-unavailable, and one whose Worker is still there not (ADR-0069)', async () => {
+    /** An agent whose process goes away mid-run; with `vanishes`, its runtime's probe fails from then on. */
+    class VanishingAgent extends ScriptedAgent {
+      constructor(private readonly state: { available: boolean; vanishes: boolean }) {
+        super(state)
+      }
+
+      override async run(spec: RunSpec): ReturnType<ScriptedAgent['run']> {
+        this.runs.push(spec)
+        if (this.state.vanishes) this.state.available = false
+        throw new ProviderError('session_broken', 'the agent process exited mid-run')
+      }
+    }
+    const outcome = async (vanishes: boolean) => {
+      const agent = new VanishingAgent({ available: true, vanishes })
+      const { ctx } = await boot(agent, { workers: [worker()], probeTtlMs: 0 })
+      const admitted = await ctx.workers.route(requirement())
+      const source = ctx.workers.source('agents')!
+      const started = source.start({ key: 'k', worker: 'agent:reviewer', prompt: 'review', requirement: requirement(), decisions: admitted.decisions })
+      const done = await source.wait(started.id, 10_000)
+      expect(agent.runs).toHaveLength(1)
+      return done
+    }
+    const gone = await outcome(true)
+    expect(gone).toMatchObject({ status: 'failed', submitted: true, error: { kind: 'session_broken', infrastructure: 'worker-unavailable', message: expect.stringMatching(/the agent process exited mid-run; agent:reviewer became unavailable while it ran: its scripted probe failed/) } })
+    // The same failure on a Worker still there is the run's own: never marked.
+    const there = await outcome(false)
+    expect(there).toMatchObject({ status: 'failed', submitted: true, error: { kind: 'session_broken', message: 'the agent process exited mid-run' } })
+    expect(there.error).not.toHaveProperty('infrastructure')
   })
 
   it('never makes a describe wait for a re-probe: a slow one keeps the Worker routable within probeTtlMs, past it the Worker is unavailable while the source still answers, and a failed one admits nothing (T50)', async () => {
@@ -235,20 +281,25 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
   })
 
   it('runs one thing at a time per Worker: a second run waits for the first (one writer per workspace, INV-15)', async () => {
-    const agent = new ScriptedAgent({ sandboxes: ['read-only', 'workspace-write'], holdMs: 600 })
+    // Held long enough that a loaded host still sees the second run queued while the first runs; waited
+    // for by what happened, never by a fixed sleep (it failed under load when the first had not started yet).
+    const agent = new ScriptedAgent({ sandboxes: ['read-only', 'workspace-write'], holdMs: 1500 })
     const { ctx } = await boot(agent, { workers: [worker({ id: 'dev', sandbox: 'workspace-write', tools: [] })] })
     const admitted = await ctx.workers.route(requirement({ capabilities: ['develop'] }))
     const source = ctx.workers.source('agents')!
     const start = (key: string) => source.start({ key, worker: 'agent:dev', prompt: key, requirement: requirement({ capabilities: ['develop'] }), decisions: admitted.decisions })
     const one = start('one')
     const two = start('two')
-    await new Promise((resolve) => setTimeout(resolve, 300))
-    expect(agent.runs.map((r) => r.prompt)).toEqual(['one'])
-    expect(source.get(two.id)).toMatchObject({ status: 'queued', submitted: false })
-    await source.wait(one.id, 10_000)
-    expect((await source.wait(two.id, 10_000)).status).toBe('completed')
-    expect(agent.runs.map((r) => r.prompt)).toEqual(['one', 'two'])
-  })
+    // One of them runs, the other waits: which goes first is not promised (the two starts race), only that
+    // never both at once (INV-15).
+    await vi.waitFor(() => expect(agent.runs).toHaveLength(1), { timeout: 10_000, interval: 20 })
+    const first = agent.runs[0]!.prompt === 'one' ? one : two
+    const second = first === one ? two : one
+    expect(source.get(second.id)).toMatchObject({ status: 'queued', submitted: false })
+    expect((await source.wait(first.id, 10_000)).status).toBe('completed')
+    expect((await source.wait(second.id, 10_000)).status).toBe('completed')
+    expect(agent.runs.map((r) => r.prompt).sort()).toEqual(['one', 'two'])
+  }, 20_000)
 
   it('cancels a running run, and a queued one never starts (REQ-WRK-4)', async () => {
     const agent = new ScriptedAgent({ holdMs: 30_000 })
@@ -316,8 +367,10 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
     const queued = source.start({ key: 'k-2', worker: 'agent:reviewer', prompt: 'next', requirement: requirement(), decisions: admitted.decisions })
     await new Promise((resolve) => setTimeout(resolve, 300))
     await first.stop()
-    // A crash: the dead process still holds the queued run's lease for a few seconds.
+    // A crash: the dead process still holds the queued run's lease for a few seconds, and no stop
+    // marked its started run as cut by the host (T283), so that one is never run again (INV-4).
     const db = new DatabaseSync(join(dir, 'system.db'))
+    db.prepare('UPDATE agent_runs SET host_stopped_at = NULL').run()
     db.prepare("INSERT OR REPLACE INTO leases (resource, owner, token, generation, expires_at) VALUES (?, 'dead:1:x', 'dead', 7, ?)").run(`agent-run:${queued.id}`, Date.now() + 3000)
     db.close()
     const again = new ScriptedAgent()
@@ -326,7 +379,7 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
     expect(again.runs.map((r) => r.prompt)).toEqual(['next'])
   }, 60_000)
 
-  it('never runs a started run again after a restart: it fails for the operator to inspect (INV-4)', async () => {
+  it('never runs a started run again after a crash: it fails for the operator to inspect (INV-4)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'system-agents-'))
     // The agent's process is reported, and ends with the stop: the verdict can find it gone (PROP-0013).
     const first = await boot(new ScriptedAgent({ holdMs: 30_000, process: true }), undefined, dir)
@@ -335,6 +388,10 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
     const started = source.start({ key: 'k', worker: 'agent:reviewer', prompt: 'long', requirement: requirement(), decisions: admitted.decisions })
     await new Promise((resolve) => setTimeout(resolve, 300))
     await first.stop()
+    // A crash, not a stop: nothing marked the run as cut by the host (T283).
+    const crashed = new DatabaseSync(join(dir, 'system.db'))
+    crashed.prepare('UPDATE agent_runs SET host_stopped_at = NULL WHERE run_id = ?').run(started.id)
+    crashed.close()
     const again = new ScriptedAgent()
     const second = await boot(again, { workers: [worker()], deadAfterSeconds: 1 }, dir)
     const done = await second.ctx.workers.source('agents')!.wait(started.id, 10_000)
@@ -378,7 +435,7 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
       return dir
     }
     /** The developer fixes calc.py; the reviewer answers with an assessment naming `subjectOf(prompt)`. */
-    const develop = async (review: (prompt: string, workspace: string) => string) => {
+    const develop = async (review: (prompt: string, workspace: string) => string, verifier: (prompt: string) => string = (prompt) => verify(prompt)) => {
       const ws = gitRepo()
       const agent = new ScriptedAgent({
         sandboxes: ['read-only', 'workspace-write'],
@@ -389,6 +446,8 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
             else writeFileSync(join(ws, 'calc.py'), 'def add(a, b):\n    return a + b\n')
             return 'done'
           }
+          // The second reviewer confirms each important finding it is given (ADR-0075).
+          if (spec.prompt.includes('## Verify these findings')) return verifier(spec.prompt)
           return review(spec.prompt, ws)
         },
       })
@@ -411,8 +470,14 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
       return { ctx, agent, approvals, done: await ctx.workflow.wait(run.runId, 60_000) }
     }
     const subjectOf = (prompt: string): string => /^Subject: (\S+)$/m.exec(prompt)![1]!
-    const assessment = (subject: string) => '```json\n' + JSON.stringify({ subject, verdict: 'approve', findings: [{ severity: 'info', title: 'add() now adds' }] }) + '\n```'
-    const changes = (subject: string) => '```json\n' + JSON.stringify({ subject, verdict: 'changes-requested', findings: [{ severity: 'blocking', title: 'no test for add()', file: 'calc.py' }] }) + '\n```'
+    const assessment = (subject: string) => '```json\n' + JSON.stringify({ subject, verdict: 'approve', findings: [{ severity: 'nit', title: 'add() now adds' }] }) + '\n```'
+    const changes = (subject: string) => '```json\n' + JSON.stringify({ subject, verdict: 'changes-requested', findings: [{ severity: 'important', title: 'no test for add()', file: 'calc.py', line: 2, evidence: 'calc.py line 2 changed add(), and no test calls it' }] }) + '\n```'
+    function verify(prompt: string): string {
+      const subject = /^Verified subject: (\S+)$/m.exec(prompt)![1]!
+      const votes = [...prompt.matchAll(/^- (f\d+) important:/gm)].map((m) => ({ finding: m[1], vote: 'confirm', reason: 'no test calls add()' }))
+      return '```json\n' + JSON.stringify({ subject, votes }) + '\n```'
+    }
+    const isReview = (prompt: string): boolean => /^Subject: /m.test(prompt)
 
     it('remediates blocking findings: a fix, then a review of the new subject; the report waits for both', async () => {
       let reviews = 0
@@ -424,12 +489,15 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
       expect(byId['plan:1:review:approve:1']).toMatchObject({ state: 'COMPLETED' })
       expect(byId['plan:1:review:fix:1']).toMatchObject({ state: 'COMPLETED', worker: 'agent:dev' })
       expect(byId['plan:1:review:review:2']).toMatchObject({ state: 'COMPLETED', worker: 'agent:reviewer' })
-      expect(agent.runs.find((r) => r.prompt.includes('Fix the blocking findings'))!.prompt).toContain('- no test for add() (calc.py)')
+      expect(agent.runs.find((r) => r.prompt.includes('Fix the blocking findings'))!.prompt).toContain('- no test for add() (calc.py:2)')
       // Each review bound to its own subject: the fix changed the tree.
-      const subjects = agent.runs.filter((r) => r.sandbox === 'read-only').map((r) => subjectOf(r.prompt))
+      const subjects = agent.runs.filter((r) => r.sandbox === 'read-only' && isReview(r.prompt)).map((r) => subjectOf(r.prompt))
       expect(subjects).toHaveLength(2)
       expect(subjects[0]).not.toBe(subjects[1])
-      expect(ctx.artifacts.list({ kind: 'assessment' }).map((a) => (a.body as { verdict: string }).verdict).sort()).toEqual(['approve', 'changes-requested'])
+      // The first review (its important finding still unverified: it requests nothing yet), the
+      // verification's (with the confirmed vote: changes requested), and the approving re-review.
+      expect(byId['plan:1:review:verify']).toMatchObject({ state: 'COMPLETED' })
+      expect(ctx.artifacts.list({ kind: 'assessment' }).map((a) => (a.body as { verdict: string }).verdict).sort()).toEqual(['approve', 'approve', 'changes-requested'])
       expect(done.nodes.at(-1)!.nodeId).toBe('report:1')
     })
 
@@ -448,6 +516,7 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
         await new Promise((resolve) => setTimeout(resolve, 50))
       }
       const again = await ctx.workflow.wait(done.runId, 60_000)
+      expect(again.error).toBeUndefined()
       expect(again.status).toBe('completed')
       const states = Object.fromEntries(ctx.workflow.records(done.runId).map((r) => [r.nodeId, r.state]))
       // What review 2 grew before is history; its new growth carries its new generation.
@@ -459,7 +528,9 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
       const { ctx, done } = await develop((prompt) => changes(subjectOf(prompt)))
       expect(done.status).toBe('completed')
       expect(done.nodes.map((n) => n.nodeId).filter((id) => id.includes(':review'))).toEqual([
-        'plan:1:review', 'plan:1:review:approve:1', 'plan:1:review:fix:1', 'plan:1:review:review:2', 'plan:1:review:approve:2', 'plan:1:review:fix:2', 'plan:1:review:review:3',
+        // Each review's important finding is verified before it can grow a fix (ADR-0075); the third's too, though the bound refuses its fix.
+        'plan:1:review', 'plan:1:review:verify', 'plan:1:review:approve:1', 'plan:1:review:fix:1', 'plan:1:review:review:2', 'plan:1:review:review:2:verify',
+        'plan:1:review:approve:2', 'plan:1:review:fix:2', 'plan:1:review:review:3', 'plan:1:review:review:3:verify',
       ])
       const growth = ctx.artifacts.list({ kind: 'decision' }).map((a) => a.body as { decisionType: string; decider: { id: string }; outcome: { option: string } })
         .filter((d) => d.decider.id === 'workflow.remediation').map((d) => d.outcome.option)
@@ -474,8 +545,8 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
       expect(prompt).toContain('+    return a + b')
       expect(prompt).toContain('Requested change: Fix add()')
       const [stored] = ctx.artifacts.list({ kind: 'assessment' })
-      expect(stored).toMatchObject({ bodySchema: 'assessment@1.0', subject: { type: 'git-head' } })
-      expect(stored!.body).toMatchObject({ verdict: 'approve', reviewer: 'agent:reviewer', findings: [{ severity: 'info' }] })
+      expect(stored).toMatchObject({ bodySchema: 'assessment@1.1', subject: { type: 'git-head' } })
+      expect(stored!.body).toMatchObject({ verdict: 'approve', reviewer: 'agent:reviewer', findings: [{ severity: 'nit' }], summary: '1 nit; nothing blocks.' })
       expect(`git:${(stored!.body as { subject: { ref: string; version: string } }).subject.ref}:${(stored!.body as { subject: { version: string } }).subject.version}`).toBe(subjectOf(prompt))
     })
 
@@ -485,6 +556,45 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
       expect(done.error!.message).toMatch(/not the subject it was given/)
     })
 
+    it('asks a review whose answer has no JSON assessment once more for it, and passes when the JSON comes (T349b)', async () => {
+      let asked = 0
+      const { ctx, agent, done } = await develop((prompt) => (++asked === 1 ? 'The change looks fine to me.' : assessment(subjectOf(prompt))))
+      expect(done.status).toBe('completed')
+      const reviews = agent.runs.filter((r) => r.sandbox === 'read-only' && !r.prompt.includes('## Verify these findings'))
+      expect(reviews).toHaveLength(2)
+      expect(reviews[1]!.prompt).toContain('the review has no JSON assessment')
+      expect(reviews[1]!.prompt).toContain('"verdict": "approve" or "changes-requested"')
+      expect(ctx.artifacts.list({ kind: 'assessment' })).toHaveLength(1)
+    })
+
+    it('fails the step as assessment_missing, never stale_subject, when the answer misses its JSON twice (T349b)', async () => {
+      const { done } = await develop(() => 'No JSON here, only prose.')
+      expect(done).toMatchObject({ status: 'failed', error: { kind: 'assessment_missing' } })
+      expect(done.error!.message).toMatch(/the review has no JSON assessment/)
+    })
+
+    it('asks for the verdict a JSON without one lacks, and fails twice-missed as assessment_missing (T349b)', async () => {
+      const { done } = await develop((prompt) => '```json\n' + JSON.stringify({ subject: subjectOf(prompt), findings: [] }) + '\n```')
+      expect(done).toMatchObject({ status: 'failed', error: { kind: 'assessment_missing' } })
+      expect(done.error!.message).toMatch(/no verdict/)
+    })
+
+    it('asks a verifier whose answer has no JSON votes once more for them; its second miss leaves the finding unverified, as before (T349b)', async () => {
+      // The review raises one important finding; its verifier answers prose once, then votes.
+      let asked = 0
+      const once = await develop((prompt) => (asked > 0 ? assessment(subjectOf(prompt)) : changes(subjectOf(prompt))), (prompt) => (++asked === 1 ? 'I looked and agree.' : verify(prompt)))
+      expect(once.done.error).toBeUndefined()
+      expect(once.done.status).toBe('completed')
+      const verifiers = once.agent.runs.filter((r) => r.prompt.includes('## Verify these findings'))
+      expect(verifiers).toHaveLength(2)
+      expect(verifiers[1]!.prompt).toContain('the verification has no JSON votes')
+      expect(verifiers[1]!.prompt).toContain('"votes": [{"finding": "f1"')
+      // A verifier that never votes is asked once, then leaves the finding unverified: it never blocks, and the step is no failure.
+      const never = await develop((prompt) => changes(subjectOf(prompt)), () => 'No votes.')
+      expect(never.done.status).toBe('completed')
+      expect(never.agent.runs.filter((r) => r.prompt.includes('## Verify these findings'))).toHaveLength(2)
+    })
+
     it('fails the gate when the working tree changes during the review (INV-5)', async () => {
       const { done } = await develop((prompt, ws) => {
         writeFileSync(join(ws, 'calc.py'), 'def add(a, b):\n    return b + a\n')
@@ -492,6 +602,16 @@ describe('ctx.workers source `agents`: agent runtimes as Workers', () => {
       })
       expect(done).toMatchObject({ status: 'failed', error: { kind: 'stale_subject' } })
       expect(done.error!.message).toMatch(/changed during the review/)
+    })
+
+    it('fails as stale_subject, never asking again, when the tree moved and the answer also has no JSON (T349b)', async () => {
+      const { agent, done } = await develop((_prompt, ws) => {
+        writeFileSync(join(ws, 'calc.py'), 'def add(a, b):\n    return b + a\n')
+        return 'No JSON here, only prose.'
+      })
+      expect(done).toMatchObject({ status: 'failed', error: { kind: 'stale_subject' } })
+      expect(done.error!.message).toMatch(/changed during the review/)
+      expect(agent.runs.filter((r) => r.prompt.includes('Your answer cannot be read'))).toHaveLength(0)
     })
   })
 

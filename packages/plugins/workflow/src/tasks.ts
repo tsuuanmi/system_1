@@ -22,22 +22,28 @@
  * choices is a decision with a reason for every candidate (INV-13). The board is optional: a run
  * for a task needs it, every other run does not.
  */
-import { type ArtifactRef, BoardError, type BoardTask, type Board, type Classification, type Project, renderTasks, type RunOutcome, type Subject, UNRELEASED_MAX, type UnreleasedHold, unreleasedText } from '@tsuuanmi/system-board-core'
-import type { Lease } from '@tsuuanmi/system-leases'
+import type { DatabaseSync } from 'node:sqlite'
+import { type ArtifactRef, BoardError, type BoardTask, type Board, type Classification, type InfrastructureFailure, type Lease, type Project, renderTasks, type RunOutcome, type Subject, UNRELEASED_MAX, type UnreleasedHold, unreleasedText } from '@tsuuanmi/system-board-core'
 import { takesKind, type WorkerExecution } from '@tsuuanmi/system-workers-core'
-import { BRIEF_LIMITS, type BriefBudgetLine, type BriefFile, type BriefPointer, captureGitSubject, questionsOf } from '@tsuuanmi/system-libs'
+import { BRIEF_LIMITS, type BriefBudgetLine, type BriefFile, type BriefPointer, captureGitSubject, clampText, CLEAN_VERSION, QUESTION_LIMITS, questionsOf } from '@tsuuanmi/system-libs'
 import { type BudgetLine, ResourcesError, type UsageRecord } from '@tsuuanmi/system-resources-core'
 import type { Check } from '@tsuuanmi/system-approvals-core'
+import { recordOutcome } from './advisor.ts'
 import type { TaskFrame } from './briefs.ts'
-import { TaskCarries } from './carries.ts'
-import { type RanChecks, ranOn } from './checks.ts'
+import { keepable, TaskCarries } from './carries.ts'
+import { type LandingTarget, MAX_FAILURE_LINES, type RanChecks, ranOn } from './checks.ts'
 import { withdrawCalls } from './continuations.ts'
+import { holderLapsedAtStart, infrastructureOf } from './infrastructure.ts'
 import { TaskDigests } from './digests.ts'
+import { TaskDossiers } from './dossiers.ts'
 import { TaskLandings } from './landings.ts'
 import type { Engine, Prepared } from './engine.ts'
 import { routedDecisions } from './recovery.ts'
+import { type AcceptanceRisk, finalTreeReview, heavyReasons } from './risk.ts'
+import { writes as writesChange } from './review.ts'
 import { heldWhy } from './sessions.ts'
-import { clampText, type ResolvedNode } from './spec.ts'
+import { blocks, type Finding, type ResolvedNode } from './spec.ts'
+import { admittedRestriction } from './teams.ts'
 import {
   newId, type NodeRecord, type NodeRow, now, type RunRow, type RunView, type StartInput, type StepHold, TASK_LEASE_TTL_MS, type TaskBudget, type TaskDispatch, type TaskOutcome, type TaskQuestion, type TaskRow, type TaskStartInput, type TaskView, type WorkflowError, WorkflowFailure,
 } from './types.ts'
@@ -55,9 +61,14 @@ const TASKS_FILE = '.system/TASKS.md'
 /** Pointers a task's run adds to every brief it writes, at most (the brief holds 64). */
 const FRAME_POINTERS = 16
 const PRODUCER = { producer: { type: 'system' as const, ref: 'workflow' } }
+/** The decider of whether a run continues the steps of an answered question's run (T291). */
+const CONTINUE = { type: 'rule' as const, id: 'workflow.task-continue', version: '1' }
 
 type Result = { artifacts: ArtifactRef[]; subject: Subject }
-type Lost = { at: string; decision: ArtifactRef; reason: string }
+/** `infrastructure`: the holder lapsed while the host was stopped, found at the first renewal after the start (ADR-0069). */
+type Lost = { at: string; decision: ArtifactRef; reason: string; infrastructure?: InfrastructureFailure }
+/** The run's last review as a task's acceptance names it (`outcome.detail.review`, D80). */
+type AcceptanceReview = { node: string; gate: ArtifactRef; assessment: ArtifactRef; verdict: string; blocking: number; summary?: string; cycle: number; maxCycles: number; subject: { ref: string; version: string } }
 
 const describe = (s: Subject): string => `${s.type} ${s.ref}${s.version ? ` at ${s.version}` : ''}`
 const refusal = (error: BoardError): string => `${error.failure}: ${error.message}`
@@ -96,11 +107,14 @@ export class TaskRuns {
   readonly landings: TaskLandings
   /** Whether each run starts from the work its task's previous attempt left. */
   readonly carries: TaskCarries
+  /** Each task's dossier, across its attempts (ADR-0070). */
+  readonly dossiers: TaskDossiers
 
   constructor(private readonly e: Engine) {
     this.digests = new TaskDigests(e)
     this.landings = new TaskLandings(e)
     this.carries = new TaskCarries(e)
+    this.dossiers = new TaskDossiers(e)
   }
 
   row(runId: string): TaskRow | undefined {
@@ -153,6 +167,8 @@ export class TaskRuns {
   /** On start: outcomes a stop or crash left unreported are reported (running runs resume through their advance). */
   recover(): void {
     this.digests.recover()
+    // Changes a stop left pending to be kept as their attempts' commits (T271) are kept now.
+    this.carries.recover()
     // Reservations a stop or crash left held after their run finished are released (they would expire on their own).
     const held = this.e.ctx.store.db.prepare(`SELECT t.run_id FROM workflow_tasks t JOIN workflow_runs r ON r.run_id = t.run_id
       WHERE t.budget IS NOT NULL AND (json_extract(t.budget, '$.state') IN ('due', 'reserved') OR json_array_length(t.budget, '$.holds') > 0)
@@ -205,6 +221,10 @@ export class TaskRuns {
     if (task.template !== undefined && task.template !== plain.template) {
       throw new WorkflowFailure('invalid_input', `board task ${task.taskId} runs template ${task.template}, not ${plain.template}; nothing was started`)
     }
+    // Its variant too (board-task@1.5): the writing step's kind of work is the variant's, so another one would route it elsewhere.
+    if (task.variant !== undefined && task.variant !== plain.variant) {
+      throw new WorkflowFailure('invalid_input', `board task ${task.taskId} runs variant ${task.variant} of ${task.template}, not ${plain.variant ?? 'its default'}; nothing was started`)
+    }
     const project = await board.project(task.projectId)
     const classification = classificationOf(plain.classification, project?.classification, task)
     // A task with a budget runs only where the ledger can hold it to its lines (INV-2), checked before it is taken.
@@ -212,16 +232,24 @@ export class TaskRuns {
     const runId = newId('run')
     // What every brief of the run carries, and whether the run resumes the session of the work
     // before it; both settled before the task is taken, so a failure here claims nothing.
-    const frame = await this.frameOf(board, task, project, classification)
-    const session = plain.sessionId === undefined ? await this.session(task, prepared, plain.template, runId) : undefined
+    // The attempt this run is: the next one, or the same one again when its question was answered (T291).
+    // Never guessed: a board that cannot say fails the start before the task is taken, as its other reads do.
+    const attempt = task.attempts.count > 0 && await board.continuing(task.taskId) ? task.attempts.count : task.attempts.count + 1
+    const frame = await this.frameOf(board, task, project, classification, attempt)
+    const session = plain.sessionId === undefined ? await this.session(task, prepared, plain.template, runId, attempt) : undefined
     const started = { ...plain, ...(classification ? { classification } : {}), ...(session?.sessionId ? { sessionId: session.sessionId } : {}) }
     const admittedAs = session?.sessionId ? e.prepare(started) : prepared
+    // A dispatched start runs its writing step on the Worker dispatch chose or on none (ADR-0064):
+    // when the step's own restriction leaves that Worker out (the session the run resumes stays on
+    // another, say), it is refused here, before the task is taken, so no attempt is spent on a step
+    // that could only fail; dispatch chooses again (INV-6).
+    if (options.dispatch) await this.dispatchable(task, claim, runId, options.dispatch, admittedAs, classification, session?.decision)
     // A start dispatch chose names its decisions in the run's admission (ADR-0064).
-    const { option, generation, expiresAt, decision } = await this.take(board, task, claim, runId, options.dispatch?.decisions ?? [])
+    const { option, generation, expiresAt, decision } = await this.take(board, task, claim, runId, options.dispatch?.decisions ?? [], attempt)
     // Whether its worktree starts from the work the previous attempt left, carried at its first turn
     // (ADR-0061): decided once the run holds the task, so a refused claim decides nothing for a run
     // that never exists; a record of the earlier attempt it cannot read starts the run from HEAD, recorded.
-    const carry = this.carries.plan(task, runId)
+    const carry = this.carries.plan(task, runId, claim.fresh === true, attempt)
     const bound = {
       runId, taskId: task.taskId, holder: claim.holder ?? ownerOf(runId), generation, claim: option === 'adopt' ? 'adopted' as const : 'own' as const, writes: task.writes, frame,
       ...(task.budget?.length ? { budget: { state: 'due' as const, caps: task.budget } } : {}), ...(carry ? { carry } : {}), ...(options.dispatch ? { dispatch: options.dispatch } : {}),
@@ -255,6 +283,24 @@ export class TaskRuns {
   }
 
   /**
+   * Refuse a dispatched start, before its task is taken, when the restriction routing will apply to
+   * its writing step leaves out the Worker dispatch chose, or the step could not be routed at all
+   * (ADR-0064, INV-6): the step would fail at once with nothing sent, spending the attempt. The
+   * refusal is the run's `workflow.task-admission` decision, its inputs dispatch's decisions.
+   */
+  private async dispatchable(task: BoardTask, claim: TaskStartInput['task'], runId: string, dispatch: TaskDispatch, admittedAs: Prepared, classification: Classification | undefined, session: ArtifactRef | undefined): Promise<void> {
+    const { prefer } = dispatch
+    const node = admittedAs.spec.nodes.find((n) => n.nodeId === prefer.node)
+    if (!node) return
+    const bound = await admittedRestriction(this.e, runId, node, classification)
+    const why = 'problem' in bound ? bound.problem
+      : bound.restrict && !bound.restrict.workers.includes(prefer.worker) ? `${bound.restrict.reason}: ${prefer.worker}, which dispatch chose for step ${prefer.node} (decision ${prefer.decision}), may not take it` : undefined
+    if (!why) return
+    const refused = this.admission(task, undefined, 'refuse', claim, `${why}; the start is refused before it takes the task, so no attempt is spent`, [...dispatch.decisions, ...(session ? [session] : [])])
+    throw new WorkflowFailure('invalid_input', `${why}; nothing was started, and no attempt was spent (decision ${refused})`)
+  }
+
+  /**
    * The run a repeated `clientRequestId` already started for a task, if any. That run may have
    * resumed an earlier session, which its spec names: the same request is the same template and
    * input, resolved with or without that session.
@@ -278,8 +324,7 @@ export class TaskRuns {
    * completed. Only stored artifacts are pointed at, at most {@link FRAME_POINTERS}. The
    * budget is what the task may still draw: its lines less the usage the ledger counts for it.
    */
-  private async frameOf(board: Board, task: BoardTask, project: Project | undefined, classification: Classification | undefined): Promise<TaskFrame> {
-    const attempt = task.attempts.count + 1
+  private async frameOf(board: Board, task: BoardTask, project: Project | undefined, classification: Classification | undefined, attempt: number): Promise<TaskFrame> {
     const pointers: BriefPointer[] = []
     const add = (ref: ArtifactRef, role: BriefPointer['role'], note: string): void => {
       if (pointers.length < FRAME_POINTERS && !pointers.some((p) => p.ref === ref) && this.e.ctx.artifacts.get(ref)) pointers.push({ ref, role, note: clampText(note, BRIEF_LIMITS.note) })
@@ -295,10 +340,10 @@ export class TaskRuns {
       // An attempt the task's spent budget stopped between steps leaves the results of the steps it completed (ADR-0047).
       for (const { nodeId, ref } of this.stoppedSteps(task.taskId)) add(ref, 'prior', `the result of step ${nodeId} of attempt ${task.attempts.count}, which the task's spent budget stopped before its next step`)
       if (task.lastDecision) {
-        // Answers to the questions the previous attempt asked resume the task: its next brief points at them.
+        // Answers to the questions this attempt asked continue it (T291): its next brief points at them.
         const answered = (this.e.ctx.artifacts.get(task.lastDecision)?.body as { outcome?: { detail?: { answers?: unknown } } } | undefined)?.outcome?.detail?.answers
         add(task.lastDecision, 'review', Array.isArray(answered)
-          ? `the answers to the ${answered.length} question(s) attempt ${task.attempts.count} asked, and the decision that made attempt ${attempt}`
+          ? `the answers to the ${answered.length} question(s) attempt ${task.attempts.count} asked, and the decision that ${attempt === task.attempts.count ? 'continues it' : `made attempt ${attempt}`}`
           : `the decision behind attempt ${attempt}: why attempt ${task.attempts.count} did not finish the task`)
       }
     }
@@ -449,7 +494,42 @@ export class TaskRuns {
    * choice is an `admission` decision (`workflow.task-session`). Undefined when there was no work
    * before it with a session, or the caller named a session itself.
    */
-  private async session(task: BoardTask, prepared: Prepared, template: string, runId: string): Promise<{ sessionId?: string; decision: ArtifactRef } | undefined> {
+  private async session(task: BoardTask, prepared: Prepared, template: string, runId: string, attempt: number): Promise<{ sessionId?: string; decision: ArtifactRef } | undefined> {
+    const checked = await this.resumable(task, prepared.spec.nodes, template)
+    if (!checked) return undefined
+    const { previous, what, fresh, handle } = checked
+    const resume = !fresh
+    const decision = this.e.ctx.artifacts.recordDecision({
+      decisionType: 'admission',
+      question: `Does run ${runId}, attempt ${attempt} of board task ${task.taskId}, resume the session of ${what}?`,
+      inputs: [],
+      candidates: [
+        { option: 'resume', selected: resume, reasons: resume ? [`session ${previous.sessionId} of ${what} keeps native session ${handle}, and its Worker can resume it`, 'the brief is the session\'s next message: the Worker keeps its context'] : [`not resume: ${fresh}`] },
+        { option: 'fresh', selected: !resume, reasons: resume ? ['not fresh: the session can be resumed, so the Worker keeps the context it built'] : [fresh!, 'a fresh session is given the brief, which points at the earlier work'] },
+      ],
+      decider: { type: 'rule', id: 'workflow.task-session', version: '1' },
+      outcome: { option: resume ? 'resume' : 'fresh', detail: { taskId: task.taskId, from: previous.runId, sessionId: previous.sessionId, ...(resume ? { nativeHandle: handle } : {}) } },
+      deterministic: true,
+    }, { ...PRODUCER, runId }).id as ArtifactRef
+    return { ...(resume ? { sessionId: previous.sessionId } : {}), decision }
+  }
+
+  /**
+   * The session a run started now for the task's next attempt would resume (see {@link session}),
+   * or undefined when it would start fresh: what dispatch reads to choose the writing step's Worker
+   * within the restriction routing will apply (ADR-0064, INV-6). Records nothing.
+   */
+  async resumes(task: BoardTask, template: string, nodes: readonly ResolvedNode[]): Promise<string | undefined> {
+    const checked = await this.resumable(task, nodes, template)
+    return checked && !checked.fresh ? checked.previous.sessionId : undefined
+  }
+
+  /**
+   * Whether the task's next run can resume the session of the work before it, with why not
+   * (`fresh`); undefined when there was no work before it with a session. Records nothing: the
+   * start records it as its `workflow.task-session` decision, and dispatch reads the same answer.
+   */
+  private async resumable(task: BoardTask, nodes: readonly ResolvedNode[], template: string): Promise<{ previous: { sessionId: string; runId: string; taskId: string; via: 'attempt' | 'dependency' }; what: string; fresh?: string; handle?: string } | undefined> {
     const previous = this.previousSession(task.taskId, 'attempt') ?? (task.attempts.count === 0 && task.dependsOn.length === 1 ? this.previousSession(task.dependsOn[0]!, 'dependency') : undefined)
     if (!previous) return undefined
     const workers = this.e.ctx.workers
@@ -457,7 +537,8 @@ export class TaskRuns {
     const what = previous.via === 'attempt' ? `attempt ${task.attempts.count}'s run ${previous.runId}` : `run ${previous.runId} of task ${previous.taskId}, which it depends on`
     let fresh: string | undefined
     let handle: string | undefined
-    if (!prepared.spec.nodes.some((n) => n.session.persist)) fresh = `template ${template} keeps no conversation across its steps, so there is no session to resume`
+    if (!nodes.some((n) => n.session.persist)) fresh = `template ${template} keeps no conversation across its steps, so there is no session to resume`
+    else if (previous.via === 'attempt' && this.e.config.resumeAcrossAttempts === false) fresh = `workflow.resumeAcrossAttempts is off: attempt ${task.attempts.count + 1} starts a fresh session from its brief and the task's dossier, not ${what}'s transcript (T369)`
     else {
       handle = workers.handle(previous.sessionId)
       const bound = workers.affinity(previous.sessionId) ?? []
@@ -465,7 +546,7 @@ export class TaskRuns {
       // An offer scoped to another kind of work (a review member's conversation, ADR-0049) never resumes a task's session.
       const ready = listed.find((w) => (w.state === 'ready' || w.state === 'busy') && w.capabilities.some((c) => c.capability === 'persistent-conversation' && c.scope === undefined))
       // The steps that would continue it must be work its Worker takes (ADR-0057), or they could never route there.
-      const continuing = prepared.spec.nodes.filter((n) => n.session.persist)
+      const continuing = nodes.filter((n) => n.session.persist)
       const untaken = ready ? continuing.filter((n) => !takesKind(ready, n)) : []
       const served = (this.e.ctx.store.db.prepare('SELECT COUNT(*) AS n FROM workflow_runs WHERE session_id = ?').get(previous.sessionId) as { n: number }).n
       // A session blocked on an approval, or whose latest run is not finished or known to be gone,
@@ -477,20 +558,7 @@ export class TaskRuns {
       else if (untaken.length) fresh = `the Worker of session ${previous.sessionId}, ${ready.worker}, takes ${ready.kinds!.join(', ')} work only, and ${untaken.map((n) => `${n.nodeId} is ${n.kind === undefined ? 'work that names no kind' : `${n.kind} work`}`).join(', ')}`
       else if (served >= max) fresh = `session ${previous.sessionId} has served ${served} runs (limit ${max}, workflow.maxSessionRuns; INV-9)`
     }
-    const resume = !fresh
-    const decision = this.e.ctx.artifacts.recordDecision({
-      decisionType: 'admission',
-      question: `Does run ${runId}, attempt ${task.attempts.count + 1} of board task ${task.taskId}, resume the session of ${what}?`,
-      inputs: [],
-      candidates: [
-        { option: 'resume', selected: resume, reasons: resume ? [`session ${previous.sessionId} of ${what} keeps native session ${handle}, and its Worker can resume it`, 'the brief is the session\'s next message: the Worker keeps its context'] : [`not resume: ${fresh}`] },
-        { option: 'fresh', selected: !resume, reasons: resume ? ['not fresh: the session can be resumed, so the Worker keeps the context it built'] : [fresh!, 'a fresh session is given the brief, which points at the earlier work'] },
-      ],
-      decider: { type: 'rule', id: 'workflow.task-session', version: '1' },
-      outcome: { option: resume ? 'resume' : 'fresh', detail: { taskId: task.taskId, from: previous.runId, sessionId: previous.sessionId, ...(resume ? { nativeHandle: handle } : {}) } },
-      deterministic: true,
-    }, { ...PRODUCER, runId }).id as ArtifactRef
-    return { ...(resume ? { sessionId: previous.sessionId } : {}), decision }
+    return { previous, what, ...(fresh ? { fresh } : {}), ...(handle ? { handle } : {}) }
   }
 
   /** The session of the latest run that served a task, and that run. */
@@ -511,10 +579,10 @@ export class TaskRuns {
    * board fences by generation, or claim the ready task as the run. The choice is an `admission`
    * decision made before the board is asked; a refusal is one too, and refuses the start.
    */
-  private async take(board: Board, task: BoardTask, claim: TaskStartInput['task'], runId: string, chosen: readonly ArtifactRef[] = []): Promise<{ option: 'adopt' | 'claim'; generation: number; expiresAt: string; decision: ArtifactRef }> {
+  private async take(board: Board, task: BoardTask, claim: TaskStartInput['task'], runId: string, chosen: readonly ArtifactRef[] = [], attempt: number = task.attempts.count + 1): Promise<{ option: 'adopt' | 'claim'; generation: number; expiresAt: string; decision: ArtifactRef }> {
     const adopting = claim.holder !== undefined
     const refuse = (why: string, inputs: ArtifactRef[] = []): never => {
-      const refused = this.admission(task, undefined, 'refuse', claim, why, [...chosen, ...inputs])
+      const refused = this.admission(task, undefined, 'refuse', claim, why, [...chosen, ...inputs], attempt)
       throw new WorkflowFailure('invalid_input', `${why}; nothing was started (decision ${refused})`)
     }
     if (adopting) {
@@ -522,7 +590,7 @@ export class TaskRuns {
       if (task.holder?.owner !== claim.holder || task.holder?.generation !== claim.generation) {
         refuse(`a stale claim: task ${task.taskId} is held by ${task.holder?.owner ?? 'no one'} at generation ${task.holder?.generation ?? '(none)'}, not by ${claim.holder} at ${claim.generation}`)
       }
-      const decision = this.admission(task, runId, 'adopt', claim, `${claim.holder} hands its live claim (generation ${claim.generation}) to the run`, [...chosen])
+      const decision = this.admission(task, runId, 'adopt', claim, `${claim.holder} hands its live claim (generation ${claim.generation}) to the run`, [...chosen], attempt)
       try {
         const renewed = await board.renew(task.taskId, claim.generation!, TASK_LEASE_TTL_MS)
         return { option: 'adopt', generation: claim.generation!, expiresAt: renewed.leaseExpiresAt, decision }
@@ -533,7 +601,7 @@ export class TaskRuns {
     }
     if (task.state !== 'ready') refuse(`task ${task.taskId} is ${task.state}, not ready to claim`)
     const how = chosen.length ? `dispatch chose its start (its decisions are this decision's inputs), and the run claims the ready task ${task.taskId} as ${ownerOf(runId)}` : `the caller holds no claim on task ${task.taskId}, which is ready: the run claims it as ${ownerOf(runId)}`
-    const decision = this.admission(task, runId, 'claim', claim, how, [...chosen])
+    const decision = this.admission(task, runId, 'claim', claim, how, [...chosen], attempt)
     try {
       const taken = await board.claim(task.taskId, ownerOf(runId), TASK_LEASE_TTL_MS)
       return { option: 'claim', generation: taken.generation, expiresAt: taken.leaseExpiresAt, decision }
@@ -560,7 +628,7 @@ export class TaskRuns {
   }
 
   /** The engine's choice of how a run takes its task: adopt the caller's claim, claim it, or refuse (INV-13). */
-  private admission(task: BoardTask, runId: string | undefined, option: 'adopt' | 'claim' | 'refuse', claim: TaskStartInput['task'], why: string, inputs: ArtifactRef[] = []): ArtifactRef {
+  private admission(task: BoardTask, runId: string | undefined, option: 'adopt' | 'claim' | 'refuse', claim: TaskStartInput['task'], why: string, inputs: ArtifactRef[] = [], attempt: number = task.attempts.count + 1): ArtifactRef {
     const adopting = claim.holder !== undefined
     const reasons = (candidate: 'adopt' | 'claim' | 'refuse'): string[] => {
       if (candidate === option) return candidate === 'refuse' ? [why, 'nothing was started: no node runs, nothing is sent (fail closed)'] : [why]
@@ -571,7 +639,7 @@ export class TaskRuns {
     const order: Array<'adopt' | 'claim' | 'refuse'> = adopting ? ['adopt', 'claim', 'refuse'] : ['claim', 'adopt', 'refuse']
     return this.e.ctx.artifacts.recordDecision({
       decisionType: 'admission',
-      question: `How does ${runId ? `run ${runId}` : 'a new run'} take board task ${task.taskId} for its attempt ${task.attempts.count + 1}?`,
+      question: `How does ${runId ? `run ${runId}` : 'a new run'} take board task ${task.taskId} for its attempt ${attempt}?`,
       inputs,
       candidates: order.map((candidate) => ({ option: candidate, selected: candidate === option, reasons: reasons(candidate) })),
       decider: { type: 'rule', id: 'workflow.task-admission', version: '1' },
@@ -617,15 +685,197 @@ export class TaskRuns {
     } else if (row.lost || this.renewals.has(runId)) {
       return this.carried(runId)
     }
-    // After a restart, the lease is renewed before anything runs: a lapse shows now, not later.
-    if ((await this.renew(this.row(runId)!, board)) === 'unknown') return 'wait'
+    // After a restart, the lease is renewed before anything runs: a lapse shows now, not later. A run
+    // that was running when this engine started and finds its holder gone at its first renewal lost
+    // it while the host was stopped (ADR-0069).
+    const atStart = this.e.inheritedRuns.has(runId)
+    if ((await this.renew(this.row(runId)!, board, atStart)) === 'unknown') return 'wait'
+    this.e.inheritedRuns.delete(runId)
     return this.carried(runId)
   }
 
-  /** Before the run's first step: the work the previous attempt left is carried into its worktree, or not (./carries.ts); then it goes. */
-  private async carried(runId: string): Promise<'go'> {
-    await this.carries.settle(runId)
+  /**
+   * Before the run's first step: the work the previous attempt left is carried into its worktree, or not
+   * (./carries.ts); then it goes. It waits while the host has no room to cut the worktree (T345).
+   */
+  private async carried(runId: string): Promise<'go' | 'wait'> {
+    if ((await this.carries.settle(runId)) === 'wait') return 'wait'
+    // An answered question continues its attempt (T291): decided once the carry settled, before any step runs.
+    this.continueAsked(runId)
     return 'go'
+  }
+
+  /**
+   * The run of the task whose step asked the questions an answer continues (T291): the task's latest
+   * reported run, when the board took its question wait. Undefined for any other.
+   */
+  private asking(taskId: string): { row: TaskRow; question: TaskQuestion } | undefined {
+    const row = this.e.ctx.store.db.prepare("SELECT * FROM workflow_tasks WHERE task_id = ? AND phase = 'reported' ORDER BY created_at DESC, rowid DESC LIMIT 1").get(taskId) as TaskRow | undefined
+    const question = row?.question ? JSON.parse(row.question) as TaskQuestion : undefined
+    return row && question?.state === 'raised' ? { row, question } : undefined
+  }
+
+  /**
+   * A run that continues an answered question's attempt (T291): it takes the asking run's steps in
+   * place of the template's fresh ones, so nothing that completed runs again. The completed steps keep
+   * their results; the asking step, and every step that had not completed, wait again. The asking step
+   * then runs on its own session (the run's, a team member's, or its author's), resumed on its Worker
+   * when the Worker keeps it, the answers its next message (the brief points at them); a step with no
+   * session of its own, or one the Worker no longer keeps, starts a new one of the same attempt, its
+   * brief carrying the answers and the run's worktree the change. Decided at the run's first turn,
+   * once its carry settled and before any step runs, and only then. Only steps whose results are bound
+   * to no run's tree are kept: a writing step, or any step whose result names the asking run's worktree,
+   * is never kept, since its result, and the review subjects, checks, and landing that read the tree
+   * from it, would point at the asking run's worktree, not this run's (INV-5; agent sources hold a run's
+   * worktree by its run). Then the whole template runs again on the same attempt, from its first step:
+   * the carry gave this run's worktree the change and its brief says so, and every brief points at the
+   * answers. Recorded as an `admission` decision (`workflow.task-continue`), in the transaction that
+   * rewrites the steps, once per run: `continue`, or `fresh` with why, when the asking run is not this
+   * template's, it completed a step bound to its tree, or its steps cannot be read. Never throws: any
+   * doubt is `fresh`.
+   */
+  private continueAsked(runId: string): void {
+    const e = this.e
+    const row = this.row(runId)
+    const frame = row?.frame ? JSON.parse(row.frame) as TaskFrame : undefined
+    if (!row || !frame || row.lost) return
+    const asked = this.asking(row.task_id)
+    if (!asked || asked.row.run_id === runId) return
+    // A continuation runs the asking run's attempt again; any other run is a new attempt, nothing to continue.
+    const askedFrame = asked.row.frame ? JSON.parse(asked.row.frame) as TaskFrame : undefined
+    if (askedFrame?.attempt !== frame.attempt) return
+    // Once per run: every advance passes here.
+    const decided = e.ctx.artifacts.list({ kind: 'decision', decisionType: 'admission', runId, limit: 1000 })
+      .some((a) => (a.body as { decider?: { id?: string } }).decider?.id === CONTINUE.id)
+    if (decided) return
+    const from = asked.row.run_id
+    const step = asked.question.nodeId
+    let why: string | undefined
+    const kept: string[] = []
+    const writers: string[] = []
+    let resumes: string | undefined
+    // A writing step that asked made edits in the asking run's worktree; when this run's worktree does not hold them, they are lost.
+    let lost: string | undefined
+    const record = (): ArtifactRef => {
+      const session = resumes ? `its session ${resumes}, resumed on its Worker when that Worker keeps it, else a new conversation of it` : 'a new session of the same attempt, as the step keeps no session of its own'
+      return e.ctx.artifacts.recordDecision({
+        decisionType: 'admission',
+        question: `Does run ${runId}, attempt ${frame.attempt} of board task ${row.task_id}, continue step ${step} of run ${from}, which asked the questions now answered?`,
+        inputs: [asked.question.decision],
+        candidates: [
+          { option: 'continue', selected: !why, reasons: why ? [clampText(`not continue: ${why}`, 300)] : [
+            clampText(`the answers continue attempt ${frame.attempt} (T291): the ${kept.length} completed step(s) of run ${from} (${kept.join(', ') || 'none'}) keep their results, bound to no run's tree, and do not run again`, 300),
+            clampText(`step ${step} runs again on ${session}, the answers its next message`, 300),
+          ] },
+          { option: 'fresh', selected: !!why, reasons: why ? [clampText(why, 300), lost
+            ? clampText(`the run runs its template from the first step on the same attempt, in a new session, in its own worktree, which does not hold the edits step ${step} made before it asked: every brief says so, and points at the answers`, 300)
+            : 'the run runs its template from the first step on the same attempt, in its own worktree (which the carry gave the change, when it carried it), every brief pointing at the answers'] : ['not fresh: the asking run\'s steps are this template\'s, none it completed is bound to its tree, and this run\'s worktree holds what the asking step left'] },
+        ],
+        decider: { ...CONTINUE },
+        outcome: { option: why ? 'fresh' : 'continue', detail: { taskId: row.task_id, attempt: frame.attempt, from, nodeId: step, kept, writers, ...(resumes ? { sessionId: resumes } : {}), ...(lost ? { lost } : {}) } },
+        deterministic: true,
+      }, { ...PRODUCER, runId }).id as ArtifactRef
+    }
+    /**
+     * The asking writing step's edits are not in this run's worktree: its session, which made them and
+     * would take them as done, is not resumed (every step on it starts a new one, and so does the run), and
+     * every brief of the run says the edits are gone, pointing at this decision.
+     */
+    const forget = (db: DatabaseSync, decision: ArtifactRef, askerSession: string | undefined): void => {
+      const run = e.runRow(runId)!
+      const old = new Set([askerSession, e.runRow(from)?.session_id].filter((s): s is string => !!s))
+      const renamed = new Map<string, string>()
+      const renamedOf = (id: string): string => renamed.get(id) ?? renamed.set(id, newId('ses')).get(id)!
+      for (const node of e.nodeRows(runId)) {
+        const spec = JSON.parse(node.spec) as ResolvedNode
+        if (!spec.session.sessionId || !old.has(spec.session.sessionId)) continue
+        db.prepare('UPDATE workflow_nodes SET spec = ? WHERE run_id = ? AND node_id = ?').run(JSON.stringify({ ...spec, session: { ...spec.session, sessionId: renamedOf(spec.session.sessionId) } }), runId, node.node_id)
+      }
+      if (run.session_id && old.has(run.session_id)) db.prepare('UPDATE workflow_runs SET session_id = ? WHERE run_id = ?').run(renamedOf(run.session_id), runId)
+      const pointer: BriefPointer = { ref: decision, role: 'prior', note: clampText(`This run's worktree does not hold the edits step ${step} made in attempt ${frame.attempt} before it asked (${lost}): make them again from the brief and the answers, in a new session`, BRIEF_LIMITS.note) }
+      const pointers = [pointer, ...frame.pointers].slice(0, FRAME_POINTERS)
+      db.prepare('UPDATE workflow_tasks SET frame = ? WHERE run_id = ?').run(JSON.stringify({ ...frame, pointers }), runId)
+    }
+    try {
+      const run = e.runRow(runId)!
+      const previous = e.runRow(from)
+      const fresh = e.nodeRows(runId)
+      const old = e.nodeRows(from)
+      const ids = new Set(old.map((n) => n.node_id))
+      const asker = old.find((n) => n.node_id === step)
+      // Completed steps bound to the asking run's tree: a writing step, or one whose result names a worktree or that was bound to its subject.
+      writers.push(...old.filter((n) => {
+        if (n.state !== 'COMPLETED') return false
+        if ((JSON.parse(n.spec) as ResolvedNode).capabilities.includes('develop')) return true
+        const result = (JSON.parse(n.record) as NodeRecord).outputReceipt?.result
+        const body = result ? e.ctx.artifacts.get(result)?.body as { workspace?: unknown } | undefined : undefined
+        return typeof body?.workspace === 'string' || n.subject != null
+      }).map((n) => n.node_id))
+      // The asking step itself writes: what it changed before it asked is in the asking run's worktree, and only the carry brings it here.
+      const askerSpec = asker ? JSON.parse(asker.spec) as ResolvedNode : undefined
+      if (askerSpec?.capabilities.includes('develop')) {
+        const carry = this.carries.view(row)
+        // A step that asked before it changed anything left nothing to carry: the source refuses its tree as empty, and nothing is lost.
+        const empty = carry?.state === 'fresh' && carry.cause === 'empty' && carry.from?.runId === from && carry.from.nodeId === step
+        if (!empty && !(carry?.state === 'carried' && carry.from?.runId === from && carry.from.nodeId === step)) {
+          lost = carry?.state === 'carried' ? `the carry brought step ${carry.from?.nodeId ?? '(unknown)'}'s tree, not step ${step}'s`
+            : carry ? `its carry is ${carry.state}${carry.reason ? `: ${carry.reason}` : ''}` : 'no carry was planned: no tree of step ' + step + ' was found to carry'
+        }
+      }
+      if (!previous) why = `run ${from} is gone`
+      else if (previous.template !== run.template) why = `run ${from} ran template ${previous.template}, not ${run.template}`
+      else if (!asker) why = `run ${from} has no step ${step}`
+      else if (fresh.some((n) => !ids.has(n.node_id))) why = `run ${from}'s steps are not this template's (${fresh.filter((n) => !ids.has(n.node_id)).map((n) => n.node_id).join(', ')} missing)`
+      else if (fresh.some((n) => n.state !== 'WAITING')) why = `run ${runId} already started a step`
+      // A kept result names the tree it was made on: kept, it would point this run's review, checks, and landing at the asking run's worktree (INV-5).
+      else if (writers.length) {
+        why = `step(s) ${writers.join(', ')} of run ${from} completed on run ${from}'s worktree, and their results name it; this run works in its own worktree, so they run again there`
+      }
+      // Resumed on a tree without its edits, the asking step would build on work that is not there.
+      else if (lost) why = `step ${step} changed run ${from}'s worktree before it asked, and this run's worktree does not hold that change (${lost}), so its session is not resumed`
+      if (why) {
+        e.ctx.store.transaction((db) => {
+          const decision = record()
+          if (lost) forget(db, decision, askerSpec?.session.sessionId)
+        })
+        return
+      }
+      const columns = (e.ctx.store.db.prepare('PRAGMA table_info(workflow_nodes)').all() as Array<{ name: string }>).map((c) => c.name)
+      const list = columns.join(', ')
+      const select = columns.map((c) => (c === 'run_id' ? '?' : c)).join(', ')
+      // The asking run's session becomes this run's (the same one, when the run resumed it).
+      const session = (spec: ResolvedNode): ResolvedNode => (previous!.session_id && spec.session.sessionId === previous!.session_id && run.session_id && run.session_id !== previous!.session_id
+        ? { ...spec, session: { ...spec.session, sessionId: run.session_id } } : spec)
+      // The steps and the decision that says why, in one transaction: a crash leaves both or neither.
+      e.ctx.store.transaction((db) => {
+        db.prepare('DELETE FROM workflow_nodes WHERE run_id = ?').run(runId)
+        db.prepare(`INSERT INTO workflow_nodes (${list}) SELECT ${select} FROM workflow_nodes WHERE run_id = ?`).run(runId, from)
+        for (const node of e.nodeRows(runId)) {
+          const spec = session(JSON.parse(node.spec) as ResolvedNode)
+          const record = { ...(JSON.parse(node.record) as NodeRecord), runId }
+          if (node.state === 'COMPLETED' || node.state === 'RETIRED') {
+            if (node.state === 'COMPLETED') kept.push(node.node_id)
+            db.prepare('UPDATE workflow_nodes SET spec = ?, record = ? WHERE run_id = ? AND node_id = ?').run(JSON.stringify(spec), JSON.stringify(record), runId, node.node_id)
+            continue
+          }
+          if (node.node_id === step) resumes = spec.session.sessionId
+          const waiting: NodeRecord = { ...record, state: 'WAITING' }
+          delete waiting.execution
+          delete waiting.outputReceipt
+          delete waiting.inputReceipt
+          // Composed again at its promotion, on this run's brief (the answers) and the tree it reads now.
+          const cleared = ['prompt', 'brief_parts', 'subject', 'execution_id', 'source', 'worker', 'not_before', 'error'].filter((c) => columns.includes(c)).map((c) => `, ${c} = NULL`).join('')
+          db.prepare(`UPDATE workflow_nodes SET spec = ?, record = ?, state = 'WAITING'${cleared} WHERE run_id = ? AND node_id = ?`).run(JSON.stringify(spec), JSON.stringify(waiting), runId, node.node_id)
+        }
+        record()
+      })
+    } catch (error) {
+      // The rewrite rolled back: the run keeps its template's steps, from the first.
+      why = `run ${from}'s steps could not be read (${(error as Error).message.slice(0, 300)})`
+      kept.length = 0
+      resumes = undefined
+      e.ctx.store.transaction(() => void record())
+    }
   }
 
   /**
@@ -682,14 +932,14 @@ export class TaskRuns {
   }
 
   /** Renew the run's lease on its task; a refusal means the board no longer holds the run's generation. */
-  private async renew(row: TaskRow, board: Board): Promise<'live' | 'lost' | 'unknown'> {
+  private async renew(row: TaskRow, board: Board, atStart = false): Promise<'live' | 'lost' | 'unknown'> {
     try {
       const renewed = await board.renew(row.task_id, row.generation, TASK_LEASE_TTL_MS)
       this.renewLater(row.run_id, { expiresAt: renewed.leaseExpiresAt })
       return 'live'
     } catch (error) {
       if (error instanceof BoardError && error.failure !== 'conflict') {
-        this.markLost(row, refusal(error))
+        this.markLost(row, refusal(error), atStart ? holderLapsedAtStart(row.task_id, row.generation, refusal(error)) : undefined)
         return 'lost'
       }
       this.warn(`could not renew the lease of run ${row.run_id} on task ${row.task_id}`, error)
@@ -719,7 +969,7 @@ export class TaskRuns {
   }
 
   /** The board no longer holds the run's generation: a `recovery` decision, then the run starts nothing new. */
-  private markLost(row: TaskRow, reason: string): void {
+  private markLost(row: TaskRow, reason: string, infrastructure?: InfrastructureFailure): void {
     const decision = this.e.ctx.artifacts.recordDecision({
       decisionType: 'recovery',
       question: `Does run ${row.run_id} go on after the board no longer holds its generation ${row.generation} of task ${row.task_id}?`,
@@ -732,7 +982,7 @@ export class TaskRuns {
       outcome: { option: 'wind-down', detail: { taskId: row.task_id, generation: row.generation } },
       deterministic: true,
     }, { ...PRODUCER, runId: row.run_id }).id as ArtifactRef
-    const lost: Lost = { at: now(), decision, reason }
+    const lost: Lost = { at: now(), decision, reason, ...(infrastructure ? { infrastructure } : {}) }
     this.e.ctx.store.transaction((db) => {
       db.prepare('UPDATE workflow_tasks SET lost = ?, updated_at = ? WHERE run_id = ? AND lost IS NULL').run(JSON.stringify(lost), now(), row.run_id)
       this.e.ctx.eventLog.append({ type: 'workflow.task.lost', runId: row.run_id, decision, data: { taskId: row.task_id, generation: row.generation, reason } })
@@ -782,8 +1032,11 @@ export class TaskRuns {
     }
     for (const pool of new Set(lines.map((l) => l.pool))) {
       const state = pools.find((p) => p.pool === pool)
-      if (!state) refuse('config_error', `task ${task.taskId}'s budget draws on pool ${pool}, which the resource ledger does not configure`)
-      else if (!state.available) refuse('overloaded', `pool ${pool} of task ${task.taskId}'s budget is unavailable${state.until ? ` until ${state.until}` : ' (a window has no reading that says ok)'}: retry once it is available`)
+      // A line on a template's pools, <pool>/<account> (ADR-0083): one of them available is enough.
+      const group = state ? [] : pools.filter((p) => p.pool.startsWith(`${pool}/`))
+      if (!state && !group.length) refuse('config_error', `task ${task.taskId}'s budget draws on pool ${pool}, which the resource ledger does not configure`)
+      else if (!state && !group.some((p) => p.available)) refuse('overloaded', `no pool of ${pool} in task ${task.taskId}'s budget is available (${group.map((p) => p.pool).join(', ')}): retry once one is`)
+      else if (state && !state.available) refuse('overloaded', `pool ${pool} of task ${task.taskId}'s budget is unavailable${state.until ? ` until ${state.until}` : ' (a window has no reading that says ok)'}: retry once it is available`)
     }
   }
 
@@ -1151,7 +1404,7 @@ export class TaskRuns {
       question: `Does step ${node.node_id} of run ${run.run_id} answer board task ${row.task_id}, or ask a person first?`,
       inputs: [result],
       candidates: [
-        { option: 'ask', selected: true, reasons: [`the step's whole answer is ${questions.length} question(s), as its brief offers: it cannot finish without a person's answer`, 'the task waits for the lead or the operator to answer; its next attempt is briefed with the answers'] },
+        { option: 'ask', selected: true, reasons: [`the step's whole answer is ${questions.length} question(s), as its brief offers: it cannot finish without a person's answer`, 'the task waits for the lead or the operator to answer; the answers continue this attempt, its next run briefed with them'] },
         { option: 'accept', selected: false, reasons: ['not accept: the answer is questions, not a result of the task'] },
       ],
       decider: { type: 'rule', id: 'workflow.task-question', version: '1' },
@@ -1166,6 +1419,22 @@ export class TaskRuns {
       this.e.ctx.eventLog.append({ type: 'workflow.node.failed', runId: run.run_id, nodeId: node.node_id, decision, data: { executionId: execution.id, source: node.source, worker: node.worker, kind: error.kind, disposition: error.disposition } })
       this.e.ctx.eventLog.append({ type: 'workflow.task.question', runId: run.run_id, nodeId: node.node_id, decision, data: { taskId: row.task_id, questions: questions.length } })
     })
+    return true
+  }
+
+  /**
+   * A step whose handbook slice was refused at its start (./handbook.ts, T321): the task waits for
+   * input on the board's question wait, as a step's own question does ({@link ask}), so the refusal
+   * never spends an attempt nor a free retry: once the layer's owner has shortened it, the answer
+   * continues this attempt (T291) and the slice is built again. Called inside the transaction that
+   * fails the step; false (the run's failure is then reported as any other) for a run that is not a
+   * task's, lost its holder, or already asked.
+   */
+  waitsOnHandbook(runId: string, nodeId: string, decision: ArtifactRef, question: string): boolean {
+    const row = this.row(runId)
+    if (!row || row.lost || row.question) return false
+    const asked: TaskQuestion = { state: 'asked', nodeId, questions: [clampText(question, QUESTION_LIMITS.chars)], decision }
+    this.e.ctx.store.db.prepare('UPDATE workflow_tasks SET question = ?, updated_at = ? WHERE run_id = ? AND question IS NULL').run(JSON.stringify(asked), now(), runId)
     return true
   }
 
@@ -1206,12 +1475,13 @@ export class TaskRuns {
    * A task's run completed: bind its result to the exact subject the task leaves, and decide on it
    * (the `acceptance` decision the board applies). The subject is the task's written subject at
    * the version the run left it (the latest result on that type and ref, still current when it
-   * names a working tree); with no write subject, the git working tree the run's required checks
-   * ran on when one ran there to an exit code and the tree is still that version (T165), else the
-   * result artifact itself. Undefined when the run is not a task's,
+   * names a working tree); with no write subject, the git working tree a writing step of the run
+   * changed, whatever the last step is (T293), else the tree the run's required checks ran on when one
+   * ran there to an exit code and the tree is still that version (T165), else the result artifact
+   * itself. Undefined when the run is not a task's,
    * or the result binds; else why it does not, and the run fails (INV-5).
    */
-  complete(run: RunRow, nodes: NodeRow[], final: ArtifactRef, ran?: RanChecks): WorkflowError | undefined {
+  complete(run: RunRow, nodes: NodeRow[], final: ArtifactRef, ran?: RanChecks, targets: readonly LandingTarget[] = [], risk?: AcceptanceRisk): WorkflowError | undefined {
     const row = this.row(run.run_id)
     if (!row) return undefined
     const writes = row.writes ? JSON.parse(row.writes) as Subject : undefined
@@ -1235,7 +1505,15 @@ export class TaskRuns {
       artifacts = [...new Set([source!, final])]
     }
     const notes = [...(ran?.notes ?? [])]
-    if (!writes && ran && Object.keys(ran.checks).length) {
+    // No write subject, and a writing step changed the run's worktree (T293): the result is that git
+    // tree, whatever the last step's own answer is (a review's, a validation's), so its checks bind to
+    // it and it lands; never a report artifact that leaves the change behind in the worktree (INV-5).
+    const written = writes ? undefined : this.writtenTree(done, targets)
+    if (written && 'problem' in written) return this.unbound(run, row, written.problem, written.source)
+    if (written) {
+      subject = written.subject
+      artifacts = [...new Set([written.source, final])]
+    } else if (!writes && ran && Object.keys(ran.checks).length) {
       // No write subject (T165): the result binds to the tree its checks ran on, through the agent
       // result that names it, while the working tree is still that version; else to the result
       // artifact, and the checks, bound to another subject, stay pending (INV-5).
@@ -1248,24 +1526,147 @@ export class TaskRuns {
     // The required checks the run ran on this very subject (./checks.ts) count with its own; one bound elsewhere never does (INV-5).
     const checks: Partial<Record<Check, boolean>> = { ...this.checksOf(done, subject), ...ranOn(ran, subject) }
     const failed = Object.entries(checks).filter(([, passed]) => !passed).map(([check]) => check)
-    const option = failed.length ? 'reject' : 'accept'
+    // A heavy result needs approving reviews of its exact tree by Workers of two provider families (ADR-0071).
+    // Judged on the git tree the reviews judged, whatever the result is bound to; a review that did not approve comes first (T280).
+    const review = this.lastReview(done, subject)
+    const second = heavyReasons(risk, subject, review)
+    const short = second.reasons.length ? second.reasons.join('; ') : undefined
+    const option = failed.length || short ? 'reject' : 'accept'
     const said = Object.keys(checks).length ? `the checks it ran: ${Object.entries(checks).map(([c, p]) => `${c} ${p ? 'passed' : 'failed'}`).join(', ')}` : 'it ran none of the checks a policy can require; the board binds those'
+    const tierSaid = risk ? [`its risk tier is ${risk.tier} (decision ${risk.decision})${risk.tier === 'heavy' && !short ?`, and ${second.families} provider families approved its exact tree` : ''}`] : []
+    // What the board's auto-accept rule reads (D80, ADR-0067): the run's last review, and where the result would land.
+    const landing = this.landingOf(artifacts, subject, targets)
+    const rejectWhy = [...(failed.length ? [`the run's own ${failed.join(', ')} check failed on ${describe(subject)}`] : []), ...(short ? [short] : [])]
     const acceptance = this.e.ctx.artifacts.recordDecision({
       decisionType: 'acceptance',
       question: `Does run ${run.run_id}'s result complete its attempt of board task ${row.task_id}?`,
-      inputs: [...artifacts, ...(ran?.evidence ? [ran.evidence] : [])],
+      inputs: [...artifacts, ...(ran?.evidence ? [ran.evidence] : []), ...(review && !artifacts.includes(review.assessment) ? [review.assessment] : []), ...(risk ? [risk.decision] : [])],
       candidates: [
-        { option: 'accept', selected: !failed.length, reasons: failed.length ? [`not accept: the run's own ${failed.join(', ')} check failed`] : [`every step of the run was accepted by its contract, and its result is on ${describe(subject)}`, said, ...notes] },
-        { option: 'reject', selected: !!failed.length, reasons: failed.length ? [`the run's own ${failed.join(', ')} check failed on ${describe(subject)}: the work goes back as another attempt`, ...notes] : ['not reject: no check the run ran failed'] },
+        { option: 'accept', selected: option === 'accept', reasons: option === 'reject' ? rejectWhy.map((w) => `not accept: ${w}`) : [`every step of the run was accepted by its contract, and its result is on ${describe(subject)}`, said, ...tierSaid, ...notes] },
+        { option: 'reject', selected: option === 'reject', reasons: option === 'reject' ? [`${rejectWhy.join('; ')}: the work goes back as another attempt`, ...notes] : ['not reject: no check the run ran failed', ...(risk?.tier === 'heavy' ? ['not reject: approving reviews of its exact tree by two provider families are recorded'] : [])] },
       ],
-      decider: { type: 'rule', id: 'workflow.task-acceptance', version: '2' },
-      outcome: { option, detail: { taskId: row.task_id, runId: run.run_id, subject, checks, ...(ran ? { checkRun: ran.detail } : {}) } },
+      decider: { type: 'rule', id: 'workflow.task-acceptance', version: '4' },
+      outcome: {
+        option, detail: {
+          taskId: row.task_id, runId: run.run_id, subject, checks, ...(ran ? { checkRun: ran.detail } : {}), ...(review ? { review } : {}), ...(landing ? { landing } : {}),
+          ...(risk ? { risk: { tier: risk.tier, decision: risk.decision, ...(risk.tier === 'heavy' ? { families: second.families, reviews: second.reviews.map((r) => ({ node: r.node, ...(r.worker ? { worker: r.worker } : {}) })) } : {}) } } : {}),
+        },
+      },
       deterministic: true,
     }, { ...PRODUCER, runId: run.run_id }).id as ArtifactRef
     const result: Result = { artifacts, subject }
     this.e.ctx.store.transaction((db) => {
       db.prepare('UPDATE workflow_tasks SET result = ?, acceptance = ?, updated_at = ? WHERE run_id = ?').run(JSON.stringify(result), acceptance, now(), run.run_id)
     })
+    // The System's evidence in the task's dossier: the checks and the acceptance, linked (ADR-0070).
+    this.dossiers.safely('the acceptance', () => this.dossiers.evidence(run.run_id,
+      `Acceptance of attempt ${this.frame(run.run_id)?.attempt ?? '?'} (run ${run.run_id}): ${option} on ${describe(subject)}; ${said}${review ? `; the last review (${review.node}) ${review.verdict} with ${review.blocking} blocking finding(s)${review.summary ? ` (${review.summary.split(';')[0]})` : ''}, cycle ${review.cycle} of ${review.maxCycles}` : ''}${tierSaid.length ? `; ${tierSaid[0]}` : ''}${short ? `; ${short}` : ''}${notes.length ? `; ${notes.join('; ')}` : ''}.`,
+      [acceptance, ...(ran?.evidence ? [ran.evidence] : []), ...artifacts], subject))
+    // What failed, in the dossier itself (T270): the Worker of the next attempt reads its failing tests
+    // there, never only a link to the check-run artifact it cannot open. Only a check that failed on
+    // the result's own subject (INV-5).
+    for (const [check, lines] of Object.entries(ran?.failures ?? {}) as Array<[Check, string[]]>) {
+      if (checks[check] !== false || !lines.length) continue
+      this.dossiers.safely(`the failures of the ${check} check`, () => this.dossiers.evidence(run.run_id,
+        `The ${check} check failed on ${describe(subject)}: ${lines.length} line${lines.length === 1 ? '' : 's'} of its output (at most ${MAX_FAILURE_LINES}), the failing tests' names and assertions, then its summary:\n${lines.join('\n')}`,
+        [acceptance, ...(ran?.evidence ? [ran.evidence] : [])], subject))
+    }
+    return undefined
+  }
+
+  /**
+   * A result held for the operator whose pending required checks ran on its exact tree (T293, from
+   * the landing's watch): the run owner's acceptance decided again, the same decision as the run's
+   * own (`workflow_tasks.acceptance`) with those checks added, rejecting on a failure, then applied on
+   * the board. The board holds it again with its checks bound, accepts it (its landing wait), or
+   * sends it back as another attempt. The failures are told in the task's dossier, as at completion.
+   * Returns the new acceptance; undefined when the run's own acceptance cannot be read.
+   */
+  async recheckHeld(row: TaskRow, board: Board, ran: RanChecks): Promise<ArtifactRef | undefined> {
+    type Body = { question: string; inputs: string[]; outcome: { option: string; detail: Record<string, unknown> } }
+    const own = row.acceptance ? this.e.ctx.artifacts.get(row.acceptance as ArtifactRef)?.body as Body | undefined : undefined
+    if (!own) return undefined
+    const subject = own.outcome.detail['subject'] as Subject
+    const checks: Partial<Record<Check, boolean>> = { ...(own.outcome.detail['checks'] as Partial<Record<Check, boolean>> | undefined), ...ranOn(ran, subject) }
+    const failed = Object.entries(checks).filter(([, passed]) => !passed).map(([check]) => check)
+    const option = failed.length ? 'reject' : own.outcome.option
+    const said = `the checks it ran: ${Object.entries(checks).map(([c, p]) => `${c} ${p ? 'passed' : 'failed'}`).join(', ')}`
+    const acceptance = this.e.ctx.artifacts.recordDecision({
+      decisionType: 'acceptance', question: own.question,
+      inputs: [...new Set([...own.inputs as ArtifactRef[], ...(ran.evidence ? [ran.evidence] : []), row.acceptance as ArtifactRef])],
+      candidates: [
+        { option: 'accept', selected: option === 'accept', reasons: option === 'accept' ? [`the required checks the result was held with ran on ${describe(subject)}, after its run, and passed`, said, ...ran.notes] : [`not accept: the run's own ${failed.join(', ')} check failed on ${describe(subject)}`] },
+        { option: 'reject', selected: option === 'reject', reasons: option === 'reject' ? [`the run's own ${failed.join(', ')} check failed on ${describe(subject)}: the work goes back as another attempt`, ...ran.notes] : ['not reject: no check the run ran failed'] },
+      ],
+      decider: { type: 'rule', id: 'workflow.task-acceptance', version: '4' },
+      outcome: { option, detail: { ...own.outcome.detail, checks, checkRun: ran.detail, held: row.acceptance } },
+      deterministic: true,
+    }, { ...PRODUCER, runId: row.run_id }).id as ArtifactRef
+    this.e.ctx.store.transaction((db) => void db.prepare('UPDATE workflow_tasks SET acceptance = ? WHERE run_id = ?').run(acceptance, row.run_id))
+    row.acceptance = acceptance
+    this.dossiers.safely('the held result\'s checks', () => this.dossiers.evidence(row.run_id,
+      `The required checks the result was held with ran on ${describe(subject)}: ${said}; ${option === 'accept' ? 'the acceptance applies again with them' : 'it goes back as another attempt'}.`,
+      [acceptance, ...(ran.evidence ? [ran.evidence] : [])], subject))
+    for (const [check, lines] of Object.entries(ran.failures ?? {}) as Array<[Check, string[]]>) {
+      if (checks[check] !== false || !lines.length) continue
+      this.dossiers.safely(`the failures of the ${check} check`, () => this.dossiers.evidence(row.run_id,
+        `The ${check} check failed on ${describe(subject)}: ${lines.length} line${lines.length === 1 ? '' : 's'} of its output (at most ${MAX_FAILURE_LINES}), the failing tests' names and assertions, then its summary:\n${lines.join('\n')}`,
+        [acceptance, ...(ran.evidence ? [ran.evidence] : [])], subject))
+    }
+    try {
+      await board.accept(row.task_id, acceptance)
+    } catch (error) {
+      if (!(error instanceof BoardError)) throw error
+      this.warn(`the acceptance of run ${row.run_id}'s held result, its checks run, was not applied on board task ${row.task_id}`, error)
+    }
+    return acceptance
+  }
+
+  /**
+   * The run's last review (D80): of its completed steps, the last whose exact-subject gate passed with
+   * an assessment, whatever tree it reviewed: its step, gate decision, assessment, verdict, blocking
+   * findings, and its remediation cycle of the bound. Undefined when no step of the run reviewed a tree.
+   */
+  private lastReview(done: NodeRow[], tree?: Subject): AcceptanceReview | undefined {
+    const found: AcceptanceReview[] = []
+    for (const node of done) {
+      // A verification step votes on its review's findings: its verdict is never a result's (T287).
+      if ((JSON.parse(node.spec) as ResolvedNode).verifies) continue
+      // The author's own review is never the run's last review (T267).
+      if ((JSON.parse(node.spec) as ResolvedNode).selfReview !== undefined) continue
+      for (const ref of node.decisions ? JSON.parse(node.decisions) as ArtifactRef[] : []) {
+        const body = this.e.ctx.artifacts.get(ref)?.body as { decisionType?: string; decider?: { id?: string }; outcome?: { option?: string; detail?: { assessment?: ArtifactRef } } } | undefined
+        if (body?.decisionType !== 'gate' || body.decider?.id !== 'workflow.exact-subject' || body.outcome?.option !== 'pass' || !body.outcome.detail?.assessment) continue
+        const assessment = this.e.ctx.artifacts.get(body.outcome.detail.assessment)?.body as { verdict?: string; findings?: Finding[]; subject?: Subject; summary?: string } | undefined
+        if (!assessment?.verdict || !assessment.subject) continue
+        found.push({
+          node: node.node_id, gate: ref, assessment: body.outcome.detail.assessment, verdict: assessment.verdict,
+          // Blocking is a confirmed important finding (ADR-0075): a nit or an unverified finding never is.
+          blocking: (assessment.findings ?? []).filter(blocks).length,
+          ...(assessment.summary ? { summary: assessment.summary } : {}),
+          cycle: (JSON.parse(node.spec) as ResolvedNode).cycle ?? 1, maxCycles: this.e.config.maxReviewCycles ?? 3,
+          subject: { ref: assessment.subject.ref, version: assessment.subject.version ?? '' },
+        })
+      }
+    }
+    // The result's review is the last one of its final tree: an earlier round's review, even one a
+    // later verification gate re-judged, is of a tree the fixes have since replaced (T287).
+    return finalTreeReview(found, tree)
+  }
+
+  /**
+   * Where the result would land (ADR-0060): the repository's checked-out branch its run's worktree was
+   * cut from, as the source that holds the worktree tells it now, for the working tree an agent result
+   * among the result's artifacts names on its exact subject. Undefined when none is known.
+   */
+  private landingOf(artifacts: ArtifactRef[], subject: Subject, targets: readonly LandingTarget[]): { repository: string; branch: string } | undefined {
+    if (subject.type !== 'git-head') return undefined
+    for (const ref of artifacts) {
+      const body = this.e.ctx.artifacts.get(ref)?.body as { schema?: string; workspace?: unknown; subject?: Subject } | undefined
+      if (!body?.schema?.startsWith('agent-result@') || typeof body.workspace !== 'string' || body.subject?.ref !== subject.ref || body.subject.version !== subject.version) continue
+      const target = targets.find((t) => t.workspace === body.workspace)
+      if (target) return { repository: target.repository, branch: target.branch }
+    }
     return undefined
   }
 
@@ -1283,6 +1684,42 @@ export class TaskRuns {
       return current && current.subject.ref === tree.ref && current.subject.version === tree.version ? ref : undefined
     }
     return undefined
+  }
+
+  /**
+   * The git tree a run with no write subject wrote (T293): when a writing step of it (one that needs
+   * `develop`) left its worktree changed, the latest agent result of the run's completed steps on a git
+   * working tree, while that tree is still the version it names. Changed is against the commit the
+   * worktree forked from, committed or not: a change left uncommitted on HEAD (its version is not the
+   * clean one), a HEAD past that fork, or a change its source reads there (`targets`). Undefined when
+   * no writing step changed it; a problem when the tree moved since, or cannot be read (INV-5).
+   */
+  private writtenTree(done: NodeRow[], targets: readonly LandingTarget[]): { subject: Subject & { version: string }; source: ArtifactRef } | { problem: string; source: ArtifactRef } | undefined {
+    type Body = { schema?: string; subject?: Subject; workspace?: string }
+    const agentResult = (node: NodeRow): { ref: ArtifactRef; body: Body } | undefined => {
+      const ref = (JSON.parse(node.record) as NodeRecord).outputReceipt?.result
+      const body = ref ? this.e.ctx.artifacts.get(ref)?.body as Body | undefined : undefined
+      return ref && body?.schema?.startsWith('agent-result@') && body.workspace && body.subject?.type === 'git-head' && body.subject.version ? { ref, body } : undefined
+    }
+    const wrote = done.some((n) => {
+      const written = writesChange(JSON.parse(n.spec) as ResolvedNode) ? agentResult(n)?.body : undefined
+      if (!written) return false
+      const target = targets.find((t) => t.workspace === written.workspace)
+      return written.subject!.version !== CLEAN_VERSION || (target !== undefined && (target.changed || written.subject!.ref !== target.fork))
+    })
+    if (!wrote) return undefined
+    const last = [...done].reverse().map(agentResult).find((r) => r !== undefined)!
+    const tree = { type: 'git-head' as const, ref: last.body.subject!.ref, version: last.body.subject!.version! }
+    let current: ReturnType<typeof captureGitSubject>
+    try {
+      current = captureGitSubject(last.body.workspace!)
+    } catch (error) {
+      return { problem: `the working tree ${last.body.workspace} its writing step changed cannot be read (${(error as Error).message.slice(0, 200)})`, source: last.ref }
+    }
+    if (!current || current.subject.ref !== tree.ref || current.subject.version !== tree.version) {
+      return { problem: `the working tree ${last.body.workspace} its writing step changed is no longer ${describe(tree)}${current ? ` (now ${describe(current.subject)})` : ''}`, source: last.ref }
+    }
+    return { subject: tree, source: last.ref }
   }
 
   /** The run's result does not bind to the subject its task writes: a `gate` decision, and the run fails as `stale_subject`. */
@@ -1316,6 +1753,7 @@ export class TaskRuns {
     if (subject.type !== 'git-head' || subject.version === undefined) return checks
     const id = `git:${subject.ref}:${subject.version}`
     for (const node of done) {
+      if ((JSON.parse(node.spec) as ResolvedNode).selfReview !== undefined) continue
       const bound = node.subject ? (JSON.parse(node.subject) as { subject?: { ref: string; version: string } }).subject : undefined
       if (!bound || `git:${bound.ref}:${bound.version}` !== id) continue
       for (const ref of node.decisions ? JSON.parse(node.decisions) as ArtifactRef[] : []) {
@@ -1380,7 +1818,10 @@ export class TaskRuns {
     const task = await board.task(row.task_id)
     // Stopped before the board's record was seen: the record decides whether anything is reported.
     if (row.phase === 'starting' && task?.run?.runId !== runId) return this.settled(row, { status: 'not-started', ...(task ? { state: task.state } : {}) })
-    if (task && row.acceptance && task.lastDecision === row.acceptance) return this.settled(row, { status: task.state === 'done' ? 'accepted' : 'rejected', state: task.state, decision: row.acceptance })
+    // Applied before a crash: as it is, or, done on the board's auto-accept rule (D80), as the result's acceptance.
+    const landing = task?.state === 'review' && task.waiting?.reason === 'landing'
+    const applied = task?.lastDecision === row.acceptance || ((task?.state === 'done' || landing) && task.run?.runId === runId && task.result?.acceptance === row.acceptance)
+    if (task && row.acceptance && applied) return this.settled(row, { status: task.state === 'done' || landing ? 'accepted' : 'rejected', state: task.state, decision: row.acceptance as ArtifactRef })
     if (!task || task.run?.runId !== runId) {
       return this.settled(row, { status: 'moved-on', ...(task ? { state: task.state } : {}), reason: task ? `task ${task.taskId} is ${task.state} and no longer waits on run ${runId}` : `task ${row.task_id} is unknown to the board` })
     }
@@ -1411,7 +1852,38 @@ export class TaskRuns {
       if (waits) return this.reconcile(row, board, outcome, row.lost ? 'the run lost its holder, then completed what was in flight' : `the task waits on the run (${task.state})`)
     } else if (waits) {
       const error = run.error ? (JSON.parse(run.error) as WorkflowError) : undefined
-      return this.reconcile(row, board, { status: 'failed' }, `the run failed${error ? ` (${error.kind})` : ''}: an attempt the board counts`)
+      // A run that failed only on the infrastructure says so (ADR-0069): the board then does not
+      // count it, while the task has free retries left (its bound, INV-9).
+      const lost = row.lost ? (JSON.parse(row.lost) as Lost) : undefined
+      const verdict = infrastructureOf(this.e, run, lost?.infrastructure)
+      if ('infrastructure' in verdict) {
+        const { infrastructure } = verdict
+        // The statement first, the reason last: a decision's reason is clamped, and its detail keeps the reason whole.
+        await this.reconcile(row, board, { status: 'failed', infrastructure },
+          `the run failed${error ? ` (${error.kind})` : ''} only on the infrastructure: reported so, the board does not count it as an attempt while the task has free retries left; ${infrastructure.kind}: ${infrastructure.reason}`)
+        // A Worker's quota ended it: the dossier says how much time the attempt lost (T272b). Written once the
+        // report is made (a repeated settle returns early), and counted to the run's end, so a restart changes neither.
+        if (error?.kind === 'quota_exhausted') {
+          const minutes = Math.max(0, Math.round((Date.parse(run.updated_at) - Date.parse(run.created_at)) / 60_000))
+          this.dossiers.safely('the lost time', () => this.dossiers.evidence(row.run_id,
+            `Lost time: run ${row.run_id} ran ${minutes} min before its Worker's quota ran out; that attempt is not spent and its work is lost. ${infrastructure.reason}`, []))
+        }
+        return
+      }
+      return this.reconcile(row, board, { status: 'failed' }, `the run failed${error ? ` (${error.kind})` : ''}: an attempt the board counts; ${verdict.counted}`)
+    } else if (run.status === 'failed' && task.state === 'waiting-for-input' && task.waiting?.reason === 'rejected') {
+      // The sweep found the run lost (its lease lapsed while the host was down) and, the policy giving
+      // remediation no ask, left the task waiting for input on it: a failure only on the
+      // infrastructure is still reported, so the board can give the attempt back (ADR-0069).
+      const lost = row.lost ? (JSON.parse(row.lost) as Lost) : undefined
+      const verdict = infrastructureOf(this.e, run, lost?.infrastructure)
+      if ('infrastructure' in verdict) {
+        const { infrastructure } = verdict
+        const error = run.error ? (JSON.parse(run.error) as WorkflowError) : undefined
+        return this.reconcile(row, board, { status: 'failed', infrastructure },
+          `the run failed${error ? ` (${error.kind})` : ''} only on the infrastructure, after the board's sweep left the task waiting for input on it: reported so, the board does not count it as an attempt while the task has free retries left; ${infrastructure.kind}: ${infrastructure.reason}`,
+          true)
+      }
     }
     return this.settled(row, { status: 'moved-on', state: task.state, reason: `task ${task.taskId} is ${task.state}, and takes no report of a ${run.status} run` })
   }
@@ -1424,6 +1896,8 @@ export class TaskRuns {
   private async accept(row: TaskRow, board: Board, acceptance: ArtifactRef): Promise<void> {
     try {
       const task = await board.accept(row.task_id, acceptance)
+      // Accepted, a writing result waits for its landing (T293): done once it landed.
+      if (task.state === 'review' && task.waiting?.reason === 'landing') return this.settled(row, { status: 'accepted', state: task.state, decision: acceptance, reason: 'accepted: it waits for its landing, done once its merge request is merged' })
       if (task.state === 'review') {
         return this.settled(row, { status: 'review', state: task.state, decision: acceptance, reason: `held for the operator until ${task.waiting?.expiresAt ?? '(no expiry)'}${task.waiting?.pendingChecks?.length ? `: ${task.waiting.pendingChecks.join(', ')} pending` : ''}` })
       }
@@ -1434,8 +1908,12 @@ export class TaskRuns {
     }
   }
 
-  /** Report the run's known outcome with `reconcileRun`, after a `reconciliation` decision saying why (INV-4). */
-  private async reconcile(row: TaskRow, board: Board, outcome: RunOutcome, why: string): Promise<void> {
+  /**
+   * Report the run's known outcome with `reconcileRun`, after a `reconciliation` decision saying why
+   * (INV-4). `waited`: the task waits for input on the run, which the board takes only while a free
+   * retry is left; its refusal of the move then leaves the task as it is (`moved-on`), not refused.
+   */
+  private async reconcile(row: TaskRow, board: Board, outcome: RunOutcome, why: string, waited = false): Promise<void> {
     const decision = this.e.ctx.artifacts.recordDecision({
       decisionType: 'reconciliation',
       question: `Does run ${row.run_id} report its ${outcome.status} outcome to board task ${row.task_id} as the run's owner?`,
@@ -1444,8 +1922,9 @@ export class TaskRuns {
         { option: 'report', selected: true, reasons: [why, `the run ${outcome.status}, as its own records show: a known outcome, reconciled, never replayed (INV-4)`] },
         { option: 'withhold', selected: false, reasons: ['not withhold: only an unknown outcome is withheld, and this run\'s is known'] },
       ],
-      decider: { type: 'rule', id: 'workflow.task-report', version: '1' },
-      outcome: { option: 'report', detail: { taskId: row.task_id, runId: row.run_id, status: outcome.status } },
+      // Version 2 tells a failure only on the infrastructure apart (ADR-0069), so one input never decides two ways under one version (INV-13).
+      decider: { type: 'rule', id: 'workflow.task-report', version: '2' },
+      outcome: { option: 'report', detail: { taskId: row.task_id, runId: row.run_id, status: outcome.status, ...(outcome.status === 'failed' && outcome.infrastructure ? { infrastructure: outcome.infrastructure } : {}) } },
       deterministic: true,
     }, { ...PRODUCER, runId: row.run_id }).id as ArtifactRef
     try {
@@ -1453,20 +1932,32 @@ export class TaskRuns {
       return this.settled(row, { status: 'reconciled', state: task.state, decision })
     } catch (error) {
       if (!(error instanceof BoardError)) throw error
+      if (waited && error.failure === 'invalid-transition') return this.settled(row, { status: 'moved-on', state: 'waiting-for-input', decision, reason: `the task waits for input on the run, and the board counts it: ${refusal(error)}` })
       return this.settled(row, { status: 'refused', decision, reason: `reconcileRun: ${refusal(error)}` })
     }
   }
 
   private settled(row: TaskRow, outcome: TaskOutcome): void {
+    // The change an attempt left without its acceptance is kept as a commit on its branch (T271): marked pending in the
+    // report's own transaction, so a stop before the commit loses nothing (./carries.ts).
+    const keep = keepable(outcome)
+    const stored: TaskOutcome = keep ? { ...outcome, kept: { state: 'pending', at: now() } } : outcome
     // A result that reached the board is due its digest, in the transaction that reports it, so a restart asks for it once.
     const due = this.e.ctx.store.transaction((db) => {
-      db.prepare("UPDATE workflow_tasks SET phase = 'reported', outcome = ?, updated_at = ? WHERE run_id = ?").run(JSON.stringify(outcome), now(), row.run_id)
+      db.prepare("UPDATE workflow_tasks SET phase = 'reported', outcome = ?, updated_at = ? WHERE run_id = ?").run(JSON.stringify(stored), now(), row.run_id)
       this.e.ctx.eventLog.append({ type: 'workflow.task.reported', runId: row.run_id, ...(outcome.decision ? { decision: outcome.decision } : {}), data: { taskId: row.task_id, ...outcome } })
+      // A dispatched attempt's labels, which the advisor's calibration and the local adapter read (PROP-0015 J1).
+      recordOutcome(this.e, row, outcome.status)
       // A result on a working tree is watched for its acceptance, then landed (ADR-0060).
       this.landings.due(row, outcome.status)
       return this.digests.due(row, outcome.status)
     })
     if (due) this.digests.drive(row.run_id)
+    // What reached the board, in the task's dossier (ADR-0070): the next attempt reads it there.
+    this.dossiers.safely('the report', () => this.dossiers.evidence(row.run_id,
+      `Reported to the board: run ${row.run_id} ${outcome.status}${outcome.state ? `, task ${outcome.state}` : ''}${outcome.reason ? `: ${outcome.reason}` : ''}.`,
+      outcome.decision ? [outcome.decision] : []))
+    if (keep) void this.carries.keep(row.run_id).catch((error: unknown) => this.warn(`the change of run ${row.run_id} was not kept yet; it is asked again`, error))
     clearTimeout(this.retries.get(row.run_id)?.timer)
     this.retries.delete(row.run_id)
     if (outcome.status === 'review' || outcome.status === 'refused') this.e.ctx.logger.warn(`workflow: run ${row.run_id}'s outcome left board task ${row.task_id} ${outcome.state ?? 'as it was'}: ${outcome.reason ?? outcome.status}`)

@@ -10,7 +10,7 @@
   "provides": [
     {
       "seam": "board",
-      "version": "1.3.0"
+      "version": "1.5.0"
     }
   ],
   "consumes": [
@@ -63,6 +63,14 @@
       "sensitive": false
     },
     {
+      "key": "defaultBudget",
+      "sensitive": false
+    },
+    {
+      "key": "maxFreeRetries",
+      "sensitive": false
+    },
+    {
       "key": "pageBound",
       "sensitive": false
     },
@@ -72,6 +80,10 @@
     },
     {
       "key": "sweepSeconds",
+      "sensitive": false
+    },
+    {
+      "key": "autoAccept",
       "sensitive": false
     }
   ],

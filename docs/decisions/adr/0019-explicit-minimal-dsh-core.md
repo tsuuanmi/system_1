@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-10-11
 - **Supersedes in part:** [ADR-0018](0018-build-on-dsh-core.md) (layering on `dsh-base`)
-- **Related:** [M0 spike](../../research/m0-dsh-core-spike.md#minimal-core-composition),
+- **Related:** M0 spike (removed; in Git history),
   [DSH core reuse map](../../architecture/plugin-model.md#dsh-core-reuse-map)
 
 ## Context

@@ -12,15 +12,18 @@
  * variant reviews with the providers' Deep research instead.
  * @module @tsuuanmi/system-profile-scientific-research
  */
+import { readFileSync } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
-import type {} from '@tsuuanmi/system-artifacts'
-import type {} from '@tsuuanmi/system-event-log'
+import type {} from '@tsuuanmi/system-ledger-core'
 import { type ContentId, extractJson, SchemaRegistry } from '@tsuuanmi/system-libs'
 import type { NodeTemplate } from '@tsuuanmi/system-workflow'
 import type {} from '@tsuuanmi/system-workers'
 
 export const name = 'profile-scientific-research'
 export const inject = ['workflow', 'workers', 'artifacts', 'eventLog']
+
+/** This package's version: its template's playbook version in a handbook slice (docs/design/handbook.md). */
+const VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version
 
 const FRAME = [
   'Frame the research question below as 2 to 4 testable hypotheses, for a study that will review the published evidence.',
@@ -101,14 +104,20 @@ export const RESEARCH: NodeTemplate[] = [
     // Two reviews in parallel on different provider families (PROP-0004, ADR-0027). Review A must
     // prove web search; review B is held to its citations, since its provider cannot prove a search.
     // Deep research needs a persistent conversation: each review has its own (`own`), never a shared one.
+    // Review B and the critique prefer another family (`diversity: preferred`, D89): when none can
+    // take them, each runs once on the first family's provider in a fresh conversation, marked
+    // single-family, and every later step and the answer say so; the run never fails or waits for it.
+    // Both reviews are research work (`kind`), the only work a research role's agent Workers take
+    // (ADR-0057, ADR-0074). Review B prefers a Worker that proves web search too (T262), of the other
+    // family, before one that only cites; the single-family fallback above stays last.
     {
       nodeId: 'literature:1', objective: 'Review the published evidence, with citations (review A)', dependsOn: ['frame:1'], prompt: LITERATURE,
-      capabilities: ['reason', 'web-search'], tier: 'standard', conversation: 'temporary', acceptance: 'acceptance.cited',
+      capabilities: ['reason', 'web-search'], tier: 'standard', kind: 'research', conversation: 'temporary', acceptance: 'acceptance.cited',
       variants: { deep: { capabilities: ['reason', 'deep-research'], tier: 'frontier', conversation: 'own' } },
     },
     {
       nodeId: 'literature:2', objective: 'Review the published evidence, with citations (review B)', dependsOn: ['frame:1'], prompt: LITERATURE,
-      capabilities: ['reason'], tier: 'standard', conversation: 'temporary', acceptance: 'acceptance.cited', differentFrom: ['literature:1'],
+      capabilities: ['reason'], prefers: ['web-search'], tier: 'standard', kind: 'research', conversation: 'temporary', acceptance: 'acceptance.cited', differentFrom: ['literature:1'], diversity: 'preferred',
       variants: { deep: { capabilities: ['reason', 'deep-research'], tier: 'frontier', conversation: 'own' } },
     },
     {
@@ -117,7 +126,7 @@ export const RESEARCH: NodeTemplate[] = [
     },
     {
       nodeId: 'critique:1', objective: 'Critique the evidence independently', dependsOn: ['frame:1', 'evidence:1'], prompt: CRITIQUE, capabilities: ['reason'],
-      tier: 'standard', conversation: 'temporary', acceptance: 'acceptance.answer', differentFrom: ['evidence:1'],
+      tier: 'standard', conversation: 'temporary', acceptance: 'acceptance.answer', differentFrom: ['evidence:1'], diversity: 'preferred',
     },
     {
       nodeId: 'conclusion:1', objective: 'Conclude per hypothesis, citing the evidence', dependsOn: ['frame:1', 'evidence:1', 'critique:1'], prompt: CONCLUDE,
@@ -157,7 +166,7 @@ export function apply(ctx: Context): void {
     if (!cited.size) return { accepted: false, reasons: ['the conclusion cites no evidence ([E1], [E2], ...)'] }
     return { accepted: true, reasons: [`concludes on ${[...hypotheses].join(', ')}, citing ${[...cited].join(', ')}`] }
   })
-  ctx.effect(() => ctx.workflow.template('research', RESEARCH))
+  ctx.effect(() => ctx.workflow.template('research', RESEARCH, { version: VERSION }))
 
   // A typed step's accepted result becomes a typed artifact derived from it. When the step's
   // result changes (the operator superseded it or an input of it, and it ran again), the new typed
@@ -166,22 +175,16 @@ export function apply(ctx: Context): void {
     const { runId, nodeId } = event
     const typed = nodeId ? TYPED[nodeId] : undefined
     if ((event.type !== 'workflow.node.completed' && event.type !== 'workflow.node.superseded') || !typed || !runId || !nodeId) return
-    const run = ctx.workflow.get(runId)
-    // `research-deep` was the deep variant's template before PROP-0004; its runs can still be superseded.
-    if (!run || (run.template !== 'research' && run.template !== 'research-deep')) return
-    const record = ctx.workflow.records(runId).find((r) => r.nodeId === nodeId)
-    const result = record?.outputReceipt?.result
+    if (ctx.workflow.get(runId)?.template !== 'research') return
+    const result = ctx.workflow.records(runId).find((r) => r.nodeId === nodeId)?.outputReceipt?.result
     const answer = result ? ctx.artifacts.get(result) : undefined
     if (!answer) return
-    // The schema the run's own step asked for: an old run's step keeps its old version.
-    const schema = record?.requirement.acceptance.resultSchema ?? typed.schema
-    const parsed = typedBody(textOf(answer.body), schema)
+    const parsed = typedBody(textOf(answer.body), typed.schema)
     if (!parsed.ok) return
-    const schemaName = schema.slice(0, schema.indexOf('@') + 1)
-    const previous = ctx.artifacts.list({ kind: typed.kind, runId, nodeId }).filter((a) => a.bodySchema.startsWith(schemaName)).at(-1)
+    const previous = ctx.artifacts.list({ kind: typed.kind, runId, nodeId }).at(-1)
     if (previous?.inputs.includes(result!)) return
     ctx.artifacts.put({
-      kind: typed.kind, bodySchema: schema, body: parsed.body, inputs: [result!],
+      kind: typed.kind, bodySchema: typed.schema, body: parsed.body, inputs: [result!],
       ...(previous ? { lineage: { supersedes: [previous.id as ContentId] } } : {}),
       classification: answer.classification, producer: { type: 'system', ref: name }, runId, nodeId,
     })

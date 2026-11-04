@@ -1,40 +1,50 @@
 # @tsuuanmi/system-web-ui
 
-The **operator's web UI**, on the DSH webserver under `/ui` (loopback only). Every page is built
-from the same few blocks (T172), one implementation each: a **status chip** (a word, a colour, and
-a symbol of its own shape, never the colour alone), a **number with its unit** (*3 tasks*, *1/2
-slots*, *2/3 steps*), a **relative time** with its exact time on hover and on keyboard focus, a
-**fold** (a `details`, closed by default) for every explanation, mechanism, and technical fact, and
-a **copy button** for ids and hashes, which are never the first thing in a row. Each page says what
-it is for in a few words; one wording per concept across pages (*Needs your attention*; *Approve /
-Deny* for approvals, *Accept / Send back* for reviews; *Automatic*, *Notify*, *Ask approval*,
-*Blocked* for policy modes); facts are folded, never deleted. Production states: a *Loading…*
-skeleton while a page first loads, *updated 12 s ago* in the header, a **stale** banner (what was
-read and when) when a refresh fails over a page already shown, an error with **Try again** when a
-page never loaded, a confirmation only before a destructive move (**Stop run**, **Close**), a **Skip
-to content** link first in the keyboard order, a visible focus, no motion under reduced motion, and
-prose capped at a readable line length on a full-width page.
+The **operator's web UI**, on the DSH webserver under `/ui` (loopback only). Its design rules
+(what needs you first as cards, a button's effect as its tooltip, the word bound on the first
+screen, one spacing and one type scale, light and dark, a 360 px phone; and the operator's iPhone:
+its safe areas, 44 px touch targets, tooltips on a tap, no zoom on focus, a detail page's primary
+action in a bar at the bottom, tables as cards below 600 px) and its screenshots are in
+[the web UI at a glance](../../../docs/design/web-ui.md) (T239, T240). Every page is built from the
+same few blocks (T172), one implementation each: the **status chip**, the **number with its unit**,
+the **relative time**, the **fold**, the **copy button**, and the **decision button** (T191), labelled
+by its concept's one wording (**Approve** / **Deny**, **Accept** / **Send back**, **Confirm** /
+**Cancel**, **Stop run**, **Retry failed step**, **Show change**, **Propose**) and described by what it
+does (`aria-describedby`, shown as its tooltip). Production states: a *Loading…* skeleton, *updated
+12 s ago* in the header, a **stale** banner when a refresh fails over a page already shown, an error
+with **Try again** when a page never loaded, a confirmation only before a destructive move, and
+**Skip to content** first in the keyboard order.
 
-**Buttons** (T191), one implementation (`decision`) on every page: a button that decides is labelled
-by its concept's one wording, never by its effect: **Approve** / **Deny** on every approval (a
-request's card on Home and on the policy page, a Board card, a start awaiting approval, a run's
-plan; **Approve all N** / **Deny all N** for a batch), **Accept** / **Send back** on every review,
-**Confirm** / **Cancel** in every confirmation (stopping a run, a project's **Pause…**, **Resume…**,
-**Close…**, a ready task's **Start…**), and **Stop run**, **Retry failed step**, **Show change**,
-**Propose**. What it does (*merges the change*, *keeps the branch only*, *marks it done*, *sends it
-back for another attempt, if it has one left*, *stops this run: nothing more of it runs*) is its
-accessible description (`aria-describedby`), said beside it in words for every reader.
-
+- **Every project in one UI** (T253, D88): Home's *Needs your attention* and its cards are grouped
+  by project, each group headed by the project's name and its own count tiles, the most urgent
+  first (what expires within the hour, then the most that waits, then the earliest deadline), what
+  is in no project under *Other*, a batch whole in its first request's project; a project's name
+  filters Home to it, its recent runs too (`/ui/?project=<id>`, until **All projects**); each project's
+  weekly report and its metrics have a small page of their own (T256, `/ui/?view=reports&project=<id>`,
+  linked as **Reports** beside its group's name), a table of the commands that print them (`system report
+  --project <id>`, `system metrics --project <id>`) with copy buttons. The Board shows one project
+  at a time, or **All projects** as each project's counts only; the Workers page stays shared, each
+  step a Worker runs naming its run's project.
+- **Round 2** (T256): every page full width, Home, a run, and Workers on a responsive grid (a side
+  column from 900 px, a third column on Home from 1600 px, one column below 900 px), prose capped at
+  75 characters; each step's run time and when it ended (a running step's ticking), a run's total
+  and a timeline bar, from `timings` in `GET runs/<id>` (each step's latest start and end in the
+  event log, `{unknown}` with why without one) and each decision's `at`; one line per decision, its
+  reasons on a click, a deferred call's wait and verdict one line; *Started by itself* a table at
+  the bottom of Home, one row per task; long hashes, ids, and paths shortened behind copy buttons;
+  every colour, space, type size, and radius a CSS variable written once (`tests/round2.spec.ts`).
 - **Home**, a dashboard: what needs the operator's attention and they can act on (open approval
   requests, reviews held for them, runs that wait for their own move or failed outside the board
-  since they last looked, each a label and its count, *Approvals · 3*, linked, then named one by one
-  under its count (up to 5 a group, each linked to its card, with when it expires), and counted in
+  since they last looked, each a tile with its label and its count, *Approvals · 3*, linked, then named one by one
+  under its count, folded (up to 5 a group, each linked to its card, with when it expires), beside the
+  Workers' availability as chips (T239), and counted in
   the window's title on every page from one route, `GET waiting`: *(3) system — Home*), what happened since the
   operator last looked (5 lines, then **Show all N**, as for the runs needing attention, T186;
   kept in the browser only, until **Mark as seen**; `GET activity`; a failed
   run led by the run page's own plain-words reason, by one function, its raw text folded, T160), the
-  Workers at a glance (with **Right now**, the Workers page's own section, so both name the same
-  Workers), then those decisions and the recent runs by their tasks' titles, each step
+  Workers at a glance (each account's capacity and **Right now**, the Workers page's own section, so
+  both name the same Workers; their counts said once, in the chips at the top), after those
+  decisions, and the recent runs (5 rows, then **Show all N**) by their tasks' titles, each step
   with its Worker's name; a running run's page and Board card say where it is now (its step, Worker,
   last event, and a stall; `GET runs/live`), and a start names who would likely take each step.
   Both reads are bounded per request and read the newest first: the runs by state and by when
@@ -55,8 +65,10 @@ accessible description (`aria-describedby`), said beside it in words for every r
   keyboard or touch, linked to its entry; every empty state is one short line, with a link where
   there is a next step ([help](../../../docs/reference/web-ui.md#help));
 - a run's page: headed by its task's title (else its template), its project and attempt below and
-  its id behind **Copy run ID**, a status chip with where it is (its step and Worker, a failure's
-  reason in plain words, or what it waits on), **What happened** in a line each (*Continued from
+  its id behind **Copy run ID** under **Technical details**, a status chip with where it is (its step
+  and Worker, or a failure's reason in plain words; what it waits on is the card below it), when it
+  started, and **Stop run** or **Retry failed step** beside them; a long answer's first lines and
+  **Show all**; **What happened** in a line each (*Continued from
   attempt 1*, or *Started over — why*,
   [ADR-0061](../../../docs/decisions/adr/0061-a-tasks-next-attempt-starts-from-the-work-its-previous-attempt-left.md);
   *Team member 1's answer: retried once after a service error*,
@@ -75,16 +87,16 @@ accessible description (`aria-describedby`), said beside it in words for every r
   a remediation fix whose plan is on the approval queue shows its request instead of the plan
   buttons, and is decided in the queue;
 - when `ctx.approvals` is present, the **approval queue**
-  ([approvals](../../../docs/design/approvals.md)) above the runs, under *3 approvals · next expiry
-  in 12 min*: open requests by batch (*2 related requests*, **Approve all 2**, its id folded), each
-  a card of one line (what is asked, for which task, *Expires in 12 min · No response: denied*, an
-  irreversible verdict as a chip) and two buttons, **Approve** and **Deny**, each described by its
+  ([approvals](../../../docs/design/approvals.md)) above the runs, its count Home's tile and its
+  next expiry in sight within the hour: open requests by batch (*2 related requests*, **Approve all
+  2**, its note for all and its id folded), each a card: what is asked as its title, an irreversible
+  verdict as its chip, *Expires in 12 min*, and two buttons, **Approve** and **Deny**, each described by its
   effect (*merges the change*, T191), with, on a `policy-change` request, **Show change** beside
   them (the effective modes it moves and the record's diff, and, for a change the queue proposed
   itself, that it did and why; never folded); everything else under the card's one closed
   **Details** (T186), kept open through the refresh once opened: the request
-  in plain words (what is asked, who asked by a readable name, what approving and denying change,
-  *Expires in 12 min · No response: denied*, the exact subject behind **Exact subject**, and what a
+  in plain words (for which task, *No response: denied*, what is asked, who asked by a readable name,
+  what approving and denying change, the exact subject behind **Exact subject**, and what a
   verdict does in words, its long hashes folded behind **details**; an accepted result's merge
   names its task and *not pushed*, asked by the run of that task, says what approving and denying
   do in words, and folds the branch, both heads, and the requester's own text with its paths and
@@ -125,19 +137,24 @@ accessible description (`aria-describedby`), said beside it in words for every r
   where the result stands on its way into the repository, until it is merged or refused
   ([what a review shows](../../../docs/reference/web-ui.md#what-a-review-shows)); above them, and on Home's waiting
   line, when the first review held for the operator expires (marked within the hour), since an
-  unanswered one expires and its task waits for input that nothing revives (T99 D6). Without it
+  unanswered one expires and its task waits for input that only a re-opening revives (T99 D6, T286). Without it
   the reviews routes answer `503`;
-- when `ctx.board` is present, the **board** page (`?view=board`), a Kanban: a project filter (all
-  by default, kept in the address as `&project=<id>`); each project's header with its state as a
+- when `ctx.board` is present, the **board** page (`?view=board`), a Kanban of one project at a
+  time: a project switcher (kept in the address as `&project=<id>`; the one project by default, or,
+  with several, **All projects**, `&project=all`: each project's header card only, its counts, what
+  of it needs you, and its moves, its name opening its board, T253); the project's header with its state as a
   chip and its open tasks (its id and charter version folded), its state as counts (*Needs you 3 ·
   Working 1 · Ready 1 · Proposed 0*, what needs you by kind folded), what of it needs the operator
-  (*Charter approval needed*, *2 task approvals*, linked), and the moves; free Workers and ready
-  tasks (how a ready task starts folded); then a column per task state (Proposed, Ready, Working,
-  Review, Needs your attention, which comes first on a narrow screen, each empty one a short line;
-  Done and Cancelled folded), one card per task with its title, when it changed and its action
-  type, who works on it (the Worker's name, since when), its template and who its first step would
-  likely go to on a ready card (*Likely Worker: …*, the others folded), what it needs as a chip
-  (*Approval needed*, *Review needed*, *Input needed — why*) with its expiry, and **Open run**; a
+  (*Charter approval needed*, *2 task approvals*, linked), and the moves, all under one **Projects**
+  fold below the columns whose summary says what of them needs you (T239); free Workers and ready
+  tasks (how a ready task starts behind the Ready column's **?**); then a column per task state
+  (Proposed, Ready, Working, Review, Needs your attention, which comes first on a narrow screen, each
+  empty one a short line; Done and Cancelled folded), one card per task with its title, its project
+  when the cards come from several, when it changed, who works on it (the Worker's name, since
+  when), what it needs as a chip (*Approval needed*, *Input needed — why*) with its expiry, its
+  primary action (**Start…**, **Approve** / **Deny**, **Review**) and **Open run**, and under its
+  **Details** its action type, its template, and who its first step would likely go to on a ready
+  card (*Likely Worker: …*, the others folded); a
   request a card waits on (a task's approval, an accepted result's merge) has its own **Approve**
   and **Deny** on the card, on the request's exact subject, as on Home; a done task's card says
   where its accepted result is on its way into the repository (*Merge approval needed · into main*,
@@ -157,19 +174,22 @@ accessible description (`aria-describedby`), said beside it in words for every r
   confirmation is open. Without the board the projects routes answer `503`;
 - the **Workers** tab (`?view=workers`, next to Board; REQ-HOST-8), read through `readRoster` in
   [`gateway-core`](../../gateway-core/README.md#the-roster) from the services mounted (`workers`,
-  `accounts`, `agentWorkers`, `resources`, `eventLog`, the engine, `board`): the counts (working,
-  free, resting and until when the first is, unavailable); **Right now**, rendered from the roster's
+  `accounts`, `agentWorkers`, `resources`, `eventLog`, the engine, `board`): the counts as Home's
+  chips (free, and working, resting, unavailable when there are any); **Right now** (folded, its
+  summary the rows that need a look as chips, open while someone is stalled or cannot work), rendered from the roster's
   `now` as the server made it (`readCapacity`, T152; the page computes none of it), by name: who is
   free, the quota lost soonest unused first, with what each has left, one excluded from teams said
   free for other steps, not team work (D58, T160) (and how many tasks are ready,
   linked to the Board), whose quota is unknown (never counted free), who is stalled, which accounts
   have no quota left and until when, who cannot work, and each ready task's likely Worker, each a
   count first (*No quota left: 1 — …*), past three names the rest folded; then the Workers by account, each
-  account once under a small header with its name and how many Workers (`Claude Code · science · 3
+  account once as a card headed by its name and how many Workers (`Claude Code · science · 3
   Workers`, [display names](../../../docs/design/roster.md#display-names); its roles under its
-  details), what stops it (resting until when, signed out, quarantined, one person on two
-  accounts), and its quota, each window of its pools as `5 h · used 42 % · resets 14:20` beside a
-  small bar
+  details), what stops it (its rest as a chip, *Resting until 14:20 (in 2 h)*; signed out,
+  quarantined, one person on two accounts), its shortest window as a small bar and a line
+  (`5 h used 42 %, resets 14:20`), what of its Workers blocks work or needs a look (a line each,
+  never folded), its Workers' cards under one fold, and, under its **Details**, its quota, each
+  window of its pools as `5 h · used 42 % · resets 14:20` beside a small bar
   ([ADR-0059](../../../docs/decisions/adr/0059-quota-readings-from-each-accounts-own-usage-report.md):
   the window by its length, its share, and its reset, on the clock with the day when not today,
   when it was read under the account's details; `at its limit` first, and listed first, while it
@@ -178,16 +198,17 @@ accessible description (`aria-describedby`), said beside it in words for every r
   *unavailable*, with its reason); the Workers of no account last. Each Worker's card is calm: its
   work (role or tier), what it is for, its status in the cross-page words (*Free*, *Working · 1/2
   slots · 1 slot free*, *Resting until 02:16*, *Unavailable — why*, *Quarantined — what its reading
-  found*), what it does now (its task by title and for how long, or a team member's answer, and
-  each run whose liveness needs a look, each a link to its run), the capabilities held off, and an
+  found*), what it does now (its task by title and for how long, or a team member's answer, the
+  project its run is for, T253, and each run whose liveness needs a look, each a link to its run),
+  the capabilities held off, and an
   **Excluded from teams** chip when the engine's `teams.excludeWorkers` leaves it out of teams
   (D58, the roster's `teams`); an account with no quota tracked says *Quota not tracked*; every unknown (`unknown (why)`),
   derived, or technical fact (its id, its derived line, its account's id, kind, and state, what it
-  serves, its load) is folded under its **details**, and a reason that blocks work never is
+  serves, its load) is folded under its **Details**, and a reason that blocks work never is
   ([roster](../../../docs/design/roster.md)). Home's Workers box shows each account's capacity in
   one line, its 5 h bar beside it. A Worker source that did not answer is named above the cards.
 
-When the roster was read is folded under *Roster read*; the header's *updated 12 s ago* says when
+When the roster was read is under *Right now* (else folded under *Roster read*); the header's *updated 12 s ago* says when
 the page was.
 
 The routes are in the [web UI API](../../../docs/reference/web-ui.md).
@@ -197,6 +218,19 @@ The routes are in the [web UI API](../../../docs/reference/web-ui.md).
 `system ui` prints the link: `http://127.0.0.1:<port>/ui/#token=…`, with the
 operator token in the fragment. Open it on
 the host, or over `ssh -L <port>:127.0.0.1:<port> host` like the login desktop.
+
+## The client
+
+The page is TypeScript only: the shell is `renderShell` in `src/ui/shell.ts` (scripts' hashes and CSP nonces
+as typed inputs), the stylesheet is built by `src/ui/styles/` (typed design tokens, a `css` helper), and the
+script is `client/`: a classic entry `app.ts` that runs `import('./boot.js')`, and typed ES modules by page and
+concern (the DOM lib; `client/tsconfig.json`, which refuses unused locals), each under 600 lines and none with
+an `any` (`tests/client-source.spec.ts`). The API's response types are one declaration file, `src/api.d.ts`,
+imported by the server and the client with `import type`. `pnpm build` compiles the script with `tsc`
+to `lib/client/`; the plugin renders the shell and the stylesheet at start, reads `app.js` from that
+directory (config `clientDir`, default `lib/client/`), and serves it and every other compiled `.js` file there,
+each one's bytes with its sha256 as the `ETag`. `pnpm typecheck` and `pnpm lint` cover it. Tests build the script into a temporary directory
+([`tests/client-build.ts`](tests/client-build.ts)); none writes into the package. See [the page's files](../../../docs/design/web-ui.md#the-pages-files).
 
 ## Security
 
@@ -283,8 +317,22 @@ decision's label (*Approve* / *Deny* on a request's card, a batch, and a run's p
 *Send back* on a review; *Confirm* / *Cancel* when stopping a run, pausing or closing a project,
 and starting a task), that each button's accessible description names what it does, and that no
 label still carries its effect.
+[`tests/layout.spec.ts`](tests/layout.spec.ts) (T239): every margin, padding, gap, and font size on
+its scale; light and dark from the system; a script that parses and loads nothing from another
+origin; and, with a browser over the store-backed composition, the Board's first screen at most half
+the words it had before T239 (the numbers before recorded in [`tests/glance.ts`](tests/glance.ts);
+Home, a run, and Workers are bounded in `web-ui.spec.ts`), a heading on every section of every
+page, no page scrolling sideways at 360 px with every button within the screen, and each button's
+tooltip shown on keyboard focus and on hover and hidden by Escape; and, on the operator's iPhone
+16 Pro (T240, 402 and 360 px at 3 device pixels each, touch, and its safe areas emulated), the
+viewport covering the screen, no page scrolling sideways, every target at least 44 by 44 px, every
+field at 16 px, the sticky header below the Dynamic Island, a table below 600 px as cards, and a
+row's tooltips opened by a tap of its **?** and closed by a second tap, a tap outside, or Escape
+(`web-ui.spec.ts` checks a run's primary action in a bar at the bottom of the screen, above the
+home indicator). Without a browser, these tests are reported as not run, with why. With `SYSTEM_UI_SHOTS`, both suites write the screenshots of
+the [design note](../../../docs/design/web-ui.md).
 [`tests/store-backed.ts`](tests/store-backed.ts) boots the UI over the store-backed board,
-approval queue, and engine under the bundle's own default studio policy, for three suites.
+approval queue, and engine under the bundle's own default studio policy, for its suites.
 [`tests/policy.spec.ts`](tests/policy.spec.ts): a proposed version asked in the queue on its
 exact hash and applied only on approval, with its `policy-change` decision, a waiting board task
 re-gated by the board's next sweep; a rejection that changes nothing; a restart that keeps the
@@ -295,6 +343,13 @@ the policy page's diff, a proposal, its queue entry, and its approval, the polic
 form (each mode, the classes that always ask fixed, commands, expiry, batch, the JSON following,
 the queue's refusal shown), and a queue entry that says
 the queue proposed the change, and why.
+[`tests/portfolio.spec.ts`](tests/portfolio.spec.ts) (T253), with a browser, over the same
+composition with two active projects: Home's groups headed by each project's name with its own
+counts, the more urgent first, its cards in the same groups, each project's Reports; the filter by
+a project's name in the address through a reload and Back, and All projects; the Board's All
+projects as counts only, a project's board by its name and by the switcher, in the address; the
+Workers page naming each running step's project; Home, the Board, and Workers within T239's word
+bound at 1280×800; and no page scrolling sideways, every target at least 44 px, at 402 px.
 [`tests/reviews.spec.ts`](tests/reviews.spec.ts) runs the UI over the same composition: a run's
 change, verdicts, and report served to the operator only (a source that cannot read its own named),
 and, with a browser, a review card led by its chips (the change, each check, the verdict), its

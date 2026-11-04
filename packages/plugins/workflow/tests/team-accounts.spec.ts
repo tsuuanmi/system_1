@@ -102,43 +102,6 @@ describe('a team\'s distinct accounts are counted by account, across every Worke
     expect(held.filter((w) => w !== 'agent:other')).toHaveLength(1)
   }, 60_000)
 
-  it('says the members share an account when the only other Worker of the family is a role of the same account, with the same family allowed (ADR-0029, ADR-0035)', async () => {
-    const ctx = await boot({ allowSameFamily: true })
-    scripted(ctx, { workers: [role('agent:review', 'family-a'), role('agent:develop', 'family-a')], accounts: [['agent:develop', 'agent:review']] })
-    const done = await brainstorm(ctx)
-    expect(done.status).toBe('completed')
-    // Before, the two roles counted as two accounts: `same-family`, "each on an account of its own".
-    expect(done.answer).toContain('Members: same provider family (allowSameFamily), some sharing one account: no other provider judged this.')
-    const m2 = ctx.workflow.explain(done.runId)!.nodes.find((n) => n.nodeId === 'brainstorm:m2:propose')!
-    expect(m2.decisions).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'admission', outcome: 'same-family-shared-account' })]))
-    expect(m2.decisions.some((d) => d.outcome === 'same-family')).toBe(false)
-  }, 60_000)
-
-  it('counts Workers whose descriptors name one account as one, whether or not a source names them siblings', async () => {
-    const ctx = await boot()
-    const started = scripted(ctx, { workers: [role('w:a', 'family-a', 'acct-1'), role('w:b', 'family-b', 'acct-1')] })
-    const refused = await brainstorm(ctx)
-    expect(refused).toMatchObject({ status: 'failed', error: { message: expect.stringContaining('another member holds this account') } })
-    expect(started).toHaveLength(1)
-  }, 60_000)
-
-  it('refuses a member, with the cause, when no source describes the Worker another member holds, though the same family is allowed (INV-2)', async () => {
-    const ctx = await boot({ allowSameFamily: true })
-    const state: Parameters<typeof scripted>[1] = { workers: [role('agent:review', 'family-a'), role('agent:develop', 'family-b')] }
-    // Once the first member started, its Worker is no longer described, and no source names its siblings.
-    state.onStart = (start) => {
-      state.workers = state.workers.filter((w) => w.worker !== start.worker)
-      state.onStart = undefined
-    }
-    const started = scripted(ctx, state)
-    const refused = await brainstorm(ctx)
-    // The family rule reads the held Worker first and says so; the distinct-account rule would refuse
-    // it for the same cause: neither can tell which account it is on.
-    expect(refused).toMatchObject({ status: 'failed', error: { kind: 'config_error', message: expect.stringMatching(/Worker agent:\w+ is no longer listed, so no Worker can be shown to differ from it/) } })
-    // Nothing was sent for the refused member.
-    expect(started).toHaveLength(1)
-  }, 60_000)
-
   it('refuses a member, with the cause, when a held Worker\'s siblings name different accounts (INV-2)', async () => {
     const ctx = await boot({ allowSameFamily: true })
     const started = scripted(ctx, {

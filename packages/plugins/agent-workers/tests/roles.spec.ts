@@ -221,7 +221,8 @@ describe('Workers = account × role: derivation (ADR-0051)', () => {
     expect(workers.filter((w) => w.sandbox === 'workspace-write').map((w) => [w.id, w.runtime, w.kinds])).toEqual([['claude-code', 'claude-agent-sdk', ['code', 'docs', 'tests']], ['codex-writer', 'codex-sdk', ['validation']]])
     const profile = rowOf('work-kinds.patch.yml', 'profile-software-development')
     expect(SoftwareDevelopment.checkConfig(profile)).toEqual([])
-    expect(SoftwareDevelopment.Config(profile as never)).toEqual({ kinds: SoftwareDevelopment.DEFAULT_KINDS })
+    // The live profile sets no pipeline (ADR-0082): it reads as full, the graph unchanged; the operator turns lean on.
+    expect(SoftwareDevelopment.Config(profile as never)).toEqual({ kinds: SoftwareDevelopment.DEFAULT_KINDS, pipeline: 'full' })
     const system = workers.filter((w) => w.workspace === '/home/tan/workspaces/system')
     expect(system.every((w) => w.worktreePerRun === true)).toBe(true)
     // T99 D5: a digest asks for a read-only Worker on the economy tier only, never one of the
@@ -403,7 +404,7 @@ describe('Workers = account × role: per account (PROP-0012 phase F)', () => {
 const LIVE = (ws: string): AgentWorkerConfig[] => [
   { id: 'claude-research', runtime: A, workspace: ws, sandbox: 'read-only', tier: 'standard', maxTurns: 4 },
   { id: 'codex-review', runtime: B, workspace: ws, sandbox: 'read-only', tier: 'standard' },
-  { id: 'agy-review', runtime: C, workspace: ws, sandbox: 'read-only', tier: 'standard', model: 'gemini-3.8-flash-high' },
+  { id: 'agy-review', runtime: C, workspace: ws, sandbox: 'read-only', tier: 'standard', model: 'model-c-1' },
 ]
 
 describe('before the move: the hand-named rows route exactly as before (PROP-0012 phase F rollout)', () => {
@@ -469,7 +470,7 @@ describe('system account migrate (PROP-0012 phase F: migration from hand-named r
     const decided = enrollments(b).length
     const planned = await call(b, 'account_migrate', {})
     const plan = planned.structuredContent!.plan as ReturnType<typeof planMigration>
-    expect(plan.roles).toEqual([{ id: 'review', workspace: ws, sandbox: 'read-only', tier: 'standard', runtimes: { [A]: { maxTurns: 4 }, [C]: { model: 'gemini-3.8-flash-high' } } }])
+    expect(plan.roles).toEqual([{ id: 'review', workspace: ws, sandbox: 'read-only', tier: 'standard', runtimes: { [A]: { maxTurns: 4 }, [C]: { model: 'model-c-1' } } }])
     expect(plan.assignments).toEqual([{ account: a, roles: ['review'] }, { account: bb, roles: ['review'] }].sort((x, y) => (x.account < y.account ? -1 : 1)))
     expect(plan.workers.map((w) => [w.from, w.to])).toEqual([['agent:agy-review', undefined], ['agent:claude-research', `agent:${a}/review`], ['agent:codex-review', `agent:${bb}/review`]])
     // Antigravity's account cannot be verified: the cutover waits for it, or the operator stops its Workers (open question 1).

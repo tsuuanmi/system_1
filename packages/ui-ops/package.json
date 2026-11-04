@@ -17,7 +17,6 @@
   "peerDependencies": { "patchright-core": "1.63.0" },
   "devDependencies": {
     "patchright-core": "1.63.0",
-    "@tsuuanmi/system-display-virtual": "workspace:*",
     "@tsuuanmi/system-browser-patchright": "workspace:*"
   }
 }

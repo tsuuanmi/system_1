@@ -2,12 +2,13 @@
  * Recovery after a failed attempt (REQ-WF-6, INV-4) and tier escalation after a rejected result
  * (REQ-WRK-9). Each choice is a decision artifact (INV-13).
  */
-import type { Lease } from '@tsuuanmi/system-leases'
+import type { InfrastructureFailure, Lease } from '@tsuuanmi/system-board-core'
 import type { ProviderErrorKind } from '@tsuuanmi/system-provider-core'
-import { type AdmissionFailure, type ArtifactRef, type CapabilityDescriptor, type RouteOptions, TIERS, type WorkerAccount, type WorkerExecution } from '@tsuuanmi/system-workers-core'
+import { type AdmissionFailure, type ArtifactRef, type CapabilityDescriptor, offeredTiers, type RouteOptions, TIERS, type WorkerAccount, type WorkerExecution } from '@tsuuanmi/system-workers-core'
 import { noteDeferral } from './continuations.ts'
 import type { Engine } from './engine.ts'
 import { MATERIAL, type SourceSnapshot } from './sources.ts'
+import { isSingleFamily, recoverSingleFamily, singleFamilyOf } from './single-family.ts'
 import type { ResolvedNode } from './spec.ts'
 import { type NodeRecord, type NodeRow, type RunRow, TASK_WAIT_MS, type TaskDispatch, type WorkflowError } from './types.ts'
 
@@ -53,14 +54,15 @@ export function escalate(e: Engine, run: RunRow, node: NodeRow, spec: ResolvedNo
   const max = spec.maxEscalations ?? 1
   const served = node.served_tier ?? spec.tier
   const next = TIERS[TIERS.indexOf(served) + 1]
-  const reachable = next === undefined || !held || ('workers' in held && held.workers.some((w) => TIERS.indexOf(w.tier) >= TIERS.indexOf(next)))
+  // A Worker that offers several tiers (ADR-0073) serves the next tier when any of them is at or above it.
+  const reachable = next === undefined || !held || ('workers' in held && held.workers.some((w) => offeredTiers(w).some((o) => TIERS.indexOf(o.tier) >= TIERS.indexOf(next))))
   const escalate = node.escalations < max && next !== undefined && reachable
   const why = escalate
     ? `escalation ${node.escalations + 1} of ${max} to ${next}: ${spec.acceptance} rejected the ${served} result (${reasons.join('; ')})`
     : next === undefined ? `no tier above ${served}`
     : node.escalations >= max ? `escalation bound reached (${max})`
     : held && 'unknown' in held ? `held Workers unknown: the Workers session ${held.session} stays on could not be listed (${held.unknown}), so no Worker can be shown to take it at tier ${next}`
-    : `session ${held!.session} stays on its Worker${held!.workers.length > 1 ? 's' : ''} ${held!.workers.map((w) => `${w.worker} (${w.tier})`).join(', ')}, none at tier ${next} or above, so no Worker could take it there`
+    : `session ${held!.session} stays on its Worker${held!.workers.length > 1 ? 's' : ''} ${held!.workers.map((w) => `${w.worker} (${offeredTiers(w).map((o) => o.tier).join(', ')})`).join(', ')}, none at tier ${next} or above, so no Worker could take it there`
   const decision = e.ctx.artifacts.recordDecision({
     decisionType: 'escalation',
     question: `Does node ${node.node_id} of run ${run.run_id} run again at a higher tier after its result was rejected?`,
@@ -116,11 +118,11 @@ export function sameFamilyOf(e: Engine, decision: ArtifactRef | undefined): stri
   return body?.decider?.id === 'workflow.same-family' ? body.outcome?.option ?? 'same-family' : undefined
 }
 
-/** The decisions recorded when the node's current attempt was routed: tier and route, after a same-family admission if there was one. */
+/** The decisions recorded when the node's current attempt was routed: tier and route, after a same-family or single-family admission if there was one. */
 export function routedDecisions(node: NodeRow, e?: Engine): ArtifactRef[] {
   const stored = node.decisions ? (JSON.parse(node.decisions) as ArtifactRef[]) : []
   const before = stored.at(-3)
-  return e && isSameFamily(e, before) ? stored.slice(-3) : stored.slice(-2)
+  return e && (isSameFamily(e, before) || isSingleFamily(e, before)) ? stored.slice(-3) : stored.slice(-2)
 }
 
 /** Failures an unsent attempt fails over from, to another Worker (ADR-0034). */
@@ -144,10 +146,12 @@ function assignedOf(node: NodeRow): { group: string; account: string } | undefin
   return account?.mode === 'assigned' ? { group: account.group, account: account.id } : undefined
 }
 
-/** Until when a node waits for an assigned account's limit (ADR-0052), while it does. */
+/** Until when a node waits for an assigned account's limit (ADR-0052), or for a Worker that proves it to be free again (T282), while it does. */
 export function waitingUntil(node: NodeRow): string | undefined {
   if (node.state !== 'READY' || !node.limit_wait_since || !node.not_before || Date.parse(node.not_before) <= Date.now()) return undefined
-  return (node.error ? (JSON.parse(node.error) as WorkflowError).kind : undefined) === 'quota_exhausted' ? node.not_before : undefined
+  // A limit's wait (ADR-0052), or a wait for a Worker that proves it to be free again (T282, `overloaded`).
+  const kind = node.error ? (JSON.parse(node.error) as WorkflowError).kind : undefined
+  return kind === 'quota_exhausted' || kind === 'overloaded' ? node.not_before : undefined
 }
 
 /**
@@ -194,6 +198,53 @@ export function waitForLimit(e: Engine, run: RunRow, node: NodeRow, failure: Adm
 }
 
 const round = (hours: number): string => (Math.round(hours * 100) / 100).toString()
+
+/**
+ * A node refused while a Worker that proves it is refused only for a while that passes by itself
+ * (T282: out of quota, or at a limit, with no assigned account's reset `waitForLimit` waits for; or
+ * unavailable while its runtime's probe is late) waits for the time routing names to look again
+ * (`AdmissionFailure.retryAt`), as a `recovery` decision with outcome `wait`: `READY` with
+ * `not_before` that time, on its row so a restart waits on (INV-4), sending nothing, spending no
+ * attempt; then it is routed again, and waits again or runs. Bounded (INV-9) as a limit's wait: from
+ * its first wait, at most `maxLimitWaitHours` in all; past it, it fails as before, saying so. Never a
+ * configuration problem: only no configured Worker proving the work at any tier is one.
+ */
+export function waitForRetry(e: Engine, run: RunRow, node: NodeRow, failure: AdmissionFailure, message: string, lease: () => Lease): { waited: true } | { why: string } {
+  const until = failure.retryAt
+  if (!until) return { why: 'no Worker that proves it is back by itself' }
+  const max = e.config.maxLimitWaitHours ?? 24
+  const since = node.limit_wait_since ?? new Date().toISOString()
+  const hours = (Date.parse(until) - Date.parse(since)) / 3_600_000
+  if (!(max > 0) || hours > max) return { why: `looking again at ${until} would pass maxLimitWaitHours (${max}) from its first wait at ${since}` }
+  const waited = Math.max(0, (Date.now() - Date.parse(since)) / 3_600_000)
+  // While it waits, it is a Worker not free yet, never a sign-in to make: `overloaded` unless it is a limit.
+  const kind = admissionKind(failure) === 'quota_exhausted' ? 'quota_exhausted' : 'overloaded'
+  const decision = e.ctx.artifacts.recordDecision({
+    schema: 'decision@1.8',
+    decisionType: 'recovery',
+    question: `How does node ${node.node_id} of run ${run.run_id} recover when the Workers that prove it are not free now?`,
+    inputs: [failure.decision],
+    candidates: [
+      { option: 'retry', selected: false, reasons: ['not retry now: no Worker is admitted now'] },
+      { option: 'failover', selected: false, reasons: ['not failover: no other Worker that proves it is admitted'] },
+      { option: 'wait', selected: true, reasons: [`a Worker that proves it is out of quota, at a limit, or not yet known to be ready, which passes by itself; it is routed again at ${until} (${round(waited)} h of the ${max} h it may wait in all), sends nothing, and spends no attempt`] },
+      { option: 'fail', selected: false, reasons: [`not fail: a Worker proves it, and ${until} is within maxLimitWaitHours (${max}) of its first wait; only no Worker proving it at any tier is a configuration problem`] },
+    ],
+    decider: { type: 'rule', id: 'workflow.recovery.retry', version: '1' },
+    outcome: { option: 'wait', detail: { kind, attempt: node.attempt, until, since, maxLimitWaitHours: max } },
+    deterministic: true,
+  }, { producer: { type: 'system', ref: 'workflow' }, runId: run.run_id, nodeId: node.node_id })
+  const error: WorkflowError = { kind, disposition: 'BACKOFF', message: `${message}; waiting until ${until}` }
+  e.ctx.store.transaction(() => {
+    e.writeNode(node, { state: 'READY', execution_id: null, worker: null, not_before: until, limit_wait_since: since, error: JSON.stringify(error), decisions: JSON.stringify([failure.decision]) }, (r) => {
+      const next: NodeRecord = { ...r, lastDecision: decision.id as ArtifactRef }
+      delete next.execution
+      return next
+    }, lease)
+    e.ctx.eventLog.append({ type: 'workflow.node.waiting', runId: run.run_id, nodeId: node.node_id, decision: decision.id, data: { until, since, attempt: node.attempt } })
+  })
+  return { waited: true }
+}
 
 /**
  * A dispatched run's writing step whose chosen Worker routing refused (ADR-0064): it runs on that
@@ -343,11 +394,19 @@ function resend(e: Engine, run: RunRow, node: NodeRow, error: WorkflowError, exe
  * over instead: the next attempt leaves the failed Worker out (ADR-0034), unless the node's session
  * is held to it.
  */
-export function failAttempt(e: Engine, run: RunRow, node: NodeRow, error: WorkflowError, attempt: { sent: boolean; execution?: WorkerExecution; decisions?: ArtifactRef[] }, lease: () => Lease): void {
+export function failAttempt(e: Engine, run: RunRow, node: NodeRow, error: WorkflowError, attempt: { sent: boolean; execution?: WorkerExecution; decisions?: ArtifactRef[]; infrastructure?: InfrastructureFailure }, lease: () => Lease): void {
   // A site's own error after the send, as its source read it on the execution's page (ADR-0062).
   const siteError = attempt.sent && attempt.execution?.error?.siteError === true ? attempt.execution : undefined
   const kept = attempt.decisions ?? (attempt.execution ? [...attempt.execution.decisions, ...routedDecisions(node, e)] : node.decisions ? (JSON.parse(node.decisions) as ArtifactRef[]) : [])
-  const notResent = siteError ? resend(e, run, node, error, siteError, kept, lease) : undefined
+  // Both guards come before a site error's resend, so a resend never runs the step again on either family.
+  // A step that prefers another family, whose Worker of that family failed its execution (sent or not:
+  // a stall, the infrastructure, the site's own error), runs once on the family it differs from at once,
+  // never resent, retried, or waited on there (./single-family.ts, D89).
+  if ((attempt.sent || attempt.execution) && recoverSingleFamily(e, run, node, error, attempt, kept, lease)) return
+  // An attempt that was that one fallback ends the step on any failure: it falls back once, never twice.
+  const spent = singleFamilyOf(e, node) && (JSON.parse(node.spec) as ResolvedNode).diversity === 'preferred'
+    ? 'it was the step\'s one single-family fallback (diversity: preferred), which never runs twice' : undefined
+  const notResent = siteError ? (spent ?? resend(e, run, node, error, siteError, kept, lease)) : undefined
   if (siteError && notResent === undefined) return
   const max = e.config.maxAttempts ?? 3
   const reasons = {
@@ -362,7 +421,8 @@ export function failAttempt(e: Engine, run: RunRow, node: NodeRow, error: Workfl
   // An assigned account's unsent failure never moves inside its provider group (ADR-0052).
   const assigned = !attempt.sent && node.worker && FAILOVER.has(error.kind) ? assignedOf(node) : undefined
   // Why a failover is not possible: the first of its conditions that does not hold.
-  const noFailover = attempt.sent ? 'the prompt was sent, so the turn stays with its Worker'
+  const noFailover = spent ? spent
+    : attempt.sent ? 'the prompt was sent, so the turn stays with its Worker'
     : !node.worker ? 'no Worker served the attempt'
     : !FAILOVER.has(error.kind) ? `${error.kind} is not a failure of one Worker (usage limit, challenge, sign-out, or overload)`
     : node.attempt >= max ? `attempt ${node.attempt} of ${max} failed`
@@ -370,7 +430,8 @@ export function failAttempt(e: Engine, run: RunRow, node: NodeRow, error: Workfl
     : assigned && error.kind === 'overloaded' ? `${node.worker}'s account is assigned: an overload is retried on it with back-off, never moved to another account of its provider`
     : undefined
   // Why the node cannot run again at all: the first of a retry's conditions that does not hold.
-  const noRetry = !RETRYABLE.has(error.disposition) ? `${error.kind} is ${error.disposition}, not retryable`
+  const noRetry = spent ? spent
+    : !RETRYABLE.has(error.disposition) ? `${error.kind} is ${error.disposition}, not retryable`
     : attempt.sent ? `${error.kind} came after the prompt was sent; resending could duplicate the provider turn`
     : node.attempt >= max ? `attempt ${node.attempt} of ${max} failed`
     : undefined
@@ -438,7 +499,9 @@ export function failAttempt(e: Engine, run: RunRow, node: NodeRow, error: Workfl
     ? { ...error, disposition: 'USER_ACTION', message: `${error.message} (the prompt was sent, so it is not resent automatically)` }
     : error
   e.ctx.store.transaction(() => {
-    e.writeNode(node, { state: 'FAILED', attempt: node.attempt, error: JSON.stringify(final), ...decisions }, (r) => ({ ...r, lastDecision: decision.id as ArtifactRef }), lease)
+    // Marked when it failed only on the infrastructure (ADR-0069): its task's attempt is then not spent on it.
+    const mark = attempt.infrastructure ? { infrastructure: JSON.stringify(attempt.infrastructure) } : {}
+    e.writeNode(node, { state: 'FAILED', attempt: node.attempt, error: JSON.stringify(final), ...decisions, ...mark }, (r) => ({ ...r, lastDecision: decision.id as ArtifactRef }), lease)
     e.ctx.eventLog.append({ type: 'workflow.node.failed', runId: run.run_id, nodeId: node.node_id, decision: decision.id, data: { attempt: node.attempt, kind: final.kind, disposition: final.disposition } })
     // A Worker that stopped at a call waiting for the operator: its session continues once that is approved.
     noteDeferral(e, run, node, final, attempt.execution)
@@ -459,10 +522,13 @@ export function errorLine(message: string): string {
 
 /**
  * How a refused admission is handled: by the state that kept an otherwise fitting Worker
- * out. With no Worker at all, the operator still has to add and sign in an account.
+ * out. With no Worker at all, the operator still has to add and sign in an account. A refusal
+ * routing says is worth routing again (`retryAt`, T282: a Worker that proves it is not free now,
+ * or a source that has not described its Workers yet since it started) is never `config_error`:
+ * only no configured Worker proving the work at any tier is.
  */
 export function admissionKind(failure: AdmissionFailure): ProviderErrorKind {
-  if (failure.rejections.length === 0) return 'reauth_required'
+  if (failure.rejections.length === 0) return failure.retryAt ? 'overloaded' : 'reauth_required'
   const onlyState = failure.rejections.filter((r) => r.failed.every((f) => f.check === 'state'))
   if (onlyState.some((r) => r.state === 'reauth-required' || r.state === 'unavailable')) return 'reauth_required'
   if (onlyState.some((r) => r.state === 'quota-exhausted')) return 'quota_exhausted'
@@ -471,7 +537,7 @@ export function admissionKind(failure: AdmissionFailure): ProviderErrorKind {
   if (failure.rejections.some((r) => r.failed.every((f) => f.check === 'locality'))) return 'egress_denied'
   // Too long for every Worker that could otherwise take it: sending it again cannot help (ADR-0032).
   if (failure.rejections.some((r) => r.failed.every((f) => f.check === 'input'))) return 'invalid_input'
-  return 'config_error'
+  return failure.retryAt ? 'overloaded' : 'config_error'
 }
 
 /**

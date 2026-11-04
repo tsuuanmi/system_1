@@ -240,7 +240,7 @@ export interface ScopeUnknownSources {
  * {@link MAX_UNKNOWN_ENTRIES}: `unread` (and `unreadable`, entries no reader can place) mean some
  * run of the scope may be missing, which a cap reads as unknown too.
  */
-export function unknownUsageOf(sources: ScopeUnknownSources, scope: { taskId?: string | undefined; projectId?: string | undefined }, pools: ReadonlySet<string>): { runs: Array<UnknownRun & { pool: string }>; unread: boolean; unreadable: number } {
+export function unknownUsageOf(sources: ScopeUnknownSources, scope: { taskId?: string | undefined; projectId?: string | undefined }, pools: Pick<ReadonlySet<string>, 'has'>): { runs: Array<UnknownRun & { pool: string }>; unread: boolean; unreadable: number } {
   const { read, unread } = readEntries(sources.entries, new Date(0).toISOString())
   const first = new Map<string, UsageUnknown>()
   let unreadable = 0

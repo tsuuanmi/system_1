@@ -35,39 +35,46 @@ import { isAbsolute, join, resolve } from 'node:path'
 import { type Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import {
-  type AgentRuntimeProvider, type LimitObservation, type RunMetering, type RunObserver, type RunResult, type RunSpec, type RuntimeEvidence, type SandboxMode, WORKSPACE_READ_BOUNDS, type WorkspaceReadBounds,
+  type AgentRuntimeProvider, type LimitObservation, type RunMetering, type RunObserver, type RunResult, type RunSpec, type RuntimeEvidence, type SandboxMode, WEB_RUN_TOOLS, WORKSPACE_READ_BOUNDS, type WorkspaceReadBounds,
   meteringOf, readLimits, workspaceReadBounds,
 } from '@tsuuanmi/system-agent-runtime-core'
-import type {} from '@tsuuanmi/system-artifacts'
-import type { Classification } from '@tsuuanmi/system-egress'
-import type {} from '@tsuuanmi/system-event-log'
-import { type Lease, LeaseLost, StaleGeneration } from '@tsuuanmi/system-leases'
+import { webAccessOf } from '@tsuuanmi/system-approvals-core'
+import type {} from '@tsuuanmi/system-ledger-core'
+import { type Lease, LeaseLost, StaleGeneration } from '@tsuuanmi/system-board-core'
 import {
-  type AccountSetting, accountSettings, ASSIGNED, bodyText, BRIEF_FILE_PATH, type BriefFile, captureGitSubject, type ContentId, currentProcess, DESCRIPTION, drawEntries, dshHome, LABEL, type LeaseProbe, type Liveness, LIVENESS_RULE, livenessOf, MAX_DESCRIPTION, MAX_LABEL,
+  type AccountSetting, accountSettings, ASSIGNED, bodyText, BRIEF_FILE_PATH, type BriefFile, captureGitSubject, type ContentId, currentProcess, DESCRIPTION, drawEntries, dshHome, type EnforceMode, enforceMode, type EnforceSource, LABEL, type LeaseProbe, type Liveness, LIVENESS_RULE, livenessOf, MAX_DESCRIPTION, MAX_LABEL,
   type ProcessIdentity, processIdentity, processIdentityOf, type ProcessProbe, pooledTermsDecision, probeProcess, QUOTA_DRAW_EVENT, type QuotaDraw, quotaDraw, sha256, USAGE_UNKNOWN_EVENT, type UsageUnknown, usageUnknown,
 } from '@tsuuanmi/system-libs'
 import { ProviderError, ProviderScheduler, dispositionOf, promptOfStart, toProviderError } from '@tsuuanmi/system-provider-core'
-import { type LimitState, type PoolState, type Resources, ResourcesError, type UsageRecord } from '@tsuuanmi/system-resources-core'
-import type {} from '@tsuuanmi/system-store'
+import { type LimitState, type PoolState, type Resources, ResourcesError, templatePool, type UsageRecord } from '@tsuuanmi/system-resources-core'
 import {
-  type ArtifactRef, type CapabilityDescriptor, type CapabilityOffer, type ExecutionStatus, type LivenessQuery, type LivenessReport, type LivenessState, MAX_LIVENESS_RUNS, type QuotaClass, type RunLiveness, type Tier,
-  type WorkerExecution, type WorkerSandbox, type WorkerStart, type WorkScope,
+  type ArtifactRef, type CapabilityDescriptor, type CapabilityOffer, type Classification, type ExecutionInfrastructure, type ExecutionStatus, type LivenessQuery, type LivenessReport, type LivenessState, MAX_LIVENESS_RUNS, type QuotaClass, type RunLiveness, type Tier,
+  type TierOffer, TIERS, type WorkerExecution, type WorkerSandbox, type WorkerStart, type WorkScope,
 } from '@tsuuanmi/system-workers-core'
 import { ACCOUNTS_MIGRATION, type AgentAccount, AgentAccounts, type HomeGate, MAX_SLOTS } from './accounts.ts'
-import { DENIAL_MIGRATION, GATE_MIGRATION, type Deferral, recordDenial, runGate, unaskedNote } from './gate.ts'
+import { describeSpace, type DiskSpace, diskSpace, GB } from './disk.ts'
+import { commandRecorder, type DossierCaller, dossiersOf, dossierTools, type StepDossiers } from './dossier.ts'
+import { DENIAL_MIGRATION, GATE_MIGRATION, type Deferral, readToolsOf, recordDenial, runGate, unaskedNote } from './gate.ts'
+import { HANDBOOK_SOURCE_EVENT, handbookSelection, type SourcePart } from './handbook.ts'
+import { repositoryLessonsFor } from './lessons.ts'
 import { type Applied, CUTOVER_MIGRATION, Cutover, type CutoverRecord, type MigrationPlan, type Moved, planMigration, type RolledBack } from './migrate.ts'
 import { Overlaps } from './overlaps.ts'
-import { Probes, refused } from './probes.ts'
+import { Probes, isLate, provenBefore, refused } from './probes.ts'
 import { regenerationOf } from './regenerate.ts'
 import { ReportSchedule, type ReportTarget } from './reports.ts'
 import {
-  type AgentAssignmentConfig, type AgentProviderConfig, type AgentRoleConfig, checkProviders, DEFAULT_LIMIT_READ_SECONDS, type DerivedWorker, deriveWorkers, kindsProblem, MAX_CONCURRENT_PER_ACCOUNT,
-  MAX_LIMIT_READ_SECONDS, setsDerivedOnly,
+  type AgentAssignmentConfig, type AgentProviderConfig, type AgentRoleConfig, checkProviders, DEFAULT_LIMIT_READ_SECONDS, type DerivedTier, type DerivedWorker, deriveWorkers, kindsProblem, MAX_CONCURRENT_PER_ACCOUNT,
+  MAX_LIMIT_READ_SECONDS, MAX_MODEL_POOLS, setsDerivedOnly,
 } from './roles.ts'
-import { CHECKS_MIGRATION, RunChecks } from './checks.ts'
+import { researchProblem, withResearchDefaults } from './research.ts'
+import { type WebProof, WebProbes } from './web-probe.ts'
+import { stepWorkers } from './check-queue.ts'
+import { CHECKS_MIGRATION, DEFAULT_MAX_CONCURRENT_CHECKS, RunChecks } from './checks.ts'
+import { type RunReport, type RunReported, runReport } from './run-report.ts'
 import { loadSetups, SETUP_MIGRATION, type Setup, type WorktreeSetupConfig, WorktreeSetups } from './setup.ts'
+import { VERIFICATION_MIGRATION } from './verification.ts'
 import { registerAccountTools, registerRunTools } from './tools.ts'
-import { CARRY_MIGRATION, FORK_MIGRATION, notKnownGone, RUN_ID, type RepositoryCheck, type RunWorktree, type RunWorktreeRelease, type SweepOutcome, type WorktreeRelease, Worktrees } from './worktrees.ts'
+import { CARRY_MIGRATION, DiskFloorError, FORK_MIGRATION, notKnownGone, RUN_ID, type RepositoryCheck, type RunWorktree, type RunWorktreeRelease, type SweepOutcome, USED_MIGRATION, type WorktreeRelease, Worktrees } from './worktrees.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -135,12 +142,22 @@ export interface AgentWorkerConfig {
   kinds?: string[]
   /** What it is for, in the operator's words (`capability-descriptor@1.7`); never a routing input. */
   description?: string
+  /**
+   * A read-only research Worker (T262, ADR-0074, ./research.ts): its tools, at every tier, are reads
+   * and the web tools only (default all of them), it takes research work only (kinds default
+   * `[research]`), its gate refuses a write or a command, and its web calls are judged under the
+   * autonomy policy's web access grant. It proves `reason`, and `web-search` once its web probe
+   * searched. Default false; refused unless `read-only` and not a review member.
+   */
+  research?: boolean
 }
 
-/** A Worker as this source runs it: a hand-named row, or one derived as account × role (`derived`). */
-type WorkerSpec = AgentWorkerConfig & { derived?: DerivedWorker['derived'] }
+/** A Worker as this source runs it: a hand-named row, or one derived as account × role (`derived`), with the tiers it offers (ADR-0073). */
+type WorkerSpec = AgentWorkerConfig & { derived?: DerivedWorker['derived']; tiers?: DerivedTier[] }
+/** What a run at its tier runs (ADR-0073): the tier, its model and options, and its model's pool. */
+type AtTier = Pick<AgentWorkerConfig, 'tools' | 'model' | 'maxTurns'> & { tier: Tier; modelPool?: DerivedTier['modelPool']; declared: boolean }
 
-export type { AgentAssignmentConfig, AgentProviderConfig, AgentRoleConfig } from './roles.ts'
+export type { AgentAssignmentConfig, AgentModelPool, AgentProviderConfig, AgentRoleConfig, AgentRoleRuntime, AgentRoleTier } from './roles.ts'
 export type { WorktreeGeneratedConfig, WorktreeSetupConfig, WorktreeSetupView } from './setup.ts'
 export type { MigrationPlan } from './migrate.ts'
 
@@ -212,6 +229,12 @@ export interface Config {
    */
   worktreeRetentionHours?: number
   /**
+   * The free space, in GB, the worktrees' filesystem must keep for a new worktree to be cut (T345; default
+   * 10, 0 sets no floor). Under it, no run that needs a new worktree starts, as the `disk-floor` mechanism's
+   * mode says (`enforce.diskFloor`). A landed run's worktree is removed at once, whatever this says.
+   */
+  diskFloorGb?: number
+  /**
    * Per repository, the commands that set a workflow run's new worktree up before any agent run
    * works in it (dependencies installed without a network, say), each allowed by the autonomy
    * policy, run confined: the host read-only but the worktree and the views named, no network
@@ -229,6 +252,32 @@ export interface Config {
    * run (`RunSpec.workspaceReads`).
    */
   workspaceReads?: Partial<WorkspaceReadBounds>
+  /**
+   * The load acceptance checks put on the host (T292): at most `maxConcurrent` check runs at once across
+   * every run (default 2), the rest queued in order; each runs its tests with `maxWorkers` workers
+   * (default the host's cores shared among `maxConcurrent`).
+   */
+  checks?: { maxConcurrent?: number; maxWorkers?: number }
+  /**
+   * The share of the host a writing step's own test runs take (T348): `coreBudget` cores (default half
+   * the host's) shared among `runs` runs testing at once (default 6; set it to the dispatch's
+   * `maxRunning`), each run's commands told the result as `SYSTEM_TEST_MAX_WORKERS`.
+   */
+  stepTests?: { coreBudget?: number; runs?: number }
+  /**
+   * The start mode of the gate-like mechanisms this source owns (ADR-0078; the plugin host's live
+   * override wins). `lockfileVerification` (unset: `warn`, the mechanism's start mode, T333): `on`
+   * opens one approval request per lockfile digest for its supply-chain verification, run on the
+   * host's network once approved; `warn` records the request it would open and opens none; `off` does
+   * not look. `diskFloor` (unset: `warn`, T345): `on` cuts no new worktree while the worktrees'
+   * filesystem has less than `diskFloorGb` free, and dispatch starts none; `warn` records the refusal it
+   * would make and refuses nothing; `off` does not look. `sandboxedCommands` (unset: `warn`,
+   * ADR-0080): `on` lets the autonomy policy's sandboxed-command rule run a Bash call no forbid or ask
+   * shape names without the operator, in a workspace-write run whose runtime proved both
+   * confinements; `warn` records the verdict the rule would give and the call still asks; `off`
+   * ignores the rule.
+   */
+  enforce?: { lockfileVerification?: EnforceMode; diskFloor?: EnforceMode; sandboxedCommands?: EnforceMode }
 }
 
 interface RunRow {
@@ -286,6 +335,21 @@ interface RunRow {
   /** The workflow template and step it serves (`WorkerStart.step`), for what it drew. */
   step_template?: string | null
   step_node?: string | null
+  /** The tier it runs at (ADR-0073): the routed one, of the tiers its Worker offers, so its model is that tier's. */
+  tier?: string | null
+  /** The model its tier's configuration gave it when it was started, on a Worker that offers tiers (ADR-0073): it runs no other. */
+  configured_model?: string | null
+  /** When the host's own stop ended its runtime while it ran (T283): set before this source stopped, so the next start runs it again instead of failing it. */
+  host_stopped_at?: string | null
+  /** How many times a host stop cut it and it ran again (bounded, INV-9). */
+  resumes?: number | null
+  /** The `reconciliation` decision of its latest resume or restart after a host stop (T283, INV-13). */
+  resume_decision?: string | null
+  /**
+   * JSON `{ role, touched? }`: who the run's brief selected its handbook slice for (`brief@1.6`
+   * `handbook.selection`), so the lessons it is given are that role's and paths' (docs/design/handbook.md).
+   */
+  handbook?: string | null
   created_at: string
   updated_at: string
 }
@@ -301,6 +365,8 @@ const newId = (): string => `arun_${randomBytes(8).toString('hex')}`
 const MAX_MODELS = 16
 /** How often finished workflow runs' worktrees are looked at for removal. */
 const SWEEP_MS = 60 * 60_000
+/** A disk floor that stays under is recorded as a decision at most this often (INV-9). */
+const DISK_RECORD_MS = 10 * 60_000
 /** The kind of work a review member's offers are scoped to (ADR-0049). */
 const REVIEW_MEMBER: WorkScope = 'review-member'
 const RANK: Record<Classification, number> = { public: 0, 'operator-shared': 1, 'local-private': 2 }
@@ -309,7 +375,7 @@ const now = (): string => new Date().toISOString()
 const MAX_COOLDOWN_MS = 604_800_000
 /** The row's settings at their defaults, left out of the row `system account migrate` prints. */
 const SETTING_DEFAULTS: Record<string, unknown> = {
-  maxReplayChars: 200_000, probeTtlMs: 5 * 60_000, runTimeoutMs: 15 * 60_000, worktreeRetentionHours: 168, stallSeconds: 300, deadAfterSeconds: 120, maxUnknownVerdicts: 3,
+  maxReplayChars: 200_000, probeTtlMs: 5 * 60_000, runTimeoutMs: 15 * 60_000, worktreeRetentionHours: 168, diskFloorGb: 10, stallSeconds: 300, deadAfterSeconds: 120, maxUnknownVerdicts: 3,
 }
 /** How often a running agent's activity is written and its stall looked at: the run lease's heartbeat (a bounded write rate). */
 const BEAT_MS = LEASE_TTL_MS / 3
@@ -317,12 +383,28 @@ const BEAT_MS = LEASE_TTL_MS / 3
 const MAX_LOOK_MS = 15 * 60_000
 /** The rule a started run's reconciliation applies (PROP-0013, ADR-0056). */
 const RECONCILE_RULE = { type: 'rule', id: 'agent-workers.reconcile', version: '2' } as const
+/** The rule that runs a run the host's own stop cut again (T283): resumed in its native session, or started again in its worktree. */
+const RESUME_RULE = { type: 'rule', id: 'agent-workers.resume-cut', version: '1' } as const
+/** A run the host's stop cut runs again at most this many times (INV-9); past it, it is reconciled as any run its holder lost. */
+const MAX_RESUMES = 5
+/** How many seconds a run the host cut waits at the start for its runtime to register, at most; then it is sent as any run is. */
+const MAX_RUNTIME_WAITS = 60
+/** The event that tells a run the host's stop cut ran again (`resumed` or `restarted`). */
+const RESUMED_EVENT = 'agent-workers.run.resumed'
+/** What a resumed agent is told: the conversation continues, and its workspace holds what it did. */
+const RESUME_PROMPT = 'The host you ran on was restarted while you worked, and your session was stopped without notice. This conversation and your workspace hold everything you had done. Check the workspace, then continue the task you were given and finish it.'
+/** What an agent that starts again is told, after its original prompt. */
+const RESTART_NOTE = '\n\n(The host you ran on was restarted while an earlier start of this task ran, and that start was stopped. Your workspace may already hold part of its work: check it before you change anything, and finish the task.)'
+/** Why the usage record of a run that ran again after a host stop is a lower bound of the run (T283): what it used before the stop is not in it. */
+const againPartial = (resumes: number): string => `it ran again after the host's stop cut it (${resumes} time(s)): this counts only what it used since; what it used before the stop is left to transcript reconciliation`
 /** The operator's word that a run's agent is gone, freeing what the run held (INV-13). */
 const FREE_DECIDER = { type: 'operator', id: 'operator.free', version: '1' } as const
 /** The operator who removes finished run worktrees before the retention would (D12). */
 const WORKTREES_DECIDER = { type: 'operator', id: 'operator.worktrees', version: '1' } as const
 /** The most run worktrees one listing shows (INV-9). */
 const MAX_LISTED_WORKTREES = 100
+/** The most worktrees `worktreeCounts` looks at in one read (each is one `git status`). */
+const MAX_COUNTED_WORKTREES = 1000
 /** A run ended without being known to be gone, and what it held stays held. */
 const UNKNOWN_EVENT = 'agent-workers.run.unknown'
 /** The operator freed what such a run held. */
@@ -360,10 +442,14 @@ function configuredWorkers(config: Partial<Config>): { derived: boolean; workers
   }
   const derivedOnly = providers.find(setsDerivedOnly)
   if (!derived && derivedOnly) {
-    throw new ProviderError('config_error', `agent-workers.providers (${derivedOnly.provider}): maxConcurrentRunsPerAccount, pool, windows, limitCooldownSeconds, and limitReadSeconds apply to Workers derived from roles and assignments; a hand-named Worker sets its own`)
+    throw new ProviderError('config_error', `agent-workers.providers (${derivedOnly.provider}): maxConcurrentRunsPerAccount, pool, windows, modelPools, limitCooldownSeconds, and limitReadSeconds apply to Workers derived from roles and assignments; a hand-named Worker sets its own`)
   }
   const workers = new Map<string, WorkerSpec>()
-  for (const worker of [...config.workers ?? [], ...derived ? deriveWorkers(config.roles ?? [], config.assignments ?? [], providers) : []] as WorkerSpec[]) {
+  for (const configured of [...config.workers ?? [], ...derived ? deriveWorkers(config.roles ?? [], config.assignments ?? [], providers) : []] as WorkerSpec[]) {
+    // A research role reads and searches the web only (T262): refused unless it can hold that, then given its defaults.
+    const research = researchProblem(configured)
+    if (research) throw new ProviderError('config_error', `agent Worker ${configured.id}: ${research}`)
+    const worker = withResearchDefaults(configured)
     if (!worker.derived && !ID.test(worker.id)) throw new ProviderError('config_error', `agent Worker id ${worker.id} must match ${ID}`)
     if (typeof worker.workspace !== 'string' || !isAbsolute(worker.workspace)) throw new ProviderError('config_error', `agent Worker ${worker.id}: workspace must be an absolute path`)
     if (workers.has(PREFIX + worker.id)) throw new ProviderError('config_error', `duplicate agent Worker ${worker.id}`)
@@ -402,6 +488,28 @@ function readBoundsOf(bounds: Partial<WorkspaceReadBounds> | undefined): Workspa
   }
 }
 
+/** The test workers of each writing step (T348): `stepTests.coreBudget` 1 to 1024 and `runs` 1 to 64 when given; `config_error` otherwise (INV-9). */
+function stepWorkersOf(stepTests: Config['stepTests']): number {
+  for (const [name, max] of [['coreBudget', 1024], ['runs', 64]] as const) {
+    const value = stepTests?.[name]
+    if (value !== undefined && (!Number.isInteger(value) || value < 1 || value > max)) throw new ProviderError('config_error', `agent Workers: stepTests.${name} is 1 to ${max}`)
+  }
+  return stepWorkers(stepTests ?? {})
+}
+
+/** The checks' bounds (T292): `maxConcurrent` 1 to 32 and `maxWorkers` 1 to 256 when given; `config_error` otherwise (INV-9). */
+function checkBoundsOf(checks: Config['checks']): { maxConcurrent?: number; maxWorkers?: number } {
+  const bounded = (name: 'maxConcurrent' | 'maxWorkers', max: number): number | undefined => {
+    const value = checks?.[name]
+    if (value === undefined) return undefined
+    if (!Number.isInteger(value) || value < 1 || value > max) throw new ProviderError('config_error', `agent Workers: checks.${name} is 1 to ${max}`)
+    return value
+  }
+  const maxConcurrent = bounded('maxConcurrent', 32)
+  const maxWorkers = bounded('maxWorkers', 256)
+  return { ...maxConcurrent !== undefined ? { maxConcurrent } : {}, ...maxWorkers !== undefined ? { maxWorkers } : {} }
+}
+
 /**
  * What the load would refuse in this row's Workers and their worktree setups, before a host starts
  * on it (`system check`): the first problem {@link configuredWorkers} or {@link loadSetups} finds, or
@@ -413,6 +521,8 @@ export function checkConfig(config: Partial<Config> = {}): string[] {
     const { workers } = configuredWorkers(config)
     loadSetups(config.worktreeSetup, [...workers.values()].filter((w) => w.worktreePerRun).map((w) => w.workspace))
     readBoundsOf(config.workspaceReads)
+    checkBoundsOf(config.checks)
+    stepWorkersOf(config.stepTests)
     return []
   } catch (error) {
     return [(error as Error).message]
@@ -443,15 +553,17 @@ export class AgentWorkers extends Service {
       // Not z.array: an omitted array would come back as [], a Worker given no kind at all; checked at load.
       kinds: z.any().description('The kinds of work it takes (ADR-0057), such as [code] or [docs, tests]: only steps that name one of them, never a step that names none; unset, any work. Not for a review member'),
       description: z.string().max(MAX_DESCRIPTION).pattern(DESCRIPTION).description('What it is for, in your words: plain text on one line, at most 200 characters; shown on the roster, never a routing input'),
+      research: z.boolean().default(false).description('A read-only research Worker (ADR-0074): its tools are Read, Grep, Glob, WebSearch, and WebFetch only (default all), it takes research work only (kinds default [research]), its gate denies a write or a command, and its web calls run unasked only under the autonomy policy\'s web access grant; it proves reason, and web-search once its web probe searched'),
     })).default([]).description('Hand-named agent-runtime Workers (the shape before Workers are account × role): they run as before until system account migrate --apply, then are refused; never with roles or assignments. Each policy comes from here only (INV-6)'),
     roles: z.array(z.object({
       id: z.string().pattern(/^[a-z][a-z0-9-]{0,31}$/).required().description('Role id: its Workers are agent:<accountId>/<role>'),
       workspace: z.string().required().description('Absolute workspace root its work is done in'),
       sandbox: z.union(['read-only', 'workspace-write']).required(),
-      tier: z.union(['economy', 'standard', 'frontier']).required(),
+      tier: z.union(['economy', 'standard', 'frontier']).description('Its one tier on a runtime that declares no tiers (runtimes.<runtime>.tiers); may be left out when every runtime it is assigned on declares them'),
       quotaClass: z.union(['subscription-chat', 'agent-plan', 'metered', 'local']).default('agent-plan'),
       worktreePerRun: z.boolean().default(false).description('Each run of a workflow run works in that run\'s own git worktree of the workspace, as a hand-named Worker\'s'),
       reviewMember: z.boolean().default(false).description('Its review team member steps run under the enforced review-member profile (ADR-0049); read-only, and each runtime it is assigned on names its family'),
+      research: z.boolean().default(false).description('A read-only research role (ADR-0074): its Workers\' tools are Read, Grep, Glob, WebSearch, and WebFetch only, at every tier (default all), on the standard tier when it gives no tier or tiers, they take research work only (kinds default [research]), their gate denies a write or a command, and their web calls run unasked only under the autonomy policy\'s web access grant; on a runtime that offers web tools'),
       // Not z.array, as a hand-named Worker's.
       kinds: z.any().description('The kinds of work its Workers take (ADR-0057), as a hand-named Worker\'s; unset, any work. Not for a review member'),
       description: z.string().max(MAX_DESCRIPTION).pattern(DESCRIPTION).description('What the role\'s Workers are for, in your words: plain text on one line, at most 200 characters; every Worker of the role shows it on the roster, never a routing input'),
@@ -460,7 +572,9 @@ export class AgentWorkers extends Service {
         model: z.string(),
         maxTurns: z.natural().min(1),
         family: z.string().min(1).max(128).description('Its provider family on this runtime (ADR-0027; default the runtime); required for a review member'),
-      })).description('What differs per runtime, by runtime kind: tools, model, maxTurns, family; never a routing input'),
+        // Not z.dict: an omitted object would come back as {}, a runtime declaring no tier at all; checked at load.
+        tiers: z.any().description('The tiers its Workers on this runtime offer (ADR-0073), {economy, standard, frontier}, each {model, tools?, maxTurns?}: one Worker offers them all, routing serves it at the lowest a step admits, and its run uses that tier\'s model. Replaces the role\'s tier on this runtime. Model names are configuration only'),
+      })).description('What differs per runtime, by runtime kind: tools, model, maxTurns, family, and tiers (ADR-0073: runtimes.<runtime>.tiers = {economy?, standard?, frontier?}, each {model, tools?, maxTurns?}, in place of the role\'s tier and the runtime\'s model there; one Worker per account then offers every tier, each run on its tier\'s model; models named in the live profile only; docs/operations/runbooks.md#give-a-role-tiers); never a routing input'),
     })).default([]).description('Role templates (PROP-0012 phase F), each defined once: what the work needs, whatever account serves it'),
     assignments: z.array(z.object({
       account: z.string().pattern(/^[a-z][a-z0-9-]{0,63}:[0-9a-f]{16}$/).required().description('An enrolled agent account, by the id system account list shows'),
@@ -478,6 +592,11 @@ export class AgentWorkers extends Service {
       windows: z.dict(z.string()).description('The runtime\'s limit window names mapped to the template\'s window ids; with pool only'),
       limitCooldownSeconds: z.natural().min(60).max(604_800).description('How long a limit hit with no reset time closes an account\'s pool, or with no pool cools the account down (default 3600); with roles and assignments only'),
       limitReadSeconds: z.natural().max(MAX_LIMIT_READ_SECONDS).description(`How often each ready account with a pool has its runtime's usage report read into its pool's windows (ADR-0059; default ${DEFAULT_LIMIT_READ_SECONDS}, at least 60; 0 turns the periodic read off); with pool only`),
+      modelPools: z.array(z.object({
+        model: z.string().required().description('The model, as the roles\' tiers name it'),
+        pool: z.string().required().description('The pool template (resources templates, of this runtime\'s group) its accounts draw on for this model: pool <pool>/<accountId>'),
+        windows: z.dict(z.string()).description('The runtime\'s window names for this model (a weekly window per model) mapped to the template\'s window ids'),
+      })).description(`Per-model quota (ADR-0073): a model whose provider reports a window of its own draws on one more pool per account; a run on it reserves on both, and its limit closes only the tiers that run it. At most ${MAX_MODEL_POOLS}; with pool only`),
     })).default([]).description('How each agent runtime\'s accounts are used and how many may be enrolled; a runtime not listed is assigned, with one slot (ADR-0051, ADR-0052)'),
     accountHomes: z.string().description('Where enrollment slots 2 and later keep their homes, <accountHomes>/<provider>/<n> (default <DSH_HOME>/system/agent-homes); hidden from every agent'),
     maxReplayChars: z.natural().min(1).max(2_000_000).default(200_000).description('Characters of earlier turns a review member\'s replayed conversation holds, at most; a turn past it fails, never cut'),
@@ -487,7 +606,8 @@ export class AgentWorkers extends Service {
     deadAfterSeconds: z.natural().min(1).max(86_400).default(120).description('A started run its holder did not finish is dead, and reconciled, only when its holder and its agent process are both positively gone and no activity was seen for this long'),
     maxUnknownVerdicts: z.natural().min(1).max(20).default(3).description('Verdicts other than dead a started run gets in a row, looked at again with a bounded backoff, before it goes to the operator, never declared dead'),
     worktreeRoot: z.string().description('Where the worktrees of worktreePerRun Workers go (default <DSH_HOME>/system/worktrees)'),
-    worktreeRetentionHours: z.natural().default(168).description('Hours a workflow run\'s worktree is kept after its last agent run ended; then its changes are committed on its branch and it is removed (0 keeps them)'),
+    worktreeRetentionHours: z.natural().default(168).description('Hours a workflow run\'s worktree is kept after its last agent run ended, when its landing did not end it (a landed run\'s worktree is removed at once, T345); then its changes are committed on its branch and it is removed (0 keeps them)'),
+    diskFloorGb: z.natural().default(10).description('The free space, in GB, the worktrees\' filesystem must keep for a new worktree to be cut (T345; 0 sets no floor): under it, no run that needs a new worktree starts, as the disk-floor mechanism\'s mode (enforce.diskFloor) says, and dispatch says why'),
     worktreeSetup: z.array(z.object({
       repository: z.string().required().description('The repository (absolute): the workspace of the worktreePerRun Workers whose worktrees it sets up'),
       commands: z.array(z.string()).required().description('1 to 16 commands run in order in a new worktree before any agent run works in it, each its words split on single spaces (no shell), each judged by the autonomy policy as a command with that exact argv'),
@@ -503,13 +623,32 @@ export class AgentWorkers extends Service {
         lint: z.string().description('The command of the lint check'),
       }).description('The command of each check a policy can require, run by a workflow run on its result\'s exact tree in this setup\'s confinement, only when the autonomy policy allows it unasked (T151)'),
       checkTimeoutSeconds: z.natural().min(1).max(3600).default(1800).description('Each check\'s deadline'),
+      checkStallSeconds: z.natural().min(1).max(3600).default(300).description('Seconds a check may print nothing before it is reported as stalled in the run\'s explain and the web UI; it goes on to its deadline (T235)'),
+      dependencyFiles: z.array(z.string()).description('File names (at any depth) that say what the setup installs, default package.json, pnpm-lock.yaml, pnpm-workspace.yaml, .npmrc, .pnpmfile.cjs: when a result changes any of them, the setup runs again, offline and confined, on the result\'s tree before its checks (T235)'),
       checkScratch: z.array(z.string()).description('Paths inside the worktree (relative, each ignored by git and holding nothing tracked) its checks see as fresh private writable directories, such as a test runner\'s cache (node_modules/.vite); the checks see the rest of the worktree read-only'),
       // An omitted object comes back as {}: read as none declared when loaded (src/setup.ts).
+      lockfileVerification: z.object({
+        registry: z.string().description('The registry (https:// URL) a new lockfile\'s supply-chain verification talks to: the one host its approval request names, the registry its command is told to use, and the only one the result\'s own files may name'),
+        cacheDir: z.string().description('The directory (absolute, outside every path hidden from agents) where pnpm keeps registry metadata: every setup run sees it read-only and the verification alone writes it, so a lockfile it verified passes the offline install after it'),
+      }).description('Lets a setup that lacks only the lockfile\'s supply-chain verification (pnpm 12, ERR_PNPM_NO_OFFLINE_META) have it run once on the host\'s network, on one approval per lockfile digest, with its scripts and pnpmfile off and only this registry configured (T333); the mechanism lockfile-verification (enforce.lockfileVerification) switches it'),
       generated: z.object({
         paths: z.array(z.string()).description('1 to 32 repository-relative paths of generated files; a * stands for any characters within one path segment, for example packages/*/plugin-manifest.json'),
         commands: z.array(z.string()).description('1 to 16 commands that regenerate them, run in order, each its words split on single spaces (no shell), each judged by the autonomy policy as a command with that exact argv and run only when it allows it unasked'),
       }).description('The repository\'s generated files: a landing whose merge conflicts only in them takes either side, runs the commands in the run\'s worktree in this setup\'s confinement, and merges only when they exit 0, change no other file, and change nothing on a repeat (T166)'),
     })).default([]).description('Per repository, the setup of a workflow run\'s new worktree: commands the autonomy policy allows, run confined (the host read-only but the worktree, no network) before any agent run works in it; one not allowed, or that fails, fails the run at start (ADR-0058)'),
+    checks: z.object({
+      maxConcurrent: z.natural().min(1).max(32).default(2).description('How many acceptance check runs the host runs at once, across every workflow run; the rest wait their turn, in order, and never fail for the wait (T292)'),
+      maxWorkers: z.natural().min(1).max(256).description('The test workers each check run gets (the vitest config reads SYSTEM_CHECK_MAX_WORKERS); default the host\'s cores less one, shared among maxConcurrent checks, at most 32 each (T292)'),
+    }).description('The load acceptance checks put on the host (T292)'),
+    stepTests: z.object({
+      coreBudget: z.natural().min(1).max(1024).description('The cores of the host a writing step\'s own test runs may use together, default half the host\'s (T348)'),
+      runs: z.natural().min(1).max(64).description('How many runs test at once, default 6: set it to the dispatch\'s maxRunning; each run\'s commands get coreBudget / runs test workers (SYSTEM_TEST_MAX_WORKERS), 1 to 32 (T348)'),
+    }).description('The share of the host a writing step\'s own test runs take (T348)'),
+    enforce: z.object({
+      diskFloor: z.union(['off', 'warn', 'on']).description('The disk floor (default warn, the mechanism\'s start mode, T345): on cuts no new worktree while the worktrees\' filesystem has less than diskFloorGb free, and dispatch starts none; warn records the refusal it would make and refuses nothing; off does not look'),
+      lockfileVerification: z.union(['off', 'warn', 'on']).description('The supply-chain verification of a new lockfile (default warn, the mechanism\'s start mode): on opens one approval request per lockfile digest and runs the verification once on the host\'s network when approved; warn records the request it would open and opens none; off does not look (T333)'),
+      sandboxedCommands: z.union(['off', 'warn', 'on']).description('The policy\'s sandboxed-command rule (default warn, the mechanism\'s start mode, ADR-0080): on lets a Bash call that no forbid or ask shape of the rule names run without the operator, in a workspace-write run whose runtime proved both confinements; warn records the verdict the rule would give and the call still asks; off ignores the rule'),
+    }).description('Each gate-like mechanism\'s start mode (ADR-0078); the plugin host\'s live override (system enforce set) wins, read at each use'),
     workspaceReads: z.object(Object.fromEntries(Object.entries(WORKSPACE_READ_BOUNDS).map(([name, bound]) => [
       name, z.natural().min(bound.min).max(bound.max).default(bound.default).description(`${bound.description} (${bound.min} to ${bound.max})`),
     ]))).description('The bounds of the workspace reads server a runtime gives its agent to read its workspace without a shell (read_file, list_dir, search; T200b), each within its range'),
@@ -522,6 +661,8 @@ export class AgentWorkers extends Service {
   private readonly providerOf: Map<string, AgentProviderConfig>
   /** Each runtime's probe, in its own home and in each account home a Worker runs in, refreshed in the background (./probes.ts). */
   private readonly probes: Probes
+  /** Each research Worker's web probe (T262, ./web-probe.ts): what its web-search offer rests on. */
+  private readonly webProbes: WebProbes
   private readonly schedulers = new Map<string, ProviderScheduler>()
   /** One scheduler per account of derived Workers: `maxConcurrentRunsPerAccount` at once, one per Worker. */
   private readonly accountSchedulers = new Map<string, ProviderScheduler>()
@@ -531,6 +672,8 @@ export class AgentWorkers extends Service {
   private readonly declaredTo = new WeakMap<object, string>()
   private readonly waiters = new Map<string, Set<() => void>>()
   private readonly inflight = new Set<Promise<void>>()
+  /** The looks a run the host cut took while its runtime was not registered yet, by run (at most {@link MAX_RUNTIME_WAITS}). */
+  private readonly runtimeWaits = new Map<string, number>()
   private readonly cancels = new Map<string, AbortController>()
   private readonly stopped = new AbortController()
   private readonly retries = new Set<NodeJS.Timeout>()
@@ -538,9 +681,15 @@ export class AgentWorkers extends Service {
   /** Whether each `worktreePerRun` Worker's workspace can hold a worktree per run, as last checked. */
   private readonly repositories = new Map<string, { at: number; check: RepositoryCheck }>()
   private readonly worktrees: Worktrees
+  /** Where the worktrees go: the filesystem the disk floor reads. */
+  private readonly worktreeRoot: string
+  /** When the disk floor's refusal was last recorded, so a standing one is recorded once per {@link DISK_RECORD_MS}, not per look. */
+  private diskRecordedAt = 0
   /** Each repository's worktree setup, by its path as configured (resolved), and what runs them (ADR-0058). */
   private readonly setups: Map<string, Setup>
   private readonly worktreeSetups: WorktreeSetups
+  /** Where each writing run's report file is made (an owner-only directory beside the worktrees, T265). */
+  private readonly reportDir: string
   /** A workflow run's required checks, run on its result's worktree in its repository's setup's confinement (./checks.ts, T151). */
   private readonly runChecks: RunChecks
   /** Each runtime's account setting (ADR-0052); a runtime not configured is assigned. */
@@ -558,6 +707,8 @@ export class AgentWorkers extends Service {
   private sweeping: Promise<SweepOutcome> | undefined
   /** The workspace reads server's bounds every run is given (T200b), checked at load. */
   private readonly readBounds: WorkspaceReadBounds
+  /** The test workers each writing run's own test runs get (T348). */
+  private readonly testWorkers: number
 
   constructor(ctx: Context, private readonly config: Config = { workers: [] }) {
     super(ctx, 'agentWorkers')
@@ -569,15 +720,21 @@ export class AgentWorkers extends Service {
     this.accounts = configured.accounts
     if (config.worktreeRoot !== undefined && !isAbsolute(config.worktreeRoot)) throw new ProviderError('config_error', 'agent Workers: worktreeRoot must be an absolute path')
     const worktreeRoot = config.worktreeRoot ?? join(dshHome(), 'system', 'worktrees')
+    this.worktreeRoot = worktreeRoot
     // A landing whose merge conflicts only in a repository's declared generated files makes them again, in the setup's confinement (T166).
-    this.worktrees = new Worktrees(ctx, worktreeRoot, (repository, setupHash) => regenerationOf(ctx, this.setups, join(worktreeRoot, '.setup'), repository, setupHash))
+    // Every new checkout (a run's, a carried retry's, a check on a tip's) is cut only above the disk floor (T345).
+    this.worktrees = new Worktrees(ctx, worktreeRoot, (repository, setupHash) => regenerationOf(ctx, this.setups, join(worktreeRoot, '.setup'), repository, setupHash, this.worktreeSetups), () => this.diskFloorRefusal())
     // A setup is for the worktrees of a repository a worktreePerRun Worker works in; any other is refused at load.
     this.setups = loadSetups(config.worktreeSetup, [...this.workers.values()].filter((w) => w.worktreePerRun).map((w) => w.workspace))
     // Its private views are made beside the worktrees (a name no repository's directory there takes).
-    this.worktreeSetups = new WorktreeSetups(ctx, join(worktreeRoot, '.setup'))
-    this.runChecks = new RunChecks(ctx, this.worktrees, this.setups, join(worktreeRoot, '.setup'))
+    // The lockfile verification's mode is read at each use, so the operator moves it without a restart (ADR-0078).
+    this.worktreeSetups = new WorktreeSetups(ctx, join(worktreeRoot, '.setup'), () => enforceMode(ctx.get('pluginHost' as never) as EnforceSource | undefined, 'lockfile-verification', config.enforce?.lockfileVerification))
+    // Each writing run's report file is made there too, outside every worktree (T265).
+    this.reportDir = join(worktreeRoot, '.setup')
+    this.runChecks = new RunChecks(ctx, this.worktrees, this.setups, join(worktreeRoot, '.setup'), { setups: this.worktreeSetups, hostStopped: this.stopped.signal, ...checkBoundsOf(config.checks) })
     if (config.accountHomes !== undefined && !isAbsolute(config.accountHomes)) throw new ProviderError('config_error', 'agent Workers: accountHomes must be an absolute path')
     this.readBounds = readBoundsOf(config.workspaceReads)
+    this.testWorkers = stepWorkersOf(config.stepTests)
     const slots = new Map<string, number>()
     for (const entry of providers) {
       if (entry.slots === undefined) continue
@@ -607,6 +764,15 @@ export class AgentWorkers extends Service {
         void tracked.finally(() => this.inflight.delete(tracked))
       },
       warn: (message) => this.warnOnce(message),
+    })
+    this.webProbes = new WebProbes(ctx, {
+      stopped: this.stopped.signal,
+      // A stop waits for a web probe in flight, which the stop aborts (its own deadline bounds it too).
+      track: (probe) => {
+        const tracked = probe.then(() => undefined, () => undefined)
+        this.inflight.add(tracked)
+        void tracked.finally(() => this.inflight.delete(tracked))
+      },
     })
     this.reports = new ReportSchedule({
       targets: () => this.reportTargets(),
@@ -691,7 +857,25 @@ export class AgentWorkers extends Service {
       sql: `ALTER TABLE agent_runs ADD COLUMN kind TEXT;
       ALTER TABLE agent_runs ADD COLUMN step_template TEXT;
       ALTER TABLE agent_runs ADD COLUMN step_node TEXT;`,
-    }])
+    }, {
+      // The tier a run runs at (ADR-0073), of the tiers its Worker offers: its model is that tier's.
+      // A run from before has none, and runs its Worker's lowest tier, as it would have. The model
+      // its tier gave it at the start, on a Worker that offers tiers: it runs no other.
+      version: 20,
+      sql: `ALTER TABLE agent_runs ADD COLUMN tier TEXT;
+      ALTER TABLE agent_runs ADD COLUMN configured_model TEXT;`,
+    }, {
+      // A run the host's own stop cut (T283): when its runtime was ended by this source's stop, how
+      // many times that happened to it, and the decision of its latest resume or restart.
+      version: 21,
+      sql: `ALTER TABLE agent_runs ADD COLUMN host_stopped_at TEXT;
+      ALTER TABLE agent_runs ADD COLUMN resumes INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE agent_runs ADD COLUMN resume_decision TEXT;`,
+    }, {
+      // Who the run's brief selected its handbook slice for (brief@1.6 handbook.selection): the lessons it is given follow it.
+      version: 22,
+      sql: 'ALTER TABLE agent_runs ADD COLUMN handbook TEXT;',
+    }, USED_MIGRATION, VERIFICATION_MIGRATION])
     this.cutover = new Cutover(ctx)
     // Once the operator applied the move, the hand-named rows are refused: one implementation, no second path.
     const applied = config.workers?.length ? this.cutover.state() : undefined
@@ -715,6 +899,11 @@ export class AgentWorkers extends Service {
       cancel: (id) => this.cancel(id),
       reserve: (worker) => this.admit(worker),
       sandbox: (worker, runId) => this.sandboxOf(worker, runId),
+      // The model a run of a Worker that offers tiers asks for at a tier (ADR-0073), for its brief.
+      model: (worker, tier) => {
+        const spec = this.workers.get(worker)
+        return spec?.tiers?.some((t) => t.tier === tier) ? this.atTier(spec, tier).model : undefined
+      },
       affinity: (sessionId) => {
         const session = this.ctx.store.db.prepare('SELECT worker FROM agent_sessions WHERE session_id = ?').get(sessionId) as { worker: string } | undefined
         return session ? [session.worker] : undefined
@@ -738,6 +927,8 @@ export class AgentWorkers extends Service {
       carry: (step) => this.worktrees.carry(step),
       // A workflow run's required checks, run on its result's exact tree (T151).
       check: (step, signal) => this.runChecks.check(step, signal),
+      // The tests check on a ref's tip, in a worktree of its own: the daily run of every browser spec (T305b).
+      checkTip: (step, signal) => this.runChecks.checkTip(step, signal),
     })
     // The operator's enrollment tools and the tool that frees a run's holds, when the MCP endpoint is mounted (operator scope).
     ctx.inject(['mcp'], (c) => {
@@ -784,25 +975,50 @@ export class AgentWorkers extends Service {
       const proof = admits(evidence, worker) && (!repository || 'repository' in repository)
       // A Worker takes work only while its account does (INV-2): no Worker of it while its runtime
       // cools down from a limit no ledger reading holds, or while the pool of any of them is closed.
-      const { state: pool, until } = proof ? await this.accountGate(worker, true) : { state: 'ready' as const, until: undefined }
+      // A Worker whose probe is only late is gated too (T282), so it stands only while its pools can be read.
+      const { state: pool, until, why: gateWhy } = proof || isLate(evidence) ? await this.accountGate(worker, true) : { state: 'ready' as const, until: undefined, why: undefined }
       const ready = proof && pool !== 'unavailable'
+      // A probe that is only late (the last past probeTtlMs and the next not finished, or one timed
+      // out) says nothing against what the Worker proved (T282): it still lists what its runtime's last
+      // available probe proved (its role's offers when its first probe is the late one), and reads
+      // unavailable. A step that needs it is then refused for its state, which passes, never told that
+      // no Worker proves the work, which fails it as a configuration problem. Never admitted while late.
+      const before = isLate(evidence) ? provenBefore(evidence) : undefined
+      const standing = ready || (isLate(evidence) && pool !== 'unavailable' && (before === undefined || admits(before, worker)) && !(repository && 'problem' in repository))
+      const shown = before ?? evidence
+      // Why it takes no work, for the roster and its readers (`@1.9`): the probe's detail, the
+      // repository's problem, or the account's or pool's gate (the live incident of 2026-10-26).
+      const refusal = refusalOf(evidence, worker)
+      const why = ready ? undefined
+        : refusal ?? (repository && 'problem' in repository ? `it works in a worktree per run, and ${repository.problem}` : undefined) ?? gateWhy ?? 'its account or pool cannot be read'
       const probed = { kind: 'probe' as const, at: observedAt }
-      const proven: CapabilityOffer[] = ready
+      // A research role (T262, ADR-0074) proves reason, and web-search by its web probe's real search only.
+      // It takes research work only (kinds), so its reason never serves an ordinary ask (P1).
+      const web = ready && worker.research ? this.webProofOf(id, worker) : undefined
+      const research: CapabilityOffer[] = [
+        { capability: 'reason', evidence: probed },
+        ...(web ? [{ capability: 'web-search', evidence: { kind: 'probe' as const, ref: web.decision as ArtifactRef, at: web.at } }] : []),
+        ...(shown.resume ? [{ capability: 'persistent-conversation', evidence: probed }] : []),
+      ]
+      const proven: CapabilityOffer[] = standing && worker.research ? research : standing
         ? [
             ...[
               'local-data',
               // A review is independent of the change, so only a Worker that cannot write proves it (INV-15).
-              ...(worker.sandbox === 'workspace-write' ? ['develop', ...(evidence.executes ? ['validate'] : [])] : ['review']),
-              ...(evidence.resume ? ['persistent-conversation'] : []),
+              ...(worker.sandbox === 'workspace-write' ? ['develop', ...(shown.executes ? ['validate'] : [])] : ['review']),
+              ...(shown.resume ? ['persistent-conversation'] : []),
+              // A writer whose runtime gives its runs the dossier tools (ADR-0070) can show its checks' output there (T267).
+              ...(worker.sandbox === 'workspace-write' && shown.hostTools === true && dossiersOf(this.ctx) ? ['dossier'] : []),
             ].map((capability) => ({ capability, evidence: probed })),
             // The review-member profile (ADR-0049) grants reason for a review team member's steps only,
-            // and only while it is enforced: the Worker is read-only (checked at load) and ready, so
-            // its runtime enforces the read-only sandbox, keeps host state unreadable, and asks the
-            // run's gate before every tool call, which the gate denies. Never plain reason, so an
-            // ordinary ask never spends agent-plan quota (P1). Its conversation is kept natively when
-            // the runtime resumes one, else by this source's replay, for that work only.
+            // and only while it is enforced: the Worker is read-only (checked at load) and its runtime
+            // enforces the read-only sandbox, keeps host state unreadable, and asks the run's gate before
+            // every tool call, which the gate denies. It is admitted only while ready: listed while its
+            // probe is late (T282), it reads unavailable and routing refuses it for its state. Never plain
+            // reason, so an ordinary ask never spends agent-plan quota (P1). Its conversation is kept
+            // natively when the runtime resumes one, else by this source's replay, for that work only.
             ...(worker.reviewMember ? [{ capability: 'reason', evidence: probed, scope: REVIEW_MEMBER }] : []),
-            ...(worker.reviewMember && !evidence.resume ? [{ capability: 'persistent-conversation', evidence: { kind: 'conformance' as const, at: observedAt }, scope: REVIEW_MEMBER }] : []),
+            ...(worker.reviewMember && !shown.resume ? [{ capability: 'persistent-conversation', evidence: { kind: 'conformance' as const, at: observedAt }, scope: REVIEW_MEMBER }] : []),
           ]
         : []
       // A Worker runs on its account (a hand-named one on its runtime's one home), compared within the
@@ -812,15 +1028,108 @@ export class AgentWorkers extends Service {
       // A derived Worker reports its account's load: what runs and waits on it across its roles (ADR-0033).
       const load = loads && worker.derived ? this.loadOf(worker, loads) : undefined
       const state = !ready ? 'unavailable' : pool === 'ready' && load && load.running >= load.slots ? 'busy' : pool
+      // The tiers it offers (ADR-0073), each with the pools a run at it draws on, closed while its model's pool is.
+      const tiers = worker.tiers ? await this.tierOffers(id, worker, ready && pool === 'ready') : undefined
+      // Standing while its probe is late (T282): the next result is due within one probe's bound, so
+      // routing looks again then and the step waits, bounded, instead of failing (`@1.12`).
+      const expectedBack = !ready && standing ? new Date(Date.now() + (this.config.probeTtlMs || 5 * 60_000)).toISOString() : undefined
       return {
         // The operator's family, else the runtime, who serves the work (ADR-0027); the kinds of work
         // the operator gives it, so it takes no other (ADR-0057).
-        schema: worker.description ? 'capability-descriptor@1.7' : worker.kinds ? 'capability-descriptor@1.6' : 'capability-descriptor@1.5', account, ...(worker.kinds ? { kinds: [...worker.kinds] } : {}),
+        ...(expectedBack !== undefined ? { expectedBack } : {}),
+        schema: expectedBack !== undefined ? 'capability-descriptor@1.12' : tiers ? 'capability-descriptor@1.11' : why !== undefined ? 'capability-descriptor@1.9' : worker.description ? 'capability-descriptor@1.7' : worker.kinds ? 'capability-descriptor@1.6' : 'capability-descriptor@1.5', account, ...(worker.kinds ? { kinds: [...worker.kinds] } : {}),
         ...(worker.description ? { description: worker.description } : {}),
-        worker: id, provider: worker.runtime, family: worker.family ?? worker.runtime, ...(load ? { load } : {}), tier: worker.tier, quotaClass: worker.quotaClass ?? 'agent-plan',
+        ...(why !== undefined ? { unavailableReason: boundedReason(why) } : {}),
+        worker: id, provider: worker.runtime, family: worker.family ?? worker.runtime, ...(load ? { load } : {}), tier: worker.tier, ...(tiers ? { tiers } : {}), quotaClass: worker.quotaClass ?? 'agent-plan',
         locality: 'local', capabilities: proven, state, observedAt,
       }
     }))
+  }
+
+  /**
+   * The tiers a Worker offers (ADR-0073), lowest first: each with the pools a run at it draws on (its
+   * account's, and its model's when the provider names one), and closed while its model's pool is
+   * unavailable, with when it is expected back. A model's pool that cannot be read closes its tier
+   * (INV-2). `read` false (the Worker takes no work anyway): the tiers alone, no pool read.
+   */
+  private async tierOffers(id: string, worker: WorkerSpec, read: boolean): Promise<TierOffer[]> {
+    const gates = new Map<string, Promise<{ state: string; until?: string | undefined }>>()
+    return Promise.all(worker.tiers!.map(async (t): Promise<TierOffer> => {
+      const pools = worker.pool !== undefined ? [worker.pool, ...(t.modelPool ? [t.modelPool.pool] : [])] : undefined
+      // What a run at this tier uses (its model as the live profile names it, and its turn limit), for people to read.
+      const at = this.atTier(worker, t.tier)
+      const shown = { ...(at.model ? { label: at.model } : {}), ...(at.maxTurns ? { maxTurns: at.maxTurns } : {}) }
+      if (!read || !t.modelPool) return { tier: t.tier, ...(pools ? { pools } : {}), ...shown }
+      const pool = t.modelPool.pool
+      if (!gates.has(pool)) gates.set(pool, this.poolGate(id, { ...worker, pool }))
+      const gate = await gates.get(pool)!
+      return { tier: t.tier, ...(pools ? { pools } : {}), ...shown, ...(gate.state !== 'ready' ? { closed: true as const, ...(gate.until ? { until: gate.until } : {}) } : {}) }
+    }))
+  }
+
+  /**
+   * The tier a run of this Worker runs at (ADR-0073), and what it runs there: the routed tier
+   * (`WorkerStart.tier`) when the Worker offers it, else the lowest it offers at or above the
+   * requirement's minimum. A Worker that offers no tiers runs its one, as before. Refuses a tier it
+   * does not offer: nothing is started.
+   */
+  private tierOfStart(worker: WorkerSpec, request: WorkerStart): Tier {
+    if (!worker.tiers) {
+      if (request.tier !== undefined && request.tier !== worker.tier) throw new ProviderError('invalid_input', `${request.worker} offers tier ${worker.tier} only, not ${request.tier}; nothing was started`)
+      return worker.tier
+    }
+    const offered = worker.tiers.map((t) => t.tier)
+    if (request.tier !== undefined) {
+      if (!offered.includes(request.tier)) throw new ProviderError('invalid_input', `${request.worker} offers the tiers ${offered.join(', ')}, not ${request.tier}; nothing was started`)
+      return request.tier
+    }
+    const min = TIERS.indexOf(request.requirement.tier.min)
+    const found = offered.find((t) => TIERS.indexOf(t) >= min)
+    if (!found) throw new ProviderError('invalid_input', `${request.worker} offers the tiers ${offered.join(', ')}, none at or above ${request.requirement.tier.min}; nothing was started`)
+    return found
+  }
+
+  /**
+   * Why a run its Worker no longer serves as it was started (ADR-0073), or undefined: the
+   * configuration changed while it waited (a restart, a live update) so that the tier it was routed
+   * at is no longer offered (its tiers removed or changed, or a one-tier Worker's tier another), or,
+   * on a Worker that offered tiers, that tier runs another model now, or none of its own. A run from
+   * before tiers names none and runs its Worker's lowest tier, as it would have.
+   */
+  private offerChanged(row: RunRow, worker: WorkerSpec): string | undefined {
+    if (row.tier == null) return undefined
+    const offered = worker.tiers?.map((t) => t.tier) ?? [worker.tier]
+    if (!offered.includes(row.tier as Tier)) {
+      return `${row.worker} was started at tier ${row.tier}, and it no longer offers tier ${row.tier}: it offers ${offered.length === 1 ? `tier ${offered[0]} only` : `the tiers ${offered.join(', ')}`}`
+    }
+    if (row.configured_model == null) return undefined
+    const model = this.atTier(worker, row.tier).model
+    if (model === row.configured_model) return undefined
+    return `${row.worker} was started at tier ${row.tier} for the model its configuration gave that tier then, and tier ${row.tier} now ${model === undefined ? 'names no model of its own' : 'runs another model'}`
+  }
+
+  /** What a run at its tier runs (ADR-0073): the tier's model and options, else the Worker's own. */
+  private atTier(worker: WorkerSpec, tier: string | null | undefined): AtTier {
+    const at = worker.tiers?.find((t) => t.tier === tier) ?? (tier == null ? worker.tiers?.[0] : undefined)
+    if (!at) return { tier: worker.tier, ...(worker.tools ? { tools: worker.tools } : {}), ...(worker.model ? { model: worker.model } : {}), ...(worker.maxTurns ? { maxTurns: worker.maxTurns } : {}), declared: false }
+    const tools = at.tools ?? worker.tools
+    const model = at.model ?? worker.model
+    const maxTurns = at.maxTurns ?? worker.maxTurns
+    return { tier: at.tier, declared: at.declared, ...(at.modelPool ? { modelPool: at.modelPool } : {}), ...(tools ? { tools } : {}), ...(model ? { model } : {}), ...(maxTurns ? { maxTurns } : {}) }
+  }
+
+  /**
+   * A research Worker's web probe proof now (T262, ./web-probe.ts), when one stands; a probe starts in
+   * the background otherwise, in the home its runs use, on its lowest tier's model. None while that
+   * home cannot be named.
+   */
+  private webProofOf(id: string, worker: WorkerSpec): WebProof | undefined {
+    const provider = this.ctx.agentRuntimes.get(worker.runtime)
+    if (!provider) return undefined
+    const named = this.namedHome(worker, provider)
+    if (named && 'why' in named) return undefined
+    const model = this.atTier(worker, undefined).model
+    return this.webProbes.proof({ worker: id, workerKind: worker.runtime, provider, workspace: worker.workspace, ...(named ? { home: named.home } : {}), ...(model ? { model } : {}) })
   }
 
   /** Each Worker's queued and running runs now, by Worker id. */
@@ -927,20 +1236,32 @@ export class AgentWorkers extends Service {
   private rowOf(plan: MigrationPlan): Record<string, unknown> {
     const { workers: _, providers: __, roles: ___, assignments: ____, ...settings } = this.config
     // A setting at its default (an empty worktreeSetup among them) is left out.
-    const { workspaceReads, ...rest } = settings
+    const { workspaceReads, checks, stepTests, enforce, ...rest } = settings
     const kept = Object.fromEntries(Object.entries(rest).filter(([key, value]) => value !== undefined && value !== SETTING_DEFAULTS[key] && !(Array.isArray(value) && !value.length)))
     // So is each workspace reads bound at its default, and the setting when all are (T200b).
     const reads = Object.fromEntries(Object.entries(workspaceReads ?? {}).filter(([name, value]) => value !== WORKSPACE_READ_BOUNDS[name as keyof WorkspaceReadBounds]?.default))
-    return { ...kept, ...(Object.keys(reads).length ? { workspaceReads: reads } : {}), providers: plan.providers, roles: plan.roles, assignments: plan.assignments }
+    // And each checks bound at its default (or unset), and the setting when all are (T292).
+    const bounds = Object.fromEntries(Object.entries(checks ?? {}).filter(([name, value]) => value !== undefined && !(name === 'maxConcurrent' && value === DEFAULT_MAX_CONCURRENT_CHECKS)))
+    // And the step tests' share the row set, and the setting when it set none (T348).
+    const share = Object.fromEntries(Object.entries(stepTests ?? {}).filter(([, value]) => value !== undefined))
+    // And the enforce modes the row set (none when it set none, the mechanism's start mode then).
+    const modes = Object.fromEntries(Object.entries(enforce ?? {}).filter(([, value]) => value !== undefined))
+    return { ...kept, ...(Object.keys(modes).length ? { enforce: modes } : {}), ...(Object.keys(reads).length ? { workspaceReads: reads } : {}), ...(Object.keys(bounds).length ? { checks: bounds } : {}), ...(Object.keys(share).length ? { stepTests: share } : {}), providers: plan.providers, roles: plan.roles, assignments: plan.assignments }
   }
 
   /** The ledger a metered Worker's runs go through, or undefined for a Worker with no pool. */
-  private meter(id: string, worker: AgentWorkerConfig): Meter | undefined {
+  private meter(id: string, worker: WorkerSpec, model?: DerivedTier['modelPool']): Meter | undefined {
     if (worker.pool === undefined || worker.account === undefined) return undefined
     const resources = this.ctx.get('resources')
     // Configured to be metered, and no ledger: no run starts (INV-2; docs/design/resources.md).
     if (!resources) throw new ProviderError('config_error', `${id} draws on pool ${worker.pool}, and no resource ledger (ctx.resources) is loaded`)
-    return { resources, pool: worker.pool, account: worker.account }
+    return { resources, pool: worker.pool, account: worker.account, ...(model ? { model } : {}), models: this.modelPoolsOf(worker) }
+  }
+
+  /** Every model's own pool on a derived Worker's account (ADR-0073), with its window map; none for a hand-named Worker. */
+  private modelPoolsOf(worker: WorkerSpec): Meter['models'] {
+    if (!worker.derived || worker.pool === undefined) return []
+    return (this.providerOf.get(worker.runtime)?.modelPools ?? []).map((m) => ({ pool: templatePool(m.pool, worker.derived!.accountId), windows: { ...m.windows } }))
   }
 
   /** The Workers on this Worker's account, itself included, ordered by id (`siblings`, PROP-0012 phase C). */
@@ -974,7 +1295,7 @@ export class AgentWorkers extends Service {
       if (sibling.pool === undefined || seen.has(meter(sibling))) continue
       seen.add(meter(sibling))
       const gate = await this.poolGate(id, sibling)
-      if (gate.state === 'unavailable') return { state: 'unavailable', why: `the pool ${sibling.pool} of ${id}, on the same sign-in, cannot be read` }
+      if (gate.state === 'unavailable') return { state: 'unavailable', why: `the pool ${sibling.pool} of ${id}, on the same sign-in, cannot be read${gate.why ? ` (${gate.why})` : ''}` }
       if (gate.state === 'quota-exhausted') closed.push({ id, pool: sibling.pool, until: gate.until })
     }
     if (!closed.length) return { state: 'ready' }
@@ -1017,20 +1338,22 @@ export class AgentWorkers extends Service {
    * Whether a metered Worker's pool takes work now: `ready`, `quota-exhausted` while it is
    * unavailable (with `until`, when the ledger expects it back), or `unavailable` when it cannot be read.
    */
-  private async poolGate(id: string, worker: WorkerSpec): Promise<{ state: 'ready' | 'quota-exhausted' | 'unavailable'; until?: string | undefined }> {
+  private async poolGate(id: string, worker: WorkerSpec): Promise<{ state: 'ready' | 'quota-exhausted' | 'unavailable'; until?: string | undefined; why?: string }> {
     try {
       const meter = this.meter(id, worker)
       if (!meter) return { state: 'ready' }
       await this.declareAccounts(meter.resources)
       const pool = (await meter.resources.pools({ account: meter.account })).find((p) => p.pool === meter.pool)
       if (!pool) {
-        this.warnOnce(`agent Workers: ${id} draws on pool ${meter.pool} of ${meter.account}, which the resource ledger does not configure`)
-        return { state: 'unavailable' }
+        const why = `${id} draws on pool ${meter.pool} of ${meter.account}, which the resource ledger does not configure`
+        this.warnOnce(`agent Workers: ${why}`)
+        return { state: 'unavailable', why }
       }
       return pool.available ? { state: 'ready' } : { state: 'quota-exhausted', until: pool.until }
     } catch (error) {
-      this.warnOnce(`agent Workers: the pool of ${id} cannot be read: ${(error as Error).message}`)
-      return { state: 'unavailable' }
+      const why = `the pool of ${id} cannot be read: ${(error as Error).message}`
+      this.warnOnce(`agent Workers: ${why}`)
+      return { state: 'unavailable', why }
     }
   }
 
@@ -1128,6 +1451,9 @@ export class AgentWorkers extends Service {
     if ('problem' in check) throw new ProviderError('config_error', `${row.worker} works in a worktree per run, and ${check.problem}; nothing was run`)
     if (!row.workflow_run_id) return worker.workspace
     return this.worktrees.acquire(check.repository, row.workflow_run_id).catch((error: unknown) => {
+      // Under the disk floor (T345): a passing host condition, nothing sent, so the step waits for room (`overloaded`,
+      // back-off) and the run is never the attempt's; anything else about the worktree is a configuration problem.
+      if (error instanceof DiskFloorError) throw new ProviderError('overloaded', `${row.worker}: the worktree of run ${row.workflow_run_id} is not cut yet: ${error.message}; nothing was run, and it waits for room`, { cause: error })
       throw new ProviderError('config_error', `${row.worker}: the worktree of run ${row.workflow_run_id} cannot be prepared: ${(error as Error).message}; nothing was run`, { cause: error })
     })
   }
@@ -1163,6 +1489,54 @@ export class AgentWorkers extends Service {
     this.inflight.add(tracked)
     void tracked.finally(() => this.inflight.delete(tracked))
     return sweeping
+  }
+
+  /**
+   * The disk the worktrees and the store fill (T345): the free space of each one's filesystem, the floor
+   * (`diskFloorGb`) and the `disk-floor` mechanism's mode now. Reads only; `lead_health` shows it.
+   */
+  diskStatus(): DiskStatus {
+    const host = this.ctx.get('pluginHost' as never) as EnforceSource | undefined
+    const worktrees = diskSpace(this.worktreeRoot)
+    const store = diskSpace(this.ctx.store.path)
+    return { mode: enforceMode(host, 'disk-floor', this.config.enforce?.diskFloor), floorBytes: (this.config.diskFloorGb ?? 10) * GB, ...(worktrees ? { worktrees } : {}), ...(store ? { store } : {}) }
+  }
+
+  /**
+   * Why no new worktree may be cut now, when the worktrees' filesystem has less free than the floor and the
+   * `disk-floor` mechanism is `on` (T345); undefined when one may. In `warn` the refusal it would make is
+   * recorded (a `gate` decision, once per {@link DISK_RECORD_MS} while it stands) and nothing is refused;
+   * `off`, or a floor of 0, does not look. A disk that cannot be read is under the floor (INV-2). Dispatch
+   * asks it before it takes a task, and every new worktree cut asks it again (a run's, a carried retry's, a
+   * check on a tip's), so a start that bypasses dispatch is held to it too.
+   */
+  diskFloorRefusal(): string | undefined {
+    const { mode, floorBytes, worktrees } = this.diskStatus()
+    if (mode === 'off' || floorBytes <= 0) return undefined
+    const floor = `${this.config.diskFloorGb ?? 10} GB (agent-workers diskFloorGb)`
+    const low = !worktrees ? `the free space under the worktrees (${this.worktreeRoot}) cannot be read`
+      : worktrees.freeBytes < floorBytes ? `the disk under the worktrees (${this.worktreeRoot}) has ${describeSpace(worktrees)}, under the floor of ${floor}` : undefined
+    if (!low) return undefined
+    const refuse = mode === 'on'
+    if (Date.now() - this.diskRecordedAt >= DISK_RECORD_MS) {
+      this.diskRecordedAt = Date.now()
+      try {
+        this.ctx.artifacts.recordDecision({
+          decisionType: 'gate', question: 'May a run start while the worktrees\' disk is under its floor?', inputs: [],
+          candidates: [
+            { option: 'refuse', selected: refuse, reasons: [low, refuse ? 'the disk-floor mechanism is on: no new worktree is cut, so a mid-landing ENOSPC becomes an early refusal' : 'the disk-floor mechanism is in warn: the refusal is recorded, nothing is refused'] },
+            { option: 'start', selected: !refuse, reasons: [refuse ? 'not start: the disk is under the floor' : 'a run starts, as the mechanism is in warn'] },
+          ],
+          decider: { type: 'rule', id: 'agent-workers.disk-floor', version: '1' },
+          outcome: { option: refuse ? 'refuse' : 'start', detail: { mode, worktreeRoot: this.worktreeRoot, floorBytes, ...(worktrees ? { freeBytes: worktrees.freeBytes, totalBytes: worktrees.totalBytes } : {}) } },
+          deterministic: true,
+        }, { producer: { type: 'system', ref: 'agent-workers' } })
+      } catch (error) {
+        this.ctx.logger.warn(`agent Workers: the disk floor's decision was not recorded: ${(error as Error).message}`)
+      }
+      if (!refuse) this.ctx.logger.warn(`agent Workers: ${low} (the disk-floor mechanism is in warn, so runs still start)`)
+    }
+    return refuse ? `${low}: no run is started` : undefined
   }
 
   private sweepSafely(): void {
@@ -1248,13 +1622,18 @@ export class AgentWorkers extends Service {
     // It may name a branch and a directory (a worktree per run): letters, digits, `_`, and `-` only.
     if (request.runId !== undefined && !RUN_ID.test(request.runId)) throw new ProviderError('invalid_input', `run id ${JSON.stringify(request.runId)} must match ${RUN_ID}`)
     // The board task the brief serves, from the engine's own record (never from model text): the run's usage is recorded under it.
-    const task = request.brief ? this.ctx.artifacts.get(request.brief)?.body as { taskId?: unknown; projectId?: unknown; files?: BriefFile[] } | undefined : undefined
+    const task = request.brief ? this.ctx.artifacts.get(request.brief)?.body as { taskId?: unknown; projectId?: unknown; files?: BriefFile[]; handbook?: unknown } | undefined : undefined
     const taskId = typeof task?.taskId === 'string' ? task.taskId : null
+    // Who its handbook slice was selected for (brief@1.6), from the engine's record: its lessons follow it.
+    const handbook = handbookSelection(task?.handbook)
     const projectId = taskId !== null && typeof task?.projectId === 'string' ? task.projectId : null
     // Its files' text, resolved now like the prompt, so the egress check reads what the agent will (INV-12).
     const files = places && Array.isArray(task?.files) && task.files.length ? JSON.stringify(task.files.map((file) => this.fileOf(file))) : null
     // The template step it serves, as the engine named it: kept only when both are ids.
     const step = request.step && DRAW_ID.test(request.step.template) && DRAW_ID.test(request.step.node) ? request.step : undefined
+    // The tier it runs at (ADR-0073): the routed one, so its model is that tier's, kept with it, as its brief names it.
+    const tier = this.tierOfStart(worker, request)
+    const configuredModel = worker.tiers ? this.atTier(worker, tier).model ?? null : null
     const key = sha256(`agent\0${request.key}`)
     return this.ctx.store.transaction((db) => {
       const existing = db.prepare('SELECT * FROM agent_runs WHERE request_key = ?').get(key) as RunRow | undefined
@@ -1277,12 +1656,13 @@ export class AgentWorkers extends Service {
         scope: request.requirement.scope ?? null, session_generation: generation,
         // Its kind of work and template step, for what it draws (PROP-0015 E2): only well-formed ones, never guessed.
         kind: request.requirement.kind !== undefined && WORK_KIND.test(request.requirement.kind) ? request.requirement.kind : null,
-        step_template: step?.template ?? null, step_node: step?.node ?? null,
+        step_template: step?.template ?? null, step_node: step?.node ?? null, tier, configured_model: configuredModel,
+        handbook: handbook ? JSON.stringify(handbook) : null,
         created_at: now(), updated_at: now(),
       }
-      db.prepare(`INSERT INTO agent_runs (run_id, request_key, worker, session_id, prompt, classification, status, workflow_run_id, task_id, project_id, files, scope, session_generation, kind, step_template, step_node, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(row.run_id, key, row.worker, row.session_id, row.prompt, row.classification, row.workflow_run_id ?? null, taskId, projectId, files,
-        row.scope ?? null, generation, row.kind ?? null, row.step_template ?? null, row.step_node ?? null, row.created_at, row.updated_at)
+      db.prepare(`INSERT INTO agent_runs (run_id, request_key, worker, session_id, prompt, classification, status, workflow_run_id, task_id, project_id, files, scope, session_generation, kind, step_template, step_node, tier, configured_model, handbook, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(row.run_id, key, row.worker, row.session_id, row.prompt, row.classification, row.workflow_run_id ?? null, taskId, projectId, files,
+        row.scope ?? null, generation, row.kind ?? null, row.step_template ?? null, row.step_node ?? null, tier, configuredModel, row.handbook ?? null, row.created_at, row.updated_at)
       this.ctx.store.afterCommit(() => this.schedule(row.run_id))
       return execution(row)
     })
@@ -1530,6 +1910,21 @@ export class AgentWorkers extends Service {
   }
 
   /**
+   * How many run worktrees are not removed, how many an agent run holds now (`inUse`), how many an agent
+   * run left held (`held`), and how many hold something not committed or are not intact (`uncommitted`):
+   * every one, never the first 100 of the listing (T345). More than {@link MAX_COUNTED_WORKTREES} are not
+   * counted, and it says so, never a part read as the whole (INV-2, INV-9). `lead_health` shows it.
+   */
+  async worktreeCounts(): Promise<{ total: number; inUse: number; held: number; uncommitted: number }> {
+    const { total, worktrees } = await this.worktrees.list(this.config.worktreeRetentionHours ?? 168, MAX_COUNTED_WORKTREES)
+    if (total > worktrees.length) throw new ProviderError('overloaded', `${total} worktrees are not removed, more than the ${MAX_COUNTED_WORKTREES} counted at once`)
+    return {
+      total, inUse: worktrees.filter((w) => w.state === 'in-use').length, held: worktrees.filter((w) => w.state === 'held').length,
+      uncommitted: worktrees.filter((w) => w.changes === 'uncommitted' || w.changes === 'not-intact').length,
+    }
+  }
+
+  /**
    * The operator removes finished worktrees now instead of waiting for the retention (D12), every one
    * or those of one workflow run (`runId`): a worktree is removed only while no agent run of its
    * workflow run is unfinished or ended without being known to be gone, and only when it holds
@@ -1553,7 +1948,7 @@ export class AgentWorkers extends Service {
       question: `Are ${removing.length} finished run worktree(s) removed now, on the operator's word, before the retention would?`,
       inputs: [],
       candidates: [
-        { option: 'remove', selected: true, reasons: [`the operator asked to remove the finished worktrees${input.runId ? ` of workflow run ${input.runId}` : ''}${note ? `: ${note}` : ''}`, ...removing.map((p) => `worktree ${p.path} of ${p.runId}: ${p.why}`)] },
+        { option: 'remove', selected: true, reasons: removalReasons(`the operator asked to remove the finished worktrees${input.runId ? ` of workflow run ${input.runId}` : ''}${note ? `: ${note}` : ''}`, removing) },
         { option: 'keep', selected: false, reasons: ['not kept: no agent run of their workflow runs is unfinished or held, and each holds nothing uncommitted or has its changes committed on its branch first, so nothing is lost; the branch stays'] },
       ],
       decider: WORKTREES_DECIDER,
@@ -1606,6 +2001,85 @@ export class AgentWorkers extends Service {
       runtime: probeProcess(processIdentityOf(parsed(row.agent_process))),
       lastActivityAt: activity.length ? Math.max(...activity) : undefined,
     }, this.bounds())
+  }
+
+  /**
+   * A started run whose runtime this source's own stop ended (T283): marked before the source
+   * stopped, so only a stop of the host (a drain, shutdown, update) marks it, never a crash, a lost
+   * lease, the operator's cancel, or an agent that died on its own. It runs again unless its Worker is
+   * gone, it was cut more than {@link MAX_RESUMES} times (INV-9), or an agent process of it is still
+   * present on this host (it may be acting: the liveness verdict takes it, INV-4).
+   */
+  private cutByHost(row: RunRow): boolean {
+    if (!row.host_stopped_at || (row.resumes ?? 0) >= MAX_RESUMES || !this.workers.has(row.worker)) return false
+    return probeProcess(processIdentityOf(parsed(row.agent_process))).state !== 'present'
+  }
+
+  /**
+   * Mark a run that was in flight when this source stopped: its runtime was ended by that stop, and
+   * the next start runs it again (T283). A run the operator cancelled, or one that is not started or
+   * is over, is not marked. A mark that cannot be written leaves the run as a crash would, and is logged.
+   */
+  private markCut(runId: string, lease: () => Lease): void {
+    try {
+      const row = this.row(runId)
+      if (!row || !row.submitted_at || row.status !== 'running' || this.cancels.get(runId)?.signal.aborted) return
+      this.update(runId, { host_stopped_at: now() }, lease)
+    } catch (error) {
+      this.ctx.logger.warn(`agent Workers: ${runId} was in flight when this source stopped, and that could not be recorded, so its next start reconciles it as a run its holder lost: ${(error as Error).message}`)
+    }
+  }
+
+  /**
+   * What a run the host cut is sent when it runs again (T283). Its own native conversation continued,
+   * told only to go on, when its runtime resumes one and the run's own handle was recorded: only then
+   * is its prompt in that conversation. Otherwise its own prompt is sent again, with a note that
+   * earlier work may be in the worktree, exactly as the run would be sent anew: continuing its
+   * session's conversation (`session`, an earlier run's) where the runtime resumes one, else in a
+   * fresh one. Its task is never left out. Nothing is failed: the run keeps its id, step, and attempt.
+   */
+  private async againAfterCut(row: RunRow, worker: AgentWorkerConfig, turn: Turn): Promise<{ turn: Turn; how: 'resumed' | 'restarted'; handle?: string; session?: string }> {
+    const evidence = await this.evidence(worker, 'proven')
+    if (evidence.resume && row.native_handle) return { turn: { ...turn, prompt: RESUME_PROMPT, resume: row.native_handle }, how: 'resumed', handle: row.native_handle }
+    // `turn.resume` is set only where the runtime resumes (turnOf): the session's own conversation, never this run's.
+    return { turn: { ...turn, prompt: `${turn.prompt}${RESTART_NOTE}` }, how: 'restarted', ...(turn.resume ? { session: turn.resume } : {}) }
+  }
+
+  /**
+   * Record that a run the host cut runs again, before it is sent (T283): a `reconciliation` decision
+   * on the run (INV-13), its count of cuts, an `agent-workers.run.resumed` event, and a log line.
+   * Returns its count of cuts, which its usage record names (`account`).
+   */
+  private noteAgain(row: RunRow, again: { how: 'resumed' | 'restarted'; handle?: string; session?: string }, lease: () => Lease): number {
+    const resumes = (row.resumes ?? 0) + 1
+    const was = `${row.worker} was running this task when this source stopped (the host's drain, shutdown, or update: recorded at ${row.host_stopped_at}), its runtime was ended by that stop, and no agent process of it is present`
+    const restart = again.session
+      ? `its own conversation was never recorded (the stop came before its runtime reported it), so its prompt is sent again, in the same worktree, continuing its session's conversation ${again.session} as any later turn of the session does`
+      : 'it has no native conversation of its own to continue: it starts again from the same worktree with its prompt'
+    const decision = this.ctx.artifacts.recordDecision({
+      decisionType: 'reconciliation',
+      question: `Does agent run ${row.run_id} on ${row.worker}, which the host's own stop cut while it ran, run again?`,
+      inputs: [],
+      candidates: [
+        { option: 'resume', selected: again.how === 'resumed', reasons: again.how === 'resumed' ? [was, `its runtime resumes a conversation: it continues native session ${again.handle}, in the same workspace`] : ['not resume: its runtime cannot resume, or its own native conversation was never recorded, so its prompt may be in none'] },
+        { option: 'restart', selected: again.how === 'restarted', reasons: again.how === 'restarted' ? [was, restart] : ['not restart: it continues its own native conversation, which holds its prompt'] },
+        { option: 'fail', selected: false, reasons: [`not fail: only its host's stop cut it (not its agent, a lost lease, or the operator), so it is not reconciled as lost and costs no attempt; cut ${resumes} of at most ${MAX_RESUMES} times (INV-9)`] },
+      ],
+      decider: RESUME_RULE,
+      outcome: { option: again.how === 'resumed' ? 'resume' : 'restart', detail: { agentRun: row.run_id, worker: row.worker, resumes, max: MAX_RESUMES, ...(again.handle ? { nativeHandle: again.handle } : {}), ...(again.session ? { sessionHandle: again.session } : {}) } },
+      deterministic: true,
+    }, { producer: { type: 'system', ref: 'agent-workers' }, ...(row.workflow_run_id ? { runId: row.workflow_run_id } : {}), classification: row.classification as Classification }).id as ContentId
+    this.update(row.run_id, { resumes, resume_decision: decision }, lease)
+    this.ctx.logger.info(`agent Workers: ${row.run_id} on ${row.worker} was cut by the host's stop and ${again.how === 'resumed' ? `resumes native session ${again.handle}` : `starts again in its worktree with its prompt${again.session ? `, in its session's conversation ${again.session}` : ''}`} (cut ${resumes} of at most ${MAX_RESUMES}); decision ${decision}`)
+    try {
+      this.ctx.get('eventLog')?.append({
+        type: RESUMED_EVENT, ...(row.workflow_run_id ? { runId: row.workflow_run_id } : {}), ...(row.workflow_run_id && row.step_node ? { nodeId: row.step_node } : {}), ...(row.session_id ? { sessionId: row.session_id } : {}), decision,
+        data: { agentRun: row.run_id, worker: row.worker, how: again.how, resumes, ...(row.step_node ? { step: row.step_node } : {}), ...(again.handle ? { nativeHandle: again.handle } : {}), ...(again.session ? { sessionHandle: again.session } : {}) },
+      })
+    } catch (error) {
+      this.ctx.logger.warn(`agent Workers: that ${row.run_id} ran again after the host's stop was not appended: ${(error as Error).message}`)
+    }
+    return resumes
   }
 
   /** The process that held a run: when it is this one, gone only once this process runs no agent of the run; else as this host shows it. */
@@ -1799,7 +2273,18 @@ export class AgentWorkers extends Service {
       try {
         const row = this.row(runId)
         if (!row || row.status === 'completed' || row.status === 'failed') return
-        if (row.submitted_at) {
+        // Started, and its runtime ended by this source's own stop (a drain, shutdown, or update): not a
+        // loss of its holder. It runs again as itself, not as a new attempt (T283).
+        const cut = row.submitted_at !== null && this.cutByHost(row)
+        // Taken up at the start, before its runtime registered: what the runtime can resume is not known
+        // yet, so it waits for it, bounded (INV-9), rather than being sent as if it could not.
+        if (cut && !this.ctx.agentRuntimes.get(this.workers.get(row.worker)!.runtime) && (this.runtimeWaits.get(runId) ?? 0) < MAX_RUNTIME_WAITS) {
+          this.runtimeWaits.set(runId, (this.runtimeWaits.get(runId) ?? 0) + 1)
+          this.retryLater(runId, 1000)
+          return
+        }
+        this.runtimeWaits.delete(runId)
+        if (row.submitted_at && !cut) {
           // Started, and its holder no longer holds it: the agent may already have acted in its
           // workspace, and may still be acting. It is never run again (INV-4); it is reconciled as
           // gone only on a `dead` verdict, and otherwise looked at again, then left to the operator.
@@ -1823,7 +2308,8 @@ export class AgentWorkers extends Service {
           this.fail(row, new ProviderError('reconciliation_failed', liveness.verdict === 'dead'
             ? `${row.worker} was running this task when its holder stopped, and it is gone (liveness ${liveness.verdict}, decision ${decision})${row.native_handle ? `; native session ${row.native_handle}` : ''}; it is not run again automatically`
             : `${row.worker} was running this task when its holder stopped, and after ${looks} looks it is not known to be gone (liveness ${liveness.verdict}: ${liveness.reasons.join('; ')}; decision ${decision}); it is not declared dead, so its session stays held, and the operator decides${row.native_handle ? ` (native session ${row.native_handle})` : ''}: system free ${row.run_id} --agent-gone, once its agent is gone`),
-          current, { liveness_looks: looks, liveness_verdict: liveness.verdict, liveness_decision: decision })
+          // Its holder stopped with it in flight, and that alone ended it: the host's, not the run's (ADR-0069).
+          current, { liveness_looks: looks, liveness_verdict: liveness.verdict, liveness_decision: decision }, 'host-stopped')
           if (liveness.verdict !== 'dead') this.toldUnknown(row, liveness.verdict, looks, decision, 'holder')
           // Its usage is not invented: it comes from the agent's transcript, reconciled later. Until
           // then the ledger counts none of it, which is recorded (docs/design/resources.md).
@@ -1835,11 +2321,21 @@ export class AgentWorkers extends Service {
         }
         const worker = this.workers.get(row.worker)
         if (!worker) throw new ProviderError('config_error', `${row.worker} is no longer configured`)
+        // Its Worker's configuration changed while it waited (ADR-0073): a tier, or a tier's model, it no
+        // longer offers runs nothing else in its place; routing serves the work again.
+        const changed = this.offerChanged(row, worker)
+        if (changed) throw new ProviderError('worker_changed', `${changed}; nothing was run, and routing serves the work again`)
         // A derived Worker's account that is not ready takes nothing, whatever the run would send (REQ-ACC-11).
         const account = worker.derived ? this.agentAccounts.accountGate(worker.derived.accountId) : undefined
         if (account?.state === 'unavailable') throw new ProviderError('config_error', `${row.worker}: ${account.why}; nothing was run`)
         // What the agent is sent: its prompt, or a review member's conversation replayed before it (ADR-0049).
-        const turn = await this.withUnasked(await this.turnOf(row, worker, current), row, worker)
+        // The source's half of its handbook slice, recorded with what it rendered (./handbook.ts).
+        const rendered: SourcePart[] = []
+        let turn = await this.withUnasked(await this.withLessons(await this.turnOf(row, worker, current), row, worker, rendered), row, worker, rendered)
+        this.recordHalf(row, rendered)
+        // A run the host cut is told so, and resumes from its native conversation or starts again in its worktree.
+        const again = cut ? await this.againAfterCut(row, worker, turn) : undefined
+        if (again) turn = again.turn
         // INV-12: the prompt reaches the agent's remote model, so it is checked before anything starts,
         // with the files it will read in its worktree: one check of exactly what the agent is given.
         const placed = row.files ? (JSON.parse(row.files) as Array<{ path: string; text: string }>) : []
@@ -1851,9 +2347,14 @@ export class AgentWorkers extends Service {
           this.fail(row, new ProviderError('egress_denied', `${egress.reason} (decision ${egress.decision})`), current)
           return
         }
-        await this.scheduler(row.worker, worker).runTurn(row.worker, signal, async (slot) => this.execute(row, worker, turn, AbortSignal.any([signal, slot.signal]), current))
+        // Run with its count of cuts, so its usage record is its own unit and a lower bound of the run (`account`).
+        const ran = again ? { ...row, resumes: this.noteAgain(row, again, current) } : row
+        await this.scheduler(row.worker, worker).runTurn(row.worker, signal, async (slot) => this.execute(ran, worker, turn, AbortSignal.any([signal, slot.signal]), current))
       } catch (error) {
-        if (this.stopped.signal.aborted) return
+        if (this.stopped.signal.aborted) {
+          this.markCut(runId, current)
+          return
+        }
         if (error instanceof LeaseLost || error instanceof StaleGeneration || lost.aborted) {
           this.retryLater(runId, LEASE_TTL_MS)
           return
@@ -1863,12 +2364,43 @@ export class AgentWorkers extends Service {
           this.fail(row, new ProviderError('aborted', 'cancelled by the operator'), current)
           return
         }
-        if (row && row.status !== 'completed' && row.status !== 'failed') this.fail(row, error, current)
+        if (row && row.status !== 'completed' && row.status !== 'failed') {
+          // Sent, and its Worker is positively unavailable now: it went away mid-run, and that alone ended the run (ADR-0069).
+          const gone = row.submitted_at ? await this.workerGone(row, error) : undefined
+          if (gone) {
+            const typed = toProviderError(error)
+            this.fail(row, new ProviderError(typed.kind, `${typed.message}; ${row.worker} became unavailable while it ran: ${gone}`, { cause: error }), current, {}, 'worker-unavailable')
+          } else this.fail(row, error, current)
+        }
       } finally {
         this.cancels.delete(runId)
       }
     })
     if (!outcome.held) this.retryLater(runId, outcome.retryInMs)
+  }
+
+  /**
+   * Why a run that was sent and then failed failed only because its Worker became unavailable while
+   * it ran (ADR-0069), or undefined. Only a failure of the runtime or its session (its process or
+   * connection gone, an internal or setup failure), never one of the run's own (a timeout, a limit,
+   * a violation, a denial, its own answer), and only when the Worker, looked at again now, is
+   * positively unavailable: no longer configured, its runtime no longer registered or its probe
+   * failing (or no longer proving what the Worker needs), or its account signed out, quarantined, or
+   * not ready. A look that fails says nothing (fail closed: the attempt pays for the run).
+   */
+  private async workerGone(row: RunRow, error: unknown): Promise<string | undefined> {
+    if (!WORKER_GONE_KINDS.has(toProviderError(error).kind)) return undefined
+    try {
+      const worker = this.workers.get(row.worker)
+      if (!worker) return `${row.worker} is no longer configured`
+      const refusal = refusalOf(await this.evidence(worker, 'proven'), worker)
+      if (refusal) return refusal
+      const enrolled = worker.derived ? this.agentAccounts.accountGate(worker.derived.accountId) : this.handNamedGate(worker)
+      if (enrolled.state === 'unavailable') return enrolled.why
+    } catch (caught) {
+      this.ctx.logger.warn(`agent Workers: whether ${row.worker} became unavailable while ${row.run_id} ran could not be told: ${(caught as Error).message}`)
+    }
+    return undefined
   }
 
   /**
@@ -1944,20 +2476,69 @@ export class AgentWorkers extends Service {
    * queue, or one that cannot be read, the turn is sent as it is (logged), since the gate still
    * decides every call. Appended before the egress check, which sees it.
    */
-  private async withUnasked(turn: Turn, row: RunRow, worker: AgentWorkerConfig): Promise<Turn> {
+  private async withUnasked(turn: Turn, row: RunRow, worker: AgentWorkerConfig, rendered: SourcePart[] = []): Promise<Turn> {
     if (row.scope === REVIEW_MEMBER) return turn
     const approvals = this.ctx.get('approvals')
     if (!approvals) return turn
     const workspace = worker.worktreePerRun && row.workflow_run_id && RUN_ID.test(row.workflow_run_id) ? this.worktrees.pathOf(worker.workspace, row.workflow_run_id) : worker.workspace
     try {
       const evidence = await this.evidence(worker, 'proven').catch(() => undefined)
-      const note = unaskedNote(await approvals.policy(), workspace, {
-        shellReads: evidence?.cleanShells === true, workspaceReads: evidence?.workspaceReads === true, resumes: row.session_id !== null && row.session_id !== undefined, sandbox: worker.sandbox,
+      // A research run is told its web tools and the grant its gate judges them under (T262), the project's as well.
+      const grant = worker.research ? webAccessOf((await approvals.policy(row.project_id ?? undefined)).policies, 'research') : undefined
+      const policy = await approvals.policy()
+      const note = unaskedNote(policy, workspace, {
+        shellReads: evidence?.cleanShells === true, workspaceReads: evidence?.workspaceReads === true, readTools: readToolsOf(evidence, this.atTier(worker, row.tier).tools), resumes: row.session_id !== null && row.session_id !== undefined, sandbox: worker.sandbox,
+        dossier: this.dossierOf(row, evidence) !== undefined,
+        ...(worker.research ? { research: { tools: (this.atTier(worker, row.tier).tools ?? []).filter((t) => WEB_RUN_TOOLS.includes(t)), grant: grant ?? null } } : {}),
       })
+      // Its version is the policy it was rendered from: each policy's id and version, and the set in force.
+      const version = `policy:${policy.policies.map((p) => `${p.id}@${p.version}`).join(',') || 'none'}:${policy.set?.hash ?? 'unhashed'}`.slice(0, 300)
+      rendered.push({ layer: 2, part: 'L2.gate-view', version, sha256: sha256(note).slice('sha256:'.length), tokens: Math.ceil(Buffer.byteLength(note, 'utf8') / 4) })
       return { ...turn, prompt: `${turn.prompt}\n\n${note}` }
     } catch (error) {
       this.ctx.logger.warn(`agent Workers: the autonomy policy could not be read for ${row.run_id}'s note of the calls that run unasked; it is sent without it: ${(error as Error).message}`)
       return turn
+    }
+  }
+
+  /**
+   * The turn with the repository's lessons appended (lessons.ts, T220), from the lessons file as its
+   * repository (the configured workspace, whose HEAD a run's worktree is cut from) has it committed
+   * at HEAD, within its bound (lessons.ts `LESSONS_LIMITS`). A run whose brief records its handbook
+   * slice (`brief@1.6`, docs/design/handbook.md) is given the lessons that apply to the role and paths
+   * the slice was selected for, whatever its sandbox: a reviewer is given the lessons whose check is
+   * the review (X3; a review member's empty workspace holds no repository, so it has none). Any other
+   * run: a writing Worker (`workspace-write`) only, never a review member, every lesson. No such
+   * file, or none committed, is no section; one that cannot be read is none either (logged), since
+   * nothing else depends on it. Appended before the egress check, which sees it; what was given is
+   * recorded in `rendered`.
+   */
+  private async withLessons(turn: Turn, row: RunRow, worker: AgentWorkerConfig, rendered: SourcePart[] = []): Promise<Turn> {
+    const who = row.handbook ? handbookSelection({ selection: JSON.parse(row.handbook) as unknown }) : undefined
+    if (!who && (row.scope === REVIEW_MEMBER || worker.sandbox !== 'workspace-write')) return turn
+    try {
+      const read = await repositoryLessonsFor(worker.workspace, who)
+      if (read && who) rendered.push({ layer: 5, part: 'L5.lessons', version: read.version, ...(read.sha256 ? { sha256: read.sha256 } : {}), tokens: read.tokens, lessons: read.lessons })
+      const section = read?.section
+      return section ? { ...turn, prompt: `${turn.prompt}\n\n${section}` } : turn
+    } catch (error) {
+      this.ctx.logger.warn(`agent Workers: the lessons of ${worker.workspace} could not be read for ${row.run_id}; it is sent without them: ${(error as Error).message}`)
+      return turn
+    }
+  }
+
+  /**
+   * Record what this source rendered of a run's handbook slice (./handbook.ts): for a run of a
+   * workflow run whose brief records its slice, one {@link HANDBOOK_SOURCE_EVENT} event naming the
+   * execution and step, and each part's version, sha256, and estimated tokens (none: the part was not
+   * rendered). Logged, never failing the run, when the log cannot take it.
+   */
+  private recordHalf(row: RunRow, rendered: readonly SourcePart[]): void {
+    if (!row.handbook || !row.workflow_run_id) return
+    try {
+      this.ctx.get('eventLog')?.append({ type: HANDBOOK_SOURCE_EVENT, runId: row.workflow_run_id, data: { execution: row.run_id, ...(row.step_node ? { node: row.step_node } : {}), parts: rendered } })
+    } catch (error) {
+      this.ctx.logger.warn(`agent Workers: what ${row.run_id} was given of its handbook slice could not be recorded: ${(error as Error).message}`)
     }
   }
 
@@ -1992,6 +2573,19 @@ export class AgentWorkers extends Service {
     return repository === undefined ? undefined : `its workspace ${workspace} is inside the repository ${repository}, whose files a runtime may read on its own`
   }
 
+  /**
+   * The engine's dossier and the step a run's dossier tools are bound to (ADR-0070), when the run
+   * gets them: its runtime offers host tools (`evidence.hostTools`), it serves a step of a board
+   * task's workflow run (its row's workflow run, step, and task, from the engine's own start request),
+   * it is no review member's (whose gate allows no call), and an engine that keeps a dossier is
+   * loaded. The execution is this run itself.
+   */
+  private dossierOf(row: RunRow, evidence: RuntimeEvidence | undefined): { dossiers: StepDossiers; caller: DossierCaller } | undefined {
+    if (evidence?.hostTools !== true || row.scope === REVIEW_MEMBER || !row.task_id || !row.workflow_run_id || !row.step_node) return undefined
+    const dossiers = dossiersOf(this.ctx)
+    return dossiers ? { dossiers, caller: { runId: row.workflow_run_id, nodeId: row.step_node, execution: row.run_id } } : undefined
+  }
+
   private async execute(row: RunRow, worker: WorkerSpec, turn: Turn, signal: AbortSignal, lease: () => Lease): Promise<void> {
     const provider = this.ctx.agentRuntimes.get(worker.runtime)
     if (!provider) throw new ProviderError('config_error', `no ${worker.runtime} runtime is registered`)
@@ -2022,15 +2616,17 @@ export class AgentWorkers extends Service {
     const setup = workspace !== worker.workspace ? this.setups.get(resolve(worker.workspace)) : undefined
     if (setup) {
       const outcome = await this.worktreeSetups.ensure({
-        agentRun: row.run_id, worker: row.worker, workflowRunId: row.workflow_run_id!, sessionId: row.session_id ?? undefined,
+        agentRun: row.run_id, worker: row.worker, workflowRunId: row.workflow_run_id!, sessionId: row.session_id ?? undefined, taskId: row.task_id ?? undefined,
         classification: row.classification as 'public' | 'operator-shared' | 'local-private', worktree: workspace, repository: realpathSync(worker.workspace),
       }, setup, signal)
       this.update(row.run_id, { setup_decision: outcome.decision }, lease)
       if (outcome.failure) throw outcome.failure
     }
     // The brief's files go into the run's own worktree before the agent starts; nothing has reached it yet.
-    if (row.files && workspace !== worker.workspace) {
-      await this.worktrees.place(workspace, JSON.parse(row.files) as Array<{ path: string; text: string }>).catch((error: unknown) => {
+    // Its `.system/` then holds this brief's files only (T267): one a step before placed is gone, so a
+    // step given none (an author's fresh-context self-review) cannot read another step's dossier there.
+    if (workspace !== worker.workspace) {
+      await this.worktrees.place(workspace, row.files ? JSON.parse(row.files) as Array<{ path: string; text: string }> : []).catch((error: unknown) => {
         throw new ProviderError('config_error', `${row.worker}: the brief's files cannot be written into ${workspace}: ${(error as Error).message}; nothing was run`, { cause: error })
       })
     }
@@ -2038,37 +2634,78 @@ export class AgentWorkers extends Service {
     const member = row.scope === REVIEW_MEMBER
     const problem = member ? this.profileProblem(worker, workspace) : undefined
     if (problem) throw new ProviderError('config_error', `${row.worker} cannot run a review member's step under the review-member profile: ${problem}; nothing was run`)
+    // Its board task's dossier tools (ADR-0070), bound to the step this run serves from its own row,
+    // never from the agent's input; only where the runtime offers host tools.
+    const dossier = this.dossierOf(row, evidence)
+    const hostTools = dossier ? dossierTools(dossier.dossiers, dossier.caller) : []
     // Every tool call passes the run's gate before it runs; the runtime's own policy still holds.
     // Under the review-member profile, the gate denies every one.
     const gate = runGate(this.ctx, {
-      runId: row.run_id, worker: row.worker, workerKind: worker.runtime, workspace, sessionId: row.session_id ?? undefined, workflowRunId: row.workflow_run_id ?? undefined,
-      classification: row.classification as 'public' | 'operator-shared' | 'local-private', ...(member ? { profile: REVIEW_MEMBER } : {}),
+      runId: row.run_id, worker: row.worker, workerKind: worker.runtime, workspace, ...(workspace !== worker.workspace ? { repository: realpathSync(worker.workspace) } : {}), sessionId: row.session_id ?? undefined, workflowRunId: row.workflow_run_id ?? undefined,
+      classification: row.classification as 'public' | 'operator-shared' | 'local-private', ...(member ? { profile: REVIEW_MEMBER } : worker.research ? { profile: 'research' as const } : {}),
+      // A research run's web calls are judged under its task's project's policy and grant too, and name its step (T262).
+      ...(row.project_id ? { projectId: row.project_id } : {}), ...(row.task_id ? { taskId: row.task_id } : {}), ...(row.step_node ? { nodeId: row.step_node } : {}),
       // A shell command is taken for a read only where the runtime enforces shells that read no startup code (T198).
       shellReads: evidence.cleanShells === true,
       // The workspace reads server's tools are reads only where the runtime gives its agent that server (T200b).
       workspaceReads: evidence.workspaceReads === true,
+      // A shell inspection command the agent has a reading tool for is denied at once, naming it (T222).
+      readTools: readToolsOf(evidence, this.atTier(worker, row.tier).tools),
+      // Only the host tools this run was given are classified (ADR-0070).
+      hostTools: hostTools.map((tool) => tool.name),
+      // The sandboxed-command rule (ADR-0080): a workspace-write run whose runtime proved both confinements, under its enforce switch read at each call.
+      sandbox: worker.sandbox, commandsSandboxed: evidence.sandboxedCommands === true && evidence.readsConfined,
+      sandboxedCommands: () => enforceMode(this.ctx.get('pluginHost' as never) as EnforceSource | undefined, 'sandboxed-commands', this.config.enforce?.sandboxedCommands),
     })
+    // What it runs at its tier (ADR-0073): that tier's model, tools, and turn limit, else the Worker's own
+    // (one it still offers, with the model it was started for: checked before the egress check).
+    const at = this.atTier(worker, row.tier)
     const spec: RunSpec = {
       prompt: turn.prompt, workspace, sandbox: worker.sandbox,
+      // A research role's run lists the web tools beside its reads (T262): never on a review member's step.
+      ...(worker.research && !member ? { web: true } : {}),
       // Omitted or empty means the runtime's minimal set: the config schema turns an omitted list into [].
-      ...(worker.tools?.length ? { tools: worker.tools } : {}), ...(worker.model ? { model: worker.model } : {}), ...(worker.maxTurns ? { maxTurns: worker.maxTurns } : {}),
+      ...(at.tools?.length ? { tools: at.tools } : {}), ...(at.model ? { model: at.model } : {}), ...(at.maxTurns ? { maxTurns: at.maxTurns } : {}),
       // Only a runtime that reports `resume` is ever asked to continue a conversation.
       ...(turn.resume ? { resume: turn.resume } : {}),
       // A derived Worker's account in another home than the runtime's own runs there, and only there (ADR-0051).
       ...(named ? { home: named.home } : {}),
       // A runtime that gives its agent the workspace reads server bounds it so (T200b); one that gives none ignores it.
       workspaceReads: this.readBounds,
+      ...(hostTools.length ? { hostTools } : {}),
+      // A writing run's own test runs take a share of the host, not every core of it (T348).
+      ...(worker.sandbox === 'workspace-write' ? { testWorkers: this.testWorkers } : {}),
       toolGate: gate.gate,
+      // The commands a writing step's Worker ran, with the exit code and output tail its runtime reports, are recorded by the System itself (T284).
+      ...(dossier && worker.sandbox === 'workspace-write' ? { onToolResult: commandRecorder(this.ctx, dossier.dossiers, dossier.caller) } : {}),
     }
-    // Metered: nothing runs without a reservation (INV-2, INV-9).
-    const meter = this.meter(row.worker, worker)
-    if (meter) await this.declareAccounts(meter.resources)
-    const reservation = meter ? await this.reserve(row, meter, lease) : undefined
+    // A writing run's commands say on a report file of its own what their tests did not run, as a
+    // check's command does (T265): its result says so, and its review is told. One that cannot be
+    // made is said on the result (`reportUnread`), never taken for a report naming no skip.
+    let report: RunReport | undefined
+    let unmade: RunReported | undefined
+    if (worker.sandbox === 'workspace-write' && !member) {
+      try {
+        report = runReport(this.reportDir)
+        spec.reportFile = report.path
+      } catch (error) {
+        unmade = { unread: `its report file could not be made in ${this.reportDir}: ${(error as Error).message}`.slice(0, 300) }
+        this.ctx.logger.warn(`agent Workers: ${row.worker}'s run ${row.run_id} has no report file (${unmade.unread}); its result says so`)
+      }
+    }
     try {
-      const result = await this.submit(row, worker, provider, spec, turn.native, signal, lease, meter, gate.deferral)
-      this.complete(row, worker, workspace, result, turn, lease)
+      // Metered: nothing runs without a reservation (INV-2, INV-9), on its model's pool too when it has one (ADR-0073).
+      const meter = this.meter(row.worker, worker, at.modelPool)
+      if (meter) await this.declareAccounts(meter.resources)
+      const reservation = meter ? await this.reserve(row, meter, lease) : undefined
+      try {
+        const result = await this.submit(row, worker, provider, spec, turn.native, signal, lease, meter, gate.deferral)
+        this.complete(row, worker, workspace, result, turn, lease, at, report?.read() ?? unmade)
+      } finally {
+        if (reservation) await this.release(row.worker, reservation)
+      }
     } finally {
-      if (reservation) await this.release(row.worker, reservation)
+      report?.dispose()
     }
   }
 
@@ -2093,7 +2730,8 @@ export class AgentWorkers extends Service {
     // recorded with it, and the submission is its first activity (PROP-0013).
     const submittedAt = now()
     const holder = currentProcess()
-    this.update(row.run_id, { status: 'running', submitted_at: submittedAt, activity_at: submittedAt, ...(holder ? { holder: JSON.stringify(holder) } : {}) }, lease)
+    // A host stop's mark is cleared as it runs: a later loss of its holder is a crash, never that stop.
+    this.update(row.run_id, { status: 'running', submitted_at: submittedAt, activity_at: submittedAt, host_stopped_at: null, ...(holder ? { holder: JSON.stringify(holder) } : {}) }, lease)
     const startedAt = Date.now()
     const deadline = AbortSignal.timeout(this.config.runTimeoutMs ?? 15 * 60_000)
     const watched = this.watch(row, lease)
@@ -2250,7 +2888,8 @@ export class AgentWorkers extends Service {
   }
 
   /** Store the result as a `report` artifact and complete the run. */
-  private complete(row: RunRow, worker: AgentWorkerConfig, workspace: string, result: RunResult, turn: Turn, lease: () => Lease): void {
+  private complete(row: RunRow, worker: WorkerSpec, workspace: string, result: RunResult, turn: Turn, lease: () => Lease, at?: AtTier, reported: RunReported = {}): void {
+    const { notRun, unread: reportUnread } = reported
     const handle = result.nativeHandle ?? this.row(row.run_id)?.native_handle ?? undefined
     const native = turn.native
     const member = row.scope === REVIEW_MEMBER
@@ -2273,10 +2912,13 @@ export class AgentWorkers extends Service {
     this.ctx.store.transaction((db) => {
       this.ctx.leases.fence(lease())
       if (handle && row.session_id && native) db.prepare('UPDATE agent_sessions SET native_handle = ? WHERE session_id = ?').run(handle, row.session_id)
-      // `agent-result@1.3` for a review member's step (its profile, and the turns it replayed), else
-      // `@1.2` when the runtime reported its token usage, `@1.1` otherwise.
+      // `agent-result@1.5` when its commands reported tests they did not run, or what they reported is
+      // not known (T265), `@1.4` for a Worker that offers tiers (ADR-0073: the tier it ran at and the model it
+      // was given there), `@1.3` for a review member's step (its profile, and the turns it replayed),
+      // else `@1.2` when the runtime reported its token usage, `@1.1` otherwise.
       const usage = usageOf(result)
-      const schema = member ? 'agent-result@1.3' : usage.usage ? 'agent-result@1.2' : 'agent-result@1.1'
+      const tiered = at && worker.tiers ? { tier: at.tier, ...(at.model ? { configuredModel: at.model } : {}) } : undefined
+      const schema = notRun !== undefined || reportUnread !== undefined ? 'agent-result@1.5' : tiered ? 'agent-result@1.4' : member ? 'agent-result@1.3' : usage.usage ? 'agent-result@1.2' : 'agent-result@1.1'
       const artifact = this.ctx.artifacts.put({
         kind: 'report', bodySchema: schema,
         body: {
@@ -2286,9 +2928,12 @@ export class AgentWorkers extends Service {
           ...(captured ? { subject: captured.subject } : {}),
           ...(result.turns !== undefined ? { turns: result.turns } : {}), ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}),
           ...(usage.usage && result.model ? { model: result.model } : {}), ...usage,
+          ...tiered,
           // The answer is bound to exactly what it answered: the earlier turns replayed, by run and answer, and the hash of all it was sent.
           ...(member ? { profile: REVIEW_MEMBER } : {}),
           ...(turn.replay ? { replay: { runs: turn.replay.runs, answers: turn.replay.answers, promptHash: sha256(turn.prompt) } } : {}),
+          // What its own test runs did not run, as they reported it, or that it is not known (T265): a review is told.
+          ...(notRun !== undefined ? { notRun } : {}), ...(reportUnread !== undefined ? { reportUnread } : {}),
           text: result.text,
         },
         ...(turn.replay ? { inputs: turn.replay.answers } : {}),
@@ -2305,7 +2950,9 @@ export class AgentWorkers extends Service {
    * `config_error` when the ledger does not configure it. Returns the reservation id.
    */
   private async reserve(row: RunRow, meter: Meter, lease: () => Lease): Promise<string> {
-    const reserved = await meter.resources.reserve({ runId: row.run_id, ...scopeOf(row), lines: [{ pool: meter.pool, unit: 'runs', amount: 1 }] }).catch((error: unknown) => {
+    // A run on a model with a pool of its own draws on both (ADR-0073): either closed refuses it.
+    const lines = [{ pool: meter.pool, unit: 'runs' as const, amount: 1 }, ...(meter.model ? [{ pool: meter.model.pool, unit: 'runs' as const, amount: 1 }] : [])]
+    const reserved = await meter.resources.reserve({ runId: row.run_id, ...scopeOf(row), lines }).catch((error: unknown) => {
       throw error instanceof ResourcesError ? new ProviderError('config_error', `the resource ledger refused to reserve for ${row.worker}: ${error.message}`, { cause: error }) : error
     })
     try {
@@ -2315,9 +2962,9 @@ export class AgentWorkers extends Service {
       throw error
     }
     if (reserved.state === 'reserved') return reserved.reservationId
-    const configured = await meter.resources.pools({ account: meter.account }).then((pools) => pools.some((p) => p.pool === meter.pool), () => true)
+    const configured = await meter.resources.pools({ account: meter.account }).then((pools) => lines.every((l) => pools.some((p) => p.pool === l.pool)), () => true)
     const reasons = reserved.reasons.join('; ')
-    throw new ProviderError(configured ? 'quota_exhausted' : 'config_error', `${row.worker} may not draw on pool ${meter.pool} now: ${reasons} (budget decision ${reserved.decision}); nothing was run`)
+    throw new ProviderError(configured ? 'quota_exhausted' : 'config_error', `${row.worker} may not draw on pool ${lines.map((l) => l.pool).join(' and ')} now: ${reasons} (budget decision ${reserved.decision}); nothing was run`)
   }
 
   private async release(worker: string, reservationId: string): Promise<void> {
@@ -2418,26 +3065,42 @@ export class AgentWorkers extends Service {
    * `report`: what the account's usage report said after the run (ADR-0059), recorded after the run's
    * own observations, so the latest reading has its share, and never opening a window a limit closed.
    * Whether a `limited` reading of the pool was recorded.
+   *
+   * A run that runs again after a host stop cut it (T283, `resumes` above 0) is metered the same way,
+   * but what its runtime reports now is only what it used since the restart: its record is a lower
+   * bound of the run (`partial` says so), so it never reconciles the run's unknown usage from before
+   * the stop, which is left to transcript reconciliation (INV-2, never invented); and it is its own
+   * unit, never a duplicate of the cut execution's record. Unless its result reports its session's
+   * running totals (`sessionTotals`, PROP-0022): those hold what it used before the stop too, so its
+   * record is whole, `usage-record@1.2`, and the ledger counts the difference.
    */
   private async account(row: RunRow, worker: AgentWorkerConfig, meter: Meter, metering: RunMetering | undefined, outcome: 'completed' | 'failed' | 'aborted', durationMs: number, report: readonly LimitObservation[], ending: string): Promise<boolean> {
     const ran = metering?.limits?.length ? await this.observe(row.worker, worker, meter, metering.limits) : false
     const reported = report.length ? await this.observe(row.worker, worker, meter, report, true) : false
     const limited = ran || reported
     const usage = usageOf(metering)
-    const partial = metering?.partial
+    // A session's running totals at a result (never a lower bound) hold the whole session so far.
+    const totals = metering?.partial === undefined ? metering?.sessionTotals : undefined
+    const again = row.resumes && totals === undefined ? againPartial(row.resumes) : undefined
+    const partial = [metering?.partial, again].filter((p): p is string => p !== undefined).join('; ').slice(0, 300) || undefined
     if ((!usage.usage && metering?.turns === undefined) || (partial && !anyCounted(usage.usage, metering?.turns))) {
-      const said = partial ? `its runtime reported no number above 0 before it ended: ${partial}` : 'its runtime reported neither tokens nor turns'
+      const said = partial ? `its runtime reported no number above 0${metering?.partial ? ' before it ended' : ''}: ${partial}` : 'its runtime reported neither tokens nor turns'
       this.unknownUsage(row, meter, 'not-reported', `${ending}; ${said}`, { outcome })
       this.ctx.logger.warn(`agent Workers: ${row.run_id} on ${row.worker} reported no usage (${ending}); it is left to transcript reconciliation`)
       return limited
     }
-    const model = { ...(worker.model ? { request: worker.model } : {}), ...(metering?.model ? { response: metering.model } : {}) }
+    // The model it asked for is its tier's (ADR-0073).
+    const asked = this.atTier(worker, row.tier).model
+    const model = { ...(asked ? { request: asked } : {}), ...(metering?.model ? { response: metering.model } : {}) }
     const record: UsageRecord = {
       // A lower bound says so on its record (`@1.1`, `partial`), in the ledger's one write of it: a
       // crash or a failed append before its fact never leaves it reading as the run's usage (INV-2).
-      schema: partial ? 'usage-record@1.1' : 'usage-record@1.0',
-      // The runtime's own identity of its result, so another source of the same unit is a duplicate.
-      requestId: `${worker.runtime}:${metering?.resultId ?? row.run_id}`,
+      schema: partial ? 'usage-record@1.1' : totals ? 'usage-record@1.2' : 'usage-record@1.0',
+      // The session's running totals (`@1.2`): the ledger counts the run's own spend.
+      ...(totals ? { sessionTotals: totals } : {}),
+      // The runtime's own identity of its result, so another source of the same unit is a duplicate;
+      // without one, a run that ran again after a host stop is a unit of its own each time (T283).
+      requestId: `${worker.runtime}:${metering?.resultId ?? (row.resumes ? `${row.run_id}:again-${row.resumes}` : row.run_id)}`,
       source: 'runtime-result', observedAt: now(), account: meter.account, pool: meter.pool, worker: row.worker, runId: row.run_id,
       ...(row.session_id ? { sessionId: row.session_id } : {}), ...scopeOf(row),
       ...(Object.keys(model).length ? { model } : {}), ...usage,
@@ -2460,9 +3123,34 @@ export class AgentWorkers extends Service {
    * which closes a window as a run's do, and never opens one a `limited` reading closed until the
    * later of its reset and cooldown: such an `ok` reading is not recorded, and is logged. Its
    * rejections are recorded first, so its own `ok` of a window it closes is not either.
+   *
+   * Every model's pool of the account gets its readings, but only a `limited` reading of a pool the
+   * run drew on (the account's, and its own model's, `meter.model`) counts in the answer (ADR-0073):
+   * another model's limit says nothing of the limit this run hit, so it never stands in for it, and
+   * the run's own limit still closes its pools when nothing placed it.
    */
   private async observe(id: string, worker: AgentWorkerConfig, meter: Meter, limits: readonly LimitObservation[], report = false): Promise<boolean> {
-    const pool = await meter.resources.pools({ account: meter.account }).then((pools) => pools.find((p) => p.pool === meter.pool), () => undefined)
+    // A window a model's pool maps (ADR-0073) is a reading of that pool: its limit closes only the tiers
+    // that run that model. Every other observation is the account's, as before (an unplaced limit closes it whole).
+    const ofModels = (name: string): boolean => meter.models.some((m) => m.windows[name] !== undefined)
+    const own = limits.filter((l) => worker.windows?.[l.window] !== undefined || !ofModels(l.window))
+    let limited = own.length ? await this.observeIn(id, worker, meter, { pool: meter.pool, windows: worker.windows ?? {}, account: true }, own, report) : false
+    for (const model of meter.models) {
+      const mine = limits.filter((l) => model.windows[l.window] !== undefined)
+      if (!mine.length) continue
+      const closed = await this.observeIn(id, worker, meter, { pool: model.pool, windows: model.windows, account: false }, mine, report)
+      if (model.pool === meter.model?.pool) limited = closed || limited
+    }
+    return limited
+  }
+
+  /**
+   * Record observations as readings of one pool's mapped windows (the account's, or a model's,
+   * ADR-0073); whether a `limited` one was recorded. On the account's pool, a limit hit it cannot place
+   * closes every window, as before.
+   */
+  private async observeIn(id: string, worker: AgentWorkerConfig, meter: Meter, target: { pool: string; windows: Record<string, string>; account: boolean }, limits: readonly LimitObservation[], report: boolean): Promise<boolean> {
+    const pool = await meter.resources.pools({ account: meter.account }).then((pools) => pools.find((p) => p.pool === target.pool), () => undefined)
     const cooldownMs = (worker.limitCooldownSeconds ?? 3600) * 1000
     let limited = false
     /** Windows this call closed: a report's `ok` of one of them is not recorded either. */
@@ -2471,25 +3159,25 @@ export class AgentWorkers extends Service {
     // A usage report read every period names the same unmapped windows each time: it says so once.
     const unmapped = (message: string): void => (report ? this.warnOnce(message) : this.ctx.logger.warn(message))
     for (const limit of ordered) {
-      const windowId = worker.windows?.[limit.window]
+      const windowId = target.windows[limit.window]
       const mapped = windowId === undefined ? undefined : pool?.windows.find((w) => w.id === windowId)
       // A limit hit the ledger cannot place (an unmapped or unnamed window) closes every window of
-      // the pool: it is never retried on the same pool unseen (INV-2). Anything else unmapped is skipped.
-      const windows = mapped ? [mapped] : limit.status === 'rejected' ? pool?.windows ?? [] : []
+      // the account's pool: it is never retried on the same pool unseen (INV-2). Anything else unmapped is skipped.
+      const windows = mapped ? [mapped] : limit.status === 'rejected' && target.account ? pool?.windows ?? [] : []
       if (!windows.length) {
-        unmapped(`agent Workers: ${report ? `the usage report of ${meter.account}` : id} observed limit window ${limit.window}, which ${windowId === undefined ? 'its windows do not map' : `maps to ${windowId}, not a window of pool ${meter.pool}`}; not recorded`)
+        unmapped(`agent Workers: ${report ? `the usage report of ${meter.account}` : id} observed limit window ${limit.window}, which ${windowId === undefined ? 'its windows do not map' : `maps to ${windowId}, not a window of pool ${target.pool}`}; not recorded`)
         continue
       }
       for (const window of windows) {
         if (report && limit.status !== 'rejected') {
           const until = closed.has(window.id) ? Number.POSITIVE_INFINITY : closedUntil(pool, window.id)
           if (until !== undefined && Date.parse(limit.observedAt) < until) {
-            this.ctx.logger.info(`agent Workers: the usage report of ${meter.account} reads window ${window.id} of pool ${meter.pool} open (${limit.window}), and a limit closed it until ${Number.isFinite(until) ? new Date(until).toISOString() : 'a later reading'}; not recorded: a report never opens a window a limit closed`)
+            this.ctx.logger.info(`agent Workers: the usage report of ${meter.account} reads window ${window.id} of pool ${target.pool} open (${limit.window}), and a limit closed it until ${Number.isFinite(until) ? new Date(until).toISOString() : 'a later reading'}; not recorded: a report never opens a window a limit closed`)
             continue
           }
         }
         const reading: LimitState = {
-          schema: 'limit-state@1.0', pool: meter.pool, account: meter.account,
+          schema: 'limit-state@1.0', pool: target.pool, account: meter.account,
           window: { id: window.id, kind: window.kind, ...(window.seconds !== undefined ? { seconds: window.seconds } : {}) },
           // A limit hit is limited until its reset, or, with none given, for the configured cooldown:
           // never unknown, which a pool configured to admit unknown windows would ignore.
@@ -2583,9 +3271,10 @@ export class AgentWorkers extends Service {
     return scheduler
   }
 
-  private fail(row: RunRow, error: unknown, lease: () => Lease, fields: Partial<Omit<RunRow, 'run_id'>> = {}): void {
+  /** `infrastructure`: what of the infrastructure alone ended it, when this source knows it (ADR-0069). */
+  private fail(row: RunRow, error: unknown, lease: () => Lease, fields: Partial<Omit<RunRow, 'run_id'>> = {}, infrastructure?: ExecutionInfrastructure): void {
     const typed = toProviderError(error)
-    this.update(row.run_id, { ...fields, status: 'failed', error: JSON.stringify({ kind: typed.kind, disposition: dispositionOf(typed.kind), message: typed.message }) }, lease)
+    this.update(row.run_id, { ...fields, status: 'failed', error: JSON.stringify({ kind: typed.kind, disposition: dispositionOf(typed.kind), message: typed.message, ...(infrastructure ? { infrastructure } : {}) }) }, lease)
   }
 
   private update(runId: string, fields: Partial<Omit<RunRow, 'run_id'>>, lease: () => Lease): void {
@@ -2618,9 +3307,45 @@ function closedUntil(pool: PoolState | undefined, windowId: string): number | un
   return times.length ? Math.max(...times) : Number.POSITIVE_INFINITY
 }
 
-/** Whether a runtime's evidence admits a Worker: available, reads confined, its sandbox enforced, and a gate asked before each tool call. */
+/**
+ * Whether a runtime's evidence admits a Worker: available, reads confined, its sandbox enforced, and a
+ * gate asked before each tool call; a research role's (T262), web tools offered on a read-only run too.
+ */
 function admits(evidence: RuntimeEvidence, worker: AgentWorkerConfig): boolean {
-  return evidence.available && evidence.readsConfined && evidence.gatesToolCalls === true && evidence.sandboxes.includes(worker.sandbox)
+  return evidence.available && evidence.readsConfined && evidence.gatesToolCalls === true && evidence.sandboxes.includes(worker.sandbox) && (!worker.research || evidence.webTools === true)
+}
+
+/**
+ * The failures of a sent run that its Worker going away can cause (its runtime, process, session, or
+ * sign-in), so a source looks whether it did (ADR-0069). Never one of the run's own: a timeout, a
+ * limit, a violation (`reconciliation_failed`), a denial, a stop, or its input.
+ */
+const WORKER_GONE_KINDS: ReadonlySet<string> = new Set(['session_broken', 'provider_stalled', 'network', 'internal', 'config_error', 'reauth_required'])
+
+/** The longest reason an unavailable Worker's descriptor carries (`capability-descriptor@1.9`). */
+const MAX_UNAVAILABLE_REASON = 300
+
+/**
+ * Why a runtime's evidence does not admit a Worker, for people: the probe's own detail, and what of
+ * {@link admits} it misses beyond being unavailable. Undefined when it admits it.
+ */
+function refusalOf(evidence: RuntimeEvidence, worker: AgentWorkerConfig): string | undefined {
+  if (admits(evidence, worker)) return undefined
+  if (!evidence.available) return `its ${worker.runtime} probe failed: ${evidence.detail}`
+  const missing = [
+    ...(evidence.readsConfined ? [] : ['cannot keep host state unreadable']),
+    ...(evidence.gatesToolCalls === true ? [] : ["cannot ask the run's gate before each tool call"]),
+    ...(evidence.sandboxes.includes(worker.sandbox) ? [] : [`cannot enforce its ${worker.sandbox} sandbox`]),
+    ...(!worker.research || evidence.webTools === true ? [] : ['offers no web tools to a research role\'s read-only run']),
+  ]
+  return `its ${worker.runtime} runtime ${missing.join(', and ')} (${evidence.detail})`
+}
+
+/** A reason as a descriptor carries it: one line, at most {@link MAX_UNAVAILABLE_REASON} characters. */
+function boundedReason(text: string): string {
+  const line = text.replace(/\p{Cc}+/gu, ' ').replace(/\s+/g, ' ').trim() || 'its Worker source gave no detail'
+  const chars = [...line]
+  return chars.length <= MAX_UNAVAILABLE_REASON ? line : `${chars.slice(0, MAX_UNAVAILABLE_REASON - 1).join('')}…`
 }
 
 /**
@@ -2638,7 +3363,7 @@ function execution(row: RunRow): WorkerExecution {
     id: row.run_id, status: row.status, submitted: row.submitted_at !== null,
     ...(row.result ? { result: row.result as ArtifactRef } : {}),
     ...(row.error ? { error: JSON.parse(row.error) as WorkerExecution['error'] & object } : {}),
-    decisions: [row.egress_decision, row.setup_decision, row.budget_decision, row.liveness_decision, row.liveness_freed].filter((d): d is string => typeof d === 'string').map((d) => d as ContentId),
+    decisions: [row.egress_decision, row.setup_decision, row.budget_decision, row.liveness_decision, row.liveness_freed, row.resume_decision].filter((d): d is string => typeof d === 'string').map((d) => d as ContentId),
   }
 }
 
@@ -2660,6 +3385,14 @@ export interface FreeOutcome {
   worktrees: WorktreeRelease[]
 }
 
+/** The disk the worktrees and the store are on (`diskStatus`): each filesystem's space (none when unreadable), the floor, and the disk-floor mechanism's mode. */
+export interface DiskStatus {
+  mode: EnforceMode
+  floorBytes: number
+  worktrees?: DiskSpace
+  store?: DiskSpace
+}
+
 /** The run worktrees not removed (`agent_worktrees`): the retention in force, at most 100 of them, and how many in all. */
 export interface WorktreeListing {
   retentionHours: number
@@ -2676,6 +3409,35 @@ export interface WorktreeRemoval {
   decision?: ContentId
   worktrees: RunWorktreeRelease[]
   more: number
+}
+
+/** The most reasons a decision's candidate holds, and the longest one (decision@1.x `candidates[].reasons`). */
+const DECISION_REASONS = 32
+const DECISION_REASON_LENGTH = 300
+
+/** `text` cut to `max` characters, an ellipsis marking the cut. */
+function clip(text: string, max = DECISION_REASON_LENGTH): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`
+}
+
+/**
+ * The reasons of the operator's removal (T250), within the decision's bounds however many worktrees
+ * it removes: the operator's ask, then each worktree and why while they fit; else the worktrees
+ * counted by why, the last line saying how many more. Every worktree is named in the outcome's detail.
+ */
+function removalReasons(ask: string, removing: ReadonlyArray<{ runId: string; path: string; why: string }>): string[] {
+  const room = DECISION_REASONS - 1
+  if (removing.length <= room) return [clip(ask), ...removing.map((p) => clip(`worktree ${p.path} of ${p.runId}: ${p.why}`))]
+  const byWhy = new Map<string, number>()
+  for (const p of removing) byWhy.set(p.why, (byWhy.get(p.why) ?? 0) + 1)
+  const groups = [...byWhy].map(([why, n]) => ({ why, n }))
+  const shown = groups.length <= room ? groups : groups.slice(0, room - 1)
+  const rest = groups.slice(shown.length).reduce((sum, g) => sum + g.n, 0)
+  return [
+    clip(`${removing.length} worktrees, each named in the outcome's detail; ${ask}`),
+    ...shown.map((g) => clip(`${g.n} worktree(s): ${g.why}`)),
+    ...(rest ? [`and ${rest} more worktree(s), each with its own why, named in the outcome's detail`] : []),
+  ]
 }
 
 /** A stored JSON column's value, or undefined when it holds nothing readable. */
@@ -2747,8 +3509,13 @@ function replayed(turns: ReadonlyArray<{ prompt: string; answer: string }>, next
 /** The ledger a metered Worker draws on. */
 interface Meter {
   resources: Resources
+  /** The account's own pool: what every run of it draws on, and where its usage is recorded. */
   pool: string
   account: string
+  /** The run's model's own pool (ADR-0073), when its tier's model has one: reserved on beside the account's. */
+  model?: { pool: string; windows: Record<string, string> } | undefined
+  /** Every model's own pool of the account (ADR-0073): an observation one of them maps is a reading of that pool, never of the account's. */
+  models: Array<{ pool: string; windows: Record<string, string> }>
 }
 
 /** What a run's draw is watched with (PROP-0015 E2): its pool before it, when it started, and the end of its overlap watch (the other runs it overlapped). */

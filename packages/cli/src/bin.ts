@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process'
-import { type AccountTarget, accountTarget, agentAccountLine, formatMigration, parseMigrate, type SignIn, signInEnvironment, signInLine, checkProfile, type EventLine, formatEvents, formatHealth, healthExit, hostHealth, formatPlugins, hostPlugins, hostCapacity, hostRoster, parseEvents, assertRuntime, backupHost, browserDeps, callTool, claudeGatewayCommand, codexGatewayCommand, drainHost, formatTools, listTools, restoreHost, shutdownHost, ensureBrowser, formatArtifact, type ArtifactRead, type DispatchView, formatDispatch, parseDispatch,formatExplanation, formatFreed, formatLiveness, type Freed, formatUsage, parseFree, formatWorktrees, formatWorktreesRemoved, parseWorktreesRemove, type Worktrees, type WorktreesRemoved, init, mcpConfig, mcpHeaders, mcpToken, parseAsk, parseReport, readAllStdin, serveStdio, start, type ToolOutcome, uiUrl, composedRows, PRESETS, type Preset, rowOffProblem } from './index.ts'
+import { type AccountTarget, accountTarget, agentAccountLine, formatMigration, parseMigrate, type SignIn, signInEnvironment, signInLine, checkProfile, type EventLine, formatEvents, formatHealth, healthExit, hostHealth, formatPlugins, hostPlugins, type EnforceView, formatEnforce, formatPluginRows, parseEnforce, parsePlugin, type PluginRowView,hostCapacity, hostRoster, parseEvents, assertRuntime, backupHost, browserDeps, callTool, claudeGatewayCommand, codexGatewayCommand, drainHost, formatTools, listTools, restoreHost, shutdownHost, ensureBrowser, formatArtifact, type ArtifactRead, type DispatchView, formatDispatch, parseDispatch,formatExplanation, formatFreed, formatLiveness, type Freed, formatUsage, parseFree, formatWorktrees, formatWorktreesRemoved, parseWorktreesRemove, type Worktrees, type WorktreesRemoved, init, leadBrief, leadInbox, leadToken, parseDecisions, runDecisions, mcpConfig, mcpHeaders, mcpToken, parseAsk, parseLead, parseMetrics, parseReport, readAllStdin, serveStdio, start, type ToolOutcome, uiUrl, composedRows, PRESETS, type Preset, rowOffProblem, useProfile } from './index.ts'
+import { bundlePlugins, bundleStudioPolicy, parseProjectNew, profileHost, type ProjectHost, projectNew } from './project.ts'
 
-const USAGE = `Usage: system <command>
+const USAGE = `Usage: system <command> [--profile system|system-test]
+
+  --profile system-test     act on the test profile (init, start, check, ask, ...): its own data directory,
+                            port and Workers; live updates run on it first (scripts/live-update.sh --stage)
 
   init [--preset default|api-first]
                             create or refresh the system DSH profile (a preset is kept until changed);
@@ -48,6 +52,13 @@ const USAGE = `Usage: system <command>
   dispatch pause [reason...] | dispatch resume
                             pause dispatch entirely (nothing more is asked or started by itself; its open asks are
                             withdrawn), or resume it; each recorded as your decision and kept across restarts
+  project new --kind <kind> --id <id> --repository <path> [--target-branch <b>] [--coordination <dir>] [--dry-run]
+                            a project from a template by kind (software-repository): its charter and the policy
+                            change its commands need, filed on the approval queue; its profile patch fragment,
+                            printed and written, never applied; its coordination directory (LEAD.md, lessons,
+                            decisions), default ~/workspaces/<id>-coordination, the only directory written.
+                            Refuses an unknown kind, a repository that is not a git checkout, an id in use;
+                            --dry-run prints all of it and writes and asks nothing
   continue <runId> [nodeId] reopen a failed run's failed node as a new attempt
   delete <runId> [--yes]    preview, then delete a finished run (artifacts stay)
   supersede <runId> <nodeId> (<text...> | -)
@@ -57,6 +68,10 @@ const USAGE = `Usage: system <command>
   report [--project <id>] [--since <time> | --days <n>] [--until <time>] [--json]
                             the baseline report, from recorded data only: progress, results, what asked for you,
                             usage, cost per accepted result; by default the last 7 days (the weekly investor report)
+  metrics [--days <n>] [--project <id>] [--until <time>] [--json]
+                            the maturity metrics (PROP-0016), from recorded data only, over the last 30 days by
+                            default: each one's value, sample, and records read, or why it is not measurable yet;
+                            and the reading against the L3 lines
   explain [--json] <runId|artifact|agentRun>
                             the decision chain behind a run (egress, tier, route, acceptance), every attempt's
                             decisions, and its executions whose liveness needs a look (the verdict, its looks,
@@ -116,6 +131,11 @@ const USAGE = `Usage: system <command>
                             Worker each would likely go to (the roster's now)
   plugins [--json]          every plugin of the composition: its recorded lifecycle state, on or off, version,
                             class, rows, why a manifest is absent or refused, and what the manifest check found
+  plugin [list|off <row> [reason…]|on <row>] [--json]
+                            the rows, on or off, required or optional; or turn an optional row off or on in the
+                            running host, no restart, kept in the profile's patch (a required row is refused)
+  enforce [list|set <mechanism> <off|warn|on|configured> [reason…]] [--json]
+                            each gate-like mechanism's mode; or set one live, no restart (configured clears it)
   shutdown [--deadline <s>] drain, then stop the running profile (unfinished runs resume on start)
   check [--env-file <file>]  check the profile against this install's code before starting it (an update's preflight);
                             --env-file: also the daemon unit's environment file (names only, never values)
@@ -132,6 +152,33 @@ const USAGE = `Usage: system <command>
                             and Help (how System works in plain words, and a glossary)
   mcp-token --scope model   print the model gateways' token (for a model client's environment variable;
                             needs a gateway row)
+  lead wait [--project <id>] [--timeout <s>] [--json]
+                            block until a notice is unread in a project's lead inbox, then print it (exit 1 when
+                            --timeout passes first): the loop a lead runs instead of polling
+  lead inbox [--project <id>] [--json]
+                            print the unread notices; lead ack [--project <id>] <id>... marks them handled
+  lead digest [--project <id>] [--day <date>] [--json]
+                            the day's digest (UTC, default today): what landed, what the lead decided, what waits on the
+                            operator, what failed, and the day's measures; a finished day is stored and read back
+  lead health [--project <id>] [--json]
+                            the project's health table: dispatch, Workers, quota, sinks, live update, landing queue,
+                            worktrees, enforce switches; each ok, degraded, or unknown with its reason
+  lead brief --project <id> [--json] [--since <time>]
+                            the one read-only page a lead session reads at its start and when it is lost (inbox, what waits
+                            on the operator or on you, running work, the last day, what could not be read); writes only the
+                            event lead.brief-read
+  decisions list [--state asked|answered] [--project <id>] [--studio] [--after <n>] [--limit <n>] [--json]
+                            the operator's decisions in number order (needs the decisions row)
+  decisions show D<n>       one decision, with the decisions that supersede it
+  decisions ask <question> [--project <id>] [--option <text>]... [--recommend <text>] [--link <text>]... [--supersedes D<n>]
+                            record a question: the store gives it the studio's next number
+  decisions answer D<n> <answer> [--source <text>]
+                            record the operator's answer to a question that waits
+  decisions import <file>   import the lead's decisions.json, once: refuses a gap or a duplicated number, a second run changes nothing
+  lead-token issue <project>   issue a project's lead token (lead-<project>.token beside operator.token, owner-only; replaces one
+                            issued before): its holder decides as lead:<project>, within a closed list of rights System enforces
+  lead-token revoke <project>  revoke it: requests with it are refused at once
+  lead-token list           the projects a lead token is issued for
   mcp-headers               print the Authorization header as JSON (Claude Code headersHelper)
   mcp-stdio                 serve the running profile's MCP tools on stdio (Codex and other clients)
 `
@@ -243,8 +290,21 @@ async function agentAccount(action: string, target: Extract<AccountTarget, { kin
   return 0
 }
 
-async function main(argv: string[]): Promise<number> {
-  const [command, ...rest] = argv
+/**
+ * `--profile <name>` names the profile a command acts on (`system`, or `system-test`, T323). For
+ * `start` it must come first: what follows is the launcher's own arguments.
+ */
+function takeProfile(argv: string[]): string[] {
+  const at = argv[0] === 'start' ? (argv[1] === '--profile' ? 1 : -1) : argv.indexOf('--profile')
+  if (at < 0) return argv
+  const name = argv[at + 1]
+  if (!name) throw new Error('--profile needs a name: system or system-test')
+  useProfile(name)
+  return [...argv.slice(0, at), ...argv.slice(at + 2)]
+}
+
+async function main(args: string[]): Promise<number> {
+  const [command, ...rest] = takeProfile(args)
   switch (command) {
     case 'init': {
       const preset = rest[0] === '--preset' ? rest[1] : undefined
@@ -337,6 +397,20 @@ async function main(argv: string[]): Promise<number> {
       console.log(`stopped: ${rest[0]}`)
       return 0
     }
+    case 'project': {
+      const args = rest[0] === 'new' ? parseProjectNew(rest.slice(1)) : undefined
+      if (!args) break
+      // A profile that does not answer is no host: a dry run renders without it, a real run is refused.
+      let host: ProjectHost | undefined = profileHost((name, input) => callTool(name, input))
+      try {
+        await host.projectIds()
+      } catch {
+        host = undefined
+      }
+      const outcome = await projectNew(args, { host, plugins: bundlePlugins, bundleStudio: () => bundleStudioPolicy() })
+      console.log(outcome.lines.join('\n'))
+      return 0
+    }
     case 'continue': {
       if (!rest[0]) break
       return awaitRun(await callTool('continue', { runId: rest[0], ...(rest[1] ? { nodeId: rest[1] } : {}) }))
@@ -377,6 +451,14 @@ async function main(argv: string[]): Promise<number> {
       const input = parseReport(rest.filter((a) => a !== '--json'))
       if (!input) break
       const outcome = await callTool('report', input)
+      if (outcome.isError) throw new Error(outcome.text)
+      console.log(rest.includes('--json') ? JSON.stringify(outcome.structured, null, 2) : outcome.text.trimEnd())
+      return 0
+    }
+    case 'metrics': {
+      const input = parseMetrics(rest.filter((a) => a !== '--json'))
+      if (!input) break
+      const outcome = await callTool('metrics', input)
       if (outcome.isError) throw new Error(outcome.text)
       console.log(rest.includes('--json') ? JSON.stringify(outcome.structured, null, 2) : outcome.text.trimEnd())
       return 0
@@ -695,6 +777,26 @@ async function main(argv: string[]): Promise<number> {
       console.log(rest.includes('--json') ? JSON.stringify(plugins, null, 2) : formatPlugins(plugins).join('\n'))
       return 0
     }
+    case 'plugin': {
+      // A row turned off or on in the running host, no restart (ADR-0078).
+      const parsed = parsePlugin(rest)
+      if (!parsed) break
+      const outcome = await callTool('plugin', parsed.args)
+      if (outcome.isError) throw new Error(outcome.text)
+      const listed = (outcome.structured as { rows?: PluginRowView[] }).rows
+      console.log(parsed.json ? JSON.stringify(outcome.structured, null, 2) : listed ? formatPluginRows(listed).join('\n') : outcome.text)
+      return 0
+    }
+    case 'enforce': {
+      // A gate-like mechanism's mode, set live (ADR-0078).
+      const parsed = parseEnforce(rest)
+      if (!parsed) break
+      const outcome = await callTool('enforce', parsed.args)
+      if (outcome.isError) throw new Error(outcome.text)
+      const listed = (outcome.structured as { mechanisms?: EnforceView[] }).mechanisms
+      console.log(parsed.json ? JSON.stringify(outcome.structured, null, 2) : listed ? formatEnforce(listed).join('\n') : outcome.text)
+      return 0
+    }
     case 'resume': {
       const outcome = await callTool('resume', {})
       if (outcome.isError) throw new Error(outcome.text)
@@ -709,6 +811,23 @@ async function main(argv: string[]): Promise<number> {
     case 'ui':
       // Opened over ssh -L like the login desktop; the link carries the token in its fragment.
       console.log(uiUrl())
+      return 0
+    case 'lead': {
+      // The lead's inbox (D107): `wait` is the loop a lead runs instead of polling.
+      const parsed = parseLead(rest)
+      if (!parsed) break
+      return parsed.action === 'brief' ? leadBrief(parsed) : leadInbox(parsed)
+    }
+    case 'decisions': {
+      // The operator's decisions as records (D109): the `decisions` row is off in the bundle.
+      const parsed = parseDecisions(rest)
+      if (!parsed) break
+      requireRow('decisions')
+      return runDecisions(parsed)
+    }
+    case 'lead-token':
+      // The operator's command (ADR-0076): a project's lead principal, with its own token and the decider lead:<project>.
+      for (const line of leadToken(rest[0], rest[1])) console.log(line)
       return 0
     case 'mcp-token': {
       // Only the model scope is printed, and only when named (ADR-0023): the CLI uses the
@@ -728,7 +847,23 @@ async function main(argv: string[]): Promise<number> {
   return 2
 }
 
-main(process.argv.slice(2)).then((code) => process.exit(code), (error: unknown) => {
+/**
+ * Exit once stdout and stderr have handed everything on: `process.exit` drops what a pipe has not
+ * taken yet, so a JSON answer piped to a reader was cut at the pipe's 64 KiB (live, 2026-10-26).
+ * Each stream's empty write calls back after every write before it, or with the error of a stream
+ * that is gone.
+ */
+function exitWhenWritten(code: number): void {
+  process.exitCode = code
+  let open = 2
+  const done = (): void => {
+    if (--open === 0) process.exit(code)
+  }
+  process.stdout.write('', done)
+  process.stderr.write('', done)
+}
+
+main(process.argv.slice(2)).then(exitWhenWritten, (error: unknown) => {
   console.error(error instanceof Error ? error.message : error)
-  process.exit(1)
+  exitWhenWritten(1)
 })

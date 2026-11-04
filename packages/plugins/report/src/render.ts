@@ -1,9 +1,11 @@
 /**
  * The report rendered for the operator: one screen of Markdown, read in layers (PROP-0008's
- * investor report): progress, results, attention, resources, the baseline, digests. Deterministic,
+ * investor report): progress, results, attention, resources, the baseline, digests, and the dispatch
+ * advisor's calibration once there is any. Deterministic,
  * from the report alone; numbers are written without a locale.
  */
 import { drawFigureText } from '@tsuuanmi/system-libs'
+import { renderMetrics } from './metrics.ts'
 import type { Report } from './report.ts'
 
 /** A whole number with thousands separated by commas, whatever the host's locale. */
@@ -75,13 +77,13 @@ export function renderReport(report: Report): string {
     lines.push(`- Charter allows ${allowed} a day: ${at.daysOver ? `over it on ${plural(at.daysOver, 'day')} (${at.days.filter((d) => d.over).map((d) => d.date).join(', ')})` : 'never over it'}.`)
   }
   if (at.reviewsHeld) {
-    // When each expires unseen, as of the report: unanswered, its task waits for input, which nothing revives.
+    // When each expires unseen, as of the report: unanswered, its task waits for input, which only a re-opening revives.
     const asOf = Date.parse(report.asOf)
     const held = at.reviewsHeld.map((r) => {
       const left = Math.round((Date.parse(r.expiresAt) - asOf) / 1000)
       return `${r.taskId} "${r.title}" (${left > 0 ? `expires in ${duration(left)}` : 'expired'}, at ${r.expiresAt}${r.pendingChecks.length ? `; ${r.pendingChecks.join(', ')} not run` : ''})`
     })
-    lines.push(`- Reviews held for you now: ${held.join(', ')}${at.reviewsHeldOmitted ? ` and ${whole(at.reviewsHeldOmitted)} more` : ''}. Accept or Reject each on /ui before it expires: unanswered, its task waits for input, which nothing revives.`)
+    lines.push(`- Reviews held for you now: ${held.join(', ')}${at.reviewsHeldOmitted ? ` and ${whole(at.reviewsHeldOmitted)} more` : ''}. Accept or Reject each on /ui before it expires: unanswered, its task waits for input, which only a re-opening revives (board_reopen_review).`)
   }
   if (at.liveness) {
     const l = at.liveness
@@ -126,6 +128,18 @@ export function renderReport(report: Report): string {
 
   const d = report.digests
   lines.push('', '## Digests', '', `- ${whole(d.attached)} attached, ${whole(d.bypassed)} bypassed${d.claimsKept !== undefined ? `; claims kept ${whole(d.claimsKept)}, dropped ${whole(d.claimsDropped!)}; ${plural(d.escalated!, 'escalation')}` : ''}.`)
+
+  if (report.advice) {
+    // The advisor in shadow (PROP-0015 J1): it changed no choice; this says how well calibrated it was.
+    const v = report.advice
+    lines.push('', '## Dispatch advice (shadow)', '',
+      `- Choices advised: ${whole(v.advised)}; no advice: ${whole(v.unavailable)}. Outcomes recorded: ${whole(v.outcomes)}, ${whole(v.scored)} of them advised (the shadow period runs for ${whole(v.shadowAttempts)}).`)
+    for (const q of v.questions) lines.push(`- ${q.question}: Brier ${q.brier} over ${plural(q.scored, 'attempt')} (always answering the rate ${q.rate}: ${q.baseline}; lower is better).`)
+    if (!v.questions.length) lines.push('- No advised attempt has an outcome yet: nothing to score.')
+  }
+
+  // The maturity metrics and the L3 reading (PROP-0016 I4): their own rolling 30 days, to the period's end.
+  if (report.maturity) lines.push('', ...renderMetrics(report.maturity, '##'))
 
   if (report.notes.length) lines.push('', '## Not counted', '', ...report.notes.map((n) => `- ${n}`))
   return `${lines.join('\n')}\n`

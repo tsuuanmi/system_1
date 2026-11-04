@@ -3,7 +3,7 @@
  * steps appended after it; steps that need approval wait behind a gate bound to the exact plan
  * (INV-5), opened or closed by the operator (`approve` in `operator.ts`) or by policy.
  */
-import type { Lease } from '@tsuuanmi/system-leases'
+import type { Lease } from '@tsuuanmi/system-board-core'
 import { canonicalJson, sha256 } from '@tsuuanmi/system-libs'
 import type { ArtifactRef, Tier } from '@tsuuanmi/system-workers-core'
 import type { Engine } from './engine.ts'
@@ -28,7 +28,8 @@ export function grow(e: Engine, run: RunRow, planner: NodeRow, spec: ResolvedNod
   const classification = run.classification ?? e.ctx.egress.defaultClassification
   // A planner that plans again (re-planning) supersedes its previous plan (REQ-ART-2): the new plan
   // is a new artifact, so an approval of the old one can never open the new gate (INV-5).
-  const previous = e.ctx.artifacts.list({ kind: 'plan', runId: run.run_id, nodeId: planner.node_id, limit: 1000 }).at(-1)?.id
+  // A plan of the graph's, never a task dossier's `plan` entry its step appended (ADR-0070).
+  const previous = e.ctx.artifacts.list({ kind: 'plan', runId: run.run_id, nodeId: planner.node_id, limit: 1000 }).filter((a) => a.bodySchema === 'plan@1.0').at(-1)?.id
   const plan = parsed.ok
     ? e.ctx.artifacts.put({
       kind: 'plan', bodySchema: 'plan@1.0',

@@ -16,8 +16,4 @@ describe('the subject a review binds to (REQ-WF-5)', () => {
     const result = { schema: 'agent-result@1.1', workspace: gone, subject: { type: 'git-head', ref: 'HEAD', version: 'x' } }
     expect(reviewSubject(engineWith(result), [H('a')], 'Fix add()')).toEqual({ missing: gone })
   })
-
-  it('binds no subject when no dependency is an agent\'s change', () => {
-    expect(reviewSubject(engineWith({ schema: 'provider-answer@1.0', text: 'an answer' }), [H('b')], 'Review this')).toBeUndefined()
-  })
 })

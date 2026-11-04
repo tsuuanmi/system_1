@@ -6,17 +6,19 @@
  * @module @tsuuanmi/system-agent-runtime-core
  */
 import { execFile } from 'node:child_process'
-import { chmodSync, closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { accessSync, chmodSync, closeSync, constants, type Dirent, fstatSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { createHash, createHmac, randomBytes } from 'node:crypto'
-import { isAbsolute, join, relative, sep } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { type Context, Service } from '@deepseek-ai/cordis'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import type { WorkspaceReadBounds } from './workspace-reads.ts'
 
 export {
-  SECRET_NAMES, WORKSPACE_READS_PROTOCOLS, WORKSPACE_READS_SCRIPT, WORKSPACE_READS_SERVER, WORKSPACE_READ_BOUNDS, WORKSPACE_READ_TOOLS, type WorkspaceReadBounds, WorkspaceReads,
-  answerMessage, parseWorkspaceReadArgs, serveWorkspaceReads, workspaceReadArgs, workspaceReadBounds, workspaceReadBoundsProblem, workspaceReadTools,
+  COMMIT_ID, GIT_CONFIG_PINS, GIT_LOG_FIELDS, WORKSPACE_GIT_TOOLS, gitArgv, gitEnvironment,
+  SECRET_LIKE, SECRET_NAMES, SECRET_PATHS, WORKSPACE_READS_PROTOCOLS, WORKSPACE_READS_SCRIPT, WORKSPACE_READS_SERVER, WORKSPACE_READ_BOUNDS, WORKSPACE_READ_TOOLS, type WorkspaceReadBounds,
+  WorkspaceReads, answerMessage, parseWorkspaceReadArgs, searchResourceLimits, serveWorkspaceReads, workspaceReadArgs, workspaceReadBounds, workspaceReadBoundsProblem,
 } from './workspace-reads.ts'
 
 declare module '@deepseek-ai/cordis' {
@@ -56,7 +58,8 @@ export interface RuntimeEvidence {
    * non-login, non-interactive shell that reads no startup file and no startup variable (`bash
    * --norc --noprofile` with no `BASH_ENV` or `ENV`), the shell a trusted program the agent cannot
    * choose or change (T198). Every runtime here enforces that no startup code its agent wrote ever
-   * runs: its shells' `HOME` is an empty private directory bound back read-only ({@link agentHome}),
+   * runs: its shells' `HOME` is a private directory with no file bound back read-only, only its
+   * tool-state directories writable and fish's startup directories in them read-only ({@link agentHome}),
    * their environment names no startup variable or file ({@link agentShellEnvironment}), and nothing
    * its agent runs can write where its shells read startup code. That is not this field, which also
    * needs the shell program pinned. Absent or false: a gate never takes a shell command for a read,
@@ -66,19 +69,217 @@ export interface RuntimeEvidence {
    */
   cleanShells?: boolean
   /**
+   * Every Bash call of a `workspace-write` run is confined by the runtime's own sandbox, proven on
+   * this host now together with {@link readsConfined}: writes to the worktree only, no network, and
+   * no command ever runs outside it (`allowUnsandboxedCommands: false`). Only then may the autonomy
+   * policy's sandboxed-command rule (ADR-0080) apply to a run. Absent or false: it never does (a
+   * Codex Worker keeps `approvalPolicy: never` inside its own sandbox, and is unchanged).
+   */
+  sandboxedCommands?: boolean
+  /**
    * It gives every run's agent the workspace reads server ({@link WORKSPACE_READS_SCRIPT}, T200b),
    * started under the run's read confinement with the workspace bound read-only, proven to start on
-   * this host now: its three read-only tools (`read_file`, `list_dir`, `search`) reach the agent as
+   * this host now: its read-only tools (`read_file`, `list_dir`, `search`, and the git views
+   * `git_log`, `git_show`, `git_diff`, `git_status`, T223) reach the agent as
    * MCP tools of the server {@link WORKSPACE_READS_SERVER}, so it reads without a shell. Absent or
    * false: it offers none (Claude Code keeps its own Read, Grep, and Glob).
    */
   workspaceReads?: boolean
+  /**
+   * The reading tools of its own its agent has on a run whose `tools` list names them, or names
+   * none (Claude Code: `Read`, `Grep`, `Glob`). Where the agent has the reading tool for a shell
+   * inspection command (`cat` and `Read`, `grep` and `Grep`, `ls` and `Glob`, …), a run's gate denies
+   * that command at once, naming the tool, instead of asking the operator about it (T222). The
+   * workspace reads server's tools are {@link workspaceReads}, never listed here. Absent or empty:
+   * none.
+   */
+  readTools?: string[]
   /**
    * It runs in the home a run or probe names ({@link RunSpec.home}, {@link ProbeOptions.home}), one
    * account's own sign-in, binding back only that home (ADR-0051). Absent or false: it runs in its
    * own configured home only, and refuses a run that names another.
    */
   homes?: boolean
+  /**
+   * It gives a run's agent the run's host tools ({@link RunSpec.hostTools}, ADR-0070) as MCP tools of
+   * the server {@link HOST_TOOLS_SERVER}, each call answered in System's own process by the tool its
+   * Worker source bound to that run, and passed to the run's gate first like any other call. Absent
+   * or false: it offers none, and a source gives it none.
+   */
+  hostTools?: boolean
+  /**
+   * A `read-only` run that names {@link RunSpec.web} may list the runtime's web tools ({@link WEB_RUN_TOOLS},
+   * `WebSearch` and `WebFetch`) among its `tools`, each call passing the run's gate first like any
+   * other (T262, ADR-0074: a research role). Absent or false: it offers none, and refuses a run that
+   * names `web`.
+   */
+  webTools?: boolean
+}
+
+/**
+ * The web tools a research role's run may list (T262): the two calls that send a query or a URL out
+ * of this machine. A runtime that reports {@link RuntimeEvidence.webTools} offers them on a
+ * `read-only` run that names {@link RunSpec.web}, never otherwise.
+ */
+export const WEB_RUN_TOOLS: readonly string[] = ['WebSearch', 'WebFetch']
+
+/** The name a runtime gives the server of a run's host tools: an MCP client names its tools `mcp__system__<name>`. */
+export const HOST_TOOLS_SERVER = 'system'
+
+/** A host tool's name: lowercase letters, digits, and `_`, starting with a letter, at most 64 characters. */
+const HOST_TOOL_NAME =/^[a-z][a-z0-9_]{0,63}$/
+
+/** One argument of a host tool, in the closed subset of JSON Schema a runtime must render exactly. */
+export type HostToolProperty =
+  | { type: 'string'; description?: string; minLength?: number; maxLength?: number; enum?: string[] }
+  | { type: 'integer'; description?: string; minimum?: number; maximum?: number }
+  | { type: 'array'; description?: string; maxItems?: number; items: { type: 'string'; maxLength?: number } }
+
+/** A host tool's input: an object of named arguments and no other. */
+export interface HostToolSchema {
+  type: 'object'
+  additionalProperties: false
+  properties: Record<string, HostToolProperty>
+  required?: string[]
+}
+
+/**
+ * A tool a Worker source gives one run's agent (ADR-0070), answered in System's own process: the
+ * source binds it to that run when it builds the run (its workflow run, step, and execution, from
+ * its own record, never from the agent's input), so the agent names only what the tool takes. A
+ * runtime that reports {@link RuntimeEvidence.hostTools} offers each as `mcp__system__<name>`,
+ * validating the input against `inputSchema` before `call` sees it; every call passes the run's gate
+ * first. `call` never throws for a refusal: it answers `isError` with why.
+ */
+export interface HostTool {
+  /** {@link HOST_TOOL_NAME}. */
+  name: string
+  description: string
+  inputSchema: HostToolSchema
+  /** It changes nothing (MCP `readOnlyHint`). */
+  readOnly: boolean
+  call(input: Record<string, unknown>): Promise<{ text: string; isError: boolean }>
+}
+
+/** Why `tools` are not host tools a runtime can offer (a bad or repeated name, a schema outside the subset), or undefined. */
+export function hostToolsProblem(tools: readonly HostTool[]): string | undefined {
+  const seen = new Set<string>()
+  for (const tool of tools) {
+    if (typeof tool?.name !== 'string' || !HOST_TOOL_NAME.test(tool.name)) return `${JSON.stringify(String(tool?.name).slice(0, 80))} is not a host tool name`
+    if (seen.has(tool.name)) return `the host tool ${tool.name} is given twice`
+    seen.add(tool.name)
+    const schema = tool.inputSchema
+    if (schema?.type !== 'object' || schema.additionalProperties !== false || typeof schema.properties !== 'object') return `the host tool ${tool.name}'s input is not a closed object`
+    for (const [name, property] of Object.entries(schema.properties)) {
+      const ok = property?.type === 'string' || property?.type === 'integer' || (property?.type === 'array' && property.items?.type === 'string')
+      if (!ok) return `the host tool ${tool.name}'s argument ${name} is not a string, an integer, or a list of strings`
+    }
+    if (schema.required?.some((name) => !Object.hasOwn(schema.properties, name))) return `the host tool ${tool.name} requires an argument it does not name`
+  }
+  return undefined
+}
+
+/** Why `input` does not meet a host tool's schema (not an object, an argument it does not name, one of another type or out of its bounds, a required one missing), or undefined. */
+function hostToolInputProblem(schema: HostToolSchema, input: unknown): string | undefined {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) return 'the arguments are not an object'
+  const chars = (text: string): number => [...text].length
+  for (const [name, value] of Object.entries(input)) {
+    const p = Object.hasOwn(schema.properties, name) ? schema.properties[name] : undefined
+    if (!p) return `${JSON.stringify(name.slice(0, 64))} is not an argument of this tool (${Object.keys(schema.properties).join(', ')})`
+    if (p.type === 'string') {
+      if (typeof value !== 'string') return `${name} is not a string`
+      if ((p.minLength !== undefined && chars(value) < p.minLength) || (p.maxLength !== undefined && chars(value) > p.maxLength)) return `${name} holds ${chars(value)} characters, not ${p.minLength ?? 0} to ${p.maxLength ?? 'any'}`
+      if (p.enum && !p.enum.includes(value)) return `${name} is none of ${p.enum.join(', ')}`
+    } else if (p.type === 'integer') {
+      if (!Number.isSafeInteger(value)) return `${name} is not an integer`
+      if ((p.minimum !== undefined && (value as number) < p.minimum) || (p.maximum !== undefined && (value as number) > p.maximum)) return `${name} is not from ${p.minimum ?? 'any'} to ${p.maximum ?? 'any'}`
+    } else {
+      if (!Array.isArray(value) || !value.every((v) => typeof v === 'string')) return `${name} is not a list of strings`
+      if (p.maxItems !== undefined && value.length > p.maxItems) return `${name} holds more than ${p.maxItems} items`
+      const max = p.items.maxLength
+      if (max !== undefined && value.some((v: string) => chars(v) > max)) return `an item of ${name} is longer than ${max} characters`
+    }
+  }
+  const missing = schema.required?.find((name) => (input as Record<string, unknown>)[name] === undefined)
+  return missing ? `${missing} is required` : undefined
+}
+
+/** The transport an in-process MCP server is connected over (the MCP SDK's `Transport`, as far as it is used here). */
+export interface HostToolsTransport {
+  onmessage?: ((message: unknown) => void) | undefined
+  send(message: unknown): Promise<void>
+  start?(): Promise<void>
+  close?(): Promise<void>
+}
+
+/** The MCP protocol versions the host tools server answers in; the first is its own. */
+const HOST_TOOLS_PROTOCOLS: readonly string[] = ['2025-06-18', '2025-03-26', '2024-11-05']
+
+/**
+ * A minimal MCP server over a run's host tools ({@link HostTool}), for a runtime that hosts an MCP
+ * server in its own process (the Claude Agent SDK's `sdk` servers take any object with
+ * `connect(transport)`). It answers `initialize`, `ping`, `tools/list` (each tool's name,
+ * description, schema, and read-only hint), and `tools/call`: the input checked against the tool's
+ * schema ({@link hostToolInputProblem}; refused as the call's error result, `call` never reached),
+ * then the tool's own answer, a tool that throws answered as an error result. Any other method is
+ * not found; a notification is not answered. Its tools are fixed when it is made.
+ */
+export function hostToolsServer(tools: readonly HostTool[]): { connect(transport: HostToolsTransport): Promise<void>; close(): Promise<void>; answer(message: unknown): Promise<Record<string, unknown> | undefined> } {
+  const problem = hostToolsProblem(tools)
+  if (problem) throw new Error(problem)
+  const byName = new Map(tools.map((tool) => [tool.name, tool]))
+  const answer = async (message: unknown): Promise<Record<string, unknown> | undefined> => {
+    const m = typeof message === 'object' && message !== null && !Array.isArray(message) ? message as Record<string, unknown> : {}
+    const id = typeof m.id === 'string' || (typeof m.id === 'number' && Number.isFinite(m.id)) ? m.id : undefined
+    if (typeof m.method !== 'string' || id === undefined) return undefined
+    const params = typeof m.params === 'object' && m.params !== null ? m.params as Record<string, unknown> : {}
+    const result = (value: unknown): Record<string, unknown> => ({ jsonrpc: '2.0', id, result: value })
+    switch (m.method) {
+      case 'initialize': {
+        const asked = params.protocolVersion
+        return result({
+          protocolVersion: typeof asked === 'string' && HOST_TOOLS_PROTOCOLS.includes(asked) ? asked : HOST_TOOLS_PROTOCOLS[0],
+          capabilities: { tools: { listChanged: false } }, serverInfo: { name: `system-${HOST_TOOLS_SERVER}`, version: '1.0.0' },
+        })
+      }
+      case 'ping':
+        return result({})
+      case 'tools/list':
+        return result({ tools: tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema, annotations: { readOnlyHint: t.readOnly, destructiveHint: false, idempotentHint: t.readOnly, openWorldHint: false } })) })
+      case 'tools/call': {
+        const tool = typeof params.name === 'string' ? byName.get(params.name) : undefined
+        const reply = (text: string, isError: boolean): Record<string, unknown> => result({ content: [{ type: 'text', text }], isError })
+        if (!tool) return reply(`refused: ${String(params.name).slice(0, 100)} is not a tool of this server (${[...byName.keys()].join(', ')})`, true)
+        const input = params.arguments === undefined ? {} : params.arguments
+        const wrong = hostToolInputProblem(tool.inputSchema, input)
+        if (wrong) return reply(`refused: ${wrong}`, true)
+        try {
+          const { text, isError } = await tool.call(input as Record<string, unknown>)
+          return reply(text, isError)
+        } catch (error) {
+          return reply(`failed: ${(error as Error)?.message?.slice(0, 500) ?? String(error)}`, true)
+        }
+      }
+      default:
+        return { jsonrpc: '2.0', id, error: { code: -32601, message: `${m.method.slice(0, 100)} is not a method of this server` } }
+    }
+  }
+  let connected: HostToolsTransport | undefined
+  return {
+    answer,
+    async connect(transport) {
+      connected = transport
+      transport.onmessage = (message) => {
+        void answer(message).then((reply) => (reply ? transport.send(reply) : undefined)).catch(() => undefined)
+      }
+      await transport.start?.()
+    },
+    async close() {
+      const transport = connected
+      connected = undefined
+      await transport?.close?.()
+    },
+  }
 }
 
 /** What a probe is asked about (ADR-0051). */
@@ -159,6 +360,43 @@ export type ToolVerdict =
  */
 export type ToolGate = (call: ToolCall, signal: AbortSignal) => Promise<ToolVerdict>
 
+/**
+ * What a tool call came to, as its runtime reports it (T284): the call, whether the tool reported an
+ * error (Claude Code's `PostToolUseFailure`: its shell tool prints no exit code, so a failing
+ * command is the error flag), the exit code where the runtime reports one (Codex's command items)
+ * or the tool's own error text names one (`Exit code 2`), and a bounded tail of its output
+ * ({@link RESULT_TAIL_CHARS}). Only what the runtime reports: never a guess.
+ */
+export interface ToolResult {
+  tool: string
+  input: unknown
+  callId?: string | undefined
+  /** The tool reported an error (a command that exited non-zero, was interrupted, or was refused). */
+  isError: boolean
+  exitCode?: number | undefined
+  /**
+   * The runtime reported no end of the command (T284): a background launch (it answers once the
+   * command starts), a command interrupted or still running when the tool answered. Such a result
+   * never carries an exit code, and is never taken for a command that ran to its end.
+   */
+  unfinished?: boolean | undefined
+  /** The last {@link RESULT_TAIL_CHARS} characters of the output. */
+  tail: string
+}
+
+/** The characters of a tool result's output a runtime reports: its tail (INV-9). */
+export const RESULT_TAIL_CHARS = 1000
+
+/** The tail of `output` a {@link ToolResult} carries. */
+export function tailOf(output: unknown): string {
+  const text = typeof output === 'string' ? output : output === undefined || output === null ? '' : JSON.stringify(output)
+  const trimmed = text.trimEnd()
+  return trimmed.length > RESULT_TAIL_CHARS ? `…${trimmed.slice(-(RESULT_TAIL_CHARS - 1))}` : trimmed
+}
+
+/** A run's observer of its tool calls' results: never a gate (the call has run), and a failure of it never fails the run. */
+export type ToolResultSink = (result: ToolResult) => void
+
 /** How long a gate may take over one tool call by default (30 s); past it the call is denied. */
 export const TOOL_GATE_MS = 30_000
 
@@ -212,6 +450,8 @@ export interface RunSpec {
   resume?: string | undefined
   /** Asked before every tool call the agent makes ({@link ToolGate}). */
   toolGate?: ToolGate | undefined
+  /** Told what each tool call came to, once it ran (T284), by a runtime that can observe it; ignored by one that cannot. */
+  onToolResult?: ToolResultSink | undefined
   /**
    * The home the agent runs in (an absolute path): one account's own sign-in, the only home its
    * confinement binds back (ADR-0051). Absent: the provider's own configured home. A provider that
@@ -226,6 +466,288 @@ export interface RunSpec {
    * has nothing they bound.
    */
   workspaceReads?: Partial<WorkspaceReadBounds> | undefined
+  /**
+   * Tools bound to this run by its Worker source ({@link HostTool}, ADR-0070), for a runtime that
+   * reports {@link RuntimeEvidence.hostTools}; a source gives none to any other. Such a runtime
+   * refuses tools {@link hostToolsProblem} finds a problem in (`config_error`), before running anything.
+   */
+  hostTools?: HostTool[] | undefined
+  /**
+   * A research role's run (T262, ADR-0074): with a `read-only` sandbox only, its `tools` may list
+   * the web tools ({@link WEB_RUN_TOOLS}) beside the reading ones, and no other. A runtime that does
+   * not report {@link RuntimeEvidence.webTools} refuses it (`config_error`), before running anything;
+   * so does one asked for it with any other sandbox.
+   */
+  web?: boolean | undefined
+  /**
+   * The run's report file (an absolute path to an empty, owner-only file its Worker source made
+   * outside the workspace, T265): a `workspace-write` run's commands see it writable, named in
+   * {@link RUN_REPORT_VARIABLE}, so a test run its agent starts says there what it did not run (its
+   * browser tests: `browser-tests-not-run: <why>`), as a check's command does. The source reads it
+   * once the run ended. A `read-only` run, which runs no command, ignores it.
+   */
+  reportFile?: string | undefined
+  /**
+   * The test workers a writing run's own test runs may use (T348, {@link TEST_WORKERS_VARIABLE}): its
+   * share of the host. A `read-only` run, which runs no command, ignores it.
+   */
+  testWorkers?: number | undefined
+}
+
+/**
+ * The variable that names a command's report file, where a test run says what it did not run
+ * (`browser-tests-not-run: <why>`, scripts/browser-skips.ts): a check's report file (agent-workers),
+ * and a writing run's ({@link RunSpec.reportFile}, T265).
+ */
+export const RUN_REPORT_VARIABLE = 'SYSTEM_CHECK_REPORT_PATH'
+
+/**
+ * The variable that names, inside a confinement, where the managed Chrome is bound back read-only
+ * (`$DSH_HOME/system/browsers`, a path and nothing secret, T247).
+ */
+export const BROWSERS_DIR_VARIABLE = 'SYSTEM_BROWSERS_DIR'
+
+/**
+ * The shared memory directory Chrome writes. The read confinement hides the host's behind a fresh
+ * tmpfs of the child's own (empty, private, writable): a Worker's command sandbox gives it back
+ * writable, or a headless Chrome cannot start in a Worker's own tool call (T265).
+ */
+export const SHARED_MEMORY = '/dev/shm'
+
+/**
+ * What a writing run's own command sandbox (the runtime's second layer: Claude Code's sandbox,
+ * Codex's) gives its commands beyond the workspace, so a browser test runs in a Worker's own tool
+ * call as in a check's confinement (T247, T265): the managed Chrome readable (`read`: the directory
+ * the read confinement binds back read-only and names in {@link BROWSERS_DIR_VARIABLE}), and the
+ * confinement's private {@link SHARED_MEMORY} and the run's report file writable (`write`). Fonts
+ * and the rest of the host stay readable as the confinement shows them; vite's scratch
+ * (`node_modules/.vite`, `.vite-temp`) lies in the workspace, writable already. Nothing it names is
+ * a secret or a hidden path.
+ */
+export function toolSandboxAllowances(confinement: Confinement, reportFile?: string): { read: string[]; write: string[] } {
+  const browsers = confinement.env?.[BROWSERS_DIR_VARIABLE]
+  return {
+    read: browsers && isAbsolute(browsers) ? [browsers] : [],
+    write: [SHARED_MEMORY, ...(reportFile !== undefined ? [reportFile] : [])],
+  }
+}
+
+/**
+ * The confinement of a writing run with its report file (T265): the file bound back writable at its
+ * own path and named in {@link RUN_REPORT_VARIABLE}; `confinement` itself when the run has none.
+ * Throws when the file is not an absolute path to a regular file.
+ */
+export function withRunReport(confinement: Confinement, reportFile: string | undefined): Confinement {
+  if (reportFile === undefined) return confinement
+  if (!isAbsolute(reportFile) || !lstatSync(reportFile, { throwIfNoEntry: false })?.isFile()) throw new Error(`the run's report file ${reportFile} is not an absolute path to a regular file`)
+  return { ...confinement, writable: [...confinement.writable, reportFile], env: { ...confinement.env, [RUN_REPORT_VARIABLE]: reportFile } }
+}
+
+/** The variable that names a writing run's test-worker budget to its commands; the repository's vitest config reads it (T348). */
+export const TEST_WORKERS_VARIABLE = 'SYSTEM_TEST_MAX_WORKERS'
+
+/**
+ * The confinement of a writing run with its test-worker budget (T348), named in {@link TEST_WORKERS_VARIABLE}:
+ * the test runs its agent starts share the host with the runs beside it. `confinement` itself when the run has none.
+ * Throws when the budget is not a positive integer.
+ */
+export function withTestWorkers(confinement: Confinement, workers: number | undefined): Confinement {
+  if (workers === undefined) return confinement
+  if (!Number.isInteger(workers) || workers < 1) throw new Error(`the run's test-worker budget ${workers} is not a positive integer`)
+  return { ...confinement, env: { ...confinement.env, [TEST_WORKERS_VARIABLE]: String(workers) } }
+}
+
+/**
+ * Where {@link writableUnixSockets} looks on disk, and how deep: the system's runtime directories
+ * (where daemons' sockets live: a container engine's, the system bus, snapd), the account's home two
+ * levels down, and, deeper, where container engines run for the account itself (Docker Desktop's
+ * `~/.docker/desktop` and `~/.docker/run`, Podman machines under `~/.local/share/containers`, Colima,
+ * Lima, Rancher Desktop). Every socket a process of the host has bound is found besides, wherever it
+ * lies ({@link BOUND_UNIX_SOCKETS}). The temporary directories, the session's runtime directory, and
+ * the DSH home are hidden from every agent already.
+ */
+export const SOCKET_ROOTS: ReadonlyArray<{ path: string; depth: number }> = [
+  { path: '/run', depth: 4 }, { path: '/var/run', depth: 4 }, { path: homedir(), depth: 2 },
+  { path: join(homedir(), '.docker'), depth: 4 }, { path: join(homedir(), '.local', 'share', 'containers'), depth: 8 },
+  { path: join(homedir(), '.colima'), depth: 4 }, { path: join(homedir(), '.lima'), depth: 4 }, { path: join(homedir(), '.rd'), depth: 4 },
+]
+
+/**
+ * The kernel's list of the unix sockets bound in this network namespace, the host's for the daemon:
+ * every socket a process of the host listens on, by the path it was bound to, at whatever depth.
+ */
+export const BOUND_UNIX_SOCKETS = '/proc/net/unix'
+
+/**
+ * The directories where the host's daemons make their unix sockets, by their real paths: the
+ * {@link SOCKET_ROOTS} but the account's home itself (the system's runtime directories, and the
+ * container engines' own directories in the home). A writing run whose commands may make unix sockets
+ * has every one of these covered for the whole run (T265): a socket a daemon makes there after the run
+ * started (dockerd starting, making `/run/docker.sock`; Docker Desktop starting for the first time,
+ * making `~/.docker/desktop/docker.sock`) is no more reachable than the ones there when it started; a
+ * mask of a socket is only a snapshot. A directory can be covered only if it exists when the run
+ * starts, so one in the home that does not is made now, empty and owner-only (the engine that would
+ * make it later finds it there and uses it); one outside the home that does not exist is left (only a
+ * process with the right to make it in `/` could, which a covered `/run` keeps no socket of anyway).
+ * `complete` is false when one in the home could not be made: its later socket could not be covered,
+ * so the run's commands make no unix socket. The sockets that exist elsewhere when the run starts are
+ * masked ({@link writableUnixSockets}).
+ */
+export function socketDirectories(roots: ReadonlyArray<{ path: string; depth: number }> = SOCKET_ROOTS, home: string = homedir()): { directories: string[]; complete: boolean } {
+  const own = real(home) ?? home
+  let complete = true
+  const directories = new Set<string>()
+  for (const root of roots) {
+    let path = real(root.path)
+    const inHome = under(resolve(root.path), resolve(home)) || (path !== undefined && under(path, own))
+    if (!path && inHome) {
+      try {
+        mkdirSync(root.path, { recursive: true, mode: 0o700 })
+        path = real(root.path)
+      } catch {
+        complete = false
+      }
+    }
+    if (!path || path === own) continue
+    if (!statSync(path).isDirectory()) {
+      complete = false
+      continue
+    }
+    directories.add(path)
+  }
+  return { directories: [...directories], complete }
+}
+
+/**
+ * Of `directories` ({@link socketDirectories}), those in the account's home, which a writing run's own
+ * confinement hides besides (its agent never needs a container engine's directory); the system's
+ * runtime directories stay seen there, where the agent itself reads `/run` (its DNS), and are denied
+ * to its commands by its command sandbox.
+ */
+export function homeSocketDirectories(directories: readonly string[], home: string = homedir()): string[] {
+  const own = real(home) ?? home
+  return directories.filter((path) => under(path, own))
+}
+
+/**
+ * How deep {@link writableUnixSockets} scans on disk a path bound back from under a hidden one (a
+ * run's worktree, an agent's home): a live socket there at any depth is in the kernel's list anyway.
+ */
+const BOUND_SCAN_DEPTH = 4
+
+/** The most directory entries {@link writableUnixSockets} reads before it gives up. */
+const SOCKET_SCAN_ENTRIES = 50_000
+
+/**
+ * The paths of the unix sockets named in `listing` ({@link BOUND_UNIX_SOCKETS}' text): each line's
+ * last field when it is an absolute path (an abstract socket, `@…`, has no path; a network namespace
+ * of the agent's own, which its sandbox has, holds none of the host's).
+ */
+export function boundUnixSockets(listing: string): string[] {
+  const paths = new Set<string>()
+  for (const line of listing.split('\n').slice(1)) {
+    const path = /^\s*\S+:\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+ (\/.*)$/.exec(line)?.[1]
+    if (path) paths.add(path)
+  }
+  return [...paths]
+}
+
+/**
+ * The unix sockets this account can connect to (it may write them) that a confined child sees, each
+ * by its real path: every one the host has bound ({@link BOUND_UNIX_SOCKETS}, read by `bound`), whose
+ * path is a socket now, and every one on disk under `roots`. What the child sees is the confinement's
+ * own view: a path under `skip` (the paths it hides) is left only when no path of `rebound` (the
+ * paths it binds back, read-only or writable) that lies inside that hidden one holds it, since a
+ * bind brings back what lies under it, a socket too (the runs' worktrees and the agents' homes lie
+ * under the hidden DSH home and are bound back); each such bound-back path is scanned on disk as a
+ * root of its own. `complete` is false when either may have missed one: the kernel's list cannot be
+ * read, or the scan reached its bound ({@link SOCKET_SCAN_ENTRIES}). A writing run whose commands may
+ * make unix sockets (Chrome needs them) has these masked in its confinement (T265,
+ * {@link Confinement.masks}), under paths it binds back too (a read-only mount does not stop a
+ * connect): its commands then reach no daemon of the host through one, as they reach none through
+ * the network. Links are never followed on disk; a directory it cannot read is passed over.
+ */
+export function writableUnixSockets(roots: ReadonlyArray<{ path: string; depth: number }> = SOCKET_ROOTS, skip: readonly string[] = [], bound: () => string = () => readFileSync(BOUND_UNIX_SOCKETS, 'utf8'), rebound: readonly string[] = []): { sockets: string[]; complete: boolean } {
+  const skipped = skip.map((path) => real(path) ?? path)
+  const binds = rebound.map((path) => real(path) ?? path)
+  const within = (path: string, root: string): boolean => path === root || under(path, root)
+  // Hidden: under a hidden path, and under no bind inside that hidden path, which would bring it back.
+  const hidden = (path: string): boolean => skipped.some((s) => within(path, s) && !binds.some((b) => within(path, b) && under(b, s)))
+  const sockets = new Set<string>()
+  const seen = new Set<string>()
+  let entries = 0
+  const writable = (path: string): boolean => {
+    try {
+      accessSync(path, constants.W_OK)
+      return true
+    } catch {
+      return false
+    }
+  }
+  let listing: string
+  try {
+    listing = bound()
+  } catch {
+    return { sockets: [], complete: false }
+  }
+  for (const path of boundUnixSockets(listing)) {
+    const at = real(path)
+    if (!at || hidden(at) || !lstatSync(at, { throwIfNoEntry: false })?.isSocket()) continue
+    if (writable(at)) sockets.add(at)
+  }
+  const walk = (dir: string, depth: number): boolean => {
+    let listed: Dirent[]
+    try {
+      listed = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return true
+    }
+    for (const entry of listed) {
+      if (++entries > SOCKET_SCAN_ENTRIES) return false
+      const path = join(dir, entry.name)
+      if (hidden(path)) continue
+      if (entry.isSocket()) {
+        if (writable(path)) sockets.add(path)
+      } else if (entry.isDirectory() && depth > 1 && entry.name !== 'node_modules' && entry.name !== '.git') {
+        if (!walk(path, depth - 1)) return false
+      }
+    }
+    return true
+  }
+  // What a bind brings back from under a hidden path is scanned on disk as a root of its own (a
+  // scan from `roots` passes over the hidden path it lies in).
+  const brought = binds.filter((b) => skipped.some((s) => under(b, s))).map((path) => ({ path, depth: BOUND_SCAN_DEPTH }))
+  for (const root of [...roots, ...brought]) {
+    const path = real(root.path)
+    if (!path || seen.has(path) || hidden(path)) continue
+    seen.add(path)
+    if (!walk(path, root.depth)) return { sockets: [...sockets].sort(), complete: false }
+  }
+  return { sockets: [...sockets].sort(), complete: true }
+}
+
+/**
+ * The directories to hide in a confinement instead of masking `sockets` one by one, where its
+ * bubblewrap cannot mount over a socket (bubblewrap 0.4 opens a mount point that is no regular file
+ * as one, and fails on a socket: `No such device or address`, T265): each socket's own directory, an
+ * empty tmpfs inside, what else it holds hidden with it. A socket under `denied` (the directories the
+ * run's commands are denied for the whole run, {@link socketDirectories}) needs none. `complete` is
+ * false when a socket's directory cannot be hidden without hiding what the run works in: `/`, the
+ * account's home or a directory above it, or one that is, lies under, or holds a path the confinement
+ * binds back (`binds`: the workspace, the run's homes and report file, the managed tools and Chrome).
+ */
+export function socketCovers(sockets: readonly string[], binds: readonly string[], denied: readonly string[] = [], home: string = homedir()): { directories: string[]; complete: boolean } {
+  const own = real(home) ?? home
+  const bound = binds.map((path) => real(path) ?? path)
+  const within = (path: string, root: string): boolean => path === root || under(path, root)
+  const directories = new Set<string>()
+  for (const socket of sockets) {
+    if (denied.some((dir) => within(socket, dir))) continue
+    const dir = resolve(socket, '..')
+    if (dir === sep || within(own, dir) || bound.some((b) => within(b, dir) || within(dir, b))) return { directories: [], complete: false }
+    directories.add(dir)
+  }
+  return { directories: [...directories].sort(), complete: true }
 }
 
 /**
@@ -352,6 +874,14 @@ export async function readLimits(provider: AgentRuntimeProvider, options: Limits
 export interface RunMetering {
   /** The runtime's own identity of the result the numbers come from (a deduplication key, opaque). */
   resultId?: string | undefined
+  /**
+   * Present when the numbers of this result are the running totals of a runtime session as of this
+   * result, not what this run alone consumed (a resumed Claude Agent SDK session reports its whole
+   * session so far): the session's id as the runtime names it. The ledger then counts the run's own
+   * spend, the difference from the session's latest result (`usage-record@1.2`, `sessionTotals`).
+   * Never on a `partial` report.
+   */
+  sessionTotals?: string | undefined
   /** The model the run's main loop answered with, as the runtime names it. */
   model?: string | undefined
   /** The whole run's usage, every model and subagent included. */
@@ -621,6 +1151,20 @@ export interface Confinement {
   readOnly: readonly string[]
   /** Paths under a hidden directory bound back writable (the child's own home, a writable workspace). */
   writable: readonly string[]
+  /**
+   * Non-secret values the child is given inside (bubblewrap `--setenv`), over any of its
+   * environment: where a path bound back lies when the variable that would name it is scrubbed
+   * (`SYSTEM_BROWSERS_DIR`, the managed Chrome under a custom `DSH_HOME`, T247). Never a secret,
+   * nor a variable a shell runs code from.
+   */
+  env?: Readonly<Record<string, string>>
+  /**
+   * Files covered by the null device after every other mount, wherever they lie, under a path bound
+   * back too (T265: the host's unix sockets a writing run's commands could connect to, which a
+   * read-only bind does not stop). One that does not exist, or that the child does not see (under a
+   * hidden path that no deeper bind brings back), is left; a directory is refused.
+   */
+  masks?: readonly string[]
 }
 
 const real = (path: string): string | undefined => {
@@ -653,6 +1197,10 @@ interface Plan {
   conflicts: string[]
   /** The host's `/tmp` (its real path), when no hidden directory already lies over it: a tmpfs is mounted there. */
   tmp?: string
+  /** The confinement's masks the child would otherwise see (real paths): each covered by the null device, last. */
+  masks: string[]
+  /** Masks that are directories: refused. */
+  maskProblems: string[]
 }
 
 function plan(confinement: Confinement): Plan {
@@ -676,7 +1224,17 @@ function plan(confinement: Confinement): Plan {
   const masked = [...hides.keys(), ...(host !== undefined && !covered ? [host] : [])]
   const conflicts = [...binds.keys()].flatMap((bind) => masked.filter((h) => h === bind || under(h, bind)).map((h) => `binding back ${bind} would expose ${h}`))
   const hidden = [...hides].filter(([path]) => ![...hides.keys()].some((other) => other !== path && under(path, other))).map(([path, dir]) => ({ path, dir }))
-  return { hidden, hides: masked, binds: [...binds].map(([path, writable]) => ({ path, writable })), absent, conflicts, ...(host !== undefined && !covered ? { tmp: host } : {}) }
+  // A mask the child would see: not under a hidden path (the private /tmp among them), unless a bind deeper than it brings it back.
+  const seen = (path: string): boolean => !masked.some((h) => (path === h || under(path, h)) && ![...binds.keys()].some((b) => (path === b || under(path, b)) && under(b, h)))
+  const masks: string[] = []
+  const maskProblems: string[] = []
+  for (const entry of confinement.masks ?? []) {
+    const path = real(entry)
+    if (!path || !seen(path) || masks.includes(path)) continue
+    if (statSync(path).isDirectory()) maskProblems.push(`the mask ${path} is a directory`)
+    else masks.push(path)
+  }
+  return { hidden, hides: masked, binds: [...binds].map(([path, writable]) => ({ path, writable })), absent, conflicts, ...(host !== undefined && !covered ? { tmp: host } : {}), masks, maskProblems }
 }
 
 /**
@@ -722,8 +1280,9 @@ export interface ConfinedCommandOptions {
  * of its environment. Throws when a bind or a view would re-expose a hidden path or the host's `/tmp`.
  */
 export function confinedCommand(command: string, args: readonly string[], confinement: Confinement, options: ConfinedCommandOptions = {}): { command: string; args: string[] } {
-  const { hidden, hides, binds, conflicts, tmp } = plan(confinement)
+  const { hidden, hides, binds, conflicts, tmp, masks, maskProblems } = plan(confinement)
   if (conflicts.length) throw new Error(`read confinement refused: ${conflicts[0]}`)
+  if (maskProblems.length) throw new Error(`read confinement refused: ${maskProblems[0]}`)
   const views = (options.views ?? []).map((view) => {
     const source = real(view.source)
     if (!source) throw new Error(`read confinement refused: the view source ${view.source} does not exist`)
@@ -733,6 +1292,10 @@ export function confinedCommand(command: string, args: readonly string[], confin
     return [view.writable ? '--bind' : '--ro-bind', source, view.path]
   })
   if (options.chdir !== undefined && !isAbsolute(options.chdir)) throw new Error(`read confinement refused: the start directory ${options.chdir} is not absolute`)
+  const values = Object.entries(confinement.env ?? {})
+  for (const [name] of values) {
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(name) || isShellStartupVariable(name) || ['TMPDIR', 'TMP', 'TEMP'].includes(name)) throw new Error(`read confinement refused: the confinement's value ${name} is not a name it may set`)
+  }
   const mounts = [
     ...(tmp !== undefined ? [{ path: tmp, args: ['--tmpfs', tmp] }] : []),
     ...hidden.filter((h) => h.dir || !options.nested).map((h) => ({ path: h.path, args: h.dir ? ['--tmpfs', h.path] : ['--ro-bind', '/dev/null', h.path] })),
@@ -741,7 +1304,11 @@ export function confinedCommand(command: string, args: readonly string[], confin
   const root = options.readOnly ? ['--ro-bind', '/', '/', '--dev', '/dev'] : ['--dev-bind', '/', '/']
   const argv = [
     '--die-with-parent', '--unshare-pid', ...(options.network === false ? ['--unshare-net'] : []), '--new-session', ...root, '--proc', '/proc',
-    ...mounts.flatMap((m) => m.args), ...views.flat(), ...(options.chdir !== undefined ? ['--chdir', options.chdir] : []),
+    ...mounts.flatMap((m) => m.args), ...views.flat(),
+    // Last, so no bind or view lies over one; a nested command's outer confinement masks them already.
+    ...(options.nested ? [] : masks.flatMap((path) => ['--ro-bind', '/dev/null', path])),
+    ...(options.chdir !== undefined ? ['--chdir', options.chdir] : []),
+    ...values.flatMap(([name, value]) => ['--setenv', name, value]),
     ...['TMPDIR', 'TMP', 'TEMP'].flatMap((name) => ['--setenv', name, PRIVATE_TMP]),
   ]
   return { command: confinement.bwrap, args: [...argv, '--', command, ...args] }
@@ -802,8 +1369,8 @@ const runCommand: RunCommand = async (command, args) => (await promisify(execFil
  * 3. Inside, every hidden file is the null device (character device 1:3), never the file.
  */
 export async function proveConfinement(confinement: Confinement, run: RunCommand = runCommand): Promise<{ confined: boolean; detail: string }> {
-  const { hidden, binds, absent, conflicts } = plan(confinement)
-  if (conflicts.length) return { confined: false, detail: `read confinement refused: ${conflicts[0]}` }
+  const { hidden, binds, absent, conflicts, masks, maskProblems } = plan(confinement)
+  if (conflicts.length || maskProblems.length) return { confined: false, detail: `read confinement refused: ${conflicts[0] ?? maskProblems[0]}` }
   const confined = (command: string, args: string[]) => {
     const c = confinedCommand(command, args, confinement)
     return run(c.command, c.args)
@@ -828,7 +1395,8 @@ export async function proveConfinement(confinement: Confinement, run: RunCommand
       if (dir !== b.path && !masked.has(dir)) masked.set(dir, new Set())
     }
   }
-  const files = hidden.filter((h) => !h.dir).map((h) => h.path)
+  // Every hidden file, and every mask (T265), is the null device inside.
+  const files = [...hidden.filter((h) => !h.dir).map((h) => h.path), ...masks]
   try {
     const lines = (await confined('stat', ['-c', '%n|%d:%i|%F|%t:%T', '--', ...masked.keys(), ...files])).split('\n').filter(Boolean)
     const inside = new Map(lines.map((line) => {
@@ -870,7 +1438,7 @@ const SESSION_ACCESS = ['DBUS_SESSION_BUS_ADDRESS', 'SSH_AUTH_SOCK', 'GPG_AGENT_
  */
 export const SHELL_STARTUP_VARIABLES: readonly string[] = ['BASH_ENV', 'ENV', 'ZDOTDIR', 'PROMPT_COMMAND', 'PS0', 'PS4', 'SHELLOPTS', 'BASHOPTS', 'INPUTRC']
 /** The prefix of an exported bash function's variable (`BASH_FUNC_echo%%`). */
-export const EXPORTED_FUNCTION = 'BASH_FUNC_'
+const EXPORTED_FUNCTION ='BASH_FUNC_'
 
 /** Whether `name` is a variable a shell runs code from ({@link SHELL_STARTUP_VARIABLES}, an exported function). */
 export const isShellStartupVariable = (name: string): boolean => SHELL_STARTUP_VARIABLES.includes(name) || name.startsWith(EXPORTED_FUNCTION)
@@ -909,8 +1477,9 @@ export const SHELL_CONFIG_DIRECTORIES: readonly string[] = ['XDG_CONFIG_HOME', '
  * code from, nor one naming another directory a shell reads startup files from
  * ({@link SHELL_CONFIG_DIRECTORIES}), `HOME` the private home ({@link agentHome}), so every startup
  * file a shell looks for in its home (`~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zshenv`,
- * `~/.config/fish/config.fish`, …) is that empty directory's, which the confinement binds back
- * read-only: none exists, and none can be made during the run. `XDG_CACHE_HOME` keeps naming the
+ * `~/.config/fish/config.fish`, …) is that private directory's, which the confinement binds back
+ * read-only (but for its tool-state directories, T270, where no shell reads startup code, fish's
+ * kept read-only): none exists, and none can be made during the run. `XDG_CACHE_HOME` keeps naming the
  * operator's cache (`<HOME>/.cache` when it was unset), where tools find what they already
  * downloaded (corepack's package managers among them); no shell reads a startup file there.
  * The environment alone does not choose the shell a runtime starts, so it never earns
@@ -923,21 +1492,50 @@ export function agentShellEnvironment(env: Record<string, string>, home: string)
   return { ...clean, ...(cache ? { XDG_CACHE_HOME: cache } : {}), HOME: home }
 }
 
-/** A run's private shell home: its path, and how to remove it once the run ended. */
+/**
+ * Where a tool keeps its state under its home (T270), relative to it: the XDG defaults for data,
+ * state, cache, and configuration (`~/.local/share`, `~/.local/state`, `~/.cache`, `~/.config`). Each
+ * is in the private home from the start, and a runtime binds each back **writable** over the
+ * read-only home, so a tool that makes `~/.local/share/<tool>`, `~/.cache/<tool>`, or
+ * `~/.config/<tool>` writes it instead of printing `EROFS`. No shell reads a startup file there but
+ * fish, whose directories ({@link HOME_STARTUP_DIRECTORIES}) stay read-only.
+ */
+export const HOME_STATE_DIRECTORIES: readonly string[] = ['.local/share', '.local/state', '.cache', '.config']
+
+/**
+ * The directories inside {@link HOME_STATE_DIRECTORIES} where a shell reads startup code, relative to
+ * the home: fish's `config.fish` and `conf.d` (`~/.config/fish`) and its data directory's
+ * `vendor_conf.d` (`~/.local/share/fish`). Each is an empty directory a runtime binds back
+ * **read-only** over the writable one it lies in, so nothing can be planted there (T198, T270).
+ */
+export const HOME_STARTUP_DIRECTORIES: readonly string[] = ['.config/fish', '.local/share/fish']
+
+/**
+ * A run's private shell home: its path, the directories in it a runtime binds back writable and
+ * read-only again over the read-only home (T270), and how to remove it once the run ended.
+ */
 export interface AgentHome {
   path: string
+  /** Its tool-state directories, absolute ({@link HOME_STATE_DIRECTORIES}): bound back writable. */
+  writable: string[]
+  /** The shell startup directories in those, absolute ({@link HOME_STARTUP_DIRECTORIES}): bound back read-only over them. */
+  startup: string[]
   remove(): void
 }
 
 /**
- * A fresh, empty, owner-only home for one agent run or probe (T198), made in `parent` (an
- * owner-only directory outside every workspace, such as the runtime's run directory, which the read
+ * A fresh, owner-only home for one agent run or probe (T198), made in `parent` (an owner-only
+ * directory outside every workspace, such as the runtime's run directory, which the read
  * confinement hides and binds the home back from). Refused (throws) when it would lie in
  * `workspace`, or the workspace in it: a home in the worktree is git-visible and a Worker's tools
- * write there. A runtime binds it back into its confinement **read-only** (a `readOnly` bind, never a
- * `writable` one): it stays empty for the whole run, so no shell its agent starts, login,
- * interactive, or neither, in whatever mode a call asks for, finds a startup file there, and no tool
- * call can write one for a later call's shell to read. Nothing in it survives the run
+ * write there. It holds no file, only the empty tool-state directories ({@link HOME_STATE_DIRECTORIES})
+ * and the shell startup directories in them ({@link HOME_STARTUP_DIRECTORIES}). A runtime binds the
+ * home back into its confinement **read-only** (a `readOnly` bind, never a `writable` one), each of
+ * {@link AgentHome.writable} writable over it, and each of {@link AgentHome.startup} read-only again
+ * over those: so no shell its agent starts, login, interactive, or neither, in whatever mode a call
+ * asks for, finds a startup file in its home (`~/.bashrc`, `~/.profile`, `~/.zshenv`,
+ * `~/.config/fish/config.fish`, …), and no tool call can write one for a later call's shell to
+ * read, while a tool's own state under the home is writable (T270). Nothing in it survives the run
  * ({@link AgentHome.remove}).
  */
 export function agentHome(parent: string, workspace?: string): AgentHome {
@@ -946,6 +1544,7 @@ export function agentHome(parent: string, workspace?: string): AgentHome {
   const remove = (): void => rmSync(path, { recursive: true, force: true })
   try {
     chmodSync(path, 0o700)
+    for (const name of [...HOME_STATE_DIRECTORIES, ...HOME_STARTUP_DIRECTORIES]) mkdirSync(join(path, name), { recursive: true, mode: 0o700 })
     if (workspace !== undefined) {
       const home = realpathSync(path)
       const ws = real(workspace) ?? workspace
@@ -955,5 +1554,5 @@ export function agentHome(parent: string, workspace?: string): AgentHome {
     remove()
     throw error
   }
-  return { path, remove }
+  return { path, writable: HOME_STATE_DIRECTORIES.map((name) => join(path, name)), startup: HOME_STARTUP_DIRECTORIES.map((name) => join(path, name)), remove }
 }

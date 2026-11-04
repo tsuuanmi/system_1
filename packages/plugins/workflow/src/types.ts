@@ -4,8 +4,9 @@
  */
 import { randomBytes } from 'node:crypto'
 import type { UnreleasedHold } from '@tsuuanmi/system-board-core'
-import type { ContentId, DrawFigure } from '@tsuuanmi/system-libs'
+import type { BriefHandbook, ContentId, DrawFigure, EnforceMode } from '@tsuuanmi/system-libs'
 import type { ArtifactRef, Classification, RunLiveness, Tier, WorkRequirement } from '@tsuuanmi/system-workers-core'
+import type { AdvisorConfig } from './advisor.ts'
 import type { CallerOptions, NodeTemplate } from './spec.ts'
 
 export type RunStatus = 'running' | 'completed' | 'failed'
@@ -47,8 +48,14 @@ export interface NodeView {
   /** The Worker source that runs it. */
   source?: string
   worker?: string
-  /** The tier of the Worker that served the node. */
+  /** The tier the node was served at: of a Worker that offers several, the one routing chose (ADR-0073). */
   tier?: Tier
+  /**
+   * The model its result ran on, as its result records it (ADR-0073): the model the operator's
+   * configuration gives its Worker at that tier (`agent-result@1.4` `configuredModel`), else the one
+   * its runtime reports answering with. Configuration, shown only.
+   */
+  model?: string
   quotaClass?: string
   result?: ArtifactRef
   /** The brief its latest execution was started with (docs/design/workflow-engine.md#briefs). */
@@ -136,6 +143,8 @@ export interface StartInput extends CallerOptions {
   classification?: Classification | undefined
   /** Retry-safe request key: the same key returns the same run. */
   clientRequestId?: string | undefined
+  /** The project a lead started the run for (T285): a run that serves no board task is tagged with it, and its retry key is the project's. */
+  projectId?: string | undefined
 }
 
 /**
@@ -150,6 +159,11 @@ export interface TaskClaim {
   holder?: string | undefined
   generation?: number | undefined
   revision?: number | undefined
+  /**
+   * Opt out of starting from the work the task's previous attempt left (T271): the run's worktree is
+   * cut from HEAD, as when a review rejected the previous approach. Default: the work is carried.
+   */
+  fresh?: boolean | undefined
 }
 
 /**
@@ -231,6 +245,14 @@ export interface TaskCarry {
   worktree?: string
   branch?: string
   commit?: string
+  /** Once carried: the commit the worktree starts at, and what a move of the repository's HEAD since the earlier tree did (T271). */
+  base?: string
+  rebase?: { outcome: 'rebased' | 'conflict'; from: string; onto: string; files?: string[] }
+  /**
+   * While `due`: when the source first had no room to cut the run's worktree (T345). The wait is
+   * bounded from here by `maxLimitWaitHours` (INV-9), kept on the row so a restart keeps the bound.
+   */
+  roomSince?: string
   cause?: string
   reason?: string
   at: string
@@ -238,13 +260,32 @@ export interface TaskCarry {
 
 /**
  * Where the landing of a task's accepted result stands (ADR-0060): `watch` until the board has the
- * task done on it; `commit` while its worktree is committed on its branch; `committed`, then `asked`
- * while the `merge` request waits for the operator; `merging` on the approval; then `merged`, or
- * `refused` (a step changed nothing, `cause` and `reason` say why), `rejected` (the request was not
- * approved), or `none` (nothing to land: the task moved on, or no source holds the tree).
+ * task done on it; `commit` while its worktree is committed on its branch; `queued` while the target's
+ * turn is another's, `stacked` while it waits on the stack it is in (docs/design/workflow-engine.md#the-landing-queue); then, when the base moved
+ * since the result's work started (ADR-0068), `rebase` while it is made again on top of the base,
+ * `resolving` while a writing step resolves the rebase's conflict, `returning` while a rebase that
+ * cannot go on is abandoned and the result sent back (persisted before either, so a restart finishes
+ * both, INV-4), and `recheck` while its required checks run again on the rebased tree (or, when the
+ * base did not move, on the committed tree: the landing's full suite, T299); `committed`,
+ * then `asked` while the `merge` request waits for
+ * the operator; `merging` on the approval; then `merged`, or `returned` (it could not land on its
+ * target as that is now, and went back to the board as another attempt), `refused` (a step changed
+ * nothing, `cause` and `reason` say why), `rejected` (the request was not approved), or `none`
+ * (nothing to land: the task moved on, or no source holds the tree).
  */
 export interface TaskLanding {
-  state: 'watch' | 'commit' | 'committed' | 'asked' | 'merging' | 'merged' | 'refused' | 'rejected' | 'none'
+  state: 'watch' | 'commit' | 'queued' | 'stacked' | 'rebase' | 'resolving' | 'returning' | 'recheck' | 'committed' | 'asked' | 'merging' | 'merged' | 'returned' | 'refused' | 'rejected' | 'none'
+  /** Its place in its target's queue, once committed: `queued` waits for the target's turn, `stacked` waits on its stack (TaskQueue). */
+  queue?: TaskQueue
+  /** Where the result forked from the base, as its commit found it (ADR-0068). */
+  fork?: string
+  /** The landing's rebase onto its target, once the base moved since the result's work started (ADR-0068). */
+  rebase?: TaskRebase
+  /**
+   * A landing whose base did not move: the committed tree its required checks run on at the landing's
+   * scope (the full suite, once per landing, T299) in `recheck`, before the merge is asked.
+   */
+  verify?: { subject: { ref: string; version: string }; checks: string[] }
   /** The working tree the result is on, and its exact subject there. */
   workspace?: string
   subject?: { ref: string; version: string }
@@ -265,12 +306,121 @@ export interface TaskLanding {
   approval?: ArtifactRef
   /** The base branch's head that holds the change, once merged. */
   commit?: string
+  /** The commits the landed change reverts, as its commit messages say (`This reverts commit <sha>`), once merged; the metrics read each as a defect of the reverted task (PROP-0016 I4). */
+  reverts?: string[]
   cause?: string
   reason?: string
   /** The landing's own `gate` decisions (rule `workflow.landing`), in order. */
   decisions?: ArtifactRef[]
+  /**
+   * How the landing ended for the board (T293): `merged`, or `not-needed` when the accepted tree holds no
+   * change; the board's landing wait takes it (`Board.landed`), and only then is the task done. `told`
+   * once the board took it, or no longer waits on this landing.
+   */
+  tell?: 'merged' | 'not-needed'
+  told?: boolean
+  /**
+   * The required checks a result held for the operator left pending, run on its exact tree by the
+   * landing's watch (T293), once per subject: the version they ran on, and what they came to. `requests`:
+   * the approval requests a `not-run` waits on (a new lockfile's verification, T333): the watch asks
+   * again once none is open, and the checks run then.
+   */
+  held?: { version: string; outcome: 'checked' | 'not-run'; reason?: string; acceptance?: ArtifactRef; requests?: string[] }
   /** When it last changed or was looked at. */
   at: string
+}
+
+/**
+ * A landing's rebase of its result onto the base as it is now (ADR-0068): from the branch's head
+ * (the accepted commit, or an earlier rebase of it) onto the base, forked from it at `fork`.
+ */
+export interface TaskRebase {
+  from: string
+  base: { branch: string; sha: string }
+  fork: string
+  /** Rebases this landing made before this one (a target moved by a push the queue did not make is followed each time). */
+  count: number
+  /** Once rebased: the branch's new head, the worktree's exact subject at it, and the change against the base. */
+  head?: string
+  subject?: { ref: string; version: string }
+  stat?: string
+  /** A conflict: the files it left marked (and how many more), and the base's commits since the fork. */
+  files?: string[]
+  more?: number
+  moved?: string[]
+  /**
+   * The writing step that resolves a conflict: the result's own author (the run's writing step that
+   * wrote the tree, its Worker and source), what it is told, the brief it is started on (a board task's
+   * brief, naming the task and its project, recorded once) and how long that renders, its execution once
+   * started, and since when it waits to be.
+   */
+  nodeId?: string
+  worker?: string
+  source?: string
+  prompt?: string
+  brief?: ArtifactRef
+  chars?: number
+  executionId?: string
+  since?: string
+  /** The required checks run again on the rebased tree. */
+  checks?: string[]
+  /**
+   * A rebase that cannot go on (`returning`): why the result goes back and the decisions that say so,
+   * kept before the branch is put back; then the `return` decision, once recorded, so a restart
+   * neither records it twice nor loses it.
+   */
+  returning?: { why: string; inputs: ArtifactRef[]; decision?: ArtifactRef }
+  /**
+   * A result stacked on an earlier one of its batch (`from` onto that one's rebased head, `base`): the
+   * target's own tip, which the stack merges into and which the merge request binds.
+   */
+  target?: { branch: string; sha: string }
+}
+
+/**
+ * A landing's place in its target's queue (one per repository and target branch, ADR-0068 successor):
+ * results enter in the order they were committed (`seq`), one holds the target's `turn` at a time, and
+ * a later one never moves the target under it. With a batch, the head holds the turn for the stack
+ * (`batch.runs`, in order; `limit` is the configured size): each is rebased onto the one before, the
+ * tip's checks run once, one merge lands the stack.
+ */
+export interface TaskQueue {
+  /** `<repository>#<branch>`. */
+  key: string
+  seq: number
+  /** The landing holds the target: it, and its stack, is the one landing at a time. */
+  turn?: true
+  /** Where the results of a stack are, in order, and the batch size configured when it was formed. */
+  batch?: {
+    runs: string[]
+    limit: number
+    /** This result's head and exact subject once it is on top of the one before it (the stack as far as it). */
+    head?: string
+    subject?: { ref: string; version: string }
+    /** The target's tip the stack was rebased onto. */
+    target?: { branch: string; sha: string }
+    /** A failing stack's search: the prefix up to `lo` passed, the one up to `hi` fails (indexes in `runs`). */
+    bisect?: { lo: number; hi: number; fails?: string }
+    /** On the tip, once its merge request is asked: the results under it that the request names and lands with it, in order. */
+    lands?: string[]
+    /** On a result under the tip, once merged with it: the tip's run, whose request named it. */
+    tip?: string
+    /** Set on the result found to fail, by the tip that found it: it goes back alone. */
+    blame?: { why: string; inputs: ArtifactRef[] }
+  }
+}
+
+/** A landing queue as `explain` and `/ui` show it: where a result stands in its target's queue. */
+export interface LandingQueueView {
+  key: string
+  state: TaskLanding['state']
+  /** From 1; undefined once the landing ended. */
+  position?: number
+  length: number
+  /** The result that holds the target's turn, when it is not this one. */
+  holder?: { runId: string; taskId: string }
+  /** The stack this result is in: its size now, the configured size, and its place in it (from 1). */
+  batch?: { size: number; limit: number; index: number }
 }
 
 /**
@@ -378,6 +528,14 @@ export interface TaskOutcome {
   /** The decision the report applied or recorded (acceptance or reconciliation). */
   decision?: ArtifactRef
   reason?: string
+  /**
+   * Whether the change the attempt left was kept as a commit on its run's branch (T271): `pending`
+   * from the report (or from the operator's rejection of a result held for review) until it is, asked
+   * again at start and before the next attempt decides; then `kept` with the commit and its branch,
+   * or `not-kept` with why. Its dossier entry says the same; `said` once it is written, so a stop
+   * between the two writes it at the next keep (INV-4).
+   */
+  kept?: { state: 'pending' | 'kept' | 'not-kept'; commit?: string; branch?: string; reason?: string; said?: boolean; at: string }
 }
 
 export interface ExplainedDecision {
@@ -392,6 +550,18 @@ export interface ExplainedDecision {
   ballots?: Array<{ round: number; member: string; choice: string; confidence: string; rationale: string }>
 }
 
+/**
+ * A review step's latest assessment as `explain` shows it (ADR-0075): its summary, which opens with the
+ * count, its verdict, and its findings by severity, each with its place, class, and the second
+ * reviewer's vote and reason when it has one.
+ */
+export interface ExplainedReview {
+  assessment: ArtifactRef
+  verdict: string
+  summary: string
+  findings: Array<{ id?: string; severity: string; title: string; place?: string; class?: string; blocks: boolean; vote?: string; reason?: string; repeated?: string }>
+}
+
 export interface Explanation {
   runId: string
   template: string
@@ -403,7 +573,20 @@ export interface Explanation {
    * report, the funding gate, and the digest. Only when there are any.
    */
   decisions?: ExplainedDecision[]
-  nodes: Array<{ nodeId: string; state: NodeState; executionId?: string; worker?: string; quotaClass?: string; decisions: ExplainedDecision[] }>
+  /**
+   * The run's risk tier (ADR-0071) and why: its latest `workflow.risk-tier` decision, the
+   * acceptance's when there is one, else the latest review's (`at` names that step). Only when the
+   * run's project has a path map.
+   */
+  risk?: { tier: 'light' | 'normal' | 'heavy'; reasons: string[]; decision: ArtifactRef; at?: string }
+  /** `tier` and `model`: the tier a tiered Worker's step ran at and the model it ran on (ADR-0073), only when its result names them. */
+  /**
+   * For a step whose latest brief recorded one (`brief@1.6`), `handbook`: the slice it was given, the
+   * bound and its mode, what selected it, and each layer's version and size
+   * (docs/design/handbook.md#what-a-brief-records), with what its Worker source recorded it rendered
+   * of the source's half (`source`: the gate view and the lessons, each version and size).
+   */
+  nodes: Array<{ nodeId: string; state: NodeState; executionId?: string; worker?: string; quotaClass?: string; tier?: Tier; model?: string; decisions: ExplainedDecision[]; review?: ExplainedReview; handbook?: BriefHandbook & { source?: Array<{ layer: number; part: string; version: string; sha256?: string; tokens: number; lessons?: number }> } }>
   /**
    * The run's executions whose liveness needs a look, as their Worker sources tell it
    * (`ctx.workers.liveness`, PROP-0013): stalled, looked at, or ended not known to be gone, with the
@@ -412,6 +595,63 @@ export interface Explanation {
   liveness?: Array<RunLiveness & { source: string }>
   /** Each source that could not tell, with why: such a source is never read as having none (INV-2). */
   livenessUnread?: Array<{ source: string; detail: string }>
+  /**
+   * Each check of the run's result that is stalled now (T235): its command printed nothing for its
+   * bound (`worktreeSetup[].checkStallSeconds`) and goes on to its deadline, as the Worker source that
+   * runs it told (`agent-workers.check` events): the check, its command, when it was found stalled,
+   * and when it last printed. Only while the run is running and there are any.
+   */
+  stalledChecks?: StalledCheck[]
+  /**
+   * The run's web calls (T262, ADR-0074): each `WebSearch` or `WebFetch` call of a research role's
+   * Worker the web access rule judged, from its `agent-workers.web-access` decision: how many, how
+   * many ran unasked, asked, and were denied in their session, and each call's query or URL, verdict,
+   * and egress outcome. Only when there are any.
+   */
+  webCalls?: WebCalls
+  /** Where the run's accepted result stands in its target's landing queue, while it is in one. */
+  landing?: LandingQueueView
+}
+
+/** A run's web calls, as `explain` and `/ui` show them (T262). */
+export interface WebCalls {
+  count: number
+  /** Calls that ran unasked under the grant. */
+  auto: number
+  /** Calls that asked the operator (past the bound, an egress refusal, no grant). */
+  asked: number
+  /** Calls the grant would have let run that this session was denied before: they never ran. */
+  denied: number
+  /** The calls, oldest first, at most {@link MAX_WEB_CALLS_SHOWN}; `count` counts them all. */
+  calls: WebCall[]
+}
+
+/** The web calls a run's view lists at most (INV-9). */
+export const MAX_WEB_CALLS_SHOWN = 200
+
+/** One web call: its tool, its query or URL (as recorded, at most 500 characters), and what the rule said. */
+export interface WebCall {
+  at: string
+  nodeId?: string
+  tool: string
+  target: string
+  /** `auto`: it ran unasked; `ask`: it asked the operator; `deny`: the grant would have let it run, but this session was denied that exact call. */
+  verdict: 'auto' | 'ask' | 'deny'
+  egress: 'allow' | 'deny' | 'not-checked'
+  /** Why it asked or was denied, a code (`bound`, `egress`, `local-path`, `no-grant`, `session-denied`, …), when it did. */
+  reason?: string
+  decision: ArtifactRef
+}
+
+/** A check of a run's result that printed nothing for its bound, and still runs (T235). */
+export interface StalledCheck {
+  check: string
+  command: string
+  /** When it was found stalled. */
+  since: string
+  /** When it last printed. */
+  quietSince: string
+  stallSeconds: number
 }
 
 export interface Config {
@@ -446,12 +686,34 @@ export interface Config {
   /**
    * Hours a node refused only for assigned accounts' limits may wait for their reset, in all from
    * its first wait (default 24; 0 never waits); past it, it fails `quota_exhausted` (ADR-0052, INV-9).
+   * It bounds too a board task's run waiting for room on the host's disk to carry its previous
+   * attempt's work (T345, `TaskCarry.roomSince`): past it, the run starts fresh.
    */
   maxLimitWaitHours?: number
   /** Approve a high-confidence plan by policy (`by: policy`) instead of waiting for the operator (default false). */
   autoApprovePlans?: boolean
+  /**
+   * The handbook slice every step of a board task's run is given (docs/design/handbook.md, ADR-0072):
+   * `enabled` (default true); `warnTasks`, the distinct board tasks whose slice is built in warn mode
+   * before a slice over the 6,000-token bound is refused (default 30, 0 to 1,000); `root`, the System
+   * repository the homes of layers 1 and 4 are read from (default: the one this package sits in).
+   */
+  handbook?: { enabled?: boolean; warnTasks?: number; root?: string }
+  /**
+   * The start mode of the engine's gate-like mechanisms (ADR-0078, `MECHANISMS` in the libs): the
+   * evidence gate (`off`, `warn`, `on`), the handbook bound (`warn`, `on`), and the review-guide
+   * selection (`off`, `on`); each `on` by default. The plugin host's live override (`system enforce
+   * set`) wins over it, and each is read at its use.
+   */
+  enforce?: { evidenceGate?: EnforceMode; handbookBound?: EnforceMode; reviewGuides?: EnforceMode; redOnBase?: EnforceMode }
   /** Reviews of one change, the first included, before remediation stops (default 3). */
   maxReviewCycles?: number
+  /**
+   * Minutes a review's fix that continues its author's session waits for that session's Worker while
+   * it cannot take the fix now (default 60; INV-9), from the fix's first wait; past it, the session is
+   * handed off, recorded (docs/design/sessions-and-messaging.md#a-review-fix-continues-its-authors-session).
+   */
+  fixSessionWaitMinutes?: number
   /** Hours a tied team waits for a deciding `vote`, then completes `inconclusive` by rule (default 24; INV-9). */
   tieTimeoutHours?: number
   /** Hours a plan's gate waits for the operator's verdict, then closes and fails the run by rule (default 24; INV-9). */
@@ -461,6 +723,12 @@ export interface Config {
    * fix's request while its run waits on it, and the requests a Worker's deferred tool call waits on.
    */
   approvalPollSeconds?: number
+  /**
+   * Results the head of a target's landing queue lands at once, as a stack rebased in order and checked
+   * once (a merge train; default 1: no batching). A stack that fails is bisected to the failing result,
+   * which goes back alone.
+   */
+  landingBatch?: number
   /**
    * Minutes a board task's step waits on the operator for its Worker's deferred tool call of class
    * `command`, from its request's creation (default 10; INV-9); past it the call is treated as
@@ -473,6 +741,12 @@ export interface Config {
    * resumes the session of the work before it (default 5; INV-9): past it, the run starts fresh.
    */
   maxSessionRuns?: number
+  /**
+   * Whether a board task's next attempt resumes the session of its previous attempt (default true).
+   * False: it starts a fresh session given its brief and the task's dossier, which carry the previous
+   * attempt's diff, checks, and open findings (PROP-0022 change 4, PROP-0023; T369).
+   */
+  resumeAcrossAttempts?: boolean
   /**
    * Digests of board task results the engine asks `ctx.digests` for in any hour, at most (default
    * 6; INV-9); 0 asks for none. Past it, a result keeps no digest, recorded with why.
@@ -488,6 +762,65 @@ export interface Config {
   repositories?: { hosts?: string[]; maxFiles?: number; maxBytes?: number; maxFileBytes?: number; maxSourceChars?: number }
   /** Dispatch (ADR-0064): System starts ready board tasks on free Workers chosen by quota, within these bounds (./dispatch.ts). */
   dispatch?: DispatchConfig
+  /** The scheduled review of existing code, one area a day, filing confirmed findings as proposed board tasks (D93 item 8; ./scheduled-review.ts). Off by default. */
+  scheduledReview?: ScheduledReviewConfig
+  /** The daily run of every browser spec on a ref's tip, filing a failure as one board task (T305b; ./daily-check.ts). Off by default. */
+  dailyCheck?: DailyCheckConfig
+}
+
+/**
+ * The daily check's settings (T305b), each validated when the row loads. Off unless the operator sets
+ * `enabled`; then `projectId` and `repository` are required. The repository's own `worktreeSetup`
+ * (agent-workers) gives the setup and the `tests` command it runs.
+ */
+export interface DailyCheckConfig {
+  /** Whether the daily run happens (default false: the operator turns it on). */
+  enabled?: boolean
+  /** The board project a failure is proposed in (required when enabled). */
+  projectId?: string
+  /** Path of the git repository whose tip is checked (required when enabled). */
+  repository?: string
+  /** The branch or ref checked, at its tip (default `dev`). */
+  ref?: string
+  /** The UTC hour from which the day's run may start (0 to 23, default 4). */
+  hourUtc?: number
+  /** Minutes a run may take before it is recorded as an error (default 180). */
+  timeoutMinutes?: number
+  /** The action class the proposed task carries (default `workspace-write`). */
+  actionClass?: string
+  /** The board task template the proposed task names, when the project uses one (default none). */
+  taskTemplate?: string
+}
+
+/**
+ * The scheduled review's settings (D93 item 8), each validated when the row loads. Off unless the
+ * operator sets `enabled`; then `projectId` and `repository` are required.
+ */
+export interface ScheduledReviewConfig {
+  /** Whether the daily review runs (default false: the operator turns it on). */
+  enabled?: boolean
+  /** The board project the findings are proposed in (required when enabled). */
+  projectId?: string
+  /** Path of the git repository whose guides name the areas (required when enabled). */
+  repository?: string
+  /** The branch or ref reviewed, at its tip (default `dev`). */
+  ref?: string
+  /** The UTC hour from which the day's review may start (0 to 23, default 3). */
+  hourUtc?: number
+  /** The most tasks one run proposes (1 to 20, default 5); the rest of its confirmed findings are counted, not filed. */
+  maxTasksPerRun?: number
+  /** Files of the area one review reads at most (default 80), bytes of text in all (default 400,000), and a larger file is listed as unread (default 60,000). */
+  maxFiles?: number
+  maxBytes?: number
+  maxFileBytes?: number
+  /** Minutes a run may take before it is recorded as unfinished (default 120). */
+  timeoutMinutes?: number
+  /** The action class the proposed tasks carry (default `workspace-write`). */
+  actionClass?: string
+  /** The board task template the proposed tasks name, when the project uses one (default none). */
+  taskTemplate?: string
+  /** The workflow template a review runs (default `scheduled-review`, which the software-development profile provides). */
+  template?: string
 }
 
 /**
@@ -508,6 +841,8 @@ export interface DispatchConfig {
   maxRunningPerProject?: number
   /** The same, per account of the chosen Worker; also the most an account's load may be for it to be free (1 to 16, default 1). */
   maxRunningPerAccount?: number
+  /** Dispatched runs or asks on one account none of whose windows has a reading yet (pool `unknown: available`), at most (1 to 16, default 1; T294). A reading replaces it. */
+  maxRunningUnreadPerAccount?: number
   /** The same, per repository: the chosen writing Worker's workspace (1 to 16, default 4; D64). */
   maxRunningPerRepository?: number
   /** Active runs kept for the lead's and the operator's own starts (0 to maxActiveRuns − 1, default 4). */
@@ -520,6 +855,12 @@ export interface DispatchConfig {
   maxPerHour?: number
   /** The same, per project (0 to maxPerHour, default 3 or maxPerHour when lower). */
   maxPerHourPerProject?: number
+  /**
+   * The advisor asked in shadow at every dispatch choice (PROP-0015 J1, ./advisor.ts): `none` by
+   * default (no advisor), `local` (a logistic regression on this host), or `model` (a configured
+   * model Worker, metered; off unless set). Its advice is recorded and changes no choice.
+   */
+  advisor?: AdvisorConfig
 }
 
 /**
@@ -582,6 +923,11 @@ export interface NodeRow {
   assignment?: string | null
   /** When the node first waited for an assigned account's limit: its waits are bounded from here (`maxLimitWaitHours`). */
   limit_wait_since?: string | null
+  /**
+   * JSON `{ kind, reason }` of a `FAILED` node that failed only on the infrastructure (ADR-0069): the
+   * host stopped its execution, or a Worker it needed became unavailable. Cleared on every other failure.
+   */
+  infrastructure?: string | null
   error: string | null
   updated_at: string
 }

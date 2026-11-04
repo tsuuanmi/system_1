@@ -19,11 +19,12 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import type {} from '@tsuuanmi/system-artifacts'
+import type {} from '@tsuuanmi/system-ledger-core'
 import type { BoardTask, BudgetLine, TaskInput } from '@tsuuanmi/system-board-core'
+import { type Advice, type AdvisorFeatures, DispatchAdvisor } from '@tsuuanmi/system-decision-core'
 import { captureGitSubject, SchemaRegistry, sha256, startPrompt } from '@tsuuanmi/system-libs'
 import type { PoolConfig } from '@tsuuanmi/system-resources-core'
-import type { ArtifactRef, CapabilityDescriptor, WorkerExecution, WorkerSource, WorkerStart } from '@tsuuanmi/system-workers-core'
+import type { ArtifactRef, CapabilityDescriptor, ExecutionInfrastructure, WorkerExecution, WorkerSource, WorkerStart } from '@tsuuanmi/system-workers-core'
 import { expect, vi } from 'vitest'
 import { type ContractVersion, defineSuite, type Scenario } from '../../../libs/conformance/runner.ts'
 import { worker } from '../../../workers-core/conformance/workers.ts'
@@ -39,14 +40,43 @@ export interface Booted {
 
 export type Boot = (source: (ctx: Context) => WorkerSource, config: Config) => Promise<Booted>
 
+/**
+ * A brief's handbook slice (`brief@1.6`, docs/design/handbook.md), when it has one: its pointer (the
+ * last of its artifacts, role `context`, at a `handbook-slice@1.0`) and that pointer as the brief's
+ * rendering shows it among the pointers its instructions do not place. Undefined for a brief with
+ * none (a run that serves no board task, or the slice turned off).
+ */
+export function handbookPointer(ctx: Context, brief: { artifacts: Array<{ ref: string; role: string; note?: string }> }): { pointer: { ref: string; role: string; note?: string }; rendered: string } | undefined {
+  const pointer = brief.artifacts.at(-1)
+  const body = pointer ? ctx.artifacts.get(pointer.ref as ArtifactRef)?.body as { schema?: string; text?: string } | undefined : undefined
+  if (!pointer || body?.schema !== 'handbook-slice@1.0') return undefined
+  return { pointer, rendered: `<artifact id="${pointer.ref}" role="${pointer.role}"${pointer.note ? ` note=${JSON.stringify(pointer.note)}` : ''}>\n${body.text}\n</artifact>` }
+}
+
 /** A start as the scripted Worker reads it: its brief rendered to the prompt a text-prompted source sends. */
 export type Rendered = WorkerStart & { prompt: string }
 
 /**
  * A scripted execution's outcome: an answer, a failure (sent or not; since 1.8 `siteError`, the site
- * answered the sent input with its own error), or `hold` until {@link ScriptedWorkers.release}.
+ * answered the sent input with its own error; `infrastructure`, the source's word that the host's stop
+ * or its Worker going away alone ended it, ADR-0069), or `hold` until {@link ScriptedWorkers.release}.
  */
-export type Reply = { text: string } | { fail: string; disposition: string; sent: boolean; siteError?: true } | 'hold'
+export type Reply = { text: string } | { fail: string; disposition: string; sent: boolean; siteError?: true; infrastructure?: ExecutionInfrastructure } | 'hold'
+
+/**
+ * A scripted second reviewer's answer to a review's verification step (ADR-0075): a vote on every
+ * important finding it is given (`confirm` unless told otherwise), naming the subject it was given.
+ * Undefined for any other prompt, so a scenario's reply falls through to its own script.
+ */
+export function verifierReply(prompt: string, vote: 'confirm' | 'reject' = 'confirm'): { text: string } | undefined {
+  if (!prompt.includes('## Verify these findings')) return undefined
+  const subject = /^Verified subject: (\S+)$/m.exec(prompt)?.[1]
+  const votes = [...prompt.matchAll(/^- (f\d+) important:/gm)].map((m) => ({ finding: m[1], vote, reason: `scripted ${vote}` }))
+  return { text: '```json\n' + JSON.stringify({ subject, votes }) + '\n```' }
+}
+
+/** A scripted reviewer's important finding, with the file, line, and evidence an important finding needs (ADR-0075). */
+export const importantFinding = (title: string, file: string): Record<string, unknown> => ({ severity: 'important', title, file, line: 1, evidence: `${file} line 1 shows it: ${title}` })
 
 const PROVES = ['reason', 'develop']
 /** One Worker per tier, each proving `reason` and `develop`, none `deep-research`. */
@@ -76,6 +106,8 @@ export class ScriptedWorkers {
    * as its first execution starts (`native-<sessionId>`). Off, sessions keep no handle.
    */
   keepsHandles = true
+  /** Whether a held execution waits at this runtime before anything of it is sent (not `submitted`, ADR-0069); off, it is sent at start. */
+  holdsUnsent = false
   /** Since 1.5: sets of Workers this runtime names as siblings of one another (one account each); others name none. */
   accounts: string[][] = []
   /** Since 1.6: the sessions this runtime says take no input now, with why (`WorkerSource.held`); others are free. */
@@ -99,6 +131,8 @@ export class ScriptedWorkers {
   readonly worktrees = new Map<string, string>()
   /** Runs once an answer's subject was captured, before the engine checks it (an agent's later edits). */
   afterCapture: (worktree: string) => void = () => {}
+  /** The model a Worker of this runtime runs at a tier (`WorkerSource.model`, ADR-0073), by `<worker> <tier>`; none by default. */
+  readonly models = new Map<string, string>()
   private readonly worktreeOf = new Map<string, string>()
   private readonly executions = new Map<string, WorkerExecution>()
   private readonly requests = new Map<string, Rendered>()
@@ -117,6 +151,7 @@ export class ScriptedWorkers {
       get: (id) => this.get(id),
       wait: (id, timeoutMs) => this.wait(id, timeoutMs),
       cancel: (id) => this.cancel(id),
+      model: (worker, tier) => this.models.get(`${worker} ${tier}`),
       affinity: (sessionId) => {
         const session = this.sessions.get(sessionId)
         return session ? [session.worker] : undefined
@@ -186,7 +221,7 @@ export class ScriptedWorkers {
     this.keys.set(start.key, id)
     this.requests.set(id, request)
     this.started.push({ ...request, id, ...(session?.handle ? { conversation: session.handle } : {}) })
-    this.executions.set(id, { id, status: 'running', submitted: true, decisions: [] })
+    this.executions.set(id, { id, status: 'running', submitted: !this.holdsUnsent, decisions: [] })
     const reply = this.reply(request)
     if (reply !== 'hold') this.finish(id, reply)
     return this.get(id)!
@@ -229,7 +264,7 @@ export class ScriptedWorkers {
     } else {
       execution.status = 'failed'
       execution.submitted = reply.sent
-      execution.error = { kind: reply.fail, disposition: reply.disposition, message: `scripted ${reply.fail}`, ...(reply.siteError ? { siteError: true as const } : {}) }
+      execution.error = { kind: reply.fail, disposition: reply.disposition, message: `scripted ${reply.fail}`, ...(reply.siteError ? { siteError: true as const } : {}), ...(reply.infrastructure ? { infrastructure: reply.infrastructure } : {}) }
     }
     for (const wake of this.waiters.get(id) ?? []) wake()
     this.waiters.delete(id)
@@ -239,7 +274,8 @@ export class ScriptedWorkers {
     const execution = this.executions.get(id)
     if (execution?.status !== 'running') return false
     this.cancelled.push(id)
-    this.finish(id, { fail: 'aborted', disposition: 'NONE', sent: true })
+    // A cancel sends nothing: one held unsent stays unsent.
+    this.finish(id, { fail: 'aborted', disposition: 'NONE', sent: execution.submitted })
     return true
   }
 
@@ -488,7 +524,14 @@ export const workflowSuite = defineSuite<Boot>({
   // `operator`, which a start may say it is); under a policy that gives dispatch `auto` or `notify` the
   // pass starts the chosen attempt with nothing asked; dispatch is bounded per rolling hour
   // (`maxPerHour`, `maxPerHourPerProject`) and paused per project (`pauseDispatch(reason, projectId)`).
-  contract: '1.10',
+  // 1.11 (PROP-0015 J1): every dispatch choice records an advice decision (`advisor.dispatch`) as its
+  // input, unavailable while no advisor is configured (the default); `setDispatchAdvisor(advisor)`
+  // swaps one in, whose advice is recorded in shadow and never changes the choice. 1.12 (ADR-0037,
+  // T228): the engine consumes the advisor seam `ctx.dispatchAdvisor` (decision-core): while a plugin
+  // provides it, its provider is asked in place of the configured advisor, and one set through
+  // `setDispatchAdvisor` in place of both. The advisor seam has its own suite
+  // (decision-core/conformance/dispatch-advisor.ts).
+  contract: '1.12',
   scenarios: [
     scenario('node-records', 'keeps every node record valid against workflow-node@1.x with a rising revision, and completes a node only with its input receipt, an output receipt binding its Worker\'s result, and the acceptance decision that accepted it (INV-14, INV-13, INV-3)', async ({ ctx, workers }) => {
       workers.reply = () => 'hold'
@@ -877,9 +920,12 @@ export const workflowSuite = defineSuite<Boot>({
       const task = await readyTask(ctx, 'briefed', { acceptance: [{ id: 'a1', statement: 'it answers' }, { id: 'a2', statement: 'it cites' }] })
       const run = await ctx.workflow.start({ template: 'solo', input: 'q', classification: 'public', task: { taskId: task.taskId } })
       expect((await settled(ctx, run.runId)).status).toBe('completed')
-      const brief = ctx.artifacts.get(workers.started[0]!.brief!)!.body as Record<string, unknown>
+      const brief = ctx.artifacts.get(workers.started[0]!.brief!)!.body as Record<string, unknown> & { artifacts: Array<{ ref: string; role: string }> }
       expect(brief).toMatchObject({ projectId: 'p1', taskId: task.taskId, attempt: 1, goal: 'do briefed', acceptance: [{ id: 'a1', statement: 'it answers' }, { id: 'a2', statement: 'it cites' }] })
-      expect(workers.started[0]!.prompt).toBe(`Board task ${task.taskId} of project p1, attempt 1.\nGoal: do briefed\nAcceptance criteria:\n- a1: it answers\n- a2: it cites\nIf you cannot finish without an answer from a person, answer with only this JSON object and nothing else: {"questions": ["..."]}, with 1 to 8 questions of at most 500 characters each. The task then waits for the answers, and its next attempt is given them.\n\nq`)
+      // A step's handbook slice, when the engine gives one (docs/design/handbook.md), follows the instructions: the one pointer they do not place.
+      const handbook = handbookPointer(ctx, brief)
+      expect(brief.artifacts).toEqual(handbook ? [handbook.pointer] : [])
+      expect(workers.started[0]!.prompt).toBe(`Board task ${task.taskId} of project p1, attempt 1.\nGoal: do briefed\nAcceptance criteria:\n- a1: it answers\n- a2: it cites\nIf you cannot finish without an answer from a person, answer with only this JSON object and nothing else: {"questions": ["..."]}, with 1 to 8 questions of at most 500 characters each. The task then waits for the answers, and this attempt continues with them: asking spends no attempt.\n\nq${handbook ? `\n\nRead these too:\n\n${handbook.rendered}` : ''}`)
     }, {}, '1.3'),
 
     scenario('task-resume', 'resumes, for a board task\'s next attempt, the session of the attempt before it when its Worker keeps a native session it can resume, the new brief as its next message, and starts fresh otherwise; each choice a decision (INV-9, INV-13)', async ({ ctx, workers }) => {
@@ -1029,7 +1075,7 @@ export const workflowSuite = defineSuite<Boot>({
       expect((await ctx.approvals.list({ states: ['open', 'batched', 'approved', 'rejected'] })).filter((r) => r.requester.taskId === task.taskId)).toEqual([])
     }, {}, '1.4'),
 
-    scenario('task-question', 'blocks a board task on the questions a step of its run asks instead of answering, as every brief of the run offers (brief@1.2 ask): the step fails as question with no result on a gate decision, nothing after it starts, and the holder raises the board\'s question wait; answered, the next attempt\'s brief points at the answers; outside a board task nothing offers to ask, and such an answer is a result (INV-6, INV-9, INV-13)', async ({ ctx, workers }) => {
+    scenario('task-question', 'blocks a board task on the questions a step of its run asks instead of answering, as every brief of the run offers (brief@1.2 ask): the step fails as question with no result on a gate decision, nothing after it starts, and the holder raises the board\'s question wait; answered, the attempt continues and its next run\'s brief points at the answers (T291); outside a board task nothing offers to ask, and such an answer is a result (INV-6, INV-9, INV-13)', async ({ ctx, workers }) => {
       await activeProject(ctx)
       const task = await readyTask(ctx, 'unclear')
       const questions = ['Which band width?', 'Keep the old API?']
@@ -1039,7 +1085,9 @@ export const workflowSuite = defineSuite<Boot>({
       expect(failed).toMatchObject({ status: 'failed', error: { kind: 'question', disposition: 'USER_ACTION' } })
       expect(failed.nodes.map((n) => n.state)).toEqual(['FAILED', 'WAITING'])
       expect(failed.nodes[0]!.result).toBeUndefined()
-      expect(ctx.artifacts.get(workers.started[0]!.brief!)!.body).toMatchObject({ schema: 'brief@1.2', ask: { maxQuestions: 8 } })
+      // `ask` is a brief@1.2 field; a brief that also records its handbook slice is @1.6.
+      const asked = ctx.artifacts.get(workers.started[0]!.brief!)!.body as { schema: string; handbook?: unknown }
+      expect(asked).toMatchObject({ schema: asked.handbook ? 'brief@1.6' : 'brief@1.2', ask: { maxQuestions: 8 } })
       const view = await reported(ctx, run.runId)
       expect(view.task!.question).toMatchObject({ state: 'raised', nodeId: 'a', questions })
       expect(decisionOf(ctx, view.task!.question!.decision)).toMatchObject({ decisionType: 'gate', decider: { id: 'workflow.task-question' }, outcome: { option: 'ask', detail: { taskId: task.taskId, nodeId: 'a' } } })
@@ -1048,14 +1096,16 @@ export const workflowSuite = defineSuite<Boot>({
       await pause(300)
       expect(workers.started).toHaveLength(1)
 
-      // Answered: only that trusted move and the gate start the next attempt, which is briefed with the answers.
+      // Answered: only that trusted move and the gate continue the attempt, whose next run is briefed with the answers.
       await ctx.board.answer(task.taskId, ['64 is enough', 'yes, keep it'])
       expect(await ctx.board.task(task.taskId)).toMatchObject({ state: 'ready' })
       workers.reply = () => ({ text: 'the answer' })
       const next = await ctx.workflow.start({ template: 'chain', input: 'q', classification: 'public', task: { taskId: task.taskId } })
       expect((await reported(ctx, next.runId)).task!.outcome).toMatchObject({ status: 'accepted', state: 'done' })
       const brief = ctx.artifacts.get(workers.started[1]!.brief!)!.body as { attempt: number; artifacts: Array<{ role: string }> }
-      expect(brief.attempt).toBe(2)
+      // The answer continued attempt 1: the count did not move, and this run is that attempt again (T291).
+      expect(brief.attempt).toBe(1)
+      expect(await ctx.board.task(task.taskId)).toMatchObject({ attempts: { count: 1 } })
       expect(brief.artifacts.map((p) => p.role)).toContain('review')
       expect(workers.started[1]!.prompt).toContain('64 is enough')
 
@@ -1112,8 +1162,10 @@ export const workflowSuite = defineSuite<Boot>({
         const worktree = workers.worktrees.get(run.runId)!
         expect(git(worktree, 'status', '--porcelain')).toBe(' M kernel.c\n')
         expect(git(worktree, 'ls-files', '.system')).toBe('')
-        expect((await reported(ctx, run.runId)).task!.outcome).toMatchObject({ status: 'accepted', state: 'done' })
+        // Accepted on its worktree's tree, it waits for its landing: done once that lands it (T293).
+        expect((await reported(ctx, run.runId)).task!.outcome).toMatchObject({ status: 'accepted', state: 'review' })
         const board = (await ctx.board.task(task.taskId))!
+        expect(board.waiting?.reason).toBe('landing')
         const { subject, diff } = captureGitSubject(worktree)!
         expect(board.result!.subject).toEqual(subject)
         expect(diff).not.toContain('.system')
@@ -1454,8 +1506,63 @@ export const workflowSuite = defineSuite<Boot>({
       expect((await h.ctx.approvals.list()).filter((r) => r.action.class === 'dispatch')).toEqual([])
       expect(h.ctx.workflow.resumeDispatch(held.projectId).pausedProjects).toEqual([])
     }, {}, '1.10'),
+
+    scenario('dispatch-advice-off', 'records, beside each dispatch choice and as its input, the advisor\'s decision: unavailable while no advisor is configured, the default (PROP-0015 J1, INV-13)', async (h) => {
+      const choice = await dispatchChoice(h, 'no advisor')
+      expect(choice).toMatchObject({ outcome: { option: 'w:max' } })
+      expect(adviceOf(h.ctx, choice)).toMatchObject({ decisionType: 'route', decider: { type: 'rule', id: 'advisor.dispatch' }, outcome: { option: 'unavailable', detail: { reason: 'no advisor: dispatch.advisor.provider is none' } } })
+    }, {}, '1.11'),
+
+    scenario('dispatch-advice-swapped', 'records the advice of an advisor swapped in through setDispatchAdvisor beside the dispatch choice, as its input, in shadow: the choice is the one dispatch makes without it (PROP-0015 J1, INV-13)', async (h) => {
+      h.ctx.workflow.setDispatchAdvisor({
+        id: 'conformance',
+        // Advice against the chosen Worker: if shadow could change the choice, it would.
+        advise: async (features) => ({ status: 'advice', provider: 'conformance', modelVersion: 'conformance@1', candidates: features.candidates.map((c) => ({ alias: c.alias, accepted: 0, limit: 1, needsOperator: 1 })) }),
+      })
+      const choice = await dispatchChoice(h, 'advised')
+      expect(choice).toMatchObject({ outcome: { option: 'w:max' } })
+      expect(adviceOf(h.ctx, choice)).toMatchObject({ decisionType: 'route', decider: { type: 'model', id: 'advisor.dispatch', version: 'conformance@1' }, outcome: { option: 'advice' } })
+    }, {}, '1.11'),
+
+    scenario('dispatch-advice-seam', 'asks the provider of the advisor seam ctx.dispatchAdvisor at a dispatch choice while one is registered, and records its advice beside the choice, as its input, in shadow: the choice is the one dispatch makes without it (PROP-0015 J1, ADR-0037, INV-13)', async (h) => {
+      class Provider extends DispatchAdvisor {
+        readonly id = 'conformance-seam'
+        // Advice against the chosen Worker: if shadow could change the choice, it would.
+        async advise(features: AdvisorFeatures): Promise<Advice> {
+          return { status: 'advice', provider: 'conformance-seam', modelVersion: 'seam@1', candidates: features.candidates.map((c) => ({ alias: c.alias, accepted: 0, limit: 1, needsOperator: 1 })) }
+        }
+      }
+      const fiber = h.ctx.plugin({ name: 'conformance-dispatch-advisor', apply: (c: Context) => void new Provider(c) })
+      await fiber
+      try {
+        const choice = await dispatchChoice(h, 'advised by the seam')
+        expect(choice).toMatchObject({ outcome: { option: 'w:max' } })
+        expect(adviceOf(h.ctx, choice)).toMatchObject({ decisionType: 'route', decider: { type: 'model', id: 'advisor.dispatch', version: 'seam@1' }, outcome: { option: 'advice', detail: { provider: 'conformance-seam' } } })
+      } finally {
+        await fiber.dispose()
+      }
+    }, {}, '1.12'),
   ],
 })
+
+/** Since 1.11: one dispatch choice of a ready task on {@link DISPATCHABLE}: its `dispatch.choice` decision. */
+async function dispatchChoice(h: Harness, title: string): Promise<Decision> {
+  await activeProject(h.ctx)
+  h.workers.extra = [DISPATCHABLE]
+  await poolRead(h.ctx)
+  const task = await readyTask(h.ctx, title, { template: 'solo' })
+  await h.ctx.workflow.sweepDispatch()
+  const ask = h.ctx.workflow.dispatchStatus().asks.find((a) => a.taskId === task.taskId)
+  expect(ask, 'dispatch asked about the task').toBeDefined()
+  return decisionOf(h.ctx, ask!.decisions[1])
+}
+
+/** Since 1.11: the one advice decision (`advisor.dispatch`) a dispatch choice names as its input. */
+function adviceOf(ctx: Context, choice: Decision): Decision {
+  const ids = choice.inputs.filter((id) => (ctx.artifacts.get(id as ArtifactRef)?.body as Decision | undefined)?.decider?.id === 'advisor.dispatch')
+  expect(ids, 'the choice names exactly one advice decision').toHaveLength(1)
+  return decisionOf(ctx, ids[0])
+}
 
 /** Since 1.9: a Worker on the account of the ledger's pool {@link POOLS} names, idle, which dispatch may choose once its window reads ok. */
 const DISPATCHABLE: CapabilityDescriptor = worker('w:max', {

@@ -1,6 +1,6 @@
 import { chromium } from 'patchright-core'
-import { describe, expect, it, onTestFinished, vi } from 'vitest'
-import { canRunBrowser, testChrome } from '../../browser-patchright/tests/support.ts'
+import { describe, expect, onTestFinished, vi } from 'vitest'
+import { headlessIt, headlessLaunchOptions } from '../../browser-patchright/tests/support.ts'
 import { activeProject, readyTask } from '../../workflow/conformance/workflow.ts'
 import { boot, OPERATOR, reviewed } from './store-backed.ts'
 
@@ -12,10 +12,10 @@ vi.setConfig({ testTimeout: 120_000 })
 const GLOSSARY = ['worker', 'account', 'role', 'tier', 'kind', 'quota', 'window', 'resting', 'project', 'task', 'run', 'step', 'attempt', 'review', 'checks', 'landing', 'merge', 'branch', 'approval', 'action-class', 'batch', 'policy', 'mode', 'always-ask', 'policy-change', 'quarantine', 'stalled', 'held', 'derived', 'team', 'carry', 'resend', 'stale']
 
 describe('web UI: help in plain words (T126)', () => {
-  it.runIf(canRunBrowser)('has Help in the navigation: how System works, with links into the real pages, and a glossary whose entries are anchors a link focuses; it shows without a token too', async () => {
+  headlessIt('has Help in the navigation: how System works, with links into the real pages, and a glossary whose entries are anchors a link focuses; it shows without a token too', async () => {
     const booted = await boot()
     const origin = `http://127.0.0.1:${(booted.ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
     await page.goto(`${origin}/ui/#token=${OPERATOR}`)
@@ -74,14 +74,14 @@ describe('web UI: help in plain words (T126)', () => {
     expect(await bare.locator('dd#def-resting').isVisible()).toBe(true)
   }, 60_000)
 
-  it.runIf(canRunBrowser)('puts a "?" beside each such word that opens its plain sentence in place by keyboard, and links to its entry in Help; every "?" names what it explains and controls a note that exists (T126)', async () => {
+  headlessIt('puts a "?" beside each such word that opens its plain sentence in place by keyboard, and links to its entry in Help; every "?" names what it explains and controls a note that exists (T126)', async () => {
     const booted = await boot()
     const { ctx } = booted
     await activeProject(ctx)
     await reviewed(ctx, 'Fix the slow image build')
     await readyTask(ctx, 'Write the release notes', { template: 'solo' })
     const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
     await page.goto(`${origin}/ui/#token=${OPERATOR}`)
@@ -118,10 +118,10 @@ describe('web UI: help in plain words (T126)', () => {
     await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe('term-mode')
   }, 60_000)
 
-  it.runIf(canRunBrowser)('says every empty state in one short line, with a link where there is a next step, and keeps how things get there in Help (T126, T171)', async () => {
+  headlessIt('says every empty state in one short line, with a link where there is a next step, and keeps how things get there in Help (T126, T171)', async () => {
     const booted = await boot()
     const origin = `http://127.0.0.1:${(booted.ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/#token=${OPERATOR}`)
@@ -135,10 +135,9 @@ describe('web UI: help in plain words (T126)', () => {
     await activeProject(booted.ctx)
     await page.goto(`${origin}/ui/?view=board`)
     const column = (name: string) => page.getByRole('region', { name, exact: true })
-    await expect.poll(() => column('Ready').innerText()).toContain('No ready tasks')
-    expect(await column('Proposed').innerText()).toContain('No proposed tasks')
-    expect(await column('Working').innerText()).toContain('No active tasks')
-    expect(await column('Review').innerText()).toContain('No reviews')
+    // An empty column says None under its count (T239); Needs your attention, that nothing does.
+    await expect.poll(() => column('Ready').innerText()).toMatch(/^Ready \(0\)[^\n]*\n+None$/)
+    for (const name of ['Proposed', 'Working', 'Review']) expect(await column(name).innerText(), name).toMatch(new RegExp(`^${name} \\(0\\)\\n+None$`))
     expect(await column('Needs your attention').innerText()).toContain('Nothing needs you')
     // How a task moves between them is Help's Task lifecycle, folded under each state there.
     await page.goto(`${origin}/ui/?view=help`)

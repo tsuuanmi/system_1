@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { chromium } from 'patchright-core'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
-import { canRunBrowser, testChrome } from '../../browser-patchright/tests/support.ts'
+import { headlessIt, headlessLaunchOptions } from '../../browser-patchright/tests/support.ts'
 import { worker } from '../../../workers-core/conformance/workers.ts'
 import { activeProject, readyTask } from '../../workflow/conformance/workflow.ts'
 import { boot, OPERATOR, reviewed } from './store-backed.ts'
@@ -73,6 +73,16 @@ describe('web UI: since you last looked, who would take a step, and a run as it 
     stalls(ctx, run.runId, since)
     live = await call('runs/live')
     expect((live.value.runs as { value: Array<Record<string, any>> }).value.find((r) => r.runId === run.runId)!.stalled).toEqual({ value: { since } })
+    // A check of its result quiet past its bound, as the agents source tells it (T235): the run's explain lists it while it lasts.
+    const quietSince = new Date().toISOString()
+    ctx.eventLog.append({ type: 'agent-workers.check', runId: run.runId, data: { check: 'lint', command: 'corepack pnpm lint', state: 'stalled', quietSince, stallSeconds: 300, deadline: new Date(Date.now() + 600_000).toISOString() } })
+    const explained = (await call(`runs/${encodeURIComponent(run.runId)}`)).value as { explain: { stalledChecks?: unknown } }
+    expect(explained.explain.stalledChecks).toEqual([{ check: 'lint', command: 'corepack pnpm lint', since: expect.any(String), quietSince, stallSeconds: 300 }])
+    ctx.eventLog.append({ type: 'agent-workers.check', runId: run.runId, data: { check: 'lint', command: 'corepack pnpm lint', state: 'resumed', stallSeconds: 300 } })
+    expect(((await call(`runs/${encodeURIComponent(run.runId)}`)).value as { explain: { stalledChecks?: unknown } }).explain).not.toHaveProperty('stalledChecks')
+    // A stall whose check's deadline passed is over, even with no `ended` (a restart cut the check).
+    ctx.eventLog.append({ type: 'agent-workers.check', runId: run.runId, data: { check: 'lint', command: 'corepack pnpm lint', state: 'stalled', quietSince, stallSeconds: 300, deadline: new Date(Date.now() - 1000).toISOString() } })
+    expect(((await call(`runs/${encodeURIComponent(run.runId)}`)).value as { explain: { stalledChecks?: unknown } }).explain).not.toHaveProperty('stalledChecks')
   })
 
   it('reads by state and newest first, bounded with more: a long run stays live, and is in the activity once it ends, however many runs started after it; an event log that fails or reads out of order is {unknown}, never a failed reply (T127 item 7, INV-2, INV-9)', async () => {
@@ -169,7 +179,7 @@ describe('web UI: since you last looked, who would take a step, and a run as it 
     expect(seen.count).toBe(3)
   })
 
-  it.runIf(canRunBrowser)('leads a failed run on Home\'s Since you last looked with the run page\'s plain-words reason, the system\'s own text folded under it (T160)', async () => {
+  headlessIt('leads a failed run on Home\'s Since you last looked with the run page\'s plain-words reason, the system\'s own text folded under it (T160)', async () => {
     const { ctx, workers } = await boot()
     workers.reply = () => ({ fail: 'reauth_required', disposition: 'USER_ACTION', sent: false })
     const failed = ctx.workflow.start({ template: 'solo', input: 'Compare the CDN offers', classification: 'public' })
@@ -179,7 +189,7 @@ describe('web UI: since you last looked, who would take a step, and a run as it 
     // What the failure asks of the operator, in the run page's words for its disposition.
     const next = ({ USER_ACTION: 'it needs you', BACKOFF: 'it is tried again later', CODE_FIX: 'it needs a fix in the code or configuration', NONE: 'nothing more happens' } as Record<string, string>)[error.disposition]
     const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
     await page.goto(`${origin}/ui/#token=${OPERATOR}`)
@@ -198,13 +208,13 @@ describe('web UI: since you last looked, who would take a step, and a run as it 
     const reason = /^Failed: a solo run — (.+?) open the run/.exec(await item.innerText())![1]!
     await page.goto(`${origin}/ui/?run=${encodeURIComponent(failed.runId)}#token=${OPERATOR}`)
     // Its status line (T172): the Failed chip, where it failed, then that reason and the raw text.
-    const status = page.locator('p.status-line')
+    const status = page.locator('.status-line')
     await expect.poll(() => status.count(), { timeout: 15_000 }).toBe(1)
-    expect(await status.innerText()).toMatch(/^■ Failed at solo: /)
+    expect(await status.innerText()).toMatch(/^■ Failed\s+at solo: /)
     expect(await status.innerText()).toContain(`: ${reason} — ${error.message}`)
   }, 90_000)
 
-  it.runIf(canRunBrowser)('shows on Home what happened since the operator last looked, until marked as seen; names the waiting count in the window\'s title; the start names who would likely take it; a running run\'s page and card say where it is, and a stall (T124)', async () => {
+  headlessIt('shows on Home what happened since the operator last looked, until marked as seen; names the waiting count in the window\'s title; the start names who would likely take it; a running run\'s page and card say where it is, and a stall (T124)', async () => {
     const booted = await boot()
     const { ctx, workers } = booted
     await activeProject(ctx)
@@ -215,7 +225,7 @@ describe('web UI: since you last looked, who would take a step, and a run as it 
     const run = await ctx.workflow.start({ template: 'solo', input: 'research', classification: 'public', task: { taskId: busy.taskId } })
     await vi.waitFor(() => expect(ctx.workflow.get(run.runId)?.nodes[0]?.state).toBe('RUNNING'), { timeout: 10_000 })
     const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
     await page.goto(`${origin}/ui/#token=${OPERATOR}`)
@@ -250,15 +260,21 @@ describe('web UI: since you last looked, who would take a step, and a run as it 
     await confirming.getByRole('button', { name: 'Cancel' }).click()
     stalls(ctx, run.runId, new Date().toISOString())
     const card = page.getByRole('region', { name: 'Working', exact: true }).getByRole('article', { name: 'Research the hosting options' })
-    await expect.poll(() => card.innerText(), { timeout: 15_000 }).toMatch(/last event: .+ ago/)
+    // Its last event under its Details (T239); a stall in sight.
+    await expect.poll(() => card.textContent(), { timeout: 15_000 }).toMatch(/last event: .+ ago/)
     await expect.poll(() => card.innerText(), { timeout: 15_000 }).toMatch(/Stalled since .+: no activity past its source's bound/)
     // Its run's page: the step on its Worker and for how long, its last event, and the stall.
     await card.getByRole('link', { name: 'Open the run of Research the hosting options' }).click()
     const now = page.getByRole('region', { name: 'Now' })
     await expect.poll(() => now.count()).toBe(1)
-    expect(await now.innerText()).toMatch(/^Now\b[^\n]*\nStep solo on Conformance · \w+ · \w+, for (less than a minute|\d+ min)/)
+    expect(await now.innerText()).toMatch(/^Now\b[^\n]*\nStep solo on Conformance · \w+ · \w+, for (<1 min|\d+ min)/)
     expect(await now.innerText()).toMatch(/last event: .+ ago/)
     expect(await now.getByRole('alert').innerText()).toMatch(/^Stalled since /)
+    // A check of its result quiet past its bound (T235): the run's page says so under Checks.
+    ctx.eventLog.append({ type: 'agent-workers.check', runId: run.runId, data: { check: 'lint', command: 'corepack pnpm lint', state: 'stalled', quietSince: new Date().toISOString(), stallSeconds: 300 } })
+    const checks = page.getByRole('region', { name: 'Checks' })
+    await expect.poll(() => checks.count(), { timeout: 15_000 }).toBe(1)
+    expect(await checks.innerText()).toMatch(/Check stalled\s*lint: no output since .+ · it goes on until its deadline/)
     expect(task.state).toBe('review')
   }, 90_000)
 })

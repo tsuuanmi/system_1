@@ -6,7 +6,7 @@
 charters, and their tasks.
 
 - **Records.** Projects are `project@1.0` and tasks `board-task@1.0` records (`@1.1` once a
-  task carries a funding ask or a raise), one row each in
+  task carries a funding ask or a raise, `@1.2` once it carries a `defect` link), one row each in
   `board_projects` and `board_tasks`, indexed by project and state. Every record is validated
   before it is written and after it is read: one that fails on read is never acted on. Every
   write is revision-checked.
@@ -38,6 +38,16 @@ charters, and their tasks.
     event log is loaded (optional; an append that fails is logged), so notify tells the operator
     before the hold expires
     ([a review held for the operator](../../../docs/design/board.md#a-review-held-for-the-operator)).
+  - Under `autoAccept` (D80, ADR-0067), for a listed project's result on a git working tree, the
+    run owner's accepting decision applies only when the run's last review it names approved the
+    exact tree with no blocking finding left, its `check-run@1.0` record shows each command check
+    it reports passed on that tree, none of those reported tests it did not run
+    (`checkRun.results[].notRun`, T247: "checks passed, browser tests not run" is held, T255), and
+    its landing target is a listed branch: the task is done on
+    a `board` decision of rule `board.auto-accept` naming the acceptance, the review, the record,
+    and the autonomy decision. Otherwise the review is held for the operator as above, the hold's
+    decision listing every condition that failed
+    ([System accepts a listed branch's result](../../../docs/design/board.md#system-accepts-a-listed-branchs-result)).
   - A move that ends a wait (`reconcileRun`, `cancel`, `close`) reads the request first, commits,
     and withdraws it after; a withdrawal that fails is logged, and the request expires on its
     own. The sweep leaves a task waiting on a request the board withdrew itself as it is. A
@@ -85,12 +95,28 @@ charters, and their tasks.
   after what approving does, name each run, step, and expiry (`unreleasedText`). They change
   neither the subject nor the wait, and are not kept: a request asked again after a policy change
   does not name them.
+- **A run that failed only on the infrastructure** (`reconcileRun`'s failed `infrastructure`,
+  contract 1.5,
+  [ADR-0069](../../../docs/decisions/adr/0069-an-attempt-is-not-spent-on-an-infrastructure-failure.md)):
+  checked with `infrastructureProblem` before anything moves (`invalid` when malformed). While the
+  task has free retries left (`maxFreeRetries`, default 3), the move gives the attempt back
+  (`attempts.count` one lower) and sends the same attempt through the gate, its `board` decision
+  naming the kind, the reason, and the free retries used and allowed; the count is kept in
+  `board_tasks.free_retries` (migration 3) in the move's transaction, beside the record, so the
+  bound holds across restarts. Past the bound it counts as any failed run, its decision saying so
+  with the reason ([attempts](../../../docs/design/board.md#an-attempt-not-spent-on-the-infrastructure)).
 - **A digest on a result** (`attachDigest`, contract 1.1): in one transaction, a stored
   `digest@1.0` report whose sources are exactly the result's artifacts becomes `result.digest`,
   once; the same digest again changes nothing. Refused while the task has no result, while its
   reviewer holds the review (its acceptance binds to the whole result, digest included), and once
   another is attached. No state moves and no decision is made; a review held for the operator
   takes one, and the operator's acceptance then names it.
+- **A done result sent back** (`reopen`, contract 1.4,
+  [ADR-0068](../../../docs/decisions/adr/0068-an-accepted-result-is-rebased-onto-its-target-and-checked-again-before-it-lands.md)):
+  checked before the gate is asked (done on exactly that run's result and acceptance, a stored
+  decision, a reason), then, in one transaction checked again, the move a rejected attempt makes
+  (`nextAttemptMove`, or `retries-spent` with no attempt left), its `board` decision naming the
+  landing's; a request the gate opened for a move that does not commit is withdrawn.
 - **Where the protocol's tables leave room**, this provider settles it as
   [board](../../../docs/design/board.md#where-the-tables-leave-room) says.
 - **Reads beyond the seam:** `projectPage` and `taskPage` (20 items by default, never more than
@@ -117,11 +143,37 @@ charters, and their tasks.
   at client scope, the lead's; `board_pause`, `board_resume`, and `board_close` at operator scope
   ([the operator's project moves](../../../docs/design/board.md#the-operators-project-moves)).
   Each input and structured output is validated against
-  [`schemas/mcp-board.v1.json`](../../../schemas/mcp-board.v1.json) (1.2) `$defs/<tool>-input` and
+  [`schemas/mcp-board.v1.json`](../../../schemas/mcp-board.v1.json) (1.7) `$defs/<tool>-input` and
   `-output`; a refused input does nothing, a refusal is an MCP error naming the `BoardError`. A
   tool that changes the board checks the output it would give inside the move's transaction,
   before it commits (each such method takes an optional `check`), so an output its schema refuses
   (a defect) is refused with nothing moved, and a request the move opened is withdrawn.
+  - `board_escape`, `board_breakers`, and `board_breaker_reset` (`mcp-board` 1.3, D93,
+    [ADR-0067](../../../docs/decisions/adr/0067-system-accepts-a-listed-branchs-result-on-its-review-and-checks.md)):
+    the lead or the operator records a defect found in an auto-accepted result, which trips the
+    auto-accept circuit breaker at `autoAccept.breaker`'s line, lists the breakers tripped, and turns
+    auto-accept on again once the line holds; who it was is the caller's token, never an argument;
+  - `board_reopen_review` (`mcp-board` 1.4, T286): the lead (for its own project) or the operator
+    brings a `review-expired` task back to review, held for the operator, with a reason, while it
+    has its result and its run's worktree is recorded (`agent_worktrees`) and on disk
+    (`runWorktrees`); a review whose holder's lease lapsed is held for the operator by the sweep,
+    never expired by it;
+  - `board_defect` and `board_propose`'s `fixes` (`mcp-board` 1.5, T277b, PROP-0016 I4): a task fixes a
+    defect of a **done** task of the same project, in the change that landed at `sha`; set when the task is
+    filed or later, once, by the lead (`as: reviewer` for the reviewer) or the operator, and counted by
+    `system metrics` as an escaped defect ([runbook](../../../docs/operations/runbooks.md#link-a-defect));
+    a lead token reaches its own project's tasks only (T285), as for every board tool;
+  - `board_propose_plan` (`mcp-board` 1.6, PROP-0023 change 5): a plan's tasks, every one or none, in
+    one transaction; each item names a `key`, and its `dependsOn` names other items by key or the
+    project's tasks by id; a cycle, a key named twice, or two items writing one subject is refused
+    before anything is stored ([a plan of tasks](../../../docs/design/board.md#a-plan-of-tasks));
+  - `board_propose` and each item of `board_propose_plan` take a template `variant` (`mcp-board`
+    1.7, `board-task@1.5`, PROP-0023): every run of the task starts in it, so dispatch routes its
+    writing step by the variant's kind of work; it needs `template`;
+  - a proposal that names no `budget` gets the configuration's `defaultBudget` (empty by default):
+    lines on a pool or on a template's pools, such as `{pool: claude-code.agents, unit: usd, amount: 6}`,
+    which caps the task whichever account serves it
+    ([ADR-0083](../../../docs/decisions/adr/0083-a-budget-line-on-a-template-counts-every-accounts-pool.md));
   - `board_propose` takes the attempts the task gets (`maxAttempts`, 1 to 10, `mcp-board` 1.2);
     without it, the task gets the configuration's `templateAttempts` for its template, else
     `maxAttempts` (3) ([attempts](../../../docs/design/board.md#attempts));
@@ -142,10 +194,11 @@ charters, and their tasks.
     question, `question` its index from 0 in `waiting.questions`, which the tool's own description
     says, so the generated reference shows it; its `note` is not stored (no record holds
     progress notes yet). Only a `question` wait takes answers: a `rejected`, `retries-spent`, or
-    `review-expired` wait takes no input and only expires to cancelled, and answering the last
-    attempt's questions leaves the task waiting for input (`retries-spent`), never ready with no
-    attempt left
-    ([what ends an input wait](../../../docs/design/board.md#what-ends-an-input-wait));
+    `review-expired` wait takes no input and only expires to cancelled. Answering a question wait
+    spends no attempt, also on the last one (T291): the attempt that asked continues through the
+    gate, its count unchanged, and the next `start` runs that same attempt again (the
+    `board_tasks.continues` flag, migration 5;
+    [what ends an input wait](../../../docs/design/board.md#what-ends-an-input-wait));
   - `board_cancel` cancels as `operator` for an operator token and as `lead` for a client one;
   - `board_pause`, `board_resume`, and `board_close` move the project for the operator only: the
     host serves them to the operator token, and each handler refuses any other caller (`invalid`)
@@ -161,13 +214,15 @@ charters, and their tasks.
     charter's constraint notes.
 - **Injects:** `store`, `artifacts`, `leases`, `approvals`; `mcp` is optional.
 - **Config:** `fundingMaxPercent` (default 100, 0 to 1000), `inputExpirySeconds` (default 7
-  days), `leaseTtlSeconds` (600), `maxAttempts` (3), `pageBound` (100), `projectionMaxTasks`
-  (200), `sweepSeconds` (60).
+  days), `leaseTtlSeconds` (600), `maxAttempts` (3), `maxFreeRetries` (3, 0 to 10; validated at
+  start), `pageBound` (100), `projectionMaxTasks`
+  (200), `sweepSeconds` (60), `autoAccept` (`{ projects, branches }`, off by default; validated
+  at start: project ids and plain branch names, at most 64 each, no repeats).
 - **Bundle:** the `board` row is on, over the `approvals` row
   ([`system-approvals`](../approvals/README.md)); with that row off or refused, the board waits
   on its `approvals` inject and is not mounted.
 - **Tests:** [`tests/conformance.spec.ts`](tests/conformance.spec.ts) runs the seam's suite
-  ([`board-core/conformance/board.ts`](../../board-core/conformance/board.ts)) at contract 1.3
+  ([`board-core/conformance/board.ts`](../../board-core/conformance/board.ts)) at contract 1.5
   over `FakeApprovals`, with no expected failures; the approval queue's own tests run it over the
   store-backed queue too.
   [`tests/board.spec.ts`](tests/board.spec.ts) covers what the suite does not: restart (in place

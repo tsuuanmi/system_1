@@ -6,7 +6,7 @@ import { CHROME_LOCK } from '@tsuuanmi/system-browser-patchright'
 import { SchemaRegistry } from '@tsuuanmi/system-libs'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { parse as parseYaml } from 'yaml'
-import { accountTarget, agentAccountLine, formatMigration, parseMigrate, assertRuntime, callTool, checkRows, signInEnvironment, signInLine, formatEvents, formatHealth, formatPlugins, parseEvents, healthExit, hostHealth, hostPlugins, hostCapacity, hostRoster, claudeGatewayCommand, codexGatewayCommand, drainHost, formatTools, ensureBrowser, hostProcessProblem, shutdownHost, exitCode, formatArtifact, formatDispatch, parseDispatch,formatExplanation, formatFreed, formatLiveness, parseFree, formatWorktrees, formatWorktreesRemoved, parseWorktreesRemove, formatUsage, mcpConfig, mcpHeaders, mcpToken, mergeProfileManifest, parseAsk, parseReport, uiUrl, parseComposedRows, presetOf, rowOffProblem } from '../src/index.ts'
+import { accountTarget, agentAccountLine, formatMigration, parseMigrate, assertRuntime, callTool, checkRows, signInEnvironment, signInLine, formatEvents, formatHealth, formatPlugins, parseEvents, healthExit, hostHealth, hostPlugins, hostCapacity, hostRoster, claudeGatewayCommand, codexGatewayCommand, drainHost, formatTools, ensureBrowser, hostProcessProblem, shutdownHost, exitCode, formatArtifact, formatDispatch, parseDispatch,formatExplanation, formatFreed, formatLiveness, parseFree, formatWorktrees, formatWorktreesRemoved, parseWorktreesRemove, formatUsage, mcpConfig, mcpHeaders, mcpToken, mergeProfileManifest, parseAsk, parseMetrics, parseReport, uiUrl, parseComposedRows, presetOf, rowOffProblem } from '../src/index.ts'
 
 const dirs: string[] = []
 afterEach(() => {
@@ -79,6 +79,14 @@ describe('system CLI (PR #3 kernel review)', () => {
     // The tool refuses a period it cannot name (both since and days, or days that are not a whole number), with nothing read.
     expect(parseReport(['--days', 'week'])).toEqual({ days: Number.NaN })
     for (const args of [['--project'], ['--bogus', 'x'], ['--days', '7', '--days', '8'], ['p1']]) expect(parseReport(args), args.join(' ')).toBeUndefined()
+  })
+
+  it('reads system metrics flags: --days n (1 to 366), --project, --until, each once (PROP-0016 I4)', () => {
+    expect(parseMetrics([])).toEqual({})
+    expect(parseMetrics(['--days', '14', '--project', 'system', '--until', '2026-10-26T00:00:00Z'])).toEqual({ days: 14, projectId: 'system', until: '2026-10-26T00:00:00Z' })
+    for (const args of [['--days'], ['--days', '0'], ['--days', '367'], ['--days', 'month'], ['--days', '7.5'], ['--since', '2026-10-01T00:00:00Z'], ['--days', '7', '--days', '8'], ['30']]) {
+      expect(parseMetrics(args), args.join(' ')).toBeUndefined()
+    }
   })
 
   it('reports health with exit 0, 1, or 2, and a host that does not answer as down (REQ-HOST-6)', async () => {
@@ -386,6 +394,26 @@ describe('system usage and explain output', () => {
     ])
   })
 
+  it('prints the handbook slice each step was given: its size against the bound and the mode, what selected it, each layer\'s version and size, and what the source rendered (docs/design/handbook.md)', () => {
+    const handbook = {
+      bound: { tokens: 6000, mode: 'warn' }, tokens: 4200,
+      selection: { role: 'develop', class: 'code', tier: 'heavy', tierFrom: 'unknown', paths: 'unknown' },
+      layers: [
+        { layer: 1, version: 'git:ab;adr:0072', renderedBy: 'engine', parts: ['L1.pointer'], tokens: 60 },
+        { layer: 5, version: 'source', renderedBy: 'source', parts: ['L5.lessons'], tokens: 3100, atMost: true },
+      ],
+      source: [{ layer: 5, part: 'L5.lessons', version: 'git:0a1b', tokens: 410, lessons: 6 }],
+    }
+    expect(formatExplanation({ runId: 'run_3', template: 'algorithm-development', status: 'running', specHash: 'sha256:ef', nodes: [{ nodeId: 'develop:1', state: 'RUNNING', decisions: [], handbook }] })).toEqual([
+      'run_3  algorithm-development  running  spec sha256:ef',
+      '  develop:1  RUNNING  -  -  -',
+      '    handbook  4200 of 6000 tokens (warn mode)  role develop, class code, tier heavy (from unknown), paths unknown',
+      '      layer 1  60 tokens  by engine  git:ab;adr:0072  parts L1.pointer',
+      '      layer 5  at most 3100 tokens  by source  source  parts L5.lessons',
+      '      rendered L5.lessons  410 tokens  git:0a1b  6 lesson(s)',
+    ])
+  })
+
   it('prints a run\'s executions whose liveness needs a look after its decision chain: the verdict, its looks, why, what it holds, and what to do (PROP-0013)', () => {
     const held = {
       source: 'agents', execution: 'arun_00000000000000aa', worker: 'agent:dev', state: 'unknown' as const, since: '2026-10-24T01:00:00.000Z', verdict: 'unknown (liveness@1)', looks: { taken: 3, max: 3 },
@@ -404,6 +432,42 @@ describe('system usage and explain output', () => {
     ])
     const { verdict: _v, looks: _l, decision: _d, ...stalled } = held
     expect(formatLiveness([{ ...stalled, state: 'stalled', holds: [] }])[0]).toBe('  arun_00000000000000aa  agent:dev  stalled since 2026-10-24T01:00:00.000Z')
+    // A check of the run's result quiet past its bound (T235).
+    expect(formatExplanation({
+      runId: 'run_1', template: 'develop', status: 'running', specHash: 'sha256:ab', nodes: [],
+      stalledChecks: [{ check: 'lint', command: 'corepack pnpm lint', since: '2026-10-26T01:05:00.000Z', quietSince: '2026-10-26T01:00:00.000Z', stallSeconds: 300 }],
+    })).toEqual([
+      'run_1  develop  running  spec sha256:ab',
+      'checks',
+      '  lint  stalled since 2026-10-26T01:05:00.000Z: no output since 2026-10-26T01:00:00.000Z (bound 300 s)  corepack pnpm lint',
+    ])
+  })
+
+  it('prints a run\'s web calls last: the counts, then each call\'s query or URL with its verdict and egress outcome (T262)', () => {
+    const web = {
+      count: 3, auto: 1, asked: 1, denied: 1,
+      calls: [
+        { at: '2026-10-26T01:00:00.000Z', nodeId: 'lit:2', tool: 'WebSearch', target: 'X lowers Y', verdict: 'auto' as const, egress: 'allow', decision: 'sha256:01' },
+        { at: '2026-10-26T01:00:01.000Z', nodeId: 'lit:2', tool: 'WebFetch', target: 'https://example.org/', verdict: 'ask' as const, egress: 'not-checked', reason: 'bound', decision: 'sha256:02' },
+      ],
+    }
+    expect(formatExplanation({ runId: 'run_1', template: 'research', status: 'completed', specHash: 'sha256:ab', nodes: [], webCalls: web })).toEqual([
+      'run_1  research  completed  spec sha256:ab',
+      'web calls  3: 1 unasked, 1 asked, 1 denied in their session',
+      '  2026-10-26T01:00:00.000Z  lit:2  WebSearch  auto  egress allow  "X lowers Y"  (sha256:01)',
+      '  2026-10-26T01:00:01.000Z  lit:2  WebFetch  ask  egress not-checked  (bound)  "https://example.org/"  (sha256:02)',
+      '  and 1 more',
+    ])
+  })
+
+  it('prints where a run\'s accepted result stands in its target\'s landing queue: its place, who holds the target, its stack (PROP-0016 I3)', () => {
+    const base = { runId: 'run_1', template: 'develop', status: 'completed', specHash: 'sha256:ab', nodes: [] }
+    expect(formatExplanation({ ...base, landing: { key: '/repo#dev', state: 'queued', position: 2, length: 3, holder: { runId: 'run_0', taskId: 'T1' }, batch: { size: 3, limit: 3, index: 2 } } })).toEqual([
+      'run_1  develop  completed  spec sha256:ab',
+      'landing queue  /repo#dev  queued  position 2 of 3  behind task T1 (run run_0), which holds the target',
+      '  stack  result 2 of 3  (batch size 3)',
+    ])
+    expect(formatExplanation({ ...base, landing: { key: '/repo#dev', state: 'asked', position: 1, length: 1 } })[1]).toBe('landing queue  /repo#dev  asked  position 1 of 1  holds the target')
   })
 
   it('asks to free a run only on the operator\'s word that its agent is gone, and prints what was freed and each worktree (PROP-0013)', () => {

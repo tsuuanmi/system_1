@@ -15,7 +15,7 @@ import { type Capacity, CAPACITY_BOUNDS, type CapacityStep, type CapacityTaskRea
 export const ROSTER_SCHEMA = 'mcp-roster@1.9'
 
 /** The engine's event when a step's attempt starts (docs/design/workflow-engine.md), read for when a running step began. */
-export const NODE_STARTED = 'workflow.node.started'
+const NODE_STARTED = 'workflow.node.started'
 
 /** What one roster reads at most (INV-9). */
 export const ROSTER_BOUNDS = {
@@ -63,12 +63,16 @@ export interface RosterDescriptor {
   description?: string | undefined
   /** `@1.8`: its name for people, as its source gives it (a website provider's own, a model's from the operator's catalog). */
   title?: string | undefined
+  /** `@1.9`: why an unavailable Worker takes no work, as its source knows it (a failed probe, a workspace problem, a gate). */
+  unavailableReason?: string | undefined
   /** `@1.6`: the kinds of work the operator gives it. */
   kinds?: string[] | undefined
   account?: { id: string; group: string; mode: 'assigned' | 'pooled'; limitUntil?: string | undefined } | undefined
   load?: { running: number; queued: number; pending: number; slots: number } | undefined
   cooldowns?: Array<{ capability: string; until: string }> | undefined
   tier: 'economy' | 'standard' | 'frontier'
+  /** `@1.10`: every tier it offers (ADR-0073), each closed while its model is at its limit. */
+  tiers?: ReadonlyArray<RosterTier> | undefined
   quotaClass: 'subscription-chat' | 'agent-plan' | 'metered' | 'local'
   locality: 'local' | 'remote'
   state: 'ready' | 'busy' | 'quota-exhausted' | 'reauth-required' | 'unavailable'
@@ -102,6 +106,8 @@ export interface RosterPool {
   readings: Array<{ window: { id: string }; state: 'ok' | 'limited' | 'unknown'; usedPercentage?: number | undefined; resetsAt?: string | undefined; cooldownUntil?: string | undefined; source: string; observedAt: string }>
   available: boolean
   until?: string | undefined
+  /** How the pool is configured when a window has no reading (`unknown: available` makes it available; T294). */
+  unknown?: 'available' | 'unavailable' | undefined
 }
 /** A workflow run as the engine's usage view gives it. */
 export interface RosterRun {
@@ -206,7 +212,7 @@ export interface RosterInput {
 }
 
 /** The key of one step's start in {@link RosterInput}.starts. */
-export const stepKey = (runId: string, nodeId: string): string => `${runId}\u0000${nodeId}`
+const stepKey = (runId: string, nodeId: string): string => `${runId}\u0000${nodeId}`
 
 // The record.
 
@@ -244,6 +250,8 @@ export interface RosterWork {
 }
 export interface RosterWindow { id: string; kind: string; seconds?: number; state: 'ok' | 'limited' | 'unknown'; used: Known<number>; resets: Known<string>; observedAt?: string; source?: string }
 export interface RosterPoolView { pool: string; kind: string; available: boolean; until?: string; windows: RosterWindow[]; unknownUsage: Known<{ runs: number; kinds: Partial<Record<UsageUnknownKind, number>> }> }
+/** One tier a Worker offers (`mcp-roster@1.10`): its model's display label from the live profile, its turn limit, and whether its model's limit closes it now. */
+export interface RosterTier { tier: 'economy' | 'standard' | 'frontier'; label?: string | undefined; maxTurns?: number | undefined; closed?: true | undefined; until?: string | undefined }
 export interface RosterEntry {
   worker: string
   /**
@@ -263,6 +271,8 @@ export interface RosterEntry {
   /** The role the Worker serves on its account, `null` for a Worker that is no role's (a website account's tier, a model, a hand-named agent Worker). */
   role: Known<string | null>
   tier: RosterDescriptor['tier']
+  /** `@1.10`: every tier it offers, lowest first, each with its model's display label and turn limit; only a Worker that offers tiers (ADR-0073) has it. */
+  tiers?: RosterTier[]
   quotaClass: RosterDescriptor['quotaClass']
   locality: RosterDescriptor['locality']
   /** The state its source describes; `availability` is what the roster makes of it with the account. */
@@ -372,7 +382,7 @@ function availabilityOf(d: RosterDescriptor, record: Known<RosterAccountRecord>,
   return { state: 'ready', summary: 'ready' }
 }
 
-/** Why an unavailable Worker takes no work, from what its account says; unknown when nothing does. */
+/** Why an unavailable Worker takes no work, from what its account says, else its source; unknown when nothing does. */
 function reasonOf(d: RosterDescriptor, rec: RosterAccountRecord | undefined, record: Known<RosterAccountRecord>): Known<string> {
   if (rec?.sameAs?.length) return known(`its account is signed in as the same person as ${rec.sameAs.join(', ')}, so none of them takes work`)
   if (rec && rec.status !== 'ready') {
@@ -387,8 +397,13 @@ function reasonOf(d: RosterDescriptor, rec: RosterAccountRecord | undefined, rec
     return known(what[rec.status] ?? `its account is ${rec.status}`)
   }
   if (d.state === 'reauth-required') return known('its account must sign in again (system account login)')
+  // Its source's own reason (`capability-descriptor@1.9`): a failed probe, a workspace problem, a gate.
+  if (d.unavailableReason) return known(d.unavailableReason)
   return unknown(`its Worker source gives no reason${isKnown(record) ? '' : `, and its account could not be read (${record.unknown})`}; system explain on a run it was refused for shows the route's reasons`)
 }
+
+/** What the roster's `used` says of a window of an unread pool (T294); capacity reads the pool as unread from it. */
+export const UNREAD_MARK = 'unread, admitted at the unread bound'
 
 /**
  * A pool's windows as the roster shows them. A window with no reading yet says, for the operator, why
@@ -396,10 +411,13 @@ function reasonOf(d: RosterDescriptor, rec: RosterAccountRecord | undefined, rec
  */
 function windowsOf(p: RosterPool, unread: { why: string; at: string } | undefined): RosterWindow[] {
   const none = unread ? `no reading yet: its account's usage report could not be read at ${unread.at}: ${unread.why}` : 'no reading yet'
+  // A pool configured `unknown: available` with no reading of any window is unread: dispatch admits it at the unread bound (T294).
+  // One read window makes it judged by its readings, so no window of it is marked then.
+  const bound = p.unknown === 'available' && p.readings.length === 0 ?` (${UNREAD_MARK}: dispatch admits it one run at a time, after every account with headroom)` : ''
   return p.windows.map((w) => {
     const r = p.readings.find((reading) => reading.window.id === w.id)
     const base = { id: w.id, kind: w.kind, ...(w.seconds !== undefined ? { seconds: w.seconds } : {}) }
-    if (!r) return { ...base, state: 'unknown' as const, used: unknown<number>(none), resets: unknown<string>('no reading yet') }
+    if (!r) return { ...base, state: 'unknown' as const, used: unknown<number>(none + bound), resets: unknown<string>('no reading yet') }
     const reset = later(r.resetsAt, r.cooldownUntil)
     return {
       ...base, state: r.state, observedAt: r.observedAt, source: r.source,
@@ -427,7 +445,7 @@ function poolsOf(input: RosterInput, d: RosterDescriptor, unread: { why: string;
 }
 
 /** How long from `since` to `now`, in words: "less than a minute", "4 min", "2 h 5 min", "3 days". */
-export function spanText(since: string, now: Date): string {
+function spanText(since: string, now: Date): string {
   const minutes = Math.max(0, Math.floor((now.getTime() - Date.parse(since)) / 60_000))
   if (minutes < 1) return 'less than a minute'
   if (minutes < 60) return `${minutes} min`
@@ -546,7 +564,7 @@ export function projectRoster(input: RosterInput, options: { scope: RosterScope;
         description: d.description !== undefined ? known(d.description) : unknown('no description is configured for it'),
         derived: derivedOf(d, role),
         family: d.family !== undefined ? known(d.family) : unknown('its Worker source declares no provider family'),
-        account, role, tier: d.tier, quotaClass: d.quotaClass, locality: d.locality, state: d.state, observedAt: d.observedAt,
+        account, role, tier: d.tier, ...(d.tiers?.length ? { tiers: tiersOf(d.tiers) } : {}), quotaClass: d.quotaClass, locality: d.locality, state: d.state, observedAt: d.observedAt,
         availability,
         load: d.load ? known({ running: d.load.running, queued: d.load.queued, pending: d.load.pending, slots: d.load.slots }) : unknown('its Worker source reports no load'),
         limits: [...(d.cooldowns ?? [])].map((c) => ({ capability: c.capability, until: c.until })).sort((a, b) => cmp(a.capability, b.capability)),
@@ -569,9 +587,32 @@ export function projectRoster(input: RosterInput, options: { scope: RosterScope;
   }
 }
 
+const TIER_ORDER = ['economy', 'standard', 'frontier']
+
+/** The tiers a Worker offers as the roster lists them: lowest first, each with what a reader needs and nothing a router reads. */
+function tiersOf(offers: ReadonlyArray<RosterTier>): RosterTier[] {
+  return [...offers].sort((a, b) => TIER_ORDER.indexOf(a.tier) - TIER_ORDER.indexOf(b.tier)).map((t) => ({
+    tier: t.tier,
+    ...(t.label !== undefined && /^[^\p{Cc}]{1,256}$/u.test(t.label) ? { label: t.label } : {}),
+    ...(t.maxTurns !== undefined ? { maxTurns: t.maxTurns } : {}),
+    ...(t.closed ? { closed: true as const } : {}),
+    ...(t.until ? { until: t.until } : {}),
+  }))
+}
+
+/** One offered tier in a line: `economy (model label, 12 turns, closed until …)`. */
+const tierText = (t: RosterTier): string => {
+  const parts = [...(t.label ? [t.label] : []), ...(t.maxTurns !== undefined ? [`max ${t.maxTurns} turns`] : []), ...(t.closed ? [`at its model's limit${t.until ? ` until ${t.until}` : ''}`] : [])]
+  return parts.length ? `${t.tier} (${parts.join(', ')})` : t.tier
+}
+
 /** A Worker's line made from what its source says: provider, role, tier, quota class, and locality (shown, marked as derived, when it has no description). */
 function derivedOf(d: RosterDescriptor, role: Known<string | null>): string {
-  return clip(`${d.provider} Worker${isKnown(role) && role.value ? `, role ${role.value}` : ''}, ${d.tier} tier, ${d.quotaClass}, ${d.locality}`)
+  // A Worker that offers several tiers (ADR-0073) names them, and each its model's limit closes now.
+  const tiers = d.tiers && d.tiers.length > 1
+    ? `${d.tiers.map((t) => `${t.tier}${t.closed ? ` (at its model's limit${t.until ? ` until ${t.until}` : ''})` : ''}`).join(', ')} tiers`
+    : `${d.tier} tier`
+  return clip(`${d.provider} Worker${isKnown(role) && role.value ? `, role ${role.value}` : ''}, ${tiers}, ${d.quotaClass}, ${d.locality}`)
 }
 
 /**
@@ -773,7 +814,7 @@ export function formatRoster(roster: Roster): string {
     for (const w of roster.workers.value) {
       lines.push('', `${w.name} (${w.worker})  ${w.availability.summary}`)
       lines.push(`  is         ${isKnown(w.description) ? w.description.value : `${w.derived} (derived: no description is configured)`}`)
-      lines.push(`  serves     ${w.tier}, ${w.quotaClass}, ${w.locality}; provider ${w.provider}, family ${text(w.family)}; role ${text(w.role, (r) => r ?? 'none')}`)
+      lines.push(`  serves     ${w.tiers ? `${w.tiers.map(tierText).join('; ')}` : w.tier}, ${w.quotaClass}, ${w.locality}; provider ${w.provider}, family ${text(w.family)}; role ${text(w.role, (r) => r ?? 'none')}`)
       lines.push(`  account    ${text(w.account, (a) => `${a.id} (${a.group}, ${a.mode}): ${text(a.record, (r) => `${r.kind} ${r.status}${r.label ? `, ${text(r.label, (l) => JSON.stringify(l))}` : ''}${r.slot !== undefined ? `, slot ${r.slot}` : ''}${r.quarantine ? `, quarantined ${r.quarantine.reason} since ${r.quarantine.since} (${r.quarantine.decision})` : ''}${r.sameAs ? `, same person as ${r.sameAs.join(', ')}` : ''}`)}`)}`)
       lines.push(`  load       ${text(w.load, (l) => `${l.running} running of ${l.slots}, ${l.queued} queued, ${l.pending} pending`)}${w.limits.length ? `; limited: ${w.limits.map((l) => `${l.capability} until ${l.until}`).join(', ')}` : ''}`)
       lines.push(`  work       ${text(w.work, (work) => [

@@ -10,7 +10,11 @@
  *   each request newly opened is charged to it.
  * - **The Worker** of a task's writing step is chosen by `quotaScoreOf` (`quota-score@2`) among the
  *   Workers routing admits (`ctx.workers.candidates`, nothing reserved): the first free one. An unknown
- *   or stale reading, or a metered pool, is never free (INV-2, D65).
+ *   or stale reading, or a metered pool, is never free (INV-2, D65). It is chosen within the
+ *   restriction routing will apply to that step (INV-6): when the attempt resumes the session of the
+ *   one before it, that session's Worker, and when that Worker is not free the task is not started
+ *   now ("waits for its session's Worker"). A start whose chosen Worker the step's restriction leaves
+ *   out by the time it starts is refused before it takes the task, spending no attempt (T215).
  * - **The policy** for `dispatch` decides: `ask` opens one request bound to the task, its attempt, and
  *   the Worker (INV-5), recorded on a row before it is asked and adopted after a crash; an attempt the
  *   operator approved through the board's gate starts without a second button (D62); `auto` starts it
@@ -36,8 +40,14 @@ import type { Board, BoardTask, Project, Subject } from '@tsuuanmi/system-board-
 import { contentId, QUOTA_SCORE, type QuotaCandidate, type QuotaPool, quotaScoreOf, type QuotaSettings, type ScoredCandidate, windowName } from '@tsuuanmi/system-libs'
 import type { PoolState } from '@tsuuanmi/system-resources-core'
 import { type ArtifactRef, type Candidates, TIERS } from '@tsuuanmi/system-workers-core'
+import {
+  ADVISED_EVENT, type AdviceDetail, type Advisor, adviseInShadow, advisorProblems, advisorSettings, type AdvisorSettings, type CandidateFacts, featuresOf, LocalAdvisor, ModelAdvisor,
+  modelAnswersOf, OutcomeHistory, QUESTION_SET, type ShadowAdvice,
+} from './advisor.ts'
 import type { Engine } from './engine.ts'
+import { lookTierAtRisk } from './risk.ts'
 import { type ResolvedNode, resolve } from './spec.ts'
+import { admittedRestriction } from './teams.ts'
 import { type Config, type DispatchConfig, newId, now, type TaskDispatch, WorkflowFailure } from './types.ts'
 
 /** The rules a dispatch decision names (decision@1 `decider.id`), version 1. */
@@ -45,6 +55,8 @@ const SELECT = { type: 'rule', id: 'dispatch.select', version: '1' } as const
 const CHOICE = { type: 'rule', id: 'dispatch.choice', version: '1' } as const
 const APPROVAL = { type: 'rule', id: 'dispatch.approval', version: '1' } as const
 const PAUSE = { type: 'operator', id: 'dispatch.pause', version: '1' } as const
+/** The advisor's decision when it gave no advice (PROP-0015 J1); with advice, the decider is the model. */
+const ADVISOR = { type: 'rule', id: 'advisor.dispatch', version: '1' } as const
 const PRODUCER = { producer: { type: 'system' as const, ref: 'workflow' } }
 /** Ready tasks one pass looks at, oldest first (INV-9; a decision lists at most 255 candidates). */
 export const MAX_LOOKED = 128
@@ -74,6 +86,8 @@ export interface DispatchSettings {
   maxRunning: number
   maxRunningPerProject: number
   maxRunningPerAccount: number
+  /** The most dispatched runs or asks on an account whose windows have no reading yet (T294). */
+  maxRunningUnreadPerAccount: number
   maxRunningPerRepository: number
   leaveRunsFree: number
   maxOpenAsks: number
@@ -83,11 +97,13 @@ export interface DispatchSettings {
   maxPerHourPerProject: number
   /** The engine's own `maxActiveRuns`, which `leaveRunsFree` and `maxRunning` are bounded by. */
   maxActiveRuns: number
+  /** The advisor asked in shadow at every choice (PROP-0015 J1; ./advisor.ts). */
+  advisor: AdvisorSettings
 }
 
-const RANGES: Record<Exclude<keyof DispatchConfig, 'enabled' | 'maxRunning' | 'leaveRunsFree' | 'maxPerHourPerProject'>, readonly [number, number, number]> = {
+const RANGES: Record<Exclude<keyof DispatchConfig, 'enabled' | 'maxRunning' | 'leaveRunsFree' | 'maxPerHourPerProject' | 'advisor'>, readonly [number, number, number]> = {
   sweepSeconds: [10, 3600, 60], maxPerPass: [1, 16, 2], maxRunningPerProject: [1, 16, 2], maxRunningPerAccount: [1, 16, 1],
-  maxRunningPerRepository: [1, 16, 4], maxOpenAsks: [1, 32, 4], approvedHoldMinutes: [1, 240, 30], maxPerHour: [0, 120, 6],
+  maxRunningUnreadPerAccount: [1, 16, 1], maxRunningPerRepository: [1, 16, 4], maxOpenAsks: [1, 32, 4], approvedHoldMinutes: [1, 240, 30], maxPerHour: [0, 120, 6],
 }
 
 /**
@@ -109,7 +125,8 @@ export function dispatchProblems(config: Config): string[] {
   if (Number.isInteger(leave) && leave >= 0 && leave < active) whole('maxRunning', given.maxRunning, 1, active - leave)
   const hour = given.maxPerHour ?? RANGES.maxPerHour[2]
   if (Number.isInteger(hour) && hour >= 0 && hour <= RANGES.maxPerHour[1]) whole('maxPerHourPerProject', given.maxPerHourPerProject, 0, hour)
-  const known = new Set(['enabled', 'leaveRunsFree', 'maxRunning', 'maxPerHourPerProject', ...Object.keys(RANGES)])
+  problems.push(...advisorProblems(given.advisor))
+  const known = new Set(['enabled', 'leaveRunsFree', 'maxRunning', 'maxPerHourPerProject', 'advisor', ...Object.keys(RANGES)])
   for (const key of Object.keys(given)) if (!known.has(key)) problems.push(`dispatch.${key} is not an option (${[...known].join(', ')})`)
   return problems
 }
@@ -124,9 +141,9 @@ export function dispatchSettings(config: Config): DispatchSettings {
   const pick = (key: keyof typeof RANGES): number => given[key] ?? RANGES[key][2]
   return {
     enabled: given.enabled ?? true, sweepSeconds: pick('sweepSeconds'), maxPerPass: pick('maxPerPass'), maxRunning: given.maxRunning ?? Math.min(8, active - leave),
-    maxRunningPerProject: pick('maxRunningPerProject'), maxRunningPerAccount: pick('maxRunningPerAccount'), maxRunningPerRepository: pick('maxRunningPerRepository'),
+    maxRunningPerProject: pick('maxRunningPerProject'), maxRunningPerAccount: pick('maxRunningPerAccount'), maxRunningUnreadPerAccount: pick('maxRunningUnreadPerAccount'), maxRunningPerRepository: pick('maxRunningPerRepository'),
     leaveRunsFree: leave, maxOpenAsks: pick('maxOpenAsks'), approvedHoldMinutes: pick('approvedHoldMinutes'), maxPerHour: pick('maxPerHour'),
-    maxPerHourPerProject: given.maxPerHourPerProject ?? Math.min(3, pick('maxPerHour')), maxActiveRuns: active,
+    maxPerHourPerProject: given.maxPerHourPerProject ?? Math.min(3, pick('maxPerHour')), maxActiveRuns: active, advisor: advisorSettings(given.advisor),
   }
 }
 
@@ -179,6 +196,8 @@ export interface DispatchWindow {
 /** What chose a start, kept on its row. */
 interface AskChoice {
   template: string
+  /** The task's template variant (`board-task@1.5`), which its run starts with. */
+  variant?: string
   title: string
   /** The decisions, in order: select, choice, autonomy, then the approval (the queue's, or the board approval's gate). */
   decisions: ArtifactRef[]
@@ -192,6 +211,10 @@ interface AskChoice {
   consequences: string
   /** D62: the board's own approved request for this attempt. */
   board?: { requestId: string; approval: ArtifactRef }
+  /** The advisor's shadow decision on this choice (PROP-0015 J1), an input of the choice; never read to choose. */
+  advice?: ArtifactRef
+  /** The writing step's kind (ADR-0057), which its outcome is counted under. */
+  kind?: string
 }
 
 /** Why an ask closed with no run, or that its run started. */
@@ -306,9 +329,65 @@ const errorText = (error: unknown): string => (error instanceof Error ? error.me
 export class Dispatcher {
   readonly settings: DispatchSettings
   private passing: Promise<DispatchPass> | undefined
+  /** The recorded outcomes the advisor's counts and the local adapter read. */
+  readonly history: OutcomeHistory
+  /** The advisor `dispatch.advisor.provider` names; undefined for `none`. */
+  private readonly configured: Advisor | undefined
+  /** Another provider set through `setDispatchAdvisor` ({@link setAdvisor}), in place of every other. */
+  private swapped: Advisor | undefined
+  /** When the advisor was asked in the last hour (INV-9: `dispatch.advisor.maxPerHour`). */
+  private calls: number[] = []
 
   constructor(private readonly e: Engine) {
     this.settings = dispatchSettings(e.config)
+    this.history = new OutcomeHistory(e)
+    const a = this.settings.advisor
+    this.configured = a.provider === 'local' ? new LocalAdvisor(() => this.history.training(), a.minLabelled, a.l2)
+      : a.provider === 'model' && a.model ? new ModelAdvisor(e, a.model.worker, a.model.maxTokens) : undefined
+  }
+
+  /**
+   * The thin path to the advisor seam (contract 1.11): `advisor` answers in place of the provider of
+   * `ctx.dispatchAdvisor` and of the configured one, until set back with undefined. Its advice is
+   * recorded in shadow like any other, and changes no choice.
+   */
+  setAdvisor(advisor: Advisor | undefined): void {
+    this.swapped = advisor
+  }
+
+  /**
+   * The advisor in force, asked at each choice (PROP-0015 J1): one set through {@link setAdvisor};
+   * else the provider of the seam `ctx.dispatchAdvisor`, while a plugin registers one (contract 1.12);
+   * else the one `dispatch.advisor.provider` names; else none.
+   */
+  private advisor(): Advisor | undefined {
+    return this.swapped ?? this.e.ctx.get('dispatchAdvisor') ?? this.configured
+  }
+
+  /**
+   * A Worker's quota window ended a step before it landed anything (T272b): the account is recorded
+   * as exhausted until `until`, so no pass chooses it for that window again, and the task is not
+   * taken again before then. Both are rows of `workflow_dispatch_control` (as the steps hold is), so
+   * a restart keeps them (INV-4); a later reset replaces an earlier one, never the reverse.
+   */
+  exhaust(loss: { until: string; basis: string; account?: string; window?: string; taskId?: string }): void {
+    const until = Date.parse(loss.until)
+    this.e.ctx.store.transaction((db) => {
+      const put = (id: string, value: { until: number; window?: string; basis: string }): void => {
+        const old = this.closedRow(id)
+        if (old && old.until >= value.until) return
+        db.prepare('INSERT OR IGNORE INTO workflow_dispatch_control (id, updated_at) VALUES (?, ?)').run(id, now())
+        db.prepare('UPDATE workflow_dispatch_control SET paused = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(value), now(), id)
+      }
+      if (loss.account) put(`quota-account:${loss.account}`, { until, basis: loss.basis, ...(loss.window ? { window: loss.window } : {}) })
+      if (loss.taskId) put(`quota-task:${loss.taskId}`, { until, basis: loss.basis })
+    })
+  }
+
+  /** A quota closure's row, as stored: until when (epoch ms), the window, and how the reset was known. */
+  private closedRow(id: string): { until: number; window?: string; basis: string } | undefined {
+    const row = this.e.ctx.store.db.prepare('SELECT paused FROM workflow_dispatch_control WHERE id = ?').get(id) as { paused: string | null } | undefined
+    return row?.paused ? JSON.parse(row.paused) as { until: number; window?: string; basis: string } : undefined
   }
 
   /** Wait for a pass in flight, for a stop. */
@@ -529,6 +608,11 @@ export class Dispatcher {
     }
   }
 
+  /** Why no run starts now for want of disk (the Worker source's floor, T345), or undefined; a source that has none refuses nothing. */
+  private diskRefusal(): string | undefined {
+    return (this.e.ctx.get('agentWorkers' as never) as { diskFloorRefusal?: () => string | undefined } | undefined)?.diskFloorRefusal?.()
+  }
+
   /** Keep the pass as the last one (its reasons for each task), on the durable row. */
   private keep(view: DispatchPass): DispatchPass {
     try {
@@ -560,6 +644,13 @@ export class Dispatcher {
     const looked = ready.slice(0, MAX_LOOKED)
     view.more = ready.length - looked.length
     if (!looked.length) return view
+    // The host's disk is the Worker source's to read (T345): under its floor, no run is taken, and the pass says why.
+    const disk = this.diskRefusal()
+    if (disk) {
+      view.tasks = looked.slice(0, MAX_REPORTED).map(({ task, project }) => ({ taskId: task.taskId, projectId: project.projectId, title: task.title, reason: disk }))
+      view.more += Math.max(0, looked.length - MAX_REPORTED)
+      return { ...view, state: 'waiting', reason: disk }
+    }
     const counts = this.counts()
     const engineRoom = s.maxActiveRuns - s.leaveRunsFree
     const reasons = new Map<string, string>()
@@ -578,12 +669,17 @@ export class Dispatcher {
       }
       const live = this.liveAsk(task.taskId, n)
       if (live) {
-        why(live.state === 'approved' ? `approved, waiting for ${live.worker} to be free (ask ${live.ask_id})` : `an ask for attempt ${n + 1} is ${live.state === 'starting' ? 'starting its run' : `open (ask ${live.ask_id}${live.request_id ? `, request ${live.request_id}` : ''})`}`)
+        why(live.state === 'approved' ? `approved, waiting for ${live.worker} to be free (ask ${live.ask_id})` : `an ask for attempt ${n + 1 - (n > 0 && await this.e.board?.continuing(task.taskId).catch(() => false) ? 1 : 0)} is ${live.state === 'starting' ? 'starting its run' : `open (ask ${live.ask_id}${live.request_id ? `, request ${live.request_id}` : ''})`}`)
         continue
       }
       const held = projectPaused.get(project.projectId)
       if (held) {
         why(`you paused dispatch in project ${project.projectId} at ${held.since}${held.reason ? `: ${held.reason}` : ''} (decision ${held.decision}); the lead and you still start its tasks by hand`)
+        continue
+      }
+      const until = this.closedRow(`quota-task:${task.taskId}`)?.until
+      if (until !== undefined && until > at.getTime()) {
+        why(`a Worker's quota ran out under its last attempt, which was not spent: it is not taken before ${new Date(until).toISOString()}`)
         continue
       }
       const denied = this.denied(task.taskId, n)
@@ -629,13 +725,28 @@ export class Dispatcher {
         }
       }
       // The run's writing step, and the requirement the engine would route it with (INV-6).
-      const step = this.writingStep(task.template)
+      const step = this.writingStep(task.template, task.variant)
       if ('problem' in step) {
         why(step.problem)
         continue
       }
       const classification = project.classification ?? this.e.ctx.egress.defaultClassification
-      const requirement = this.e.requirementOf(step.node, step.node.session.persist === true, classification)
+      const own = this.e.requirementOf(step.node, step.node.session.persist === true, classification)
+      // At the tier the engine will route it at: its task's risk tier may set it (ADR-0073; looked at only, the engine records it).
+      const atRisk = await lookTierAtRisk(this.e, { taskId: task.taskId, projectId: project.projectId }, step.node, own)
+      // Its tier unknown, it is not scored at its template's (INV-2).
+      if (atRisk && 'problem' in atRisk) {
+        why(atRisk.problem)
+        continue
+      }
+      const requirement = atRisk?.requirement ?? own
+      // The restriction routing will apply to that step (INV-6): the session its run would resume
+      // stays on its Worker, and any other the engine derives. The Worker is chosen within it.
+      const bound = await this.restrictionOf(task, task.template, step.node.nodeId, classification)
+      if ('problem' in bound) {
+        why(bound.problem)
+        continue
+      }
       const key = JSON.stringify(requirement)
       if (!looks.has(key)) looks.set(key, await this.e.ctx.workers.candidates!(requirement, { producer: 'workflow' }).catch((error: unknown) => ({ error: errorText(error) })))
       const look = looks.get(key)!
@@ -643,7 +754,15 @@ export class Dispatcher {
         why(`the Workers could not be read, so none can be shown free: ${look.error}`)
         continue
       }
-      const scored = this.score(look, pools, settings, counts, at)
+      const scored = this.score(look, pools, settings, counts, at, bound.restrict)
+      if (!scored.score.chosen && bound.session && bound.restrict) {
+        // Its run would resume a session that stays on its Worker: only that Worker takes it, and the
+        // task is not started now rather than on a Worker its step could never route to.
+        const mine = scored.score.candidates.filter((c) => bound.restrict!.workers.includes(c.worker)).slice(0, 4)
+        const lines = mine.map((c) => `${c.worker}: ${c.reasons.filter((r) => r.startsWith('not free: ') || r.startsWith('refused by routing: ')).map((r) => r.replace(/^not free: /, '')).join(', ') || 'not listed'}`)
+        why(`waits for its session's Worker: step ${step.node.nodeId} continues session ${bound.session}, and ${bound.restrict.reason} (${bound.restrict.workers.join(', ')}), which is not free now${lines.length ? `; ${lines.join('; ')}` : ''}; no other Worker takes it`.slice(0, 2000))
+        continue
+      }
       if (!scored.score.chosen) {
         // Each of the first admitted Workers, with every reason it is not free (bounded: the decision of a take lists them all).
         const lines = scored.score.candidates.filter((c) => c.admitted).slice(0, 4).map((c) => `${c.worker}: ${c.reasons.filter((r) => r.startsWith('not free: ')).map((r) => r.slice(10)).join(', ')}`)
@@ -688,7 +807,9 @@ export class Dispatcher {
         outcome: { option: task.taskId, detail: { taskId: task.taskId, projectId: project.projectId, attempt: n, order: 'age' } },
         deterministic: true,
       }, PRODUCER).id as ArtifactRef
-      const choice = this.choiceDecision(task, n, step.node.nodeId, scored, select, verdict, look, settings)
+      // The advisor, in shadow (PROP-0015 J1): asked after the choice is made, recorded as its input, never read to choose.
+      const advice = await this.advise(task, n, task.template, step.node, scored, settings, select, look)
+      const choice = this.choiceDecision(task, n, step.node.nodeId, scored, select, verdict, look, settings, advice)
       const decisions = [select, choice.decision, verdict.decision]
       let approval: ArtifactRef | undefined
       if (byBoard) {
@@ -713,8 +834,9 @@ export class Dispatcher {
         account: scored.accountOf.get(chosen.worker) ?? null, repository: scored.repositoryOf.get(chosen.worker) ?? null, node_id: step.node.nodeId, version: choice.version,
         request_id: null, run_id: null, outcome: null, approved_at: go ? now() : null, mode, started_at: null, created_at: now(), updated_at: now(),
         choice: JSON.stringify({
-          template: task.template, title: task.title, decisions, verdict, why: chosen.line, windows: choice.windows, classification,
+          template: task.template, ...(task.variant !== undefined ? { variant: task.variant } : {}), title: task.title, decisions, verdict, why: chosen.line, windows: choice.windows, classification,
           summary: choice.summary, consequences: choice.consequences, ...(task.writes ? { writes: task.writes } : {}),
+          ...(advice ? { advice } : {}), ...(step.node.kind !== undefined ? { kind: step.node.kind } : {}),
           ...(byBoard ? { board: { requestId: byBoard.requestId, approval: byBoard.approval ?? byBoard.decision } } : {}),
         } satisfies AskChoice & { writes?: Subject }),
       }
@@ -770,18 +892,42 @@ export class Dispatcher {
 
   /**
    * The run's writing step: its first Worker step that proves `develop`, else its first Worker step
-   * (a team's tally and decision, a review's source, and a gate run no Worker).
+   * (a team's tally and decision, a review's source, and a gate run no Worker), in the task's
+   * variant, whose kind of work routes it (ADR-0057).
    */
-  private writingStep(template: string): { node: ResolvedNode } | { problem: string } {
+  private writingStep(template: string, variant?: string): { node: ResolvedNode } | { problem: string } {
     let spec
     try {
-      spec = resolve(template, this.e.templates[template]!, {})
+      spec = resolve(template, this.e.templates[template]!, variant !== undefined ? { variant } : {})
     } catch (error) {
       return { problem: `template ${template} does not resolve: ${errorText(error)}` }
     }
     const workers = spec.nodes.filter((n) => (n.executor ?? 'worker') === 'worker')
     const node = workers.find((n) => n.capabilities.includes('develop')) ?? workers[0]
     return node ? { node } : { problem: `template ${template} has no Worker step, so no Worker can be chosen for it` }
+  }
+
+  /**
+   * The restriction routing will apply to the first execution of a task's writing step `nodeId`,
+   * were its run started now (INV-6; ADR-0064): its template resolved with the session the run would
+   * resume (`TaskRuns.resumes`), as the start resolves it, then the engine's own `restriction`.
+   * `session` names that session; a `problem` is why the step could not be routed at all.
+   */
+  private async restrictionOf(task: BoardTask, template: string, nodeId: string, classification: Classification): Promise<{ restrict?: { workers: string[]; reason: string }; session?: string } | { problem: string }> {
+    let spec
+    try {
+      const variant = task.variant !== undefined ? { variant: task.variant } : {}
+      spec = resolve(template, this.e.templates[template]!, variant)
+      const session = await this.e.tasks.resumes(task, template, spec.nodes)
+      if (session) spec = resolve(template, this.e.templates[template]!, { ...variant, sessionId: session })
+      const node = spec.nodes.find((n) => n.nodeId === nodeId)
+      if (!node) return {}
+      const bound = await admittedRestriction(this.e, `dispatch:${task.taskId}`, node, classification)
+      if ('problem' in bound) return { problem: `step ${nodeId} could not be routed if it started now: ${bound.problem}` }
+      return { ...(bound.restrict ? { restrict: bound.restrict } : {}), ...(session ? { session } : {}) }
+    } catch (error) {
+      return { problem: `the Workers step ${nodeId} may take could not be told, so none is chosen: ${errorText(error)}` }
+    }
   }
 
   /** Every pool on the ledger by account, or why they could not be read (then no Worker is free). */
@@ -796,8 +942,12 @@ export class Dispatcher {
     }
   }
 
-  /** The score of the candidates for one requirement, with what the caller knows of each Worker. */
-  private score(look: Candidates, pools: Map<string, PoolState[]> | { unknown: string }, settings: QuotaSettings, counts: Counts, at: Date): { score: ReturnType<typeof quotaScoreOf>; inputs: QuotaCandidate[]; accountOf: Map<string, string>; repositoryOf: Map<string, string> } {
+  /**
+   * The score of the candidates for one requirement, with what the caller knows of each Worker. A
+   * Worker outside `restrict` (the restriction routing will apply to the step, INV-6) is refused, as
+   * routing would refuse it, so it is never chosen.
+   */
+  private score(look: Candidates, pools: Map<string, PoolState[]> | { unknown: string }, settings: QuotaSettings, counts: Counts, at: Date, restrict?: { workers: string[]; reason: string }): { score: ReturnType<typeof quotaScoreOf>; inputs: QuotaCandidate[]; accountOf: Map<string, string>; repositoryOf: Map<string, string> } {
     const s = this.settings
     const accountOf = new Map<string, string>()
     const repositoryOf = new Map<string, string>()
@@ -810,22 +960,31 @@ export class Dispatcher {
       const sandbox = this.e.ctx.workers.source(c.source)?.sandbox?.(w.worker)
       const repository = sandbox?.mode === 'workspace-write' ? sandbox.workspace : undefined
       if (repository) repositoryOf.set(w.worker, repository)
-      const accountPools = !account ? undefined : 'unknown' in pools ? { unknown: pools.unknown as string } : (pools as Map<string, PoolState[]>).get(account) ?? []
+      // A Worker that offers several tiers is scored at the one routing would serve it at, by that tier's pools (ADR-0073).
+      const tier = c.tier ?? w.tier
+      const only = w.tiers?.find((o) => o.tier === tier)?.pools
+      const accountPools = !account ? undefined : 'unknown' in pools ? { unknown: pools.unknown as string }
+        : ((pools as Map<string, PoolState[]>).get(account) ?? []).filter((p) => only === undefined || only.includes(p.pool))
       const busy: string[] = []
       if (w.state !== 'ready') busy.push(w.state === 'busy' && w.load ? `busy ${w.load.running} of ${w.load.slots}` : `state ${w.state}`)
       else if (!w.load) busy.push('its source reports no load, so it cannot be shown free')
       else if (w.load.running + w.load.queued + w.load.pending >= s.maxRunningPerAccount) busy.push(`load ${w.load.running} of ${w.load.slots}${w.load.queued ? `, ${w.load.queued} queued` : ''}${w.load.pending ? `, ${w.load.pending} pending` : ''} (dispatch.maxRunningPerAccount ${s.maxRunningPerAccount})`)
       const step = running.get(w.worker)
       if (step) busy.push(`step ${step.node} of run ${step.run} runs on it`)
+      const out = account ? this.closedRow(`quota-account:${account}`) : undefined
+      if (out && out.until > at.getTime()) busy.push(`its account's ${out.window ? `${out.window} window` : 'quota window'} ended a step, and is closed until ${new Date(out.until).toISOString()}`)
       const used = counts.accounts.get(account ?? `worker:${w.worker}`) ?? 0
       if (used >= s.maxRunningPerAccount) busy.push(`its account has ${used} dispatched run(s) or ask(s) (dispatch.maxRunningPerAccount ${s.maxRunningPerAccount})`)
       const inRepo = repository ? counts.repositories.get(repository) ?? 0 : 0
       if (repository && inRepo >= s.maxRunningPerRepository) busy.push(`repository ${repository} has ${inRepo} dispatched run(s) or ask(s) (dispatch.maxRunningPerRepository ${s.maxRunningPerRepository}, D64)`)
       const metered = w.quotaClass === 'metered' || (Array.isArray(accountPools) && accountPools.some((p) => p.kind === 'api-key'))
+      const refused = [...c.failed.map((f) => f.reason), ...(restrict && !restrict.workers.includes(w.worker) ? [`outside the Workers this step may take: ${restrict.reason}`] : [])]
       return {
-        worker: w.worker, ...(c.failed.length ? { refused: c.failed.map((f) => f.reason) } : {}), tier: w.tier, tierRank: TIERS.indexOf(w.tier), quotaClass: w.quotaClass,
+        worker: w.worker, ...(refused.length ? { refused } : {}), tier, tierRank: TIERS.indexOf(tier), quotaClass: w.quotaClass,
         quotaRank: rank(look.order.quota, w.quotaClass), metered, ...(w.load ? { load: w.load } : {}), priorityRank: rank(look.order.priority, w.worker),
         pools: accountPools as readonly QuotaPool[] | { unknown: string } | undefined, ...(busy.length ? { busy } : {}),
+        // An account none of whose windows has a reading is admitted at this bound; a reading replaces it (T294).
+        unreadBound: { running: used, limit: s.maxRunningUnreadPerAccount },
       }
     })
     return { score: quotaScoreOf(inputs, settings, at), inputs, accountOf, repositoryOf }
@@ -840,8 +999,72 @@ export class Dispatcher {
     return out
   }
 
+  /**
+   * Ask the advisor in shadow (PROP-0015 J1) about a choice already made, and record what it said as
+   * a `route` decision (`advisor.dispatch`): every candidate's three probabilities (`modelAnswers`),
+   * or why there are none (`unavailable`). The snapshot holds features only (D73). Never throws:
+   * whatever fails leaves the choice as it was, with no advice recorded at worst.
+   */
+  private async advise(task: BoardTask, n: number, template: string, node: ResolvedNode, scored: ReturnType<Dispatcher['score']>, settings: QuotaSettings, select: ArtifactRef, look: Candidates): Promise<ArtifactRef | undefined> {
+    try {
+      const s = this.settings.advisor
+      this.history.refresh()
+      const byWorker = new Map(scored.inputs.map((i) => [i.worker, i]))
+      const facts = scored.score.candidates.flatMap((c): CandidateFacts[] => {
+        const i = byWorker.get(c.worker)
+        if (!i) return []
+        return [{ scored: c, tier: i.tier, tierRank: i.tierRank, quotaClass: i.quotaClass, metered: i.metered, ...(i.load ? { load: { running: i.load.running, slots: i.load.slots } } : {}), countsKey: scored.accountOf.get(c.worker) ?? `worker:${c.worker}` }]
+      })
+      const chosen = scored.score.chosen!
+      const { features, aliases } = featuresOf({
+        ...(node.kind !== undefined ? { kind: node.kind } : {}), template, step: node.nodeId, reservePercent: settings.reservePercent, chosen, candidates: facts,
+        counts: (key, kind) => this.history.countsOf(key, kind),
+      })
+      const advisor = this.advisor()
+      const hourAgo = Date.now() - 3_600_000
+      this.calls = this.calls.filter((t) => t > hourAgo)
+      let shadow: ShadowAdvice
+      if (!advisor) shadow = { advice: { status: 'unavailable', provider: 'none', reason: 'no advisor: dispatch.advisor.provider is none' }, elapsedMs: 0 }
+      else if (this.calls.length >= s.maxPerHour) shadow = { advice: { status: 'unavailable', provider: advisor.id.slice(0, 64), reason: `the advisor was asked ${this.calls.length} times in the last hour (dispatch.advisor.maxPerHour ${s.maxPerHour})` }, elapsedMs: 0 }
+      else {
+        this.calls.push(Date.now())
+        shadow = await adviseInShadow(advisor, features, s.timeoutMs)
+      }
+      const { advice } = shadow
+      const detail: AdviceDetail = {
+        shadow: true, status: advice.status, provider: advice.provider, ...(advice.modelVersion ? { modelVersion: advice.modelVersion } : {}),
+        ...(advice.status === 'unavailable' ? { reason: advice.reason.slice(0, 500) } : {}), elapsedMs: shadow.elapsedMs, aliases, chosen: 'A', features,
+      }
+      const pct = (p: number): string => `${Math.round(p * 100)} %`
+      const question = `What does the advisor say, in shadow, of the candidates for step ${node.nodeId} of board task ${task.taskId}, attempt ${n + 1} (${QUESTION_SET}; recorded only, the choice is dispatch.choice's)?`
+      const decision = advice.status === 'advice'
+        ? this.e.ctx.artifacts.recordDecision({
+          decisionType: 'route', question, inputs: [select, look.requirement],
+          candidates: [
+            { option: 'advice', selected: true, reasons: bounded([`shadow: ${advice.provider} ${advice.modelVersion} answered in ${shadow.elapsedMs} ms; it changes no choice`, ...advice.candidates.map((c) => `${c.alias}${c.alias === 'A' ? ' (chosen)' : ''}: accepted ${pct(c.accepted)}, limit mid-task ${pct(c.limit)}, needs the operator ${pct(c.needsOperator)}`)]) },
+            { option: 'unavailable', selected: false, reasons: ['not unavailable: the advisor answered every candidate'] },
+          ],
+          decider: { type: 'model', id: 'advisor.dispatch', version: advice.modelVersion }, modelAnswers: modelAnswersOf(advice),
+          outcome: { option: 'advice', detail: detail as unknown as Record<string, unknown> }, deterministic: false,
+        }, PRODUCER).id as ArtifactRef
+        : this.e.ctx.artifacts.recordDecision({
+          decisionType: 'route', question, inputs: [select, look.requirement],
+          candidates: [
+            { option: 'unavailable', selected: true, reasons: [`advice unavailable (${advice.provider}): ${advice.reason}`.slice(0, 300), 'the choice stands as dispatch.choice made it'] },
+            { option: 'advice', selected: false, reasons: ['not advice: the advisor gave none'] },
+          ],
+          decider: ADVISOR, outcome: { option: 'unavailable', detail: detail as unknown as Record<string, unknown> }, deterministic: true,
+        }, PRODUCER).id as ArtifactRef
+      this.e.ctx.eventLog.append({ type: ADVISED_EVENT, decision, data: { taskId: task.taskId, attempt: n, status: advice.status, provider: advice.provider, ...(advice.modelVersion ? { modelVersion: advice.modelVersion } : {}), elapsedMs: shadow.elapsedMs } })
+      return decision
+    } catch (error) {
+      this.e.ctx.logger.warn(`workflow: the dispatch advice could not be recorded; the choice stands: ${errorText(error)}`)
+      return undefined
+    }
+  }
+
   /** The `dispatch.choice` decision, the request's version, and what Home shows of the chosen Worker's windows. */
-  private choiceDecision(task: BoardTask, n: number, nodeId: string, scored: ReturnType<Dispatcher['score']>, select: ArtifactRef, verdict: AutonomyVerdict, look: Candidates, settings: QuotaSettings) {
+  private choiceDecision(task: BoardTask, n: number, nodeId: string, scored: ReturnType<Dispatcher['score']>, select: ArtifactRef, verdict: AutonomyVerdict, look: Candidates, settings: QuotaSettings, advice: ArtifactRef | undefined) {
     const { score, inputs } = scored
     const worker = score.chosen!
     const chosen = score.candidates.find((c) => c.worker === worker)!
@@ -862,7 +1085,7 @@ export class Dispatcher {
     const decision = this.e.ctx.artifacts.recordDecision({
       decisionType: 'route',
       question: `Which Worker takes step ${nodeId} of board task ${task.taskId}, attempt ${n + 1}, if System starts it (${QUOTA_SCORE})?`,
-      inputs: [select, look.requirement, verdict.decision],
+      inputs: [select, look.requirement, verdict.decision, ...(advice ? [advice] : [])],
       candidates,
       decider: { ...CHOICE, hash: contentId(settings) },
       outcome: { option: worker, detail: { taskId: task.taskId, attempt: n, nodeId, score: QUOTA_SCORE, settings, version, ...(scored.accountOf.get(worker) ? { account: scored.accountOf.get(worker) } : {}), ...(scored.repositoryOf.get(worker) ? { repository: scored.repositoryOf.get(worker) } : {}), windows } },
@@ -890,7 +1113,7 @@ export class Dispatcher {
     if (body?.decisionType !== 'approval' || body.outcome?.option !== 'approved' || typeof body.outcome.detail?.requestId !== 'string') return undefined
     const request = await this.e.ctx.get('approvals')?.get(body.outcome.detail.requestId).catch(() => undefined)
     const bound = request && request.state === 'approved' && request.requester.component === 'board' && request.requester.taskId === task.taskId
-      && request.subject.ref === `board-task:${task.taskId}:attempt:${task.attempts.count}` && request.action.class === task.actionClass
+      && (request.subject.ref === `board-task:${task.taskId}:attempt:${task.attempts.count}` || request.subject.ref.startsWith(`board-task:${task.taskId}:attempt:${task.attempts.count}:answered:`)) && request.action.class === task.actionClass
       && request.resolution?.cause === 'verdict' && request.resolution.decision === task.lastDecision && request.resolution.approval !== undefined
     return bound ? { requestId: request.requestId, decision: task.lastDecision, approval: request.resolution!.approval! } : undefined
   }
@@ -1045,7 +1268,11 @@ export class Dispatcher {
     const task = await board.task(row.task_id)
     if (!task) return `task ${row.task_id} is unknown to the board`
     if (task.state !== 'ready') return `task ${row.task_id} is ${task.state} now${task.run ? ` (run ${task.run.runId})` : ''}`
-    if (task.attempts.count !== row.attempt) return `task ${row.task_id} is at attempt ${task.attempts.count + 1} now, not ${row.attempt + 1}`
+    if (task.attempts.count !== row.attempt) {
+      // The attempt its next run is: the same one again when an answered question continues it (T291).
+      const next = task.attempts.count > 0 && await board.continuing(task.taskId).catch(() => false) ? task.attempts.count : task.attempts.count + 1
+      return `task ${row.task_id} is at attempt ${next} now, not ${row.attempt + 1}`
+    }
     const project = await board.project(task.projectId)
     if (project?.state !== 'active') return `project ${task.projectId} is ${project?.state ?? 'unknown'} now`
     return undefined
@@ -1086,7 +1313,8 @@ export class Dispatcher {
     const dispatch: TaskDispatch = { askId: row.ask_id, decisions: choice.decisions, prefer: { node: row.node_id, worker: row.worker, decision: choice.decisions[1]! } }
     try {
       const run = await this.e.tasks.start({
-        template: choice.template, input: `${task.title}\n\n${task.goal}`.slice(0, 32_000), task: { taskId: task.taskId, revision: task.revision }, clientRequestId: `dispatch:${row.ask_id}`,
+        // The variant its Worker was checked in: a task whose variant differs now is refused by the start (INV-5).
+        template: choice.template, ...(choice.variant !== undefined ? { variant: choice.variant } : {}), input: `${task.title}\n\n${task.goal}`.slice(0, 32_000), task: { taskId: task.taskId, revision: task.revision }, clientRequestId: `dispatch:${row.ask_id}`,
       }, { dispatch })
       allowance.left -= 1
       this.move(row, 'started', { run_id: run.runId, outcome: { status: 'started', reason: `run ${run.runId} serves attempt ${row.attempt + 1}`, at: now() } })
@@ -1112,6 +1340,8 @@ export class Dispatcher {
     const s = this.settings
     const pending = this.counts(row.ask_id).pending
     if (this.e.draining) return 'the host is draining'
+    const disk = this.diskRefusal()
+    if (disk) return disk
     if (this.active() + pending >= s.maxActiveRuns - s.leaveRunsFree) return `the engine is full (maxActiveRuns less dispatch.leaveRunsFree)`
     // The hour counts the starts made, never the rows still waiting, so two approved starts never hold each other back (D2).
     const full = this.hourFull(this.hourly(at, false), row.project_id)
@@ -1119,9 +1349,12 @@ export class Dispatcher {
     const resources = this.e.ctx.get('resources')
     if (!resources?.quota || !this.e.ctx.workers.candidates) return 'no Worker can be shown free (the ledger or the router cannot tell)'
     const choice = JSON.parse(row.choice) as AskChoice
-    const step = this.writingStep(choice.template)
+    const step = this.writingStep(choice.template, choice.variant)
     if ('problem' in step) return step.problem
-    const requirement = this.e.requirementOf(step.node, step.node.session.persist === true, choice.classification)
+    const own = this.e.requirementOf(step.node, step.node.session.persist === true, choice.classification)
+    const atRisk = await lookTierAtRisk(this.e, { taskId: row.task_id, projectId: row.project_id }, step.node, own)
+    if (atRisk && 'problem' in atRisk) return atRisk.problem
+    const requirement = atRisk?.requirement ?? own
     const look = await this.e.ctx.workers.candidates(requirement, { producer: 'workflow' })
     const scored = this.score(look, await this.pools(at), resources.quota(), this.counts(row.ask_id), at)
     const mine = scored.score.candidates.find((c) => c.worker === row.worker)

@@ -1,0 +1,42 @@
+{
+  "tool": "board_propose_plan",
+  "input": {
+    "projectId": "system",
+    "tasks": [
+      {
+        "key": "tests",
+        "title": "Tests for the session ceiling",
+        "goal": "Write the tests that encode the session ceiling's criteria, failing on today's code.",
+        "acceptance": [{ "id": "red", "statement": "the new tests fail on the base tree", "check": "tests" }],
+        "actionClass": "workspace-write",
+        "template": "algorithm-development"
+      },
+      {
+        "key": "code",
+        "title": "A fix starts fresh past the session ceiling",
+        "goal": "A fix continues its develop session only below workflow.sessionContextCeiling.",
+        "acceptance": [{ "id": "green", "statement": "the session ceiling's tests pass", "check": "tests" }],
+        "dependsOn": ["tests"],
+        "actionClass": "workspace-write",
+        "template": "algorithm-development"
+      },
+      {
+        "key": "docs",
+        "title": "Document the session ceiling",
+        "goal": "The workflow design and the configuration reference describe the ceiling.",
+        "acceptance": [{ "id": "docs", "statement": "the design and reference describe it", "check": "review" }],
+        "dependsOn": ["code"],
+        "actionClass": "workspace-write",
+        "template": "algorithm-development"
+      }
+    ],
+    "clientRequestId": "decompose-session-ceiling"
+  },
+  "output": {
+    "tasks": [
+      { "key": "tests", "taskId": "task-0101", "state": "proposed", "revision": 0 },
+      { "key": "code", "taskId": "task-0102", "state": "proposed", "revision": 0 },
+      { "key": "docs", "taskId": "task-0103", "state": "proposed", "revision": 0 }
+    ]
+  }
+}

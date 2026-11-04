@@ -59,6 +59,8 @@ Documentation is part of the change:
 - public API, schema, config, or CLI change → update reference material, requirements,
   and tests;
 - durable architectural decision → add an ADR; supersede, never rewrite, an accepted one;
+  delete a record superseded in whole, since Git keeps the history
+  ([rule](docs/governance/documentation.md#deleting-what-is-no-longer-current));
 - research-only work → keep it under `docs/research/` until promotion.
 
 Do not duplicate a fact. Give it one canonical home and link to it.

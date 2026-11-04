@@ -30,7 +30,7 @@
 |---|---|---|---|
 | `bwrap` | string |  | The bubblewrap executable that confines agent Workers' reads (default: found on PATH, a root-owned one first) |
 | `hide` | string[] | `[]` | Paths agent Workers must not read, besides those always hidden; $DSH_HOME expands |
-| `readOnly` | string[] | `["$DSH_HOME/system/tools"]` | Paths under a hidden directory agent Workers may read (the operator-installed agent CLIs); $DSH_HOME expands |
+| `readOnly` | string[] | `["$DSH_HOME/system/tools","$DSH_HOME/system/browsers"]` | Paths under a hidden directory agent Workers may read (the operator-installed agent CLIs, the managed Chrome); $DSH_HOME expands |
 
 ## `agent-workers`
 
@@ -57,17 +57,19 @@
 | `workers[].reviewMember` | boolean | `false` | Its review team member steps run under the enforced review-member profile (ADR-0049): no tool call runs, its workspace is an empty directory outside any repository, and the profile grants reason for those steps only; a runtime that cannot resume keeps the member's conversation by replay. Read-only Workers with a family only |
 | `workers[].kinds` | any |  | The kinds of work it takes (ADR-0057), such as [code] or [docs, tests]: only steps that name one of them, never a step that names none; unset, any work. Not for a review member |
 | `workers[].description` | string (…200) |  | What it is for, in your words: plain text on one line, at most 200 characters; shown on the roster, never a routing input |
+| `workers[].research` | boolean | `false` | A read-only research Worker (ADR-0074): its tools are Read, Grep, Glob, WebSearch, and WebFetch only (default all), it takes research work only (kinds default [research]), its gate denies a write or a command, and its web calls run unasked only under the autonomy policy's web access grant; it proves reason, and web-search once its web probe searched |
 | `roles` | object[] | `[]` | Role templates (PROP-0012 phase F), each defined once: what the work needs, whatever account serves it |
 | `roles[].id` (required) | string |  | Role id: its Workers are agent:<accountId>/<role> |
 | `roles[].workspace` (required) | string |  | Absolute workspace root its work is done in |
 | `roles[].sandbox` (required) | "read-only" \| "workspace-write" |  |  |
-| `roles[].tier` (required) | "economy" \| "standard" \| "frontier" |  |  |
+| `roles[].tier` | "economy" \| "standard" \| "frontier" |  | Its one tier on a runtime that declares no tiers (runtimes.<runtime>.tiers); may be left out when every runtime it is assigned on declares them |
 | `roles[].quotaClass` | "subscription-chat" \| "agent-plan" \| "metered" \| "local" | `"agent-plan"` |  |
 | `roles[].worktreePerRun` | boolean | `false` | Each run of a workflow run works in that run's own git worktree of the workspace, as a hand-named Worker's |
 | `roles[].reviewMember` | boolean | `false` | Its review team member steps run under the enforced review-member profile (ADR-0049); read-only, and each runtime it is assigned on names its family |
+| `roles[].research` | boolean | `false` | A read-only research role (ADR-0074): its Workers' tools are Read, Grep, Glob, WebSearch, and WebFetch only, at every tier (default all), on the standard tier when it gives no tier or tiers, they take research work only (kinds default [research]), their gate denies a write or a command, and their web calls run unasked only under the autonomy policy's web access grant; on a runtime that offers web tools |
 | `roles[].kinds` | any |  | The kinds of work its Workers take (ADR-0057), as a hand-named Worker's; unset, any work. Not for a review member |
 | `roles[].description` | string (…200) |  | What the role's Workers are for, in your words: plain text on one line, at most 200 characters; every Worker of the role shows it on the roster, never a routing input |
-| `roles[].runtimes` | Record<string, object> | `{}` | What differs per runtime, by runtime kind: tools, model, maxTurns, family; never a routing input |
+| `roles[].runtimes` | Record<string, object> | `{}` | What differs per runtime, by runtime kind: tools, model, maxTurns, family, and tiers (ADR-0073: runtimes.<runtime>.tiers = {economy?, standard?, frontier?}, each {model, tools?, maxTurns?}, in place of the role's tier and the runtime's model there; one Worker per account then offers every tier, each run on its tier's model; models named in the live profile only; docs/operations/runbooks.md#give-a-role-tiers); never a routing input |
 | `assignments` | object[] | `[]` | Which roles each enrolled account serves (D24: assigned); an account with no assignment has no Worker |
 | `assignments[].account` (required) | string |  | An enrolled agent account, by the id system account list shows |
 | `assignments[].roles` (required) | string[] | `[]` | The roles it serves: one Worker agent:<account>/<role> each |
@@ -82,6 +84,10 @@
 | `providers[].windows` | Record<string, string> | `{}` | The runtime's limit window names mapped to the template's window ids; with pool only |
 | `providers[].limitCooldownSeconds` | number (60…604800) |  | How long a limit hit with no reset time closes an account's pool, or with no pool cools the account down (default 3600); with roles and assignments only |
 | `providers[].limitReadSeconds` | number (0…86400) |  | How often each ready account with a pool has its runtime's usage report read into its pool's windows (ADR-0059; default 600, at least 60; 0 turns the periodic read off); with pool only |
+| `providers[].modelPools` | object[] | `[]` | Per-model quota (ADR-0073): a model whose provider reports a window of its own draws on one more pool per account; a run on it reserves on both, and its limit closes only the tiers that run it. At most 8; with pool only |
+| `providers[].modelPools[].model` (required) | string |  | The model, as the roles' tiers name it |
+| `providers[].modelPools[].pool` (required) | string |  | The pool template (resources templates, of this runtime's group) its accounts draw on for this model: pool <pool>/<accountId> |
+| `providers[].modelPools[].windows` | Record<string, string> | `{}` | The runtime's window names for this model (a weekly window per model) mapped to the template's window ids |
 | `accountHomes` | string |  | Where enrollment slots 2 and later keep their homes, <accountHomes>/<provider>/<n> (default <DSH_HOME>/system/agent-homes); hidden from every agent |
 | `maxReplayChars` | number (1…2000000) | `200000` | Characters of earlier turns a review member's replayed conversation holds, at most; a turn past it fails, never cut |
 | `probeTtlMs` | number (0…) | `300000` | How long a runtime's probe result stands, from when its probe started: the next probe starts in the background at half of it, a result past it admits no Worker until one finishes, and a probe not settled within it is refused as timed out (0: every read waits for a probe, bounded at 5 min) |
@@ -90,7 +96,8 @@
 | `deadAfterSeconds` | number (1…86400) | `120` | A started run its holder did not finish is dead, and reconciled, only when its holder and its agent process are both positively gone and no activity was seen for this long |
 | `maxUnknownVerdicts` | number (1…20) | `3` | Verdicts other than dead a started run gets in a row, looked at again with a bounded backoff, before it goes to the operator, never declared dead |
 | `worktreeRoot` | string |  | Where the worktrees of worktreePerRun Workers go (default <DSH_HOME>/system/worktrees) |
-| `worktreeRetentionHours` | number (0…) | `168` | Hours a workflow run's worktree is kept after its last agent run ended; then its changes are committed on its branch and it is removed (0 keeps them) |
+| `worktreeRetentionHours` | number (0…) | `168` | Hours a workflow run's worktree is kept after its last agent run ended, when its landing did not end it (a landed run's worktree is removed at once, T345); then its changes are committed on its branch and it is removed (0 keeps them) |
+| `diskFloorGb` | number (0…) | `10` | The free space, in GB, the worktrees' filesystem must keep for a new worktree to be cut (T345; 0 sets no floor): under it, no run that needs a new worktree starts, as the disk-floor mechanism's mode (enforce.diskFloor) says, and dispatch says why |
 | `worktreeSetup` | object[] | `[]` | Per repository, the setup of a workflow run's new worktree: commands the autonomy policy allows, run confined (the host read-only but the worktree, no network) before any agent run works in it; one not allowed, or that fails, fails the run at start (ADR-0058) |
 | `worktreeSetup[].repository` (required) | string |  | The repository (absolute): the workspace of the worktreePerRun Workers whose worktrees it sets up |
 | `worktreeSetup[].commands` (required) | string[] | `[]` | 1 to 16 commands run in order in a new worktree before any agent run works in it, each its words split on single spaces (no shell), each judged by the autonomy policy as a command with that exact argv |
@@ -104,10 +111,25 @@
 | `worktreeSetup[].checks.typecheck` | string |  | The command of the typecheck check |
 | `worktreeSetup[].checks.lint` | string |  | The command of the lint check |
 | `worktreeSetup[].checkTimeoutSeconds` | number (1…3600) | `1800` | Each check's deadline |
+| `worktreeSetup[].checkStallSeconds` | number (1…3600) | `300` | Seconds a check may print nothing before it is reported as stalled in the run's explain and the web UI; it goes on to its deadline (T235) |
+| `worktreeSetup[].dependencyFiles` | string[] | `[]` | File names (at any depth) that say what the setup installs, default package.json, pnpm-lock.yaml, pnpm-workspace.yaml, .npmrc, .pnpmfile.cjs: when a result changes any of them, the setup runs again, offline and confined, on the result's tree before its checks (T235) |
 | `worktreeSetup[].checkScratch` | string[] | `[]` | Paths inside the worktree (relative, each ignored by git and holding nothing tracked) its checks see as fresh private writable directories, such as a test runner's cache (node_modules/.vite); the checks see the rest of the worktree read-only |
+| `worktreeSetup[].lockfileVerification` | object | `{}` | Lets a setup that lacks only the lockfile's supply-chain verification (pnpm 12, ERR_PNPM_NO_OFFLINE_META) have it run once on the host's network, on one approval per lockfile digest, with its scripts and pnpmfile off and only this registry configured (T333); the mechanism lockfile-verification (enforce.lockfileVerification) switches it |
+| `worktreeSetup[].lockfileVerification.registry` | string |  | The registry (https:// URL) a new lockfile's supply-chain verification talks to: the one host its approval request names, the registry its command is told to use, and the only one the result's own files may name |
+| `worktreeSetup[].lockfileVerification.cacheDir` | string |  | The directory (absolute, outside every path hidden from agents) where pnpm keeps registry metadata: every setup run sees it read-only and the verification alone writes it, so a lockfile it verified passes the offline install after it |
 | `worktreeSetup[].generated` | object | `{}` | The repository's generated files: a landing whose merge conflicts only in them takes either side, runs the commands in the run's worktree in this setup's confinement, and merges only when they exit 0, change no other file, and change nothing on a repeat (T166) |
 | `worktreeSetup[].generated.paths` | string[] | `[]` | 1 to 32 repository-relative paths of generated files; a * stands for any characters within one path segment, for example packages/*/plugin-manifest.json |
 | `worktreeSetup[].generated.commands` | string[] | `[]` | 1 to 16 commands that regenerate them, run in order, each its words split on single spaces (no shell), each judged by the autonomy policy as a command with that exact argv and run only when it allows it unasked |
+| `checks` | object | `{}` | The load acceptance checks put on the host (T292) |
+| `checks.maxConcurrent` | number (1…32) | `2` | How many acceptance check runs the host runs at once, across every workflow run; the rest wait their turn, in order, and never fail for the wait (T292) |
+| `checks.maxWorkers` | number (1…256) |  | The test workers each check run gets (the vitest config reads SYSTEM_CHECK_MAX_WORKERS); default the host's cores less one, shared among maxConcurrent checks, at most 32 each (T292) |
+| `stepTests` | object | `{}` | The share of the host a writing step's own test runs take (T348) |
+| `stepTests.coreBudget` | number (1…1024) |  | The cores of the host a writing step's own test runs may use together, default half the host's (T348) |
+| `stepTests.runs` | number (1…64) |  | How many runs test at once, default 6: set it to the dispatch's maxRunning; each run's commands get coreBudget / runs test workers (SYSTEM_TEST_MAX_WORKERS), 1 to 32 (T348) |
+| `enforce` | object | `{}` | Each gate-like mechanism's start mode (ADR-0078); the plugin host's live override (system enforce set) wins, read at each use |
+| `enforce.diskFloor` | "off" \| "warn" \| "on" |  | The disk floor (default warn, the mechanism's start mode, T345): on cuts no new worktree while the worktrees' filesystem has less than diskFloorGb free, and dispatch starts none; warn records the refusal it would make and refuses nothing; off does not look |
+| `enforce.lockfileVerification` | "off" \| "warn" \| "on" |  | The supply-chain verification of a new lockfile (default warn, the mechanism's start mode): on opens one approval request per lockfile digest and runs the verification once on the host's network when approved; warn records the request it would open and opens none; off does not look (T333) |
+| `enforce.sandboxedCommands` | "off" \| "warn" \| "on" |  | The policy's sandboxed-command rule (default warn, the mechanism's start mode, ADR-0080): on lets a Bash call that no forbid or ask shape of the rule names run without the operator, in a workspace-write run whose runtime proved both confinements; warn records the verdict the rule would give and the call still asks; off ignores the rule |
 | `workspaceReads` | object | `{}` | The bounds of the workspace reads server a runtime gives its agent to read its workspace without a shell (read_file, list_dir, search; T200b), each within its range |
 | `workspaceReads.maxReadBytes` | number (1024…8388608) | `262144` | The most bytes read_file returns, line numbers included (1024 to 8388608) |
 | `workspaceReads.maxScanBytes` | number (65536…268435456) | `8388608` | The most bytes of one file read through: for a line range, and per file searched (a larger file is not searched) (65536 to 268435456) |
@@ -117,6 +139,9 @@
 | `workspaceReads.maxLineChars` | number (80…10000) | `500` | The most characters of one matching line search shows (80 to 10000) |
 | `workspaceReads.maxPatternChars` | number (1…10000) | `1000` | The longest pattern search takes (1 to 10000) |
 | `workspaceReads.searchTimeoutMs` | number (100…120000) | `10000` | How long one search may take, in milliseconds; past it, it is stopped (100 to 120000) |
+| `workspaceReads.maxLogCount` | number (1…1000) | `100` | The most commits one git_log lists (1 to 1000) |
+| `workspaceReads.maxGitBytes` | number (1024…8388608) | `262144` | The most bytes of output one git view (git_log, git_show, git_diff, git_status) returns (1024 to 8388608) |
+| `workspaceReads.gitTimeoutMs` | number (100…120000) | `10000` | How long one git view may take, in milliseconds, every git it runs counted; past it, git is stopped (100 to 120000) |
 
 ## `approvals`
 
@@ -131,6 +156,7 @@
 | `repeatedApprovals.enabled` | boolean | `false` | Whether the queue proposes such a change at all; off by default |
 | `repeatedApprovals.approvals` | number (3…100) | `5` | Approvals of one exact studio command, among the requests made in the window, before the queue proposes listing it |
 | `repeatedApprovals.windowSeconds` | number (3600…7776000) | `604800` | The window in seconds: the requests made in it count, and none of the shape may have been rejected or have expired |
+| `devBranches` | Record<string, string[]> | `{}` | The dev branches of each project, by project id: the branches where the project's lead, on its own token (`system lead-token issue`), may approve a merge and accept a result. A branch not listed, and main and master always, stay the operator's; a project not listed has none (ADR-0076) |
 
 ## `artifacts`
 
@@ -154,9 +180,20 @@
 | `leaseTtlSeconds` | number (30…3600) | `600` | Lease length when a claim names none, in seconds (leases.maxTtlMs caps it) |
 | `maxAttempts` | number (1…10) | `3` | Attempts a task gets when its proposal names none and templateAttempts names none for its template |
 | `templateAttempts` | Record<string, number> | `{}` | Attempts a task of a template gets when its proposal names none, by template name (1 to 10 each) |
+| `defaultBudget` | object[] (…16) | `[]` | The budget a task gets when its proposal names none (PROP-0023): lines on a pool or on a template's pools, such as {pool: claude-code.agents, unit: usd, amount: 6}. Empty: such a task has no budget, as before |
+| `defaultBudget[].pool` (required) | string |  | A pool, or a template whose pools <template>/<account> the line counts together (ADR-0083) |
+| `defaultBudget[].unit` (required) | "tokens" \| "usd" \| "turns" \| "runs" \| "minutes" |  |  |
+| `defaultBudget[].amount` (required) | number (0…1000000000000) |  |  |
+| `maxFreeRetries` | number (0…10) | `3` | Failed runs of one task that failed only on the infrastructure (the host stopped them, nothing of them was sent, a Worker became unavailable) and are not counted as attempts, at most; past it such a run counts as any failed run (INV-9) |
 | `pageBound` | number (1…100) | `100` | The most items one page of board_projects or board_tasks holds |
 | `projectionMaxTasks` | number (1…10000) | `200` | The most tasks the TASKS.md projection lists, open ones first |
 | `sweepSeconds` | number (0…3600) | `60` | Seconds between the board's own sweeps, and one at start; 0 sweeps only when called |
+| `autoAccept` | object | `{}` | System accepts a result without holding it for the operator when the run's last review approved it, its required checks passed on it, and it lands on a listed branch (D80, ADR-0067); default off |
+| `autoAccept.projects` | string[] | `[]` | Project ids whose results System accepts without the operator when the conditions hold |
+| `autoAccept.branches` | string[] | `[]` | Branches such a result may land on (the repository's checked-out branch the landing merges into) |
+| `autoAccept.breaker` | object | `{"escapes":2,"days":7}` | The circuit breaker (D93): auto-accept turns itself off for a project and branch at this many escaped defects in the window, and turns on again only by the operator or the lead once the line holds |
+| `autoAccept.breaker.escapes` | number (1…100) | `2` | Escaped defects of auto-accepted results, of one project and branch, at which auto-accept for them turns off |
+| `autoAccept.breaker.days` | number (1…90) | `7` | The rolling window the escapes are counted in, in days |
 
 ## `browser-patchright`
 
@@ -178,6 +215,14 @@
 | `path` | string |  | Encrypted vault file; defaults to <DSH_HOME>/system/vault.enc |
 | `keyFile` | string |  | 32-byte owner-only key file; defaults to <DSH_HOME>/system/vault.key |
 | `lockWaitMs` | number (0…) | `30000` | Cross-process lock wait in milliseconds |
+
+## `decisions`
+
+[@tsuuanmi/system-decisions](../../packages/plugins/decisions/README.md)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `pageSize` | number (1…200) | `50` | Records one decisions_list call returns, at most: a cursor (`after`) reads the next page |
 
 ## `digest`
 
@@ -209,7 +254,7 @@
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `xvfbPath` | string | `"Xvfb"` | Xvfb executable |
-| `startupTimeoutMs` | number (0…) | `5000` | Xvfb startup timeout in milliseconds |
+| `startupTimeoutMs` | number (0…) | `30000` | Xvfb startup timeout in milliseconds, per try (one retry after a timeout) |
 | `shutdownTimeoutMs` | number (0…) | `2000` | Per-signal wait when stopping Xvfb, in milliseconds |
 
 ## `egress`
@@ -243,7 +288,7 @@
 | `path` | string | `"/anthropic"` | Route prefix; Claude Code sets ANTHROPIC_BASE_URL to it |
 | `tokenDir` | string |  | Directory of the scope token files (default <DSH_HOME>/system); the gateway takes model.token |
 | `allowedHosts` | string[] | `["127.0.0.1","localhost","[::1]"]` |  |
-| `models` | Record<string, "economy" \| "standard" \| "frontier"> | `{"haiku":"economy"}` | Model-name patterns → tier |
+| `models` | Record<string, "economy" \| "standard" \| "frontier"> | `{}` | Model-name patterns → tier, as the operator configures them (model names are configuration only, ADR-0073); none by default |
 | `classification` | "public" \| "operator-shared" \| "local-private" | `"operator-shared"` | Classification of what the client sends |
 | `timeoutMs` | number (1000…) | `900000` |  |
 | `pingMs` | number (100…) | `10000` |  |
@@ -261,6 +306,33 @@
 | `classification` | "public" \| "operator-shared" \| "local-private" | `"operator-shared"` | Classification of what the client sends |
 | `timeoutMs` | number (1000…) | `900000` |  |
 | `pingMs` | number (100…) | `10000` |  |
+
+## `landing-local`
+
+[@tsuuanmi/system-landing-local](../../packages/plugins/landing-local/README.md)
+
+No options.
+
+## `lead-inbox`
+
+[@tsuuanmi/system-lead-inbox](../../packages/plugins/lead-inbox/README.md)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `kinds` | ("result.held" \| "merge.held" \| "worker.question" \| "task.retries-spent" \| "task.landing-gave-up" \| "request.outside-rights" \| "request.stale" \| "quota.idle" \| "live-update.done" \| "live-update.failed" \| "task.landed" \| "task.digest" \| "review.held" \| "review.expiring")[] | `["result.held","merge.held","worker.question","task.retries-spent","task.landing-gave-up","request.outside-rights","request.stale","quota.idle","live-update.done","live-update.failed","task.landed","task.digest","review.held","review.expiring"]` | The kinds of notice made (default every kind) |
+| `staleMinutes` | number (1…10080) | `10` | An open request of a project older than this is a request.stale notice, in minutes |
+| `idleMinutes` | number (1…10080) | `10` | Ready tasks waiting while Workers that could take them are free, past this many minutes, are a quota.idle notice |
+| `expiringHours` | number (1…168) | `4` | A result held for the operator is a review.expiring notice this many hours before its hold expires, once per hold |
+| `link` | string | `"http://127.0.0.1:47317/ui/"` | The operator page a hold's notice links to, without its token (an http or https URL) |
+| `digestMinutes` | number (1…10080) | `60` | The landings of this many minutes are batched into one task.digest notice |
+| `dedupMinutes` | number (1…1440) | `10` | At most one notice per project, subject, and kind in this many minutes |
+| `maxAgeMinutes` | number (1…10080) | `60` | An event older than this when read makes no notice (a host or row that was off), in minutes |
+| `pollSeconds` | number (1…3600) | `15` | How often the event log and the time-based checks are read, in seconds, beside each new event |
+| `retainDays` | number (1…366) | `14` | Handled notices are kept this many days |
+| `maxNotices` | number (10…100000) | `1000` | Notices kept per project, at most; the oldest handled go first, then the oldest unread (recorded) |
+| `maxQueue` | number (1…10000) | `200` | Notices waiting to be pushed, at most; one more is dropped and recorded |
+| `coordinationDir` | string |  | The directory a file sink writes under: an absolute path, the project's coordination directory |
+| `projects` | Record<string, object> | `{}` | Push delivery by project id |
 
 ## `leases`
 
@@ -297,6 +369,7 @@
 | `minFreeBytes` | number (0…) | `1073741824` | Free space under the DSH home below which health is degraded |
 | `driftWindowHours` | number (1…) | `24` | How long a provider UI change keeps health degraded |
 | `storeCheckMinutes` | number (1…) | `15` | Minutes the store integrity check result is reused (it blocks the host while it runs) |
+| `availabilitySeconds` | number (0…) | `60` | Seconds between reads of the roster that record a change of a Worker's availability in the event log, for the maturity metrics; 0 records none |
 
 ## `models`
 
@@ -334,7 +407,10 @@
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `kinds` | ("approval.opened" \| "approval.expiring" \| "run.user-action" \| "run.escalated" \| "run.waiting" \| "pool.limited" \| "worker.quarantined" \| "review.expiring" \| "dispatch.started")[] | `["approval.opened","approval.expiring","run.user-action","run.escalated","run.waiting","pool.limited","worker.quarantined","review.expiring","dispatch.started"]` | The kinds of notice sent: approval.opened, approval.expiring, run.user-action, run.escalated, run.waiting, pool.limited, worker.quarantined, review.expiring, dispatch.started |
+| `kinds` | ("approval.opened" \| "approval.expiring" \| "run.user-action" \| "run.escalated" \| "run.waiting" \| "pool.limited" \| "worker.quarantined" \| "review.expiring" \| "dispatch.started" \| "review.held")[] | `["approval.opened","approval.expiring","run.user-action","run.escalated","run.waiting","pool.limited","worker.quarantined","review.expiring","dispatch.started","review.held"]` | The kinds of notice sent: approval.opened, approval.expiring, run.user-action, run.escalated, run.waiting, pool.limited, worker.quarantined, review.expiring, dispatch.started |
+| `holds` | "off" \| "on" | `"off"` | on: results held for the operator are sent to the sinks as review.held and review.expiring, one batched message per sweep, at most holdsPerHour an hour; off: none is |
+| `holdsLeadHours` | number (1…168) | `4` | With holds on, a held result is told as expiring this many hours before its hold expires, once |
+| `holdsPerHour` | number (1…60) | `4` | With holds on, the batched hold messages sent in an hour, at most; what is over waits for the next hour |
 | `expiryLeadMinutes` | number (1…1440) | `60` | How long before an open approval request expires (and is denied), or a review held for the operator expires, it is notified again, in minutes |
 | `dedupMinutes` | number (1…1440) | `10` | At most one notice per subject and kind in this many minutes |
 | `maxQueue` | number (1…1000) | `50` | Notices waiting to be sent, at most; one more is dropped, logged, and shown in health |
@@ -354,6 +430,8 @@
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `allowWithoutManifest` | string[] | `[]` | Packages a row may load with no plugin-manifest.json (the DSH rows the bundle composes); anything else that ships none is a finding of the manifest check |
+| `optionalWithoutManifest` | string[] | `[]` | Packages with no plugin-manifest.json whose rows the operator may turn off at runtime (system plugin off); any other row with no manifest is required |
+| `quiesceSeconds` | number (1…3600) | `60` | Seconds a turned row's plugin has to finish or hand back its in-flight work and stop, or to start; past it the row is put back as it was and nothing is recorded or written |
 
 ## `profile-scientific-research`
 
@@ -367,11 +445,12 @@ No options.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `kinds` | object | `{}` | The kind of work (ADR-0057) each algorithm-development step names, by step, so which Worker takes which step is the Workers' kinds: a Worker given kinds takes a step only when it lists that step's kind. The review names none |
+| `pipeline` | "full" \| "lean" | `"full"` | The graph algorithm-development has (ADR-0082): full (default) is develop, the author's own review (selfreview:1), then the review; lean has no selfreview:1. A run keeps the spec it started with, so a change applies to the runs started after it |
+| `kinds` | object | `{}` | The kind of work (ADR-0057) each algorithm-development step names, by step, so which Worker takes which step is the Workers' kinds: a Worker given kinds takes a step only when it lists that step's kind. The reviews name none |
 | `kinds.develop` | string | `"code"` | The kind of work develop:1 is, and the fix a review grows from it (default code) |
 | `kinds.docs` | string | `"docs"` | The kind of work develop:1 is in the docs variant (default docs) |
 | `kinds.tests` | string | `"tests"` | The kind of work develop:1 is in the tests variant (default tests) |
-| `kinds.validate` | string | `"validation"` | The kind of work validate:1 is: it runs the checks and tests and changes nothing (default validation). A Worker given kinds takes it only when it lists this one, so a writer given tests does not run it |
+| `kinds.validate` | string |  | Retired (T267): the template has no validate step any more, so this is ignored; remove it |
 
 ## `provider-chatgpt-web`
 
@@ -481,6 +560,7 @@ No options.
 | `env` | Record<string, string> | `{}` | Explicit environment for Claude Code (no secrets; use forwardEnv) |
 | `forwardEnv` | string[] | `[]` | Daemon environment variables forwarded by name, such as an API key Claude Code should use |
 | `home` | string |  | The Workers' Claude Code home (CLAUDE_CONFIG_DIR; default <DSH_HOME>/system/claude-home), never the operator's ~/.claude; sign in there once |
+| `unixSockets` | boolean | `true` | Let a writing run's commands make unix sockets, which a headless Chrome needs to run the browser tests in a Worker's own tool call (T265). Every unix socket of the host the account could connect to (a container daemon's, the system bus) is masked in that run first; false refuses unix sockets always |
 
 ## `runtime-codex-sdk`
 
@@ -538,6 +618,7 @@ No options.
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `tokenDir` | string |  | Directory of the scope token files (default <DSH_HOME>/system); the UI takes operator.token |
+| `clientDir` | string |  | Directory of the compiled client script app.js (default lib/client/ of the package) |
 | `allowedHosts` | string[] | `["127.0.0.1","localhost","[::1]"]` | Host names the UI answers |
 
 ## `worker-sessions`
@@ -562,6 +643,12 @@ No options.
 | `quotaPreference` | ("subscription-chat" \| "local" \| "agent-plan" \| "metered")[] | `["subscription-chat","local","agent-plan","metered"]` | Quota classes in order of preference |
 | `priority` | string[] | `[]` | Worker ids preferred, in order, after tier and quota class |
 
+## `workers-fake`
+
+[@tsuuanmi/system-workers-fake](../../packages/plugins/workers-fake/README.md)
+
+No options.
+
 ## `workflow`
 
 [@tsuuanmi/system-workflow](../../packages/plugins/workflow/README.md)
@@ -578,14 +665,26 @@ No options.
 | `teams` | object | `{}` | Team membership (docs/design/teams.md#workers-left-out-of-teams) |
 | `teams.excludeWorkers` | string[] (…64) | `[]` | Worker ids and accounts (as system roster lists them: an account as group/id, or its bare id when only one group has it) that no team member joins on, the first member included: a Worker id leaves out that Worker, an account every Worker naming it, each with every other Worker on its account. They still take every other node. A team they leave fewer provider families than members fails config_error before anything is sent, allowSameFamily or not; a member already in its team's conversation in that run keeps it, recorded; an entry that matches nothing is recorded as a workflow.team.unmatched-exclusions event |
 | `retainRunsDays` | number (0…) | `30` | Days a finished run is kept, then deleted with the artifacts only it needed and the website chats only it used (0: every run is kept); a session's latest run always stays |
-| `maxLimitWaitHours` | number (0…720) | `24` | Hours a node refused only because the assigned accounts that could take it are at their limit may wait for the earliest reset, in all from its first wait, spending no attempt; past it, or with no known reset, it fails quota_exhausted (ADR-0052, INV-9); 0 never waits |
+| `maxLimitWaitHours` | number (0…720) | `24` | Hours a node may wait, in all from its first wait, spending no attempt: refused only because the assigned accounts that could take it are at their limit, for the earliest reset (ADR-0052); refused while a Worker that proves it is out of quota, at a limit, or its probe late, to be routed again when routing says it is worth a look (T282). Past it, it fails with the refusal's kind (INV-9); 0 never waits. It bounds too a board task's run waiting for room on the host's disk to carry its previous attempt's work (T345): past it, the run starts fresh |
 | `autoApprovePlans` | boolean | `false` | Approve a high-confidence plan by policy instead of waiting for the operator |
+| `handbook` | object | `{}` | The per-Worker handbook slice and its bound (docs/design/handbook.md) |
+| `handbook.enabled` | boolean | `true` | Give every step of a board task's run its handbook slice (layers 1 to 4 by the engine, the gate view and the lessons by its Worker source), recorded in its brief |
+| `handbook.warnTasks` | number (0…1000) | `30` | Distinct board tasks whose slice is built in warn mode: a slice over the 6,000-token bound is sent whole with a handbook.bound decision; past them, such a slice is refused and the step fails config_error |
+| `handbook.root` | string |  | The System repository the handbook's homes are read from: the invariants and the ADR index (layer 1) and the rule inventory, docs/design/handbook.md (layer 4); default, the repository this package sits in. Unread, each version says so |
+| `enforce` | object | `{}` | Each gate-like mechanism's start mode (ADR-0078); the plugin host's live override (system enforce set) wins, read at each use |
+| `enforce.evidenceGate` | "off" \| "warn" \| "on" | `"on"` | The evidence gate at the end of a writing step of a board task's run: on refuses a step that shows no output of its required checks, warn records that refusal and lets the step end, off does not look |
+| `enforce.handbookBound` | "warn" \| "on" | `"on"` | The handbook slice's bound: on refuses a slice over it once the warn period (handbook.warnTasks) is over, warn always sends it whole and records it; handbook.enabled false gives no slice |
+| `enforce.reviewGuides` | "off" \| "on" | `"on"` | The selection of the REVIEW.md guides of the areas a review's change touches: off gives a review none |
+| `enforce.redOnBase` | "off" \| "warn" \| "on" | `"warn"` | The red-on-base check a policy rule requires of a result of the normal or heavy tier (its new tests must fail on its base tree): on holds the result to it, warn runs it, records what it would refuse, and judges the result as if it passed (the start value), off does not ask it |
 | `maxReviewCycles` | number (1…5) | `3` | Reviews of one change, the first included, before remediation stops |
+| `fixSessionWaitMinutes` | number (0…1440) | `60` | Minutes a review's fix that continues its author's session waits for that session's Worker while it cannot take the fix now (out of quota, signed out, not listed), from the fix's first wait, spending no attempt; past it, the session is handed off to another Worker with its earlier turns, recorded (INV-9); 0 hands off at once |
 | `tieTimeoutHours` | number (0.0001…720) | `24` | Hours a tied team waits for a deciding vote, then completes inconclusive (INV-9) |
 | `gateTimeoutHours` | number (0.0001…720) | `24` | Hours a plan's gate waits for the operator's approval, then closes and fails the run, by rule (INV-9); continue the run to wait again |
 | `approvalPollSeconds` | number (1…300) | `15` | Seconds between the engine's reads of the approval queue: a remediation fix's request while its run waits on it, and the requests a Worker's deferred tool calls wait on (INV-9) |
+| `landingBatch` | number (1…8) | `1` | Accepted results the head of a target branch's landing queue lands at once, as a stack rebased in order and checked once (a merge train); a stack that fails is bisected to the failing result, which goes back alone. 1 lands one at a time, no batching |
 | `deferredCommandMinutes` | number (0…1440) | `10` | Minutes a board task's step waits on the operator for a Worker's deferred tool call of class command (from its request's creation), then treats that call as denied, for it alone: the request is withdrawn, recorded as a recovery decision deny, and the session continues once, told the call was denied (INV-9); 0 waits until the request expires |
 | `maxSessionRuns` | number (1…50) | `5` | Runs one session may serve when a board task's next attempt, or the next task of a chain, resumes the session of the work before it (INV-9); past it, the run starts a fresh session given its brief |
+| `resumeAcrossAttempts` | boolean | `true` | Whether a board task's next attempt resumes the session of its previous attempt (T369, PROP-0022 change 4); false: it starts a fresh session given its brief and the task's dossier (the previous diff, checks, and open findings), so a long session is not re-read on every turn of the next attempt |
 | `tasksFile` | object | `{}` | The board's TASKS.md projection a board task's run is given in its own worktree (INV-9) |
 | `tasksFile.maxTasks` | number (0…10000) | `200` | Tasks it lists at most, open ones first, the rest counted; 0 writes no file |
 | `tasksFile.maxChars` | number (1024…1048576) | `65536` | Characters it holds at most; past it, it is cut at a line with a note |
@@ -597,12 +696,43 @@ No options.
 | `dispatch.maxRunning` | number (1…10000) |  | Dispatched runs not finished, with the asks open or approved, at most (at most maxActiveRuns less leaveRunsFree; default 8, or that when less) |
 | `dispatch.maxRunningPerProject` | number (1…16) | `2` | The same, per project |
 | `dispatch.maxRunningPerAccount` | number (1…16) | `1` | The same, per account of the chosen Worker; and the most its account's load may be for it to be free |
+| `dispatch.maxRunningUnreadPerAccount` | number (1…16) | `1` | Dispatched runs or asks at most on an account none of whose windows has a reading yet (its pool is configured unknown: available); it is ordered after every account with headroom, and a reading replaces this bound (T294) |
 | `dispatch.maxRunningPerRepository` | number (1…16) | `4` | The same, per repository (the chosen writing Worker's workspace): tasks without a write subject on one repository run in parallel up to this (D64) |
 | `dispatch.leaveRunsFree` | number (0…10000) |  | Active runs dispatch leaves for the lead's and your own starts (at most maxActiveRuns less 1; default 4, or that when less) |
 | `dispatch.maxOpenAsks` | number (1…32) | `4` | Dispatch requests open at once, waiting for your go |
 | `dispatch.approvedHoldMinutes` | number (1…240) | `30` | Minutes an approved start waits for its Worker to be free; past it the approval is used for nothing and dispatch chooses again |
 | `dispatch.maxPerHour` | number (0…120) | `6` | Starts dispatch makes in any rolling hour, counted from its rows (PROP-0014 D2); 0 starts nothing |
 | `dispatch.maxPerHourPerProject` | number (0…120) |  | The same, per project (at most maxPerHour; default 3, or maxPerHour when less) |
+| `dispatch.advisor` | object | `{}` | The dispatch advisor in shadow (PROP-0015 J1; docs/design/workflow-engine.md#the-dispatch-advisor-in-shadow) |
+| `dispatch.advisor.provider` | "none" \| "local" \| "model" | `"none"` | Who advises each dispatch choice, in shadow (PROP-0015 J1): none (the default), no advisor; local, a logistic regression fitted on this host's own recorded outcomes (no data leaves the host); model, the model Worker named by model.worker (metered; off unless set). The advice is recorded as an input of the choice and never changes it |
+| `dispatch.advisor.timeoutMs` | number (100…120000) | `2000` | Milliseconds one advice may take; past it, it is recorded unavailable and the choice stands |
+| `dispatch.advisor.maxPerHour` | number (1…10000) | `120` | Advisor calls in any hour at most (INV-9); past it, unavailable |
+| `dispatch.advisor.minLabelled` | number (10…2000) | `30` | Labelled dispatched attempts the local adapter needs before it answers (at most the examples it keeps); until then, insufficient data |
+| `dispatch.advisor.l2` | number (0.001…1000) | `1` | The local adapter's L2 penalty |
+| `dispatch.advisor.model` | any |  | The model adapter {worker, maxTokens}: worker, the model Worker asked (model:<id> of the models row); maxTokens, its output bound (64 to 8192, default 1024). Features only (no task text) are sent, through the Worker's own egress check; checked when the row loads |
+| `scheduledReview` | object | `{}` | The scheduled review of existing code, one area a day, filing confirmed findings as proposed board tasks (docs/design/handbook.md#scheduled-review) |
+| `scheduledReview.enabled` | boolean | `false` | Review one area of the repository a day, round robin among the areas its review guides name, and propose each confirmed important finding as a board task (D93 item 8; docs/design/handbook.md#scheduled-review). Off by default: the operator turns it on, with projectId and repository |
+| `scheduledReview.projectId` | string |  | The board project the findings are proposed in (required when enabled) |
+| `scheduledReview.repository` | string |  | Absolute path of the git repository whose review guides name the areas, read at the tip of ref and never from its working tree (required when enabled) |
+| `scheduledReview.ref` | string | `"dev"` | The branch or ref reviewed, at its tip (default dev) |
+| `scheduledReview.hourUtc` | number (0…23) | `3` | The UTC hour from which the day's review may start; one scheduled review a day at most (default 3) |
+| `scheduledReview.maxTasksPerRun` | number (1…20) | `5` | The most tasks one review proposes (INV-9); the rest of its confirmed findings are counted as capped, not filed (default 5) |
+| `scheduledReview.maxFiles` | number (1…400) |  | Files of the area one review reads at most (default 80); an area that does not fit is read as consecutive windows, each round starting where the last ended, so every file is read in turn; the files left named |
+| `scheduledReview.maxBytes` | number (10000…4000000) |  | Bytes of the area one review reads in all (default 400,000) |
+| `scheduledReview.maxFileBytes` | number (1000…500000) |  | A larger file is listed as not read (default 60,000) |
+| `scheduledReview.timeoutMinutes` | number (1…1440) |  | Minutes a review run may take before the review is recorded as unfinished (default 120) |
+| `scheduledReview.actionClass` | string |  | The action class the proposed tasks carry (default workspace-write) |
+| `scheduledReview.taskTemplate` | string |  | The board task template the proposed tasks name, when the project uses one (default none) |
+| `scheduledReview.template` | string |  | The workflow template a review runs (default scheduled-review, which the software-development profile provides) |
+| `dailyCheck` | object | `{}` | The daily run of every browser spec on the tip of a ref, filing a failure as one board task (docs/engineering/testing.md) |
+| `dailyCheck.enabled` | boolean | `false` | Run the whole suite, every browser spec with it, on the tip of ref once a day, and propose a failure as one board task (T305b; docs/engineering/testing.md). Off by default: the operator turns it on, with projectId and repository, and a worktreeSetup of that repository (agent-workers) with a tests check |
+| `dailyCheck.projectId` | string |  | The board project a failure is proposed in (required when enabled) |
+| `dailyCheck.repository` | string |  | Absolute path of the git repository whose tip is checked, in a worktree of its own and never its working tree (required when enabled) |
+| `dailyCheck.ref` | string | `"dev"` | The branch or ref checked, at its tip (default dev) |
+| `dailyCheck.hourUtc` | number (0…23) | `4` | The UTC hour from which the day's run may start; one scheduled run a day at most (default 4) |
+| `dailyCheck.timeoutMinutes` | number (1…1440) |  | Minutes a run may take before it is recorded as an error (default 180) |
+| `dailyCheck.actionClass` | string |  | The action class the proposed task carries (default workspace-write) |
+| `dailyCheck.taskTemplate` | string |  | The board task template the proposed task names, when the project uses one (default none) |
 | `repositories` | object | `{}` | A review's repository reads: allowed hosts and bounds (INV-9) |
 | `repositories.hosts` | string[] | `["github.com"]` | Hosts a review may read a public repository from |
 | `repositories.maxFiles` | number (1…200) |  | Files a review reads from a repository (default 40) |

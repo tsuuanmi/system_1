@@ -2,7 +2,7 @@ import type { ApprovalRequest, AutonomyPolicy, PolicyChange } from '@tsuuanmi/sy
 import { SchemaRegistry } from '@tsuuanmi/system-libs'
 import { chromium } from 'patchright-core'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
-import { canRunBrowser, testChrome } from '../../browser-patchright/tests/support.ts'
+import { headlessIt, headlessLaunchOptions } from '../../browser-patchright/tests/support.ts'
 import { activeProject } from '../../workflow/conformance/workflow.ts'
 import { type Booted, boot, bundlePolicies, OPERATOR } from './store-backed.ts'
 import { decisionsIn, descriptionOf } from './wording.ts'
@@ -185,11 +185,11 @@ describe('web UI: a policy change the queue proposed itself', () => {
 })
 
 describe('web UI: the policy page in a real browser', () => {
-  it.runIf(canRunBrowser)('says in the queue entry that the queue, not the operator, proposed a change, and why', async () => {
+  headlessIt('says in the queue entry that the queue, not the operator, proposed a change, and why', async () => {
     const booted = await boot({ approvals: REPEATED })
     const change = await queueProposes(booted)
     const origin = `http://127.0.0.1:${(booted.ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/#token=${OPERATOR}`)
@@ -200,10 +200,10 @@ describe('web UI: the policy page in a real browser', () => {
     await expect.poll(() => page.locator('main').innerText()).toContain('(proposed by the queue)')
   }, 60_000)
 
-  it.runIf(canRunBrowser)('shows the policy in force and a diff of a proposed version, proposes it, shows the change in the queue entry, and shows it in force once approved there', async () => {
+  headlessIt('shows the policy in force and a diff of a proposed version, proposes it, shows the change in the queue entry, and shows it in force once approved there', async () => {
     const booted = await boot()
     const origin = `http://127.0.0.1:${(booted.ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/?view=policy#token=${OPERATOR}`)
@@ -236,7 +236,7 @@ describe('web UI: the policy page in a real browser', () => {
     // The queue entry shows the change it asks for, then the operator approves it there.
     await page.getByRole('link', { name: 'system' }).click()
     const queue = page.getByRole('region', { name: 'Approval queue' })
-    const entry = queue.locator('article', { hasText: `request ${request!.requestId}` })
+    const entry = queue.locator(`#request-${request!.requestId}`)
     // What a verdict does is under the card's Details (T186); Show change is beside the two verdicts, never folded.
     await expect.poll(() => entry.locator('details.card-details > summary').count()).toBe(1)
     await entry.locator('details.card-details > summary').click()
@@ -251,7 +251,7 @@ describe('web UI: the policy page in a real browser', () => {
       { label: 'Show change', description: 'shows what this request changes, below; decides nothing' }])
     await entry.getByRole('button', { name: 'Approve', exact: true }).click()
     await expect.poll(async () => (await booted.ctx.approvals.policy()).set?.source).toBe('store')
-    await expect.poll(() => page.locator('#outcome').textContent()).toContain('Recorded as your verdict on request ' + request!.requestId)
+    await expect.poll(async () => (await page.locator('#outcome button.copy').evaluateAll((list) => list.map((b) => b.getAttribute('data-copy'))))).toContain(request!.requestId)
     expect(await page.locator('#outcome').innerText()).toContain('Approved: ')
     await page.getByRole('navigation', { name: 'Pages' }).getByRole('link', { name: 'Autonomy policy' }).click()
     await expect.poll(() => page.locator('main').innerText()).toContain('Active policy · Approved change')
@@ -259,11 +259,11 @@ describe('web UI: the policy page in a real browser', () => {
     expect(await page.locator('details', { hasText: 'Exact set' }).textContent()).toMatch(/The change pch-\S+ you approved, kept while the configuration it came from is unchanged\./)
   }, 60_000)
 
-  it.runIf(canRunBrowser)('decides an asked change on the policy page itself: its card, with Approve and Deny, above the policy, and its history row linking to it (T95, T97)', async () => {
+  headlessIt('decides an asked change on the policy page itself: its card, with Approve and Deny, above the policy, and its history row linking to it (T95, T97)', async () => {
     const booted = await boot()
     const { change, request } = await propose(booted, merging('forbid'), 'no merges for now')
     const origin = `http://127.0.0.1:${(booted.ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage()
     await page.goto(`${origin}/ui/?view=policy#token=${OPERATOR}`)
@@ -276,7 +276,7 @@ describe('web UI: the policy page in a real browser', () => {
     expect(main).not.toContain('it waits for your approval on Home')
     expect(await page.locator('details', { hasText: 'About modes' }).textContent()).toContain('Ask approval: it waits for your approval on Home')
     expect(await page.locator('details', { hasText: 'Exact set' }).getAttribute('open')).toBeNull()
-    const card = waiting.locator('article', { hasText: `request ${request.requestId}` })
+    const card = waiting.locator(`#request-${request.requestId}`)
     // One line and two buttons (T186); what a verdict does, what it is about, and the set's hashes under its closed Details.
     // A policy change's card keeps its diff one press away, beside the two verdicts (T186).
     expect(await card.getByRole('button').allInnerTexts()).toEqual(['Approve', 'Deny', 'Show change'])
@@ -302,17 +302,19 @@ describe('web UI: the policy page in a real browser', () => {
     await card.getByRole('button', { name: 'Approve', exact: true }).click()
     await expect.poll(async () => (await booted.ctx.approvals.policy()).set?.source).toBe('store')
     expect((await booted.ctx.approvals.policy()).set?.changeId).toBe(change.changeId)
-    await expect.poll(() => page.locator('#outcome').textContent()).toContain('Recorded as your verdict on request ' + request.requestId)
+    await expect.poll(async () => (await page.locator('#outcome button.copy').evaluateAll((list) => list.map((b) => b.getAttribute('data-copy'))))).toContain(request.requestId)
     // Re-rendered: nothing waits any more, and the change is in force.
     await expect.poll(() => page.locator('main').innerText()).toContain('Active policy · Approved change')
-    expect(await page.locator('details', { hasText: 'Exact set' }).textContent()).toContain(`The change ${change.changeId} you approved`)
+    const exactSet = page.locator('details', { hasText: 'Exact set' })
+    expect(await exactSet.textContent()).toContain('The change pch-')
+    expect(await exactSet.locator('button.copy').first().getAttribute('data-copy')).toBe(change.changeId)
     expect(await waiting.count()).toBe(0)
   }, 60_000)
 
-  it.runIf(canRunBrowser)('edits the policy as a form: a mode per action class, the classes that always ask fixed at ask with why, the commands as lines, the expiry and batch numbers; the JSON follows under Advanced, and the proposal is the queue\'s to validate (T116)', async () => {
+  headlessIt('edits the policy as a form: a mode per action class, the classes that always ask fixed at ask with why, the commands as lines, the expiry and batch numbers; the JSON follows under Advanced, and the proposal is the queue\'s to validate (T116)', async () => {
     const booted = await boot()
     const origin = `http://127.0.0.1:${(booted.ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
     await page.goto(`${origin}/ui/?view=policy#token=${OPERATOR}`)
@@ -361,7 +363,8 @@ describe('web UI: the policy page in a real browser', () => {
     const change = ((await booted.call('policy')).value.changes as PolicyChange[])[0]!
     // What is next in sight; the change and request ids under Record IDs.
     expect(await page.locator('#outcome').innerText()).toContain('Approval needed — nothing changes until you approve it')
-    expect(await page.locator('#outcome').textContent()).toContain(`Recorded as change ${change.changeId}; request ${request!.requestId}.`)
+    expect(await page.locator('#outcome').textContent()).toContain('Recorded as change pch-')
+    expect(await page.locator('#outcome button.copy').evaluateAll((list) => list.map((b) => b.getAttribute('data-copy')))).toEqual([change.changeId, request!.requestId])
     expect(change.policy).toMatchObject({ version: 2, commands: ['pnpm lint', 'pnpm test'], expiry: { defaultSeconds: 43_200 }, batch: { maxSize: 5, maxWaitSeconds: 1800 } })
   }, 60_000)
 })

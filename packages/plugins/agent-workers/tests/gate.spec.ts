@@ -29,7 +29,7 @@ import Workflow from '@tsuuanmi/system-workflow'
 import { afterAll, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { parse as parseYaml } from 'yaml'
 import AgentWorkers from '../src/index.ts'
-import { classify, DENIAL_REASONS, EXPLANATION_MAX, TOOLS_NOTE_MAX, unaskedNote } from '../src/gate.ts'
+import { classify, COMMAND_MAX, DENIAL_REASONS, EXPLANATION_MAX, readToolsOf, TOOLS_NOTE_MAX, unaskedNote } from '../src/gate.ts'
 import { probeExec, scripted as scriptedCodex } from '../../runtime-codex-sdk/tests/fake-codex.ts'
 import { CHARTER } from '../../../board-core/conformance/board.ts'
 
@@ -46,9 +46,9 @@ class GatedAgent implements AgentRuntimeProvider {
   readonly kind = 'gated'
   readonly runs: RunSpec[] = []
   readonly verdicts: ToolVerdict[][] = []
-  constructor(private readonly script: Array<Array<Omit<ToolCall, 'callId'>>>, private readonly options: { goesOn?: boolean; deferredMetering?: RunMetering } = {}) {}
+  constructor(private readonly script: Array<Array<Omit<ToolCall, 'callId'>>>, private readonly options: { goesOn?: boolean; deferredMetering?: RunMetering; evidence?: { readTools?: string[]; workspaceReads?: boolean } } = {}) {}
   async probe() {
-    return { available: true, detail: 'gated 1.0', sandboxes: ['read-only', 'workspace-write'] as Array<'read-only' | 'workspace-write'>, resume: true, executes: true, readsConfined: true, gatesToolCalls: true }
+    return { available: true, detail: 'gated 1.0', sandboxes: ['read-only', 'workspace-write'] as Array<'read-only' | 'workspace-write'>, resume: true, executes: true, readsConfined: true, gatesToolCalls: true, ...this.options.evidence }
   }
   async run(spec: RunSpec, signal: AbortSignal, onHandle?: (handle: string) => void) {
     this.runs.push(spec)
@@ -101,7 +101,8 @@ async function boot(agent: AgentRuntimeProvider, approvals: AutonomyPolicy | nul
     ...(approvals ? [ctx.plugin(StoreApprovals, { policies: [approvals] })] : []),
     ...(metered ? [ctx.plugin(FakeResources, { pools: [POOL] })] : []),
     ctx.plugin(WorkerRouter, {}), ctx.plugin(AgentRuntimeRegistry),
-    ctx.plugin(AgentWorkers, { workers: [{ id: 'dev', runtime: agent.kind, workspace: WORKSPACE, sandbox, tier: 'standard', ...(metered ? { pool: POOL.pool, account: POOL.account } : {}) }] }),
+    // Its worktree root, where a writing run's report file is made (T265), is the test's own, never the host's DSH home.
+    ctx.plugin(AgentWorkers, { workers: [{ id: 'dev', runtime: agent.kind, workspace: WORKSPACE, sandbox, tier: 'standard', ...(metered ? { pool: POOL.pool, account: POOL.account } : {}) }], worktreeRoot: join(dir, 'worktrees') }),
   ]
   await Promise.all(fibers)
   ctx.agentRuntimes.register(agent)
@@ -184,6 +185,48 @@ describe('the tool gate of an agent run (docs/design/approvals.md#a-workers-tool
     // The explanation never names the call's input.
     expect(JSON.stringify(events)).not.toContain('/etc/passwd')
     expect(decisionOf(ctx, (outside as { reason: string }).reason).outcome.detail).toMatchObject({ reason: 'outside-workspace' })
+  })
+
+  it('denies each shell inspection command at once, naming the reading tool, with no request, where the runtime gives its agent read tools; under one that gives none, it asks as before (T222)', async () => {
+    const forms: Array<[string, string, string]> = [
+      ['cat src/a.ts', 'Read', 'read_file'], ['head -n 5 src/a.ts', 'Read', 'read_file'], ['tail src/a.ts', 'Read', 'read_file'], ['sed -n 1,9p src/a.ts', 'Read', 'read_file'],
+      ['wc -l src/a.ts', 'Read', 'read_file'], ['grep -rn needle src', 'Grep', 'search'], ['rg needle src', 'Grep', 'search'], ['ls -la src', 'Glob', 'list_dir'], ['find src -name a.ts', 'Glob', 'list_dir'],
+    ]
+    const script = [forms.map(([command]) => bash(command))]
+    const kinds = { claude: { readTools: ['Read', 'Grep', 'Glob'] }, codex: { workspaceReads: true } }
+    for (const [kind, evidence] of Object.entries(kinds)) {
+      const agent = new GatedAgent(script, { evidence })
+      const { ctx, run } = await boot(agent)
+      const done = await run()
+      expect(done.status, kind).toBe('completed')
+      for (const [i, [command, own, server]] of forms.entries()) {
+        const tool = kind === 'claude' ? own : server
+        const verdict = agent.verdicts[0]![i] as { decision: string; reason: string }
+        expect(verdict, `${command} under ${kind}`).toMatchObject({ decision: 'deny', reason: expect.stringContaining(`use ${tool} instead`) })
+        expect(decisionOf(ctx, verdict.reason), command).toMatchObject({ decisionType: 'gate', outcome: { option: 'deny', detail: { reason: 'use-read-tool' } } })
+      }
+      // No request: nothing waits for the operator.
+      expect(await ctx.approvals.list(), kind).toEqual([])
+      const events = ctx.eventLog.query({ type: 'agent-workers.tool.denied' })
+      expect(events.map((e) => e.data!.reason)).toEqual(forms.map(() => 'use-read-tool'))
+      expect(events.map((e) => e.data!.explanation)).toEqual(forms.map(() => DENIAL_REASONS['use-read-tool']))
+      for (const event of events) expect(agentToolDenialOf(event.data), kind).toBeDefined()
+      // The brief's Tools section says so, naming the tool for each.
+      const prompt = agent.runs[0]!.prompt
+      expect(prompt).toContain('A Bash inspection command you have a reading tool for is denied at once, never asked')
+      expect(prompt).toContain(kind === 'claude' ? 'grep, rg: use Grep' : 'grep, rg: use search')
+      expect(prompt).toContain(kind === 'claude' ? 'ls, find: use Glob' : 'ls, find: use list_dir')
+    }
+    // A runtime that gives its agent no read tools: the first form is the exact command, asked as before; the run stops there.
+    const agent = new GatedAgent(script)
+    const { ctx, run } = await boot(agent)
+    const done = await run()
+    expect(done).toMatchObject({ status: 'failed', error: { kind: 'config_error' } })
+    expect(agent.verdicts[0]).toEqual([expect.objectContaining({ decision: 'defer' })])
+    expect(await ctx.approvals.list()).toEqual([expect.objectContaining({ action: expect.objectContaining({ class: 'command', summary: 'Bash: cat src/a.ts' }) })])
+    expect(ctx.eventLog.query({ type: 'agent-workers.tool.denied' })).toEqual([])
+    expect(agent.runs[0]!.prompt).not.toContain('A Bash inspection command you have a reading tool for')
+    expect(agent.runs[0]!.prompt).toContain('cat, ls, rg, and the like are commands, judged as one')
   })
 
   it('gives every denial reason a plain explanation of at most 300 characters (T207)', () => {
@@ -293,6 +336,42 @@ describe('the tool gate of an agent run (docs/design/approvals.md#a-workers-tool
     expect(agent.verdicts[0]).toEqual([{ decision: 'allow' }])
   })
 
+  it('lets a git history read run unasked as a listed command does, under a runtime with no clean shells, and still defers a git write (T276)', async () => {
+    const reads = ['git log --oneline -n 30 main', 'git log system/run/run_d2fdef633d3e37b6', 'git log abc1234..HEAD --format=%h:%s', 'git show abc1234', 'git show abc1234:src/a.ts', 'git diff abc1234 def5678', 'git diff --stat abc1234 def5678', 'git branch --list system/run/run_d2fdef633d3e37b6']
+    for (const write of ['git commit -m x', 'git push', 'git checkout -b x', `git diff --output=${join(tmpdir(), 'out.diff')} abc1234 def5678`]) {
+      const agent = new GatedAgent([[...reads, write].map(bash)])
+      const { ctx, run } = await boot(agent)
+      expect(await run(), write).toMatchObject({ status: 'failed', error: { kind: 'config_error' } })
+      expect(agent.verdicts[0], write).toEqual([...reads.map(() => ({ decision: 'allow' })), expect.objectContaining({ decision: 'defer' })])
+      // One request, the write's: no read waited for the operator.
+      expect(await ctx.approvals.list(), write).toEqual([expect.objectContaining({ action: expect.objectContaining({ class: 'command', summary: `Bash: ${write}` }) })])
+      expect(agent.runs[0]!.prompt).toContain('- Bash git history, read-only, every path absolute and inside')
+    }
+  })
+
+  it('judges a git history read by the command mode first, then as a workspace write where that asks: a forbidden command class, or writes that ask, still bind (T276)', async () => {
+    const read = bash('git log --oneline -n 30 main')
+    // Commands forbidden: denied, as a listed command is.
+    const forbidden = new GatedAgent([[read]])
+    const one = await boot(forbidden, policy({ command: { mode: 'forbid' } }))
+    expect((await one.run()).status).toBe('completed')
+    expect(forbidden.verdicts[0]).toEqual([expect.objectContaining({ decision: 'deny' })])
+    expect(forbidden.runs[0]!.prompt).not.toContain('Bash git history')
+    // Commands and writes ask: it asks, as the command it is.
+    const asked = new GatedAgent([[read]])
+    const two = await boot(asked, policy({ 'workspace-write': { mode: 'ask' } }))
+    expect((await two.run()).status).toBe('failed')
+    expect(asked.verdicts[0]).toEqual([expect.objectContaining({ decision: 'defer' })])
+    expect(await two.ctx.approvals.list()).toEqual([expect.objectContaining({ action: expect.objectContaining({ class: 'command', summary: 'Bash: git log --oneline -n 30 main' }) })])
+    expect(asked.runs[0]!.prompt).not.toContain('Bash git history')
+    // Writes run with checks pending: it runs, the checks pending as for any workspace write.
+    const pending = new GatedAgent([[read]])
+    const three = await boot(pending, policy({ 'workspace-write': { mode: 'auto', requires: ['tests'] } }))
+    expect((await three.run()).status).toBe('completed')
+    expect(pending.verdicts[0]).toEqual([{ decision: 'allow' }])
+    expect(three.ctx.eventLog.query({ type: 'agent-workers.tool.checks-pending' }).map((e) => e.data!.actionClass)).toEqual(['workspace-write'])
+  })
+
   it('tells a Worker that may run commands which calls run unasked, the policy\'s commands list word for word, so it asks less (T199)', async () => {
     const agent = new GatedAgent([[]])
     const { run } = await boot(agent, { ...policy(), commands: ['npm run build', 'git status --short'] })
@@ -318,8 +397,14 @@ describe('the tool gate of an agent run (docs/design/approvals.md#a-workers-tool
     const effective = [{ actionClass: 'read' as const, mode: 'auto' }]
     expect(unaskedNote({ policies: [], effective }, '/ws')).not.toContain('Bash read-only inspection')
     expect(unaskedNote({ policies: [], effective }, '/ws', { shellReads: true })).toContain('- Bash read-only inspection, every path absolute and inside /ws')
+    // The git history reads (T276), in one line, wherever the gate runs them unasked.
+    expect(unaskedNote({ policies: [], effective }, '/ws', { shellReads: true })).toContain('- Bash git history, read-only, every path absolute and inside /ws: git log [<ref>|<a>..<b>] [--oneline] [-n <k>] [--format=<placeholders>] [-- <path>], git show <sha>[:<path>], git diff <a> <b> [--stat], git branch --list system/run/<runId>.')
+    expect(unaskedNote({ policies: [], effective }, '/ws')).not.toContain('Bash git history')
+    expect(unaskedNote({ policies: [], effective: [...effective, { actionClass: 'workspace-write' as const, mode: 'auto' }] }, '/ws')).toContain('- Bash git history, read-only')
+    expect(unaskedNote({ policies: [], effective: [...effective, { actionClass: 'workspace-write' as const, mode: 'auto' }, { actionClass: 'command' as const, mode: 'forbid' }] }, '/ws')).not.toContain('Bash git history')
     const reads = unaskedNote({ policies: [], effective }, '/ws', { workspaceReads: true })
-    expect(reads).toContain('- Reading tools (the workspace server\'s read_file, list_dir, and search) on paths inside your workspace /ws.')
+    expect(reads).toContain('- Reading tools (the workspace server\'s read_file, list_dir, search, git_log, git_show, git_diff, and git_status) on paths inside your workspace /ws.')
+    expect(reads).toContain('Read its git history the same way: git_log (count, skip, commit, paths)')
     expect(reads).toContain('- Read your workspace with the workspace server\'s tools, never with a shell: read_file (path; startLine and endLine for a range)')
     expect(reads).toContain('read with the workspace server\'s tools, never with a shell.')
     // A read-only Worker is told the same, whatever the policy runs unasked.
@@ -794,6 +879,67 @@ describe('classify: a tool call as the action the policy judges', () => {
     expect(classify({ tool: 'Bash', input: { command: '' } }, ws)).toMatchObject({ refused: expect.any(String), reason: 'invalid-input' })
   })
 
+  it('carries a command of 1,200 characters whole in its request, beside a short summary, and refuses one past the bound with a reason, never cutting it (T295)', () => {
+    const bash = (command: string) => ({ tool: 'Bash', input: { command } })
+    const files = (n: number) => Array.from({ length: n }, (_, i) => `packages/plugins/x/tests/case-${String(i).padStart(4, '0')}.spec.ts`)
+    const whole = `corepack pnpm vitest run ${files(26).join(' ')}`
+    expect(whole.length).toBeGreaterThan(1100)
+    expect(whole.length).toBeLessThan(1300)
+    const action = classify(bash(whole), ws)
+    expect(action).toMatchObject({ class: 'command', command: whole.split(' ') })
+    expect('consequences' in action && action.consequences).toContain(whole)
+    expect('summary' in action && action.summary.length).toBeLessThanOrEqual(500)
+    // The request's consequences stay within the record's 2000 characters at the bound.
+    const atBound = `corepack pnpm vitest run ${files(40).join(' ')}`.slice(0, COMMAND_MAX)
+    expect('consequences' in classify(bash(atBound), ws) && (classify(bash(atBound), ws) as { consequences: string }).consequences.length).toBeLessThanOrEqual(2000)
+    const long = `corepack pnpm vitest run ${files(150).join(' ')}`
+    expect(long.length).toBeGreaterThan(5000)
+    const refused = classify(bash(long), ws)
+    expect(refused).toMatchObject({ refused: expect.stringContaining(`${long.length} characters, past the ${COMMAND_MAX}`), reason: 'invalid-input' })
+    expect('refused' in refused && refused.refused).toContain('run a shorter command')
+  })
+
+  it('tells a writing Worker, in its brief, to name several test files relative to its worktree, and one test file absolute (T295)', () => {
+    const effective = [{ actionClass: 'read' as const, mode: 'auto' }, { actionClass: 'workspace-write' as const, mode: 'auto' }]
+    expect(unaskedNote({ policies: [], effective }, '/ws')).toContain('Several test files in one command are a command the operator is asked about: name them with paths relative to your worktree')
+    expect(unaskedNote({ policies: [], effective }, '/ws')).toContain('one test file runs as corepack pnpm vitest run <its absolute path inside the workspace>')
+    expect(unaskedNote({ policies: [], effective }, '/ws', { sandbox: 'read-only' })).not.toContain('paths relative to your worktree')
+  })
+
+  it('admits `corepack pnpm vitest run <one test file>` inside the worktree, as a write of it, and refuses it outside (T270)', () => {
+    const bash = (command: string) => ({ tool: 'Bash', input: { command } })
+    const inside = join(ws, 'packages', 'x', 'tests', 'x.spec.ts')
+    for (const options of [{}, { shellReads: true }] as const) {
+      expect(classify(bash(`corepack pnpm vitest run ${inside}`), ws, options)).toMatchObject({ class: 'workspace-write', summary: `corepack pnpm vitest run ${inside}` })
+    }
+    // Outside the worktree: beside it, climbing out of it, through a link out of it, elsewhere, or relative (the gate does not see where it runs).
+    symlinkSync(outside, join(ws, 'link-tests'))
+    writeFileSync(join(outside, 'y.spec.ts'), 'x')
+    for (const path of [join(outside, 'x.spec.ts'), `${ws}/../outside/x.spec.ts`, join(ws, 'link-tests', 'y.spec.ts'), '/etc/x.test.ts']) {
+      expect(classify(bash(`corepack pnpm vitest run ${path}`), ws), path).toMatchObject({ refused: expect.stringContaining('not a test file inside the workspace'), reason: 'outside-workspace' })
+    }
+    // Only exactly one absolute test file: any other form (a relative path: the policy's command rules judge it) stays the exact-argv command it was, for the policy's list.
+    for (const command of ['corepack pnpm vitest run packages/x/tests/x.spec.ts',`corepack pnpm vitest run ${inside} ${inside}`, `corepack pnpm vitest run --watch ${inside}`, `corepack pnpm vitest ${inside}`, `pnpm vitest run ${inside}`, `corepack pnpm vitest run ${join(ws, 'package.json')}`]) {
+      expect(classify(bash(command), ws), command).toMatchObject({ class: 'command' })
+    }
+  })
+
+  it('admits `corepack pnpm test:related <files>` on files inside the worktree, as a write of it, and refuses it outside (T299)', () => {
+    const bash = (command: string) => ({ tool: 'Bash', input: { command } })
+    const a = join(ws, 'packages', 'x', 'src', 'a.ts')
+    const b = join(ws, 'packages', 'x', 'tests', 'a.spec.ts')
+    for (const options of [{}, { shellReads: true }] as const) {
+      expect(classify(bash(`corepack pnpm test:related ${a} ${b}`), ws, options)).toMatchObject({ class: 'workspace-write', summary: `corepack pnpm test:related ${a} ${b}` })
+    }
+    for (const path of [join(outside, 'a.ts'), `${ws}/../outside/a.ts`, '/etc/passwd']) {
+      expect(classify(bash(`corepack pnpm test:related ${a} ${path}`), ws), path).toMatchObject({ refused: expect.stringContaining('not a file inside the workspace'), reason: 'outside-workspace' })
+    }
+    // No file, an option, or another program: the exact-argv command it was, for the policy's list.
+    for (const command of ['corepack pnpm test:related', `corepack pnpm test:related ${a} packages/x/src/a.ts`,`corepack pnpm test:related --help ${a}`, `pnpm test:related ${a}`, `corepack pnpm test:related ${a} -- -t x`]) {
+      expect(classify(bash(command), ws), command).toMatchObject({ class: 'command' })
+    }
+  })
+
   it('gives each refusal its stable reason code (T207)', () => {
     const patchOf = (...lines: string[]) => ({ tool: 'apply_patch', input: { command: ['*** Begin Patch', ...lines, '*** End Patch', ''].join('\n') } })
     const cases: Array<[ToolCall, string]> = [
@@ -881,13 +1027,72 @@ describe('classify: a tool call as the action the policy judges', () => {
       ]) {
         notRead(command)
       }
+      // git but its history reads (T276, below): a command, which the policy asks about.
       for (const command of [
-        'git status', 'git status --short', 'git diff', 'git log --oneline -n 5', 'git show HEAD:src/a.ts', 'git ls-files src', 'git grep -n foo', 'git blame src/a.ts', 'git rev-parse HEAD',
-        `git diff -- ${join(repo, 'src/a.ts')}`, `git log ${repo}`,
+        'git status', 'git status --short', 'git diff', 'git ls-files src', 'git grep -n foo', 'git blame src/a.ts', 'git rev-parse HEAD',
+        `git diff -- ${join(repo, 'src/a.ts')}`,
       ]) {
         asks(command, repo)
         asks(command)
       }
+    })
+
+    // The git history reads a Worker needs (T276), each with a path inside the workspace it runs in.
+    const history = (workspace: string): string[] => {
+      const a = join(workspace, 'src/a.ts')
+      return [
+        'git log', 'git log main', 'git log system/run/run_d2fdef633d3e37b6', 'git log abc1234..HEAD', 'git log main...HEAD^', 'git log --oneline', 'git log -n 5', 'git log --oneline -n 30 main',
+        'git log --format=%h:%s', 'git log --format=%H', `git log -- ${a}`, `git log ${a}`, `git log --oneline -n 3 --format=%h main -- ${a}`,
+        'git show abc1234', 'git show HEAD', 'git show abc1234:src/a.ts', 'git show HEAD^:docs/x.md', 'git show v1.2.3', 'git log origin/main..feature/x.y',
+        'git diff abc1234 def5678', 'git diff main HEAD', 'git diff --stat abc1234 def5678', 'git diff abc1234 def5678 --stat',
+        'git branch --list system/run/run_d2fdef633d3e37b6',
+      ]
+    }
+    // The writes, and every form beyond those reads: never taken for one.
+    const notHistory = [
+      'git commit', 'git commit -m x', 'git push', 'git push origin main', 'git checkout -b x', 'git checkout main', 'git reset --hard', 'git branch x', 'git branch -D x', 'git branch',
+      `git diff --output=${join(outside, 'x')} a b`, 'git diff --output=/etc/x a b', `git diff --output ${join(outside, 'x')} a b`, 'git log --output=/x', 'git show --output=/x HEAD',
+      'git diff --ext-diff a b', 'git diff --no-index a b', 'git -c core.pager=x log', `git -C ${ws} log`, `git --git-dir=${ws}/.git log`, 'git log -p', 'git log --exec-path',
+      'git diff', 'git diff abc1234', 'git diff a b c', 'git diff --cached a b', 'git diff --name-only a b', `git diff a b -- ${join(ws, 'src/a.ts')}`,
+      'git show', 'git show a b', 'git show --stat abc1234', 'git show abc:../x', 'git show abc:src/../../x', 'git show abc:.git/config', 'git show abc:src/.GIT/config', `git show ${join(ws, 'src/a.ts')}`,
+      'git log a b', 'git log --pretty=%h', 'git log -5', 'git log --stat HEAD', 'git log -n', 'git log -n x', 'git log --format=', 'git log --format=%h %s', 'git log -- relative/path',
+      `git log -- ${join(outside, 'secret')}`, `git log ${join(outside, 'secret')}`, `git log -- ${join(ws, 'link-file')}`, `git log -- ${ws}/../outside/secret`,
+      // A revision word that could name a path climbing out of the directory git runs in: git diffs two such words as files, with no index.
+      'git diff src/../../../x src/../../../y', 'git diff a/../../.. b', 'git diff src/../../../../etc/passwd src/../../../../dev/null', 'git diff a..b/../../x c', 'git diff ../x HEAD',
+      'git diff a/./b c', 'git diff .hidden HEAD', 'git diff a/.. b', 'git diff a/ b', 'git diff a//b c', 'git log src/../../../etc/passwd', 'git log a..b/../../x', 'git log ../x',
+      'git show src/../../../etc/passwd', 'git show a/../..:src/a.ts', 'git show ..', 'git log a....b', 'git diff a.. b', 'git diff ..a b',
+      'git branch --list', 'git branch --list main', 'git branch --list system/run/a system/run/b', 'git branch --list system/run/', 'git branch --list system/run/a/b', 'git branch --list -d system/run/a',
+    ]
+
+    it('takes the git history reads for reads where shells are clean (T276): log by ref or range with --oneline, -n, --format and a path; show <sha>[:<path>]; diff <a> <b> [--stat]; branch --list of a run branch', () => {
+      for (const workspace of [ws, repo]) {
+        for (const command of history(workspace)) {
+          expect(classify(bash(command), workspace, CLEAN), `${command} in ${workspace}`).toEqual({ class: 'read', summary: command, consequences: expect.stringContaining('Reads the git history of the run\'s workspace') })
+        }
+      }
+    })
+
+    it('takes them for history reads elsewhere (T276): the exact command, marked so the gate judges it as a listed command, under every runtime that reports no clean shells', () => {
+      for (const options of [undefined, {}, { shellReads: false }, { readTools: ['Read', 'Grep', 'Glob'] }, { workspaceReads: true }]) {
+        for (const workspace of [ws, repo]) {
+          for (const command of history(workspace)) {
+            expect(classify(bash(command), workspace, options), `${command} in ${workspace}`).toEqual({
+              class: 'command', command: command.split(' '), historyRead: true, summary: `Bash: ${command}`, consequences: expect.stringContaining('read-only git command'),
+            })
+          }
+        }
+      }
+    })
+
+    it('leaves a git write, and every git form beyond the history reads, a plain command the policy asks about (T276)', () => {
+      for (const options of [undefined, CLEAN]) {
+        for (const command of notHistory) {
+          expect(classify(bash(command), ws, options), command).toEqual({ class: 'command', command: command.split(' '), summary: `Bash: ${command}`, consequences: expect.any(String) })
+        }
+      }
+      // A path inside one workspace is outside another: not a history read there.
+      expect(classify(bash(`git log -- ${join(ws, 'src/a.ts')}`), repo, CLEAN)).toMatchObject({ class: 'command' })
+      expect(classify(bash(`git log -- ${join(ws, 'src/a.ts')}`), repo)).not.toHaveProperty('historyRead')
     })
 
     it('leaves every other form of these programs a command, which the policy asks about: an option off the list, an action, a missing path or value, a cluster or an abbreviation', () => {
@@ -1047,6 +1252,45 @@ describe('classify: a tool call as the action the policy judges', () => {
     }
   })
 
+  it('classifies exactly the workspace reads server\'s four git views as reads: commits only as hex ids, every path inside the workspace and not git\'s data (T223)', () => {
+    const served = { workspaceReads: true }
+    const hash = 'a'.repeat(40)
+    expect(classify({ tool: 'mcp__workspace__git_log', input: {} }, ws, served)).toMatchObject({ class: 'read', summary: 'mcp__workspace__git_log the workspace' })
+    expect(classify({ tool: 'mcp__workspace__git_log', input: { count: 5, skip: 1, commit: 'abc1234', paths: ['src/a.ts', 'src/gone.ts'], fields: ['hash', 'subject'] } }, ws, served))
+      .toMatchObject({ class: 'read', summary: 'mcp__workspace__git_log src/a.ts src/gone.ts' })
+    expect(classify({ tool: 'mcp__workspace__git_show', input: { commit: hash, stat: true, patch: false, paths: [join(ws, 'src')] } }, ws, served)).toMatchObject({ class: 'read' })
+    expect(classify({ tool: 'mcp__workspace__git_diff', input: { from: hash, to: 'ABCDEF12', stat: true } }, ws, served)).toMatchObject({ class: 'read' })
+    expect(classify({ tool: 'mcp__workspace__git_diff', input: { cached: true } }, ws, served)).toMatchObject({ class: 'read' })
+    expect(classify({ tool: 'mcp__workspace__git_status', input: { paths: ['src'] } }, ws, served)).toMatchObject({ class: 'read' })
+    // A commit that is not a hex id: refused, whichever field names it.
+    for (const commit of ['HEAD', 'main', 'HEAD~1', `${hash}^{tree}`, '--output=/tmp/x', 'abc', 'g1234', '']) {
+      expect(classify({ tool: 'mcp__workspace__git_show', input: { commit } }, ws, served), commit).toMatchObject({ refused: expect.stringContaining('not a commit\'s hex id'), reason: 'invalid-input' })
+      expect(classify({ tool: 'mcp__workspace__git_log', input: { commit } }, ws, served), commit).toMatchObject({ reason: 'invalid-input' })
+      expect(classify({ tool: 'mcp__workspace__git_diff', input: { from: hash, to: commit } }, ws, served), commit).toMatchObject({ reason: 'invalid-input' })
+    }
+    // A path outside the workspace, through a symlink out, climbing, into git's data, or empty: refused.
+    mkdirSync(join(ws, '.git'), { recursive: true })
+    const reasons: Record<string, string> = {
+      '/etc/hostname': 'outside-workspace', 'link-dir': 'outside-workspace', 'src/up/secret': 'outside-workspace', '../outside/secret': 'outside-workspace',
+      'src/../src/a.ts': 'outside-workspace', '.git/config': 'git-data', '.git': 'git-data', '': 'invalid-input',
+    }
+    for (const [path, reason] of Object.entries(reasons)) {
+      for (const tool of ['mcp__workspace__git_log', 'mcp__workspace__git_diff', 'mcp__workspace__git_status']) {
+        expect(classify({ tool, input: { paths: ['src', path] } }, ws, served), `${tool} ${path}`).toMatchObject({ refused: expect.any(String), reason })
+      }
+    }
+    // Fields the server does not take, or of another type.
+    expect(classify({ tool: 'mcp__workspace__git_log', input: { revision: 'HEAD' } }, ws, served)).toMatchObject({ reason: 'unsupported-field' })
+    expect(classify({ tool: 'mcp__workspace__git_log', input: { paths: 'src' } }, ws, served)).toMatchObject({ reason: 'unsupported-field' })
+    expect(classify({ tool: 'mcp__workspace__git_show', input: { commit: 1234 } }, ws, served)).toMatchObject({ reason: 'unsupported-field' })
+    // Only the four: no other git tool of that server.
+    for (const tool of ['mcp__workspace__git', 'mcp__workspace__git_checkout', 'mcp__workspace__git_blame']) {
+      expect(classify({ tool, input: {} }, ws, served), tool).toMatchObject({ reason: 'unclassified-tool' })
+    }
+    // Without the server's evidence, refused like the other tools of that name.
+    expect(classify({ tool: 'mcp__workspace__git_status', input: {} }, ws, {})).toMatchObject({ refused: expect.stringContaining('gives its agent no workspace reads server'), reason: 'unclassified-tool' })
+  })
+
   it('takes the workspace reads server\'s tools for reads only where the runtime reports it gives its agent that server: otherwise any tool of that name is refused (T200b)', () => {
     for (const options of [{}, { workspaceReads: false }, { shellReads: true }, { shellReads: true, workspaceReads: false }]) {
       for (const call of [
@@ -1056,6 +1300,57 @@ describe('classify: a tool call as the action the policy judges', () => {
         expect(classify(call, ws, options), `${call.tool} ${JSON.stringify(options)}`).toMatchObject({ refused: expect.stringContaining('gives its agent no workspace reads server'), reason: 'unclassified-tool' })
       }
     }
+  })
+
+  it('refuses a shell inspection command at once, naming the reading tool to use, where the run\'s agent has it: Claude Code\'s own, or the workspace reads server\'s; under none it stays a command (T222)', () => {
+    const a = join(ws, 'src/a.ts')
+    // Each inspection form, by its first word whatever its other words (relative paths and all), and the tool each runtime kind names for it.
+    const forms: Array<[string, string, string]> = [
+      [`cat ${a}`, 'Read', 'read_file'], ['cat src/a.ts', 'Read', 'read_file'], [`head -n 5 ${a}`, 'Read', 'read_file'], ['tail -20 src/a.ts', 'Read', 'read_file'],
+      [`sed -n 1,5p ${a}`, 'Read', 'read_file'], ['wc -l src/a.ts', 'Read', 'read_file'],
+      [`grep -n needle ${ws}`, 'Grep', 'search'], ['grep -rn needle .', 'Grep', 'search'], ['rg needle', 'Grep', 'search'], [`rg -i needle ${ws}`, 'Grep', 'search'],
+      ['ls', 'Glob', 'list_dir'], [`ls -la ${ws}`, 'Glob', 'list_dir'], ['find . -name a.ts', 'Glob', 'list_dir'], [`find ${ws} -type f`, 'Glob', 'list_dir'],
+    ]
+    const kinds = { claude: ['Read', 'Grep', 'Glob'], codex: ['read_file', 'list_dir', 'search'] }
+    for (const [command, own, server] of forms) {
+      for (const [kind, readTools] of Object.entries(kinds)) {
+        const tool = kind === 'claude' ? own : server
+        for (const options of [{ readTools }, { readTools, workspaceReads: kind === 'codex' }]) {
+          const refused = classify(bash(command), ws, options)
+          expect(refused, `${command} under ${kind}`).toEqual({ refused: expect.stringContaining(`you have ${tool} for it`), reason: 'use-read-tool' })
+          expect((refused as { refused: string }).refused, `${command} under ${kind}`).toContain(`use ${tool} instead`)
+        }
+      }
+      // Both kinds' tools at once: each is named.
+      expect(classify(bash(command), ws, { readTools: [...kinds.claude, ...kinds.codex] })).toMatchObject({ refused: expect.stringContaining(`you have ${own} or ${server} for it`), reason: 'use-read-tool' })
+      // No reading tools: the exact command, as before.
+      for (const options of [undefined, {}, { readTools: [] }, { workspaceReads: false }]) {
+        expect(classify(bash(command), ws, options), `${command} under none`).toMatchObject({ class: 'command', command: command.split(' ') })
+      }
+    }
+    // Only the tool the agent has counts: a Claude Code Worker listing Read alone has no Grep, so its grep stays a command.
+    expect(classify(bash('grep needle src'), ws, { readTools: ['Read'] })).toMatchObject({ class: 'command' })
+    expect(classify(bash('cat src/a.ts'), ws, { readTools: ['Read'] })).toMatchObject({ reason: 'use-read-tool' })
+    // A form that writes is no inspection, and neither is another program: each stays a command.
+    // A sed script that writes a file (w), runs a command (e), or comes from -e or -f is no read-only print either.
+    for (const command of ['sed -i s/a/b/ src/a.ts', 'sed -n -i 1p src/a.ts', 'sed s/a/b/ src/a.ts', 'sed -n -e woutput.txt src/a.ts', 'sed -n woutput.txt src/a.ts', 'sed -n 1woutput.txt src/a.ts', 'sed -n 1,2pw src/a.ts', 'sed -n 1e src/a.ts', 'sed -n -f script.sed src/a.ts', 'sed -n 1p -f script.sed src/a.ts', 'sed -n /x/p src/a.ts', 'sed -n 1p', 'find . -delete', `find ${ws} -name a.ts -exec rm`, 'npm test', `stat ${a}`, 'git status']) {
+      expect(classify(bash(command), ws, { readTools: kinds.claude }), command).toMatchObject({ class: 'command' })
+    }
+    // A metacharacter or an empty word is still refused for that first.
+    expect(classify(bash('cat src/a.ts | head'), ws, { readTools: kinds.claude })).toMatchObject({ reason: 'metacharacter' })
+    expect(classify(bash('cat  src/a.ts'), ws, { readTools: kinds.claude })).toMatchObject({ reason: 'empty-word' })
+    // Where the runtime enforces clean shells, an inspection inside the workspace is still a read that runs unasked; any other is refused.
+    expect(classify(bash(`cat ${a}`), ws, { ...CLEAN, readTools: kinds.claude })).toMatchObject({ class: 'read' })
+    expect(classify(bash('cat src/a.ts'), ws, { ...CLEAN, readTools: kinds.claude })).toMatchObject({ reason: 'use-read-tool' })
+  })
+
+  it('derives the reading tools a run\'s agent has from its runtime\'s evidence and the Worker\'s tools list (T222)', () => {
+    expect(readToolsOf(undefined, undefined)).toEqual([])
+    expect(readToolsOf({ readTools: ['Read', 'Grep', 'Glob'] }, undefined)).toEqual(['Read', 'Grep', 'Glob'])
+    expect(readToolsOf({ readTools: ['Read', 'Grep', 'Glob'] }, [])).toEqual(['Read', 'Grep', 'Glob'])
+    expect(readToolsOf({ readTools: ['Read', 'Grep', 'Glob'] }, ['Read', 'Bash'])).toEqual(['Read'])
+    expect(readToolsOf({ workspaceReads: true }, ['Bash'])).toEqual(['read_file', 'list_dir', 'search', 'git_log', 'git_show', 'git_diff', 'git_status'])
+    expect(readToolsOf({ workspaceReads: false }, undefined)).toEqual([])
   })
 
   it('refuses a tool it does not know and an input that is not an object', () => {
@@ -1134,7 +1429,10 @@ describe('a Claude Code Worker under the bundle\'s default policy, end to end (d
     const { ctx, run } = await boot(claude(calls, outputs, optionsSeen), bundlePolicies()[0]!)
     const done = await run()
     // The run's commands would run in the SDK's sandbox, yet the policy still decides each one.
-    expect(optionsSeen[0]).toMatchObject({ sandbox: { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false, filesystem: { allowWrite: [WORKSPACE] }, network: { allowedDomains: [] } } })
+    // Besides the workspace, what a browser test writes: the confinement's private /dev/shm and the run's report file (T265);
+    // and the shells' tool-state directories, where a tool keeps its state (T270).
+    const state = ['.local/share', '.local/state', '.cache', '.config'].map((name) => expect.stringMatching(new RegExp(`/agent-home-[^/]+/${name.replaceAll('.', '\\.')}$`)))
+    expect(optionsSeen[0]).toMatchObject({ sandbox: { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false, filesystem: { allowWrite: [WORKSPACE, '/dev/shm', expect.stringMatching(/\/worktrees\/\.setup\/run-report-[^/]+\/report$/), ...state] }, network: { allowedDomains: [] } } })
     const decision = (output: Record<string, unknown>) => (output.hookSpecificOutput as { permissionDecision?: string; permissionDecisionReason?: string }).permissionDecision
     expect(outputs.map(decision)).toEqual(['deny', 'defer'])
     expect(decisionOf(ctx, (outputs[0]!.hookSpecificOutput as { permissionDecisionReason: string }).permissionDecisionReason)).toMatchObject({ decisionType: 'gate', outcome: { option: 'deny' } })
@@ -1142,7 +1440,7 @@ describe('a Claude Code Worker under the bundle\'s default policy, end to end (d
     expect(await ctx.approvals.list()).toEqual([expect.objectContaining({ action: expect.objectContaining({ class: 'command', summary: 'Bash: npm test' }), requester: expect.objectContaining({ toolUseId: 'toolu_1' }) })])
   })
 
-  it('takes a shell read for a read only where the runtime enforces shells with no startup files: Claude Code does not, so a function named cat in a startup file or its shell snapshot could run instead, and the exact command waits for the operator (T198)', async () => {
+  it('takes a shell read for a read only where the runtime enforces shells with no startup files: Claude Code does not, so a function named echo in a startup file or its shell snapshot could run instead, and the exact command waits for the operator (T198); its cat is denied at once, naming Read (T222)', async () => {
     const a = join(WORKSPACE, 'src/a.ts')
     const calls = [['Bash', { command: `cat ${a}` }], ['Bash', { command: 'echo probe' }]] as const
     // A runtime that enforced it: both read, nothing asked.
@@ -1151,13 +1449,17 @@ describe('a Claude Code Worker under the bundle\'s default policy, end to end (d
     expect((await enforced.run()).status).toBe('completed')
     expect(clean).toEqual([{}, {}])
     expect(await enforced.ctx.approvals.list()).toEqual([])
-    // Claude Code itself: the same read is the exact command, which the operator decides; the run stops there.
+    // Claude Code itself: its cat is denied at once, naming Read; the probe is the exact command, which the operator decides; the run stops there.
     const unproven: Array<Record<string, unknown>> = []
     const { ctx, run } = await boot(claude(calls, unproven, []), bundlePolicies()[0]!)
     const done = await run()
-    expect(unproven.map((o) => (o.hookSpecificOutput as { permissionDecision?: string }).permissionDecision)).toEqual(['defer'])
+    const hook = (o: Record<string, unknown>) => o.hookSpecificOutput as { permissionDecision?: string; permissionDecisionReason?: string }
+    expect(unproven.map((o) => hook(o).permissionDecision)).toEqual(['deny', 'defer'])
+    expect(hook(unproven[0]!).permissionDecisionReason).toContain('you have Read for it')
+    expect(decisionOf(ctx, hook(unproven[0]!).permissionDecisionReason!)).toMatchObject({ decisionType: 'gate', outcome: { option: 'deny', detail: { reason: 'use-read-tool' } } })
+    expect(ctx.eventLog.query({ type: 'agent-workers.tool.denied' }).map((e) => e.data!.reason)).toEqual(['use-read-tool'])
     expect(done).toMatchObject({ status: 'failed', error: { kind: 'config_error' } })
-    expect(await ctx.approvals.list()).toEqual([expect.objectContaining({ action: expect.objectContaining({ class: 'command', summary: `Bash: cat ${a}` }) })])
+    expect(await ctx.approvals.list()).toEqual([expect.objectContaining({ action: expect.objectContaining({ class: 'command', summary: 'Bash: echo probe' }) })])
   })
 })
 
@@ -1188,7 +1490,7 @@ describe('a Codex Worker under the bundle\'s default policy, end to end (docs/de
     return { runtime, hooks: () => s.calls.flatMap((c) => c.hooks), prompts: () => s.calls.map((c) => c.prompt) }
   }
 
-  it('reads its workspace through the workspace reads server with no approval request, as its brief tells it; another tool of that server is denied, and Bash cat stays a command (T200b)', async () => {
+  it('reads its workspace through the workspace reads server with no approval request, as its brief tells it; another tool of that server is denied, and Bash cat is denied at once, naming read_file (T200b, T222)', async () => {
     const a = join(WORKSPACE, 'src/a.ts')
     const { runtime, hooks, prompts } = codex([
       { tool: 'mcp__workspace__read_file', input: { path: 'src/a.ts', startLine: 1, endLine: 20 }, item: 'mcp_tool_call' },
@@ -1199,18 +1501,21 @@ describe('a Codex Worker under the bundle\'s default policy, end to end (docs/de
     expect(await runtime.probe()).toMatchObject({ gatesToolCalls: true, cleanShells: false, workspaceReads: true })
     const { ctx, run } = await boot(runtime, bundlePolicies()[0]!)
     const done = await run()
-    // The two reads run unasked; the server's other tool is denied by the gate's own rule; the shell read waits for the operator.
+    // The two reads run unasked; the server's other tool is denied by the gate's own rule; the shell read is denied at once, naming read_file.
     expect(hooks().map((h) => h.blocked)).toEqual([false, false, true, true])
     expect(hooks()[2]!.reason).toContain('mcp__workspace__write_file is not one of the workspace reads server\'s tools')
     expect(decisionOf(ctx, hooks()[2]!.reason)).toMatchObject({ decisionType: 'gate', outcome: { option: 'deny' } })
-    expect(ctx.eventLog.query({ type: 'agent-workers.tool.denied' }).map((e) => e.data!.reason)).toEqual(['unclassified-tool'])
-    expect(done).toMatchObject({ status: 'failed', error: { kind: 'config_error', message: expect.stringContaining('stopped at its Bash call, which waits for the operator') } })
-    // One request, for the shell command alone: no read asked the operator.
-    expect(await ctx.approvals.list()).toEqual([expect.objectContaining({ action: expect.objectContaining({ class: 'command', summary: `Bash: cat ${a}` }) })])
-    // Its brief says to read with the server's tools, never with a shell, and names no shell read as unasked.
+    expect(hooks()[3]!.reason).toContain('you have read_file for it')
+    expect(decisionOf(ctx, hooks()[3]!.reason)).toMatchObject({ decisionType: 'gate', outcome: { option: 'deny', detail: { reason: 'use-read-tool' } } })
+    expect(ctx.eventLog.query({ type: 'agent-workers.tool.denied' }).map((e) => e.data!.reason)).toEqual(['unclassified-tool', 'use-read-tool'])
+    // Nothing waits for the operator: no request at all.
+    expect(done.status).toBe('completed')
+    expect(await ctx.approvals.list()).toEqual([])
+    // Its brief says to read with the server's tools, never with a shell, names no shell read as unasked, and says a shell inspection is denied.
     expect(prompts()[0]).toContain('- Read your workspace with the workspace server\'s tools, never with a shell: read_file')
-    expect(prompts()[0]).toContain('- Reading tools (the workspace server\'s read_file, list_dir, and search) on paths inside your workspace')
+    expect(prompts()[0]).toContain('- Reading tools (the workspace server\'s read_file, list_dir, search, git_log, git_show, git_diff, and git_status) on paths inside your workspace')
     expect(prompts()[0]).not.toContain('Bash read-only inspection')
+    expect(prompts()[0]).toContain('A Bash inspection command you have a reading tool for is denied at once, never asked: cat, head, tail, sed -n: use read_file')
   })
 
   it('is admitted on its probe, patches its workspace through the hook, is denied outside it, and waits for the operator on a command', async () => {
@@ -1232,18 +1537,18 @@ describe('a Codex Worker under the bundle\'s default policy, end to end (docs/de
     expect(ctx.eventLog.query({ type: 'agent-workers.tool.checks-pending' })).toEqual([expect.objectContaining({ data: expect.objectContaining({ tool: 'apply_patch', pendingChecks: ['tests', 'lint'] }) })])
   })
 
-  it('reads nothing through its shell: each call picks its own shell, which the hook does not see, so even a read inside the workspace waits for the operator as the exact command it is (T198)', async () => {
+  it('reads nothing through its shell: each call picks its own shell, which the hook does not see, so even a probe waits for the operator as the exact command it is (T198); its cat is denied at once, naming read_file (T222)', async () => {
     const shell = (command: string) => ({ tool: 'Bash', input: { command }, item: 'command_execution' })
     const a = join(WORKSPACE, 'src/a.ts')
     const { runtime, hooks } = codex([shell(`cat ${a}`), shell('echo probe')])
     expect(await runtime.probe()).toMatchObject({ gatesToolCalls: true, cleanShells: false })
     const { ctx, run } = await boot(runtime, bundlePolicies()[0]!)
     const done = await run()
-    // The read is blocked (deferred); nothing after it runs.
-    expect(hooks()[0]!.blocked).toBe(true)
-    expect(hooks().every((h) => h.blocked)).toBe(true)
+    // The cat is denied, the probe blocked (deferred).
+    expect(hooks().map((h) => h.blocked)).toEqual([true, true])
+    expect(hooks()[0]!.reason).toContain('you have read_file for it')
     expect(done).toMatchObject({ status: 'failed', error: { kind: 'config_error', message: expect.stringContaining('stopped at its Bash call, which waits for the operator') } })
-    expect(await ctx.approvals.list()).toEqual([expect.objectContaining({ action: expect.objectContaining({ class: 'command', summary: `Bash: cat ${a}` }) })])
+    expect(await ctx.approvals.list()).toEqual([expect.objectContaining({ action: expect.objectContaining({ class: 'command', summary: 'Bash: echo probe' }) })])
   })
 })
 
@@ -1461,7 +1766,8 @@ describe('a board task\'s step whose Worker stops at a deferred call', { timeout
       const waiting = await blockedOn(ctx, run.runId)
       const request = (await ctx.approvals.get(waiting.blocked.approvalRequest))!
       expect(waiting.blocked.until, how).toBe(request.expiresAt)
-      if (how === 'rejected') await ctx.approvals.decide([{ requestId: request.requestId, subject: request.subject, verdict: 'rejected' }])
+      const instead = 'run corepack pnpm vitest run packages/x/tests/a.spec.ts instead'
+      if (how === 'rejected') await ctx.approvals.decide([{ requestId: request.requestId, subject: request.subject, verdict: 'rejected', note: instead }])
       const done = await reportedRun(ctx, run.runId)
       expect(done, how).toMatchObject({ status: 'completed', task: { outcome: { status: 'accepted', state: 'done' } } })
       expect(done.nodes, how).toEqual([expect.objectContaining({ nodeId: 'change', state: 'COMPLETED', attempt: 2 })])
@@ -1471,7 +1777,7 @@ describe('a board task\'s step whose Worker stops at a deferred call', { timeout
       expect(agent.runs[1]!.prompt, how).toContain(`The tool call you stopped at was denied (approval request ${request.requestId}): ${how === 'rejected' ? 'the operator rejected it' : `no verdict came by ${request.expiresAt}`}. It did not run`)
       // The call itself is denied with the reason, never run, and nothing new is asked; the Worker's next call runs.
       expect(agent.verdicts[1], how).toEqual([
-        { decision: 'deny', reason: `approval request ${request.requestId} for exactly this call was ${how === 'rejected' ? 'rejected by the operator' : 'withdrawn before a verdict (unanswered in time, its work ended, or the policy changed)'}, so it does not run; go on without it` },
+        { decision: 'deny', reason: `approval request ${request.requestId} for exactly this call was ${how === 'rejected' ? 'rejected by the operator' : 'withdrawn before a verdict (unanswered in time, its work ended, or the policy changed)'}, so it does not run; go on without it${how === 'rejected' ? `. The operator's note: ${instead}` : ''}` },
         { decision: 'allow' },
       ])
       // Recorded (INV-13): the denial, on the queue's own resolution and the autonomy decision that the class still asks.

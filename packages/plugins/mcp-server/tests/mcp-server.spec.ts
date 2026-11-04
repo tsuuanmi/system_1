@@ -14,7 +14,7 @@ import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { z as zod } from 'zod'
 import { FakePluginHost, manifestText } from '../../../plugin-host-core/conformance/plugin-host.ts'
 import { FakeResources } from '../../../resources-core/conformance/resources.ts'
-import { SchemaRegistry } from '@tsuuanmi/system-libs'
+import { issueLeadToken, leadTokenFile, leadTokens, revokeLeadToken, SchemaRegistry, secretPaths } from '@tsuuanmi/system-libs'
 import type { PluginRecord } from '@tsuuanmi/system-plugin-host-core'
 import McpEndpoint, { compactHealth, needsLook, STATUS_SCHEMA } from '../src/index.ts'
 
@@ -74,7 +74,7 @@ describe('system MCP server on ctx.webServer', () => {
     expect(statSync(join(dir, 'mcp.json')).mode & 0o777).toBe(0o600)
     const client = await connect(url, token)
     const { tools } = await client.listTools()
-    expect(tools.map((tool) => tool.name).sort()).toEqual(['artifact', 'ask', 'events', 'evidence', 'research', 'result', 'roster', 'status'])
+    expect(tools.map((tool) => tool.name).sort()).toEqual(['artifact', 'ask', 'enforce', 'events', 'evidence', 'plugin', 'research', 'result', 'roster', 'status'])
     const status = await client.callTool({ name: 'status', arguments: {} })
     expect(status.structuredContent).toMatchObject({ harness: 'system', store: 'ok', artifacts: 0, kernel: ['store', 'artifacts'] })
     // No milestone baked into the code: status reports what is mounted, not a roadmap stage.
@@ -602,6 +602,59 @@ describe('scoped tokens', () => {
     expect(refused.status).toBe(403)
   })
 
+  it('serves a project lead\'s token the client tools and the operator tools marked for a lead, and the rest is refused with a reason; a revoked token is refused at once (ADR-0076)', async () => {
+    const { url, tokens, ctx, dir } = await boot()
+    const seen: unknown[] = []
+    ctx.mcp.tool('op_only', { description: 'operator action', inputSchema: {} }, async () => ({ content: [{ type: 'text' as const, text: 'done' }] }))
+    ctx.mcp.tool('cl_tool', { description: 'client tool', inputSchema: {}, scope: 'client' }, async (_args, context) => {
+      seen.push(context)
+      return { content: [{ type: 'text' as const, text: 'ok' }] }
+    })
+    ctx.mcp.tool('lead_tool', { description: 'an operator tool a lead may call', inputSchema: {}, lead: true }, async (_args, context) => {
+      seen.push(context)
+      return { content: [{ type: 'text' as const, text: 'decided' }] }
+    })
+    issueLeadToken(dir, 'system')
+    const lead = leadTokens(dir).get('system')!
+    // The lead's token is neither the operator's nor the client's.
+    expect(lead).not.toBe(tokens.operator)
+    expect(lead).not.toBe(tokens.client)
+    const client = await connect(url, lead)
+    const listed = (await client.listTools()).tools.map((t) => t.name)
+    expect(listed).toEqual(expect.arrayContaining(['cl_tool', 'lead_tool', 'status']))
+    expect(listed).not.toContain('op_only')
+    expect(listed).not.toContain('events')
+    // The handler knows the project, and the scope stays the client's.
+    expect(await client.callTool({ name: 'lead_tool', arguments: {} })).toMatchObject({ content: [{ text: 'decided' }] })
+    await client.callTool({ name: 'cl_tool', arguments: {} })
+    expect(seen).toEqual([{ scope: 'client', lead: 'system' }, { scope: 'client', lead: 'system' }])
+    // A client token calling the lead's tool is refused; the operator's calls it with no project.
+    expect((await post(url, tokens.client, callBody('lead_tool'))).status).toBe(403)
+    await (await connect(url, tokens.operator)).callTool({ name: 'lead_tool', arguments: {} })
+    expect(seen.at(-1)).toEqual({ scope: 'operator' })
+    // Everything else of the operator's is refused for the lead token, naming whose decisions they are.
+    for (const name of ['op_only', 'events', 'artifact']) {
+      const refused = await post(url, lead, callBody(name))
+      expect(refused.status, name).toBe(403)
+      expect(await refused.json()).toMatchObject({ error: 'insufficient_scope', error_description: expect.stringMatching(/the operator's alone: the lead token of project system \(decider lead:system\)/) })
+    }
+    // Revoked, the token is refused at once, with no restart.
+    revokeLeadToken(dir, 'system')
+    expect((await post(url, lead, callBody('lead_tool'))).status).toBe(401)
+  })
+
+  it('registers a lead token file as a secret path once it is issued, and lets it go when the endpoint stops (ADR-0024)', async () => {
+    const { url, dir, stop } = await boot()
+    issueLeadToken(dir, 'system')
+    const file = leadTokenFile(dir, 'system')
+    expect(secretPaths()).not.toContain(file)
+    // Seen on the first request with it.
+    await connect(url, leadTokens(dir).get('system')!)
+    expect(secretPaths()).toContain(file)
+    await stop()
+    expect(secretPaths()).not.toContain(file)
+  })
+
   it('refuses a client token calling the operator\'s events tool (QA-14, QA-7)', async () => {
     const { url, tokens } = await boot()
     const refused = await post(url, tokens.client, callBody('events'))
@@ -617,7 +670,7 @@ describe('scoped tokens', () => {
     expect((await client.listTools()).tools.map((t) => t.name).sort()).toEqual(['ask', 'cl_tool', 'research', 'result', 'roster', 'status'])
     const operator = await connect(url, tokens.operator)
     const listed = (await operator.listTools()).tools
-    expect(listed.map((t) => t.name).sort()).toEqual(['artifact', 'ask', 'cl_tool', 'events', 'evidence', 'op_only', 'research', 'result', 'roster', 'status'])
+    expect(listed.map((t) => t.name).sort()).toEqual(['artifact', 'ask', 'cl_tool', 'enforce', 'events', 'evidence', 'op_only', 'plugin', 'research', 'result', 'roster', 'status'])
     // The reference page shows each tool's scope from the listing: marked operator, or a client tool too.
     expect(listed.find((t) => t.name === 'op_only')?._meta).toEqual({ 'system/scope': 'operator' })
     expect(listed.find((t) => t.name === 'cl_tool')).not.toHaveProperty('_meta')
@@ -658,7 +711,7 @@ describe('scoped tokens', () => {
       expect(JSON.stringify(expected)).toContain('"type":"integer","minimum":1}')
       expect(text).not.toContain(String(Number.MAX_SAFE_INTEGER))
       // Only the operator token sees a tool the client token may not call, and only it is marked.
-      expect(tools.filter((t) => t._meta !== undefined).map((t) => t.name).sort()).toEqual(scope === 'operator' ? ['artifact', 'events', 'evidence', 'op_when'] : [])
+      expect(tools.filter((t) => t._meta !== undefined).map((t) => t.name).sort()).toEqual(scope === 'operator' ? ['artifact', 'enforce', 'events', 'evidence', 'op_when', 'plugin'] : [])
     }
     // The server still checks every date-time, pattern, and safe integer with zod, as before.
     const client = await connect(url, tokens.client)

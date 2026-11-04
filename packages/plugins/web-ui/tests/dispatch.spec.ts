@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { PoolConfig } from '@tsuuanmi/system-resources-core'
 import { chromium } from 'patchright-core'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
-import { canRunBrowser, testChrome } from '../../browser-patchright/tests/support.ts'
+import { headlessIt, headlessLaunchOptions } from '../../browser-patchright/tests/support.ts'
 import { worker } from '../../../workers-core/conformance/workers.ts'
 import { activeProject, readyTask } from '../../workflow/conformance/workflow.ts'
 import { boot, OPERATOR } from './store-backed.ts'
@@ -45,7 +45,7 @@ describe('web UI: the starts System proposes, on Home (ADR-0064)', () => {
     expect((await call('dispatch', {})).status).toBe(405)
   })
 
-  it.runIf(canRunBrowser)('lists each proposed start under Starts awaiting approval with its Worker and quota line, why that Worker folded, starts it on Approve, and says when dispatch is paused', async () => {
+  headlessIt('lists each proposed start under Starts awaiting approval with its Worker and quota line, why that Worker folded, starts it on Approve, and says when dispatch is paused', async () => {
     const { ctx, workers } = await boot({ pools: POOLS })
     await activeProject(ctx)
     await freeWorker(ctx, workers, 12)
@@ -53,7 +53,7 @@ describe('web UI: the starts System proposes, on Home (ADR-0064)', () => {
     const task = await readyTask(ctx, 'Write the release notes', { template: 'solo' })
     await ctx.workflow.sweepDispatch()
     const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
     await page.goto(`${origin}/ui/#token=${OPERATOR}`)
@@ -85,11 +85,14 @@ describe('web UI: the starts System proposes, on Home (ADR-0064)', () => {
     await ctx.workflow.sweepDispatch()
     await vi.waitFor(() => expect(workers.started.map((s) => s.worker)).toEqual(['w:max']), { timeout: 15_000 })
     expect((await ctx.board.task(task.taskId))!.state).toBe('running')
-    // Started by itself (PROP-0014 D2): one line, its run's state as a chip, the task, the Worker, and how it was let start.
+    // Started by itself (PROP-0014 D2, T256): a row of its table at the bottom of Home, the task, its run's state as a chip,
+    // and the Worker in sight; how it was let start folded into the row.
     await page.reload()
     const started = page.getByRole('region', { name: 'Started by itself' })
     await expect.poll(() => started.innerText()).toContain('Write the release notes')
-    expect(await started.innerText()).toMatch(/running\s+Write the release notes · .+ · on your approval · /)
+    const row = started.getByRole('row', { name: 'Started by itself: Write the release notes' })
+    expect(await row.locator('td').allInnerTexts()).toEqual([expect.stringMatching(/^Write the release notes\s+attempt 1$/), '◆ running', expect.any(String), expect.any(String), expect.stringMatching(/ ago$/)])
+    expect(await row.textContent()).toMatch(/attempt 1 · running · .+ · on your approval · /)
     ctx.workflow.pauseDispatch('a quiet afternoon')
     await page.reload()
     await expect.poll(() => go.innerText()).toMatch(/Automatic starts paused · a quiet afternoon · since /)

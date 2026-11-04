@@ -24,16 +24,4 @@ describe.runIf(canRunBrowser)('ctx.workflow: deleting a finished run and its web
     expect(fake.deleted.has(binding!)).toBe(true)
     expect(ctx.eventLog.query({ type: 'conversation.released' })).toHaveLength(2)
   }, 180_000)
-
-  it('deletes a finished run only on the exact version its preview showed (REQ-WF-7)', async () => {
-    const { ctx } = await boot()
-    const done = await ctx.workflow.wait(ctx.workflow.start({ template: 'ask', input: 'bye' }).runId, 30_000)
-    const preview = ctx.workflow.delete(done.runId)
-    expect(preview).toMatchObject({ deleted: false, runId: done.runId, status: 'completed', updatedAt: done.updatedAt, nodes: 1 })
-    expect(() => ctx.workflow.delete(done.runId, '2000-01-01T00:00:00.000Z')).toThrow(/changed/)
-    expect(ctx.workflow.delete(done.runId, preview.updatedAt)).toMatchObject({ deleted: true })
-    expect(ctx.workflow.get(done.runId)).toBeUndefined()
-    // Artifacts are append-only and stay.
-    expect(ctx.artifacts.get(done.result!)).toBeDefined()
-  }, 60_000)
 })

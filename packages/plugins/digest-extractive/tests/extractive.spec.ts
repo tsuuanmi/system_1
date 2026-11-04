@@ -147,7 +147,8 @@ describe('ctx.digests, extractive-first', () => {
     expect(view).toMatchObject({ state: 'bypassed', reason: expect.stringMatching(/read-only Worker on the economy tier/) })
     expect(worker.started).toHaveLength(0)
     const kinds = decisionInputs(ctx, view).map((ref) => ctx.artifacts.get(ref)!).map((a) => (a.bodySchema === 'digest-extract@1.0' ? 'extract' : (a.body as { decisionType?: string }).decisionType ?? 'source'))
-    expect(kinds.sort()).toEqual(['admission', 'extract', 'source'])
+    // Both asks (`reason`, then `review` and `local-data`) found no Worker: each admission decision is named.
+    expect(kinds.sort()).toEqual(['admission', 'admission', 'extract', 'source'])
   })
 
   it('escalates once to the standard tier on the same extract when every economy claim fails, its run keyed apart (PROP-0008, INV-13)', async () => {

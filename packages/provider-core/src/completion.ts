@@ -1,4 +1,5 @@
 // Ported from tsuuanmi/internet src/browser/completion.ts (docs/design/provider-turns.md#two-clock-completion).
+import { sleep } from '@tsuuanmi/system-libs'
 import { ProviderError, abortReason } from './errors.ts'
 
 export interface CompletionSnapshot {
@@ -34,21 +35,8 @@ export interface WaitOptions {
   stableMs: number
   signal?: AbortSignal
   onProgress?: (event: ProviderProgressEvent) => void
-}
-
-function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    if (signal?.aborted) return reject(abortReason(signal))
-    const onAbort = (): void => {
-      clearTimeout(timer)
-      reject(abortReason(signal))
-    }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort)
-      resolve()
-    }, ms)
-    signal?.addEventListener('abort', onAbort, { once: true })
-  })
+  /** The clock both deadlines read (milliseconds); the wall clock when absent. A test controls it; the page's own timers are not touched. */
+  now?: () => number
 }
 
 function emit(observer: WaitOptions['onProgress'], kind: ProviderProgressKind, at: number): void {
@@ -68,17 +56,18 @@ export async function waitForStableCompletion(read: () => Promise<CompletionSnap
   if (options.stallTimeoutMs !== undefined && options.stallTimeoutMs >= options.timeoutMs) {
     throw new ProviderError('config_error', 'stallTimeoutMs must be lower than timeoutMs')
   }
-  const startedAt = Date.now()
+  const now = options.now ?? Date.now
+  const startedAt = now()
   const deadline = startedAt + options.timeoutMs
   let lastProgressAt = startedAt
   let previous: CompletionSnapshot | undefined
   let candidate: string | undefined
   let stableSince: number | undefined
 
-  while (Date.now() < deadline) {
+  while (now() < deadline) {
     if (options.signal?.aborted) throw abortReason(options.signal)
     const snapshot = await read()
-    const at = Date.now()
+    const at = now()
     const text = snapshot.text.trim()
     const presenceChanged = previous === undefined || snapshot.responsePresent !== previous.responsePresent
     if (presenceChanged) {
@@ -112,7 +101,9 @@ export async function waitForStableCompletion(read: () => Promise<CompletionSnap
     if (options.stallTimeoutMs !== undefined && at - lastProgressAt >= options.stallTimeoutMs) {
       throw new ProviderError('provider_stalled', `provider made no meaningful progress for ${options.stallTimeoutMs}ms`)
     }
-    await delay(options.pollMs, options.signal)
+    await sleep(options.pollMs, options.signal).catch(() => {
+      throw abortReason(options.signal)
+    })
   }
   throw new ProviderError('timeout', `provider did not complete within ${options.timeoutMs}ms`)
 }

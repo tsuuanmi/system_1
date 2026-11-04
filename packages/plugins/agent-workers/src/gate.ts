@@ -9,16 +9,22 @@
  * review-member profile, ADR-0049) has every call denied: its material is its prompt alone.
  * @module @tsuuanmi/system-agent-workers/gate
  */
+import { execFile } from 'node:child_process'
 import { lstatSync, realpathSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
-import { type ToolCall, type ToolGate, type ToolVerdict, WORKSPACE_READS_SERVER, WORKSPACE_READ_TOOLS } from '@tsuuanmi/system-agent-runtime-core'
-import { type ActionClass, type ApprovalRequest, type Approvals, type ArtifactRef, type AutonomyVerdict, type Check, SHELL_METACHARACTER } from '@tsuuanmi/system-approvals-core'
-import type {} from '@tsuuanmi/system-artifacts'
-import type {} from '@tsuuanmi/system-event-log'
-import { contentId } from '@tsuuanmi/system-libs'
-import type {} from '@tsuuanmi/system-store'
+import { COMMIT_ID, HOST_TOOLS_SERVER, type ToolCall, type ToolGate, type ToolVerdict, WORKSPACE_GIT_TOOLS, WORKSPACE_READS_SERVER, WORKSPACE_READ_TOOLS } from '@tsuuanmi/system-agent-runtime-core'
+import {
+  type ActionClass, type ApprovalRequest, type Approvals, type ArtifactRef, type AutonomyVerdict, type Check, type CommandPathScope, commandRulesOf, type SandboxedOutcome, sandboxedCommandOf, SHELL_METACHARACTER, warnedCommandRulesOf, webAccessOf, type WebTool, withinClassification,
+} from '@tsuuanmi/system-approvals-core'
+import type {} from '@tsuuanmi/system-ledger-core'
+import { contentId, isRecord } from '@tsuuanmi/system-libs'
+import type {} from '@tsuuanmi/system-workers-core'
+import { matchCommandRule, REF_NAME } from './command-rules.ts'
+import { namesLocalPath, WEB_PROBE_QUERY, webTarget } from './research.ts'
 
 /**
  * Why the gate denied a call (T207): a stable code, and the plain explanation of it each
@@ -51,6 +57,8 @@ export const DENIAL_REASONS = {
   'unknown-checks': 'The autonomy policy left checks pending that no rule can require, so the verdict is not one the gate knows.',
   'unknown-mode': 'The autonomy policy gave a mode the gate does not know.',
   'gate-error': 'The gate failed while it judged the call, so the call is denied.',
+  'use-read-tool': 'A Bash inspection command is denied at once, never asked, where the run\'s agent has a reading tool for it: Read or read_file for cat, head, tail, sed -n, and wc (its numbered lines count them); Grep or search for grep and rg; Glob or list_dir for ls and find.',
+  'research-role': 'A research role\'s run reads its workspace and searches and fetches the web, and nothing else (ADR-0074): a call that writes a file or runs a command is denied, and so is, in its web probe, any call but the probe\'s own search.',
 } as const satisfies Record<string, string>
 /** A stable code of why the gate denied a call. */
 export type DenialReason = keyof typeof DENIAL_REASONS
@@ -65,6 +73,12 @@ export interface ToolAction {
   class: ActionClass
   /** For `command`: the argv, the command split on single spaces (never parsed by a shell). */
   command?: string[]
+  /**
+   * For `command`: a git history read ({@link gitHistory}, T276) in a shell that is not proven clean.
+   * The policy judges it as a command; where that asks, it is judged as a workspace write, as the
+   * policy judges a command on its commands list, so a forbidden command class still binds.
+   */
+  historyRead?: true
   summary: string
   consequences: string
 }
@@ -75,8 +89,8 @@ export interface ToolAction {
  * with `command` only, `apply_patch` with the patch as `command`, `view_image`); and the Antigravity
  * CLI's file tools as its PreToolUse hook reports them (`read_file`, `write_file`, `edit_file`,
  * each naming its file in `Path`). Its `run_command` is not classified, so it is denied: no
- * confinement of its commands is proven. And the three tools of System's own workspace reads
- * server, as an MCP client names them (`mcp__workspace__read_file`, …, T200b).
+ * confinement of its commands is proven. And the tools of System's own workspace reads server, as
+ * an MCP client names them (`mcp__workspace__read_file`, …, T200b; its git views, T223).
  */
 /** What a classification knows of the run's runtime. */
 export interface ClassifyOptions {
@@ -88,21 +102,57 @@ export interface ClassifyOptions {
   shellReads?: boolean | undefined
   /**
    * The runtime gives the run's agent System's own workspace reads server
-   * (`RuntimeEvidence.workspaceReads`, T200b): only then are its three tools
-   * (`mcp__workspace__read_file`, `…list_dir`, `…search`) a `read`. Absent: every tool of that
-   * name is refused, since no server of System's started under it.
+   * (`RuntimeEvidence.workspaceReads`, T200b): only then are its tools
+   * (`mcp__workspace__read_file`, `…list_dir`, `…search`, and the git views `…git_log`,
+   * `…git_show`, `…git_diff`, `…git_status`, T223) a `read`. Absent: every tool of that name is
+   * refused, since no server of System's started under it.
    */
   workspaceReads?: boolean | undefined
+  /**
+   * The reading tools the run's agent has, by name (T222): its runtime's own (`Read`, `Grep`,
+   * `Glob`; `RuntimeEvidence.readTools`, as the Worker's tools list keeps them) and the workspace
+   * reads server's (`read_file`, `list_dir`, `search`, and its git views, with `workspaceReads`). A shell inspection
+   * command one of them serves is refused at once, naming it ({@link inspectionRefusal}). Absent or
+   * empty: none, and such a command stays a `command`.
+   */
+  readTools?: readonly string[] | undefined
+  /**
+   * The host tools its source gave the run's agent, by name (ADR-0070: `dossier_read`,
+   * `dossier_append`), which the runtime offers as `mcp__system__<name>`: only these are classified
+   * ({@link HOST_TOOL_FIELDS}); any other tool of that server, or one the run was not given, is refused.
+   */
+  hostTools?: readonly string[] | undefined
+}
+
+/** The host tools' server as an MCP client names its tools (`mcp__system__<name>`, ADR-0070). */
+const HOST_PREFIX = `mcp__${HOST_TOOLS_SERVER}__`
+
+/**
+ * The host tools the gate classifies, each with its input fields (agent-workers `dossierTools`, whose
+ * schemas the runtime checks too) and its class: reading the task's dossier is a `read`; appending
+ * to it changes System's own record of the work (no file, no command, nothing sent out), judged as
+ * a `workspace-write`, the class of the Worker writing its own work.
+ */
+const HOST_TOOL_FIELDS: Record<string, { fields: Record<string, FieldType>; class: 'read' | 'workspace-write'; summary: string }> = {
+  dossier_read: { fields: { from: 'number', limit: 'number' }, class: 'read', summary: 'Reads its board task\'s dossier (System\'s own record of the work)' },
+  dossier_append: {
+    fields: { kind: 'string', text: 'string', commits: 'strings', refs: 'strings', finding: 'string', inReplyTo: 'string' }, class: 'workspace-write',
+    summary: 'Appends an entry to its board task\'s dossier (System\'s own append-only record of the work; no file, no command)',
+  },
 }
 
 /**
  * The tools of the workspace reads server (agent-runtime-core, T200b) as an MCP client names them
  * (`mcp__<server>__<tool>`, as Codex's hook reports an MCP tool): System's own read-only server,
  * started under the run's confinement with its root fixed to the run's workspace. They run no
- * program, so they are reads. No other tool of that server is classified.
+ * program but git, which the server runs itself with an argv it builds and every setting that
+ * could run a program pinned off (T223), so they are reads. No other tool of that server is classified.
  */
 const SERVER_PREFIX = `mcp__${WORKSPACE_READS_SERVER}__`
 const SERVER_TOOLS: readonly string[] = WORKSPACE_READ_TOOLS.map((tool) => `${SERVER_PREFIX}${tool}`)
+/** The server's git views (T223): their paths (`paths`, a list) and their commits (hex ids only). */
+const GIT_VIEWS: readonly string[] = WORKSPACE_GIT_TOOLS.map((tool) => `${SERVER_PREFIX}${tool}`)
+const GIT_COMMIT_FIELDS = ['commit', 'from', 'to'] as const
 
 /** Tools that only read, and the input field that names where; a field that may be absent reads the workspace. */
 const READS: Record<string, { field: string; required: boolean }> = {
@@ -133,7 +183,7 @@ type FieldType = 'string' | 'number' | 'boolean' | 'strings' | 'edits'
  * input types (`sdk-tools.d.ts`; `MultiEdit`, `NotebookRead`, and `LS`, which it no longer
  * declares, from their last published shapes) and from what Codex's PreToolUse hook reports
  * (Codex 0.164: `apply_patch` and `view_image`; its `Bash` is a subset of Claude Code's) and the
- * Antigravity CLI's reports (agy 1.4.6 with `gemini-3.8-flash`, recorded in a supervised live check:
+ * Antigravity CLI's reports (agy 1.4.6 with its economy model, recorded in a supervised live check:
  * `runtime-antigravity-cli/tests/fixtures/agy-1.4.6-hook-inputs.json`; `ArtifactMetadata`, which
  * writes an agy artifact, is left out). A field not listed (Bash's `dangerouslyDisableSandbox`,
  * say, which would run it outside its sandbox), or a listed one of another type, refuses the call:
@@ -164,12 +214,21 @@ const FIELDS: Record<string, Record<string, FieldType>> = {
   [`${SERVER_PREFIX}read_file`]: { path: 'string', startLine: 'number', endLine: 'number' },
   [`${SERVER_PREFIX}list_dir`]: { path: 'string' },
   [`${SERVER_PREFIX}search`]: { pattern: 'string', regex: 'boolean', ignoreCase: 'boolean', path: 'string' },
+  [`${SERVER_PREFIX}git_log`]: { count: 'number', skip: 'number', commit: 'string', paths: 'strings', fields: 'strings' },
+  [`${SERVER_PREFIX}git_show`]: { commit: 'string', stat: 'boolean', patch: 'boolean', paths: 'strings' },
+  [`${SERVER_PREFIX}git_diff`]: { from: 'string', to: 'string', cached: 'boolean', stat: 'boolean', paths: 'strings' },
+  [`${SERVER_PREFIX}git_status`]: { paths: 'strings' },
 }
 const EDIT_FIELDS: Record<string, FieldType> = { old_string: 'string', new_string: 'string', replace_all: 'boolean' }
 
 const SUMMARY_MAX = 500
+/**
+ * The characters of a Bash command the gate accepts (T295): a request carries it whole in its
+ * `consequences` (approval-request@1's bound is 2000 characters, the rest of the text fits in the
+ * remaining 500), beside a short summary; a longer command is refused, never cut.
+ */
+export const COMMAND_MAX = 1500
 const clamp = (text: string): string => (text.length > SUMMARY_MAX ? `${text.slice(0, SUMMARY_MAX - 1)}…` : text)
-const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 
 /** Whether `value` has type `type`. */
 function typed(value: unknown, type: FieldType): boolean {
@@ -178,7 +237,7 @@ function typed(value: unknown, type: FieldType): boolean {
     case 'number': return typeof value === 'number' && Number.isFinite(value)
     case 'boolean': return typeof value === 'boolean'
     case 'strings': return Array.isArray(value) && value.every((v) => typeof v === 'string')
-    case 'edits': return Array.isArray(value) && value.every((edit) => isObject(edit) && unknownField(edit, EDIT_FIELDS) === undefined)
+    case 'edits': return Array.isArray(value) && value.every((edit) => isRecord(edit) && unknownField(edit, EDIT_FIELDS) === undefined)
   }
 }
 
@@ -374,10 +433,72 @@ function findRule(args: string[], workspace: string): boolean {
 
 const HEAD_TAIL: Record<string, RegExp> = { '-n': /^\+?\d+$/, '-c': /^\+?\d+$/ }
 const LS_FLAGS = among('-l', '-a', '-A', '-la', '-al', '-lA', '-1', '-R', '-h', '-lh', '-lah', '-alh', '-F')
+/** A revision word: a {@link REF_NAME}, or a range of two (`a..b`, `a...b`): never an option, never a path that leaves the directory. */
+const REVISION = new RegExp(`^${REF_NAME}(?:\\.\\.\\.?${REF_NAME})?$`)
+/** `show`'s `<rev>:<path>`: one {@link REF_NAME}, the path relative to the repository root (its `..` and `.git` segments refused). */
+const REVISION_PATH = new RegExp(`^(${REF_NAME}):([A-Za-z0-9_.][A-Za-z0-9_./-]*)$`)
+/** A run's branch (agent-workers worktrees, `system/run/<runId>`): the only names `git branch --list` looks up. */
+const RUN_BRANCH = /^system\/run\/[A-Za-z0-9_-]+$/
+/** `log`'s `--format=`: placeholders and plain characters, no space (a command is split on spaces), so one word. */
+const LOG_FORMAT = /^--format=[A-Za-z0-9%:,._-]+$/
+
 /**
- * Each read-only program and the rule its words must pass. `git` is not one: it finds its
- * repository, and the configuration it runs (`core.fsmonitor`, a diff driver), from the working
- * directory, which the gate does not see; it stays a `command`.
+ * The git history reads a Worker needs (T276), and no other form:
+ * - `git log`: at most one revision (a ref or a range), `--oneline`, `-n <k>`, `--format=<placeholders>`,
+ *   and paths, each absolute and inside the workspace, bare or after `--`;
+ * - `git show <rev>[:<path>]`: exactly one, its path relative to the root, with no `..` and no `.git` segment;
+ * - `git diff <a> <b>`: exactly two revisions, `--stat` the only option;
+ * - `git branch --list system/run/<runId>`: one run branch, by name (no wildcard passes the shell check).
+ * Any other word fails it (`-c`, `-C`, `--git-dir`, `--output`, `--ext-diff`, `-p`, …), and so does
+ * every other subcommand: a write (`commit`, `push`, `checkout`, `branch <name>`) stays a `command`.
+ * `git` finds its repository from the working directory, which the gate does not see: the runtime
+ * starts a Worker's shell in the run's worktree, and the configuration git reads there (`.git`, which
+ * no file tool writes, {@link gitData}) is the operator's, as for a listed `git` command.
+ */
+function gitHistory(argv: readonly string[], workspace: string): boolean {
+  const [program, sub, ...rest] = argv
+  if (program !== 'git') return false
+  if (sub === 'branch') return rest.length === 2 && rest[0] === '--list' && RUN_BRANCH.test(rest[1]!)
+  const forms: Record<string, { flags: (word: string) => boolean; valued: Record<string, RegExp>; revisions: [number, number]; shows: boolean; paths: boolean }> = {
+    log: { flags: (w) => w === '--oneline' || LOG_FORMAT.test(w), valued: { '-n': NUMBER }, revisions: [0, 1], shows: false, paths: true },
+    show: { flags: () => false, valued: {}, revisions: [1, 1], shows: true, paths: false },
+    diff: { flags: (w) => w === '--stat', valued: {}, revisions: [2, 2], shows: false, paths: false },
+  }
+  const form = sub !== undefined && Object.hasOwn(forms, sub) ? forms[sub] : undefined
+  if (!form) return false
+  let revisions = 0
+  let paths = false
+  for (let i = 0; i < rest.length; i += 1) {
+    const word = rest[i]!
+    if (paths) {
+      if (!pathWord(workspace, word)) return false
+      continue
+    }
+    if (word === '--' && form.paths) {
+      paths = true
+      continue
+    }
+    if (form.flags(word)) continue
+    const value = Object.hasOwn(form.valued, word) ? form.valued[word] : undefined
+    if (value) {
+      const next = rest[i + 1]
+      if (next === undefined || !value.test(next)) return false
+      i += 1
+      continue
+    }
+    if (form.paths && pathWord(workspace, word)) continue
+    const shown = form.shows ? REVISION_PATH.exec(word) : null
+    if (shown) {
+      if (shown[2]!.split('/').some((segment) => segment === '..' || segment.toLowerCase() === '.git')) return false
+    } else if (!REVISION.test(word)) return false
+    revisions += 1
+  }
+  return revisions >= form.revisions[0] && revisions <= form.revisions[1]
+}
+
+/**
+ * Each read-only program and the rule its words must pass. `git` is not one: only its history
+ * reads are ({@link gitHistory}), judged on their own.
  */
 const READ_COMMANDS: Record<string, (args: string[], workspace: string) => boolean> = {
   cat: (args, ws) => optionsAndPaths(args, ws, among('-n'), {}, 1),
@@ -404,6 +525,35 @@ function noopCommand(argv: string[]): boolean {
   return program === 'echo' || ((program === 'pwd' || program === 'true' || program === 'false') && args.length === 0)
 }
 
+/** The words that run one test file (T270), before its path: `corepack pnpm vitest run <path>`. */
+const ONE_TEST_RUN: readonly string[] = ['corepack', 'pnpm', 'vitest', 'run']
+/** A test file's name, as the repository's test runner takes one (`*.spec.ts`, `*.test.mjs`, …). */
+const TEST_FILE = /\.(spec|test|e2e)\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/
+
+/**
+ * Whether `argv` is exactly `corepack pnpm vitest run <path>`, its path a test file's name (T270):
+ * one test file run with its output readable, where the policy's whole-suite command cuts it. Where
+ * the path is is the caller's to judge: inside the workspace, or refused.
+ */
+function isOneTestRun(argv: readonly string[]): boolean {
+  return argv.length === ONE_TEST_RUN.length + 1 && ONE_TEST_RUN.every((word, i) => argv[i] === word) && TEST_FILE.test(argv[ONE_TEST_RUN.length]!)
+}
+
+/** The words that run the tests related to some files (T299), before their paths: `corepack pnpm test:related <path>…`. */
+const RELATED_TEST_RUN: readonly string[] = ['corepack', 'pnpm', 'test:related']
+/** How many files one related-tests run names at most (INV-9). */
+const RELATED_FILES_MAX = 64
+
+/**
+ * Whether `argv` is exactly `corepack pnpm test:related <path>…`: one to {@link RELATED_FILES_MAX}
+ * words, none an option (T299). It runs only the tests of the worktree that relate to those files;
+ * where each path is is the caller's to judge: inside the workspace, or refused.
+ */
+function isRelatedTestRun(argv: readonly string[]): boolean {
+  const files = argv.slice(RELATED_TEST_RUN.length)
+  return RELATED_TEST_RUN.every((word, i) => argv[i] === word) && files.length >= 1 && files.length <= RELATED_FILES_MAX && files.every((word) => !word.startsWith('-'))
+}
+
 /** Whether `argv` is a read-only inspection command inside the workspace (`READ_COMMANDS`). */
 function readCommand(argv: string[], workspace: string): boolean {
   const [program, ...args] = argv
@@ -411,12 +561,78 @@ function readCommand(argv: string[], workspace: string): boolean {
   return rule !== undefined && rule(args, workspace)
 }
 
+/**
+ * The shell inspection commands a reading tool serves (T222), by group: the programs (the argv's
+ * first word, as the gate split it; T147's programs), the reading tools that serve them in the
+ * order they are named (the runtime's own first, then the workspace reads server's), and how.
+ */
+const INSPECTIONS = [
+  { programs: ['cat', 'head', 'tail', 'sed'], forms: 'cat, head, tail, sed -n', tools: ['Read', 'read_file'], how: 'it reads a file, a range of its lines too' },
+  { programs: ['wc'], forms: 'wc', tools: ['Read', 'read_file'], how: 'it numbers a file\'s lines, so its last line number is the line count' },
+  { programs: ['grep', 'rg'], forms: 'grep, rg', tools: ['Grep', 'search'], how: 'it searches files for a pattern' },
+  { programs: ['ls', 'find'], forms: 'ls, find', tools: ['Glob', 'LS', 'list_dir'], how: 'it lists a directory or finds files by name' },
+] as const
+
+/** find's actions: a `find` that carries one is no inspection, and stays a `command`. */
+const FIND_ACTIONS = new Set(['-exec', '-execdir', '-ok', '-okdir', '-delete', '-fprint', '-fprint0', '-fprintf', '-fls'])
+
+/**
+ * Whether `args` is `sed`'s read-only printing form, `-n <a>[,<b>]p <path>…`, its paths relative or
+ * absolute (the `sed` rule of {@link READ_COMMANDS}, which wants one absolute path): no other
+ * option, so no `-i` and no `-e` or `-f` script, and no script but a line range printed, so none
+ * that writes a file (`w`) or runs a command (`e`).
+ */
+function sedPrints(args: readonly string[]): boolean {
+  return args.length >= 3 && args[0] === '-n' && /^\d+(,\d+)?p$/.test(args[1]!) && args.slice(2).every((word) => !word.startsWith('-'))
+}
+
+/**
+ * The inspection group `argv` is, by its first word, or undefined: `sed` only in its read-only
+ * printing form ({@link sedPrints}), `find` only with no action (`-exec`, `-delete`, …), since a
+ * form that writes or runs a command is no inspection a reading tool serves.
+ */
+function inspectionOf(argv: readonly string[]): (typeof INSPECTIONS)[number] | undefined {
+  const [program, ...args] = argv
+  if (program === undefined) return undefined
+  if (program === 'sed' && !sedPrints(args)) return undefined
+  if (program === 'find' && args.some((word) => FIND_ACTIONS.has(word))) return undefined
+  return INSPECTIONS.find((group) => (group.programs as readonly string[]).includes(program))
+}
+
+/**
+ * The reading tools a run's agent has (T222), from its runtime's evidence and the Worker's tools
+ * list: the workspace reads server's (its git views among them, T223) where the runtime gives it (`workspaceReads`), and the
+ * runtime's own (`readTools`) that the tools list keeps (an absent or empty list keeps every one,
+ * as the runtime then gives its default set). No evidence: none.
+ */
+export function readToolsOf(evidence: { workspaceReads?: boolean | undefined; readTools?: readonly string[] | undefined } | undefined, tools: readonly string[] | undefined): string[] {
+  const own = (evidence?.readTools ?? []).filter((tool) => !tools?.length || tools.includes(tool))
+  return [...own, ...(evidence?.workspaceReads === true ? WORKSPACE_READ_TOOLS : [])]
+}
+
+/**
+ * The refusal of a shell inspection command whose reading tool the run's agent has (T222): the
+ * tools of `readTools` that serve it, named. Undefined when it is no inspection command, or none
+ * of its tools is the agent's: it stays a `command`, judged as one.
+ */
+function inspectionRefusal(argv: readonly string[], readTools: readonly string[] | undefined): Refusal | undefined {
+  const group = inspectionOf(argv)
+  if (!group || !readTools?.length) return undefined
+  const tools = group.tools.filter((tool) => readTools.includes(tool))
+  if (!tools.length) return undefined
+  const named = tools.join(' or ')
+  return {
+    refused: `Bash: ${argv[0]} is a shell inspection command, and you have ${named} for it (${group.how}): use ${named} instead. A shell inspection command is denied at once, never asked`,
+    reason: 'use-read-tool',
+  }
+}
+
 const ANSWER = 'Approved: the next run of this session makes exactly this call. Rejected, or unanswered when the request expires: the call is denied.'
 
 /** At most this many of the policy's commands-list lines are shown to the agent (INV-9). */
 const NOTE_LINES = 50
 const NOTE_LINE_CHARS = 200
-/** The characters of a Worker's Tools section at most, whatever the policy lists (INV-9). */
+/** The UTF-8 bytes of a Worker's Tools section at most, whatever the policy lists (INV-9): 1,000 estimated tokens, the handbook's count of it. */
 export const TOOLS_NOTE_MAX = 4000
 /** The characters of the workspace path the section names at most. */
 const NOTE_PATH_CHARS = 300
@@ -434,10 +650,23 @@ export interface ToolsNoteOptions {
   sandbox?: 'read-only' | 'workspace-write' | undefined
   /**
    * The runtime gives the agent the workspace reads server (T200b): its reading tools are the
-   * server's read_file, list_dir, and search, and it is told to read with them, never with a
-   * shell. Absent: it gives none.
+   * server's read_file, list_dir, and search, and its git views (T223), and it is told to read
+   * with them, never with a shell. Absent: it gives none.
    */
   workspaceReads?: boolean | undefined
+  /**
+   * The reading tools the agent has, by name, as its gate reads them ({@link ClassifyOptions.readTools},
+   * T222): the section says a shell inspection command one of them serves is denied at once, and
+   * names the tool for each. Absent: none.
+   */
+  readTools?: readonly string[] | undefined
+  /** The run holds its board task's dossier tools (ADR-0070): the section says what to write with them. Absent: it does not. */
+  dossier?: boolean | undefined
+  /**
+   * A research role's run (T262, ADR-0074): the web tools it has, and the web access grant in force
+   * for it (`null`: none, so every web call asks the operator). Absent: it is no research run.
+   */
+  research?: { tools: readonly string[]; grant: { tools: readonly string[]; maxWebCallsPerRun: number; maxClassification: string } | null } | undefined
 }
 
 /**
@@ -453,7 +682,9 @@ export interface ToolsNoteOptions {
  * about now. A Bash inspection command is named as a read only where the runtime enforces clean
  * shells, as the gate judges it; where the runtime gives the agent the workspace reads server
  * (T200b), its tools are the reading tools named, and the agent is told to read with them, never
- * with a shell. At most {@link TOOLS_NOTE_MAX} characters: the commands list is
+ * with a shell. Where the agent has reading tools (`options.readTools`, T222), it says a shell
+ * inspection command one of them serves is denied at once, never asked, and names the tool to use
+ * for each. At most {@link TOOLS_NOTE_MAX} UTF-8 bytes: the commands list is
  * cut first, its rest counted.
  */
 export function unaskedNote(policy: { policies: readonly AutonomyPolicyLike[]; effective: ReadonlyArray<{ actionClass: ActionClass; mode: string }> }, workspace: string, options: ToolsNoteOptions = {}): string {
@@ -465,12 +696,21 @@ export function unaskedNote(policy: { policies: readonly AutonomyPolicyLike[]; e
   const workspaceReads = options.workspaceReads === true
   const lines: string[] = []
   if (unasked('read')) {
-    lines.push(`- Reading tools (${workspaceReads ? 'the workspace server\'s read_file, list_dir, and search' : 'Read, Glob, Grep, LS'}) on paths inside your workspace ${ws}.`)
+    lines.push(`- Reading tools (${workspaceReads ? 'the workspace server\'s read_file, list_dir, search, git_log, git_show, git_diff, and git_status' : 'Read, Glob, Grep, LS'}) on paths inside your workspace ${ws}.`)
     if (options.shellReads === true) {
       lines.push(`- Bash read-only inspection, every path absolute and inside ${ws} (a relative path, or a form that names none, asks): cat, head, tail, wc, ls, stat, file, sed -n <a>,<b>p, rg, grep, and find without actions; and echo, pwd, true, false with no argument but echo's.`)
     }
   }
   if (unasked('workspace-write') && !readOnly) lines.push(`- Writing tools (Write, Edit) on files inside ${ws}, outside its .git.`)
+  // The git history reads (T276): a read in a clean shell, else judged as a listed command is (a workspace write unless commands are forbidden).
+  const history = (options.shellReads === true && unasked('read')) || unasked('command') || (mode('command') !== 'forbid' && unasked('workspace-write'))
+  if (history && !options.research) lines.push(`- Bash git history, read-only, every path absolute and inside ${ws}: git log [<ref>|<a>..<b>] [--oneline] [-n <k>] [--format=<placeholders>] [-- <path>], git show <sha>[:<path>], git diff <a> <b> [--stat], git branch --list system/run/<runId>.`)
+  // A research run's web calls under the web access grant (T262): never a call the policy forbids.
+  const research = options.research
+  const webTools = research ? research.tools.filter((t) => research.grant?.tools.includes(t)) : []
+  if (research?.grant && webTools.length && mode('external-send') !== 'forbid') {
+    lines.push(`- Web calls (${webTools.join(', ')}), at most ${research.grant.maxWebCallsPerRun} in this run, each whose query or URL passes the egress check: it names no path of this machine and no credential, and your work is classified at most ${research.grant.maxClassification}. Past the bound, or refused by the egress check, a web call waits for the operator. Put nothing from your workspace or brief in a query or URL but the words you search for.`)
+  }
   // The policy's rule (approvals policy.ts `judge`, T209): a command on the commands list is judged
   // as a workspace write, not as a command, unless the command class is forbidden. So a listed
   // command follows the workspace-write mode, any other command the command mode. The gate runs a
@@ -487,9 +727,15 @@ export function unaskedNote(policy: { policies: readonly AutonomyPolicyLike[]; e
       listing.push(...listed)
     } else lines.push(readOnly ? '- Any other Bash command, under your read-only sandbox (it changes no file).' : '- Any other Bash command.')
   } else if (listed.length && writes) listing.push(...listed)
-  const bashReads = options.shellReads === true
+  // The inspection commands the gate denies at once, each with the reading tool to use (T222).
+  const served = INSPECTIONS.map((group) => ({ group, tools: group.tools.filter((tool) => options.readTools?.includes(tool)) })).filter((s) => s.tools.length)
+  const inspections = !served.length ? ''
+    : ` A Bash inspection command you have a reading tool for is denied at once, never asked${options.shellReads === true ? ' (unless it is one of the reads above)' : ''}: ${served.map(({ group, tools }) => `${group.forms}: use ${tools.join(' or ')} (${group.how})`).join('; ')}.`
+  const bashReads = (options.shellReads === true
     ? ''
-    : ` Under this runtime no Bash command is a read (cat, ls, rg, and the like are commands, judged as one): read with the ${workspaceReads ? 'workspace server\'s tools, never with a shell' : 'reading tools'}.`
+    : served.length
+      ? ` Under this runtime no Bash command is a read: read with the ${workspaceReads ? 'workspace server\'s tools, never with a shell' : 'reading tools'}.`
+      : ` Under this runtime no Bash command is a read (cat, ls, rg, and the like are commands, judged as one): read with the ${workspaceReads ? 'workspace server\'s tools, never with a shell' : 'reading tools'}.`) + inspections
   // Whether an approval resumes the step is said whatever the command mode: a read or a write the
   // policy asks about defers (and resumes) or is denied at once just as a command does.
   const commandsForbidden = command === 'forbid'
@@ -505,14 +751,18 @@ export function unaskedNote(policy: { policies: readonly AutonomyPolicyLike[]; e
     'Tools (your tool gate and the autonomy policy now):',
     `- Workspace: ${ws}. A tool's path outside it is denied, and so is a write in its .git.`,
     ...(workspaceReads
-      ? ['- Read your workspace with the workspace server\'s tools, never with a shell: read_file (path; startLine and endLine for a range), its lines numbered; list_dir (path; default the workspace); search, the lines that hold a fixed string (pattern) or match a regular expression (regex: true), under a path (default the workspace). Each path is relative to the workspace, or absolute inside it, with no "..".']
+      ? ['- Read your workspace with the workspace server\'s tools, never with a shell: read_file (path; startLine and endLine for a range), its lines numbered; list_dir (path; default the workspace); search, the lines that hold a fixed string (pattern) or match a regular expression (regex: true), under a path (default the workspace). Read its git history the same way: git_log (count, skip, commit, paths), git_show (commit; stat, patch), git_diff (the worktree, or cached: the index, against HEAD; or from and to), git_status; a commit is always its hex id (from git_log), never a branch name. Each path is relative to the workspace, or absolute inside it, with no "..".']
       : []),
     ...(readOnly ? ['- Your sandbox is read-only: no tool call writes a file (Write, Edit, and any command that changes one fail), so read, and answer with what you found.'] : []),
+    ...(research ? [`- You are a research role: you read your workspace and search and fetch the web (${research.tools.length ? research.tools.join(', ') : 'no web tool'}), and nothing else; a call that writes a file or runs a command is denied.${research.grant ? '' : ' No web access is granted now, so each web call waits for the operator.'}`] : []),
+    ...(options.dossier === true
+      ? ['- Your board task\'s dossier, through which its Workers work (none reads your conversation): dossier_read pages through it; dossier_append adds your entry as this step\'s Worker: a plan at the start, progress after each step (what you did, its commits, what remains, small decisions and why), a response per review finding (fixed in which commit, or not and why); a reviewer, its review.']
+      : []),
     'Tool calls that run without asking the operator:',
   ]
   const tail = [
     ...(lines.length || listing.length ? [] : ['- none now: every call asks the operator or is denied.']),
-    `Refused by the gate, never asked: a Bash command is words split on single spaces, never parsed by a shell, so a word with a shell metacharacter (; & | $ < > ( ) quotes * ? ~ and the like) or an empty word (a doubled, leading, or trailing space) is denied. Name every path in a Bash command absolute: the gate does not see the directory a command runs in, so a relative path makes no command a read.${bashReads}`,
+    `Refused by the gate, never asked: a Bash command is words split on single spaces, never parsed by a shell, so a word with a shell metacharacter (; & | $ < > ( ) quotes * ? ~ and the like) or an empty word (a doubled, leading, or trailing space) is denied. Name every path in a Bash command absolute: the gate does not see the directory a command runs in, so a relative path makes no command a read.${bashReads}${readOnly ? '' : ` Tests: one test file runs as corepack pnpm vitest run <its absolute path inside the workspace>, judged as a write of the workspace (a relative path is refused there). Several test files in one command are a command the operator is asked about: name them with paths relative to your worktree (corepack pnpm vitest run packages/plugins/x/tests/a.spec.ts packages/plugins/x/tests/b.spec.ts), so the operator reads it short and whole; a command past ${COMMAND_MAX} characters is refused.`}`,
     otherwise,
   ]
   if (listing.length) {
@@ -520,12 +770,12 @@ export function unaskedNote(policy: { policies: readonly AutonomyPolicyLike[]; e
     const intro = exception
       ? `- Any other Bash command${readOnly ? ', under your read-only sandbox (it changes no file),' : ','} except one on the autonomy policy's commands list:`
       : '- Bash, exactly these commands, word for word (the autonomy policy\'s commands list; no other word, option, or argument):'
-    let budget = TOOLS_NOTE_MAX - [...head, ...lines, intro, ...tail].join('\n').length - 40
+    let budget = TOOLS_NOTE_MAX - utf8([...head, ...lines, intro, ...tail].join('\n')) - 40
     const shown: string[] = []
     for (const line of listing.slice(0, NOTE_LINES)) {
-      if (line.length + 5 > budget) break
+      if (utf8(line) + 5 > budget) break
       shown.push(`  - ${line}`)
-      budget -= line.length + 5
+      budget -= utf8(line) + 5
     }
     if (shown.length) {
       lines.push(intro, ...shown)
@@ -535,7 +785,21 @@ export function unaskedNote(policy: { policies: readonly AutonomyPolicyLike[]; e
     }
   }
   const note = [...head, ...lines, ...tail].join('\n')
-  return note.length > TOOLS_NOTE_MAX ? `${note.slice(0, TOOLS_NOTE_MAX - 1)}…` : note
+  if (utf8(note) <= TOOLS_NOTE_MAX) return note
+  // Cut by UTF-8 bytes, whole code points, the ellipsis (3 bytes) included.
+  let cut = ''
+  let used = 0
+  for (const char of note) {
+    if (used + utf8(char) > TOOLS_NOTE_MAX - 3) break
+    cut += char
+    used += utf8(char)
+  }
+  return `${cut}…`
+}
+
+/** UTF-8 bytes of a text: the Tools section is bounded in bytes, so the handbook's estimate (`ceil(bytes / 4)`) of it never passes 1,000 tokens. */
+function utf8(text: string): number {
+  return Buffer.byteLength(text, 'utf8')
 }
 
 /** The part of a policy {@link unaskedNote} reads. */
@@ -586,6 +850,29 @@ function patchFiles(patch: string): Array<{ op: string; path: string }> | { refu
 }
 
 /**
+ * One of the workspace reads server's git views (T223), its fields already known whole: `read` when
+ * every commit it names (`commit`, `from`, `to`) is a hex id and every path of `paths` is inside the
+ * workspace (as written and on disk; a path only history has is where it would be), holds no `..`
+ * segment, and is not git's own data; the server refuses the rest itself, and so does the gate.
+ */
+function classifyGitView(tool: string, input: Record<string, unknown>, workspace: string): ToolAction | Refusal {
+  for (const field of GIT_COMMIT_FIELDS) {
+    const value = input[field]
+    if (value !== undefined && (typeof value !== 'string' || !COMMIT_ID.test(value))) {
+      return { refused: `${tool} names ${field} ${JSON.stringify(String(value).slice(0, 100))}, which is not a commit's hex id: the workspace reads server takes no other`, reason: 'invalid-input' }
+    }
+  }
+  const paths = (input.paths as string[] | undefined) ?? []
+  for (const path of paths) {
+    if (path === '' || !within(workspace, path)) return { refused: `${tool} names ${path === '' ? 'an empty path' : path}, which is not inside the workspace`, reason: path === '' ? 'invalid-input' : 'outside-workspace' }
+    if (path.split(/[\\/]/).includes('..')) return { refused: `${tool} names ${path}, which climbs with "..": the workspace reads server never reads such a path`, reason: 'outside-workspace' }
+    if (gitData(workspace, path)) return { refused: `${tool} names ${path}, which is git's own data (.git): the workspace reads server never reads it`, reason: 'git-data' }
+  }
+  const where = paths.length ? paths.join(' ') : 'the workspace'
+  return { class: 'read', summary: clamp(`${tool} ${where}`), consequences: `Reads the git history and status of the run's workspace (${clamp(where)}), without a shell. ${ANSWER}` }
+}
+
+/**
  * Classify one tool call, conservatively; `{ refused }` for a call the gate does not classify,
  * which is denied without asking anyone. Every classified tool's input may carry only the fields
  * its SDK type declares, each of its type (an unknown field, or a wrong type, is refused), and a
@@ -596,9 +883,11 @@ function patchFiles(patch: string): Array<{ op: string; path: string }> | { refu
  * - the workspace reads server's `mcp__workspace__read_file`, `mcp__workspace__list_dir`, and
  *   `mcp__workspace__search` (T200b): `read`, when the `path` they name is inside the workspace
  *   (absent or empty for `list_dir` and `search`: the workspace), holds no `..` segment, and is not
- *   git's own data; they run no program. Only for a run whose runtime gives its agent that server
- *   (`options.workspaceReads`, its evidence); otherwise, and for any other tool of that server
- *   (`mcp__workspace__…`), refused;
+ *   git's own data; they run no program. Its git views `mcp__workspace__git_log`, `…git_show`,
+ *   `…git_diff`, `…git_status` (T223): `read`, when every commit they name is a hex id and every
+ *   path of their `paths` passes the same checks ({@link classifyGitView}). Only for a run whose
+ *   runtime gives its agent that server (`options.workspaceReads`, its evidence); otherwise, and for
+ *   any other tool of that server (`mcp__workspace__…`), refused;
  * - `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `write_file`, `edit_file`: `workspace-write`, for
  *   a file inside the workspace; outside it is refused (the runtime refuses it too), and so is a
  *   file in git's own data (a `.git` entry in its path, as written or on disk);
@@ -624,8 +913,26 @@ function patchFiles(patch: string): Array<{ op: string; path: string }> | { refu
  *   metacharacter, so no expansion), under the run's read confinement and its runtime's own
  *   sandbox. Any word the rule does not match exactly, or that could be read as either an option
  *   or a path, leaves the call a `command`: its argv the command split on single spaces, exactly
- *   as the policy's exact-argv rule matches it;
+ *   as the policy's exact-argv rule matches it. But where the run's agent has the reading tool for
+ *   a shell inspection command (`options.readTools`, T222; {@link INSPECTIONS}: `Read` or
+ *   `read_file` for `cat`, `head`, `tail`, `sed -n`, `wc`; `Grep` or `search` for `grep`, `rg`;
+ *   `Glob` or `list_dir` for `ls`, `find`), recognised by its first word whatever its other words,
+ *   it is refused (`use-read-tool`), naming the tool, and opens no request; a `sed` other than
+ *   `sed -n <a>[,<b>]p <path>…` (an in-place edit, a `-e` or `-f` script, a script that writes
+ *   or runs a command) or a `find` with an action is no inspection, and stays a `command`.
+ *   Exactly `corepack pnpm vitest run <path>`, its path a test file's name (`*.spec.ts`,
+ *   `*.test.mjs`, …), is one test file run with readable output (T270): a `workspace-write`, under
+ *   any runtime, when the path is absolute, with no `..`, and inside the workspace on disk (so it
+ *   runs wherever the policy lets a write of the workspace run); refused (`outside-workspace`) when it
+ *   is not. Any other word, option, or a second path leaves it a `command`;
+ *   likewise `corepack pnpm test:related <path>…` (T299), one to 64 paths, none an option, each
+ *   absolute and inside the workspace, else refused (`outside-workspace`): the tests related to
+ *   those files, run in the worktree;
  * - `WebFetch`, `WebSearch`: `external-send`;
+ * - the host tools its source gave the run (`options.hostTools`, ADR-0070), as `mcp__system__<name>`:
+ *   `dossier_read`, a `read`; `dossier_append`, a `workspace-write` (System's own record of the work,
+ *   no file); each with only its own fields. Any other `mcp__system__…` tool, or one the run was not
+ *   given, is refused;
  * - any other tool (`run_command` among them), or an input that is not an object: refused.
  * A path may be a `file:` URI, which is checked as the path it names.
  *
@@ -646,11 +953,22 @@ export function classify(call: ToolCall, workspace: string, options: ClassifyOpt
     if (options.workspaceReads !== true) return { refused: `${tool.slice(0, 100)} is not a tool the gate classifies: this run's runtime gives its agent no workspace reads server`, reason: 'unclassified-tool' }
     if (!SERVER_TOOLS.includes(tool)) return { refused: `${tool.slice(0, 100)} is not one of the workspace reads server's tools (${WORKSPACE_READ_TOOLS.join(', ')}); no other tool of it runs`, reason: 'unclassified-tool' }
   }
-  if (!isObject(input)) return { refused: `the input of ${tool} is not an object`, reason: 'invalid-input' }
+  if (tool.startsWith(HOST_PREFIX)) {
+    // Only a host tool the run's source gave it (ADR-0070): a server of that name it was not given is no tool of System's.
+    const name = tool.slice(HOST_PREFIX.length)
+    const host = Object.hasOwn(HOST_TOOL_FIELDS, name) ? HOST_TOOL_FIELDS[name] : undefined
+    if (!host || !options.hostTools?.includes(name)) return { refused: `${tool.slice(0, 100)} is not a tool the gate classifies: this run was given no such host tool`, reason: 'unclassified-tool' }
+    if (!isRecord(input)) return { refused: `the input of ${tool} is not an object`, reason: 'invalid-input' }
+    const unknown = unknownField(input, host.fields)
+    if (unknown) return { refused: `${tool} ${unknown}`, reason: 'unsupported-field' }
+    return { class: host.class, summary: clamp(`${tool}${typeof input.kind === 'string' ? ` ${input.kind}` : ''}`), consequences: `${host.summary}. ${ANSWER}` }
+  }
+  if (!isRecord(input)) return { refused: `the input of ${tool} is not an object`, reason: 'invalid-input' }
   const fields = Object.hasOwn(FIELDS, tool) ? FIELDS[tool] : undefined
   if (!fields) return { refused: `${tool} is not a tool the gate classifies`, reason: 'unclassified-tool' }
   const unknown = unknownField(input, fields)
   if (unknown) return { refused: `${tool} ${unknown}`, reason: 'unsupported-field' }
+  if (GIT_VIEWS.includes(tool)) return classifyGitView(tool, input, workspace)
   const read = Object.hasOwn(READS, tool) ? READS[tool] : undefined
   if (read) {
     if (tool === 'Glob') {
@@ -696,6 +1014,8 @@ export function classify(call: ToolCall, workspace: string, options: ClassifyOpt
   if (tool === COMMAND) {
     const command = input.command
     if (typeof command !== 'string' || command === '') return { refused: `${tool} names no command`, reason: 'invalid-input' }
+    // A request carries the whole command, so a longer one is refused, never cut (T295).
+    if (command.length > COMMAND_MAX) return { refused: `${tool}: the command is ${command.length} characters, past the ${COMMAND_MAX} an approval request shows whole; run a shorter command: give paths relative to your worktree, and fewer files per command`, reason: 'invalid-input' }
     const argv = command.split(' ')
     // Defence in depth: the policy forbids a metacharacter word too, but the gate never asks it about one.
     const empty = argv.indexOf('')
@@ -706,7 +1026,33 @@ export function classify(call: ToolCall, workspace: string, options: ClassifyOpt
     // function or an alias a startup file defined could run instead, so nothing is taken for a read.
     if (options.shellReads === true && noopCommand(argv)) return { class: 'read', summary: clamp(command), consequences: `Prints its words or the working directory, or nothing, and reads and changes nothing: ${clamp(command)}. ${ANSWER}` }
     if (options.shellReads === true && readCommand(argv, workspace)) return { class: 'read', summary: clamp(command), consequences: `Reads inside the run's workspace: ${clamp(command)}. ${ANSWER}` }
-    return { class: 'command', command: argv, summary: clamp(`${tool}: ${command}`), consequences: `Runs this exact command in the run's workspace. ${ANSWER}` }
+    // A git history read (T276): a read in a clean shell; elsewhere a command the gate judges as a listed one is judged.
+    if (gitHistory(argv, workspace)) {
+      if (options.shellReads === true) return { class: 'read', summary: clamp(command), consequences: `Reads the git history of the run's workspace: ${clamp(command)}. ${ANSWER}` }
+      return { class: 'command', command: argv, historyRead: true, summary: clamp(`${tool}: ${command}`), consequences: `Runs this read-only git command in the run's workspace: it reads its history and changes nothing. ${ANSWER}` }
+    }
+    // One test file, run with its output readable (T270): a write of the workspace (the runner's caches
+    // there), only for a test file inside it; outside it, refused before the policy is asked.
+    if (isOneTestRun(argv)) {
+      const file = argv[ONE_TEST_RUN.length]!
+      // A relative path is the policy's command rules' to judge (the shell starts in the worktree); it stays a command.
+      if (!file.startsWith('/')) return { class: 'command', command: argv, summary: clamp(`${tool}: ${command}`), consequences: `Runs this exact command in the run's workspace: ${command}\n${ANSWER}` }
+      if (!pathWord(workspace, file)) return { refused: `${tool}: ${clamp(file)} is not a test file inside the workspace (an absolute path, with no "..", that stays inside it on disk): one test file runs only inside the run's worktree`, reason: 'outside-workspace' }
+      return { class: 'workspace-write', summary: clamp(command), consequences: `Runs the one test file ${file} inside the run's workspace, its output readable; it writes only the test runner's caches there. ${ANSWER}` }
+    }
+    // The tests related to the files a Worker changed (T299): a write of the workspace (the runner's caches), only for files inside it.
+    if (isRelatedTestRun(argv)) {
+      const files = argv.slice(RELATED_TEST_RUN.length)
+      const outside = files.find((file) => file.startsWith('/') && !pathWord(workspace, file))
+      // A relative path is the policy's command rules' to judge (the shell starts in the worktree); it stays a command.
+      if (outside === undefined && files.some((file) => !file.startsWith('/'))) return { class: 'command', command: argv, summary: clamp(`${tool}: ${command}`), consequences: `Runs this exact command in the run's workspace: ${command}\n${ANSWER}` }
+      if (outside !== undefined) return { refused: `${tool}: ${clamp(outside)} is not a file inside the workspace (an absolute path, with no "..", that stays inside it on disk): the related tests run only on the run's worktree`, reason: 'outside-workspace' }
+      return { class: 'workspace-write', summary: clamp(command), consequences: `Runs the tests of the run's workspace that relate to the files named, inside it; it writes only the test runner's caches there. ${ANSWER}` }
+    }
+    // An inspection command the agent has a reading tool for is denied at once, naming it, never asked (T222).
+    const inspection = inspectionRefusal(argv, options.readTools)
+    if (inspection) return inspection
+    return { class: 'command', command: argv, summary: clamp(`${tool}: ${command}`), consequences: `Runs this exact command in the run's workspace: ${command}\n${ANSWER}` }
   }
   const send = Object.hasOwn(SENDS, tool) ? SENDS[tool] : undefined
   if (send) {
@@ -725,6 +1071,11 @@ export interface GateRun {
   /** The Worker's kind, its runtime (`claude-agent-sdk`, `codex-sdk`, …): its denials are counted by it (T207). */
   workerKind?: string | undefined
   workspace: string
+  /**
+   * The repository the run's worktree is cut from (a real path), when the run works in one: a
+   * command rule's `repository-read` paths may be under it, read-only. Absent: the worktree only.
+   */
+  repository?: string | undefined
   /** The run's session: an approved call runs in a later run of it. */
   sessionId?: string | undefined
   /** The workflow run the agent run belongs to, for the decisions' and events' lineage. */
@@ -733,8 +1084,29 @@ export interface GateRun {
   /**
    * The run's step is a review team member's, under the review-member profile (ADR-0049): its
    * material is its prompt alone, so the gate denies every tool call, each a recorded decision.
+   * `research` (T262, ADR-0074): the run is a research role's, which reads and searches the web only:
+   * a call that writes or runs a command is denied (`research-role`), and a web call is judged under
+   * the autonomy policy's web access grant ({@link runGate}).
    */
-  profile?: 'review-member' | undefined
+  profile?: 'review-member' | 'research' | undefined
+  /**
+   * The board task's project the run serves (its brief's, from the engine's own record): a research
+   * run's calls are judged under that project's policy as well as the studio's, so a project's
+   * prohibition binds and its grant narrows the studio's.
+   */
+  projectId?: string | undefined
+  /**
+   * The board task the run serves (its brief's, from the engine's own record): a request it asks names
+   * it, so the task's project's lead may give its verdict (ADR-0076). It never changes how a call is judged.
+   */
+  taskId?: string | undefined
+  /** The workflow step (node id) the run serves, from the engine's own start: its web calls' decisions name it. */
+  nodeId?: string | undefined
+  /**
+   * The research role's web probe (./web-probe.ts): the only call that runs is `WebSearch` with exactly
+   * {@link WEB_PROBE_QUERY}; every other is denied (`research-role`). Only with profile `research`.
+   */
+  webProbe?: boolean | undefined
   /**
    * The run's runtime enforces that its shells read no startup code (`RuntimeEvidence.cleanShells`,
    * T198): only then does the gate take a `Bash` probe or inspection command for a read ({@link classify}).
@@ -746,6 +1118,29 @@ export interface GateRun {
    * tools for reads ({@link classify}); otherwise every `mcp__workspace__…` call is denied.
    */
   workspaceReads?: boolean | undefined
+  /**
+   * The reading tools the run's agent has, by name (T222; {@link ClassifyOptions.readTools}): a
+   * shell inspection command one of them serves is denied at once, naming it, and asks no one.
+   */
+  readTools?: readonly string[] | undefined
+  /**
+   * The host tools the run's agent was given, by name (ADR-0070; {@link ClassifyOptions.hostTools}):
+   * only these of `mcp__system__…` are classified; any other is denied.
+   */
+  hostTools?: readonly string[] | undefined
+  /** The Worker's sandbox: the sandboxed-command rule (ADR-0080) reaches only a `workspace-write` run. */
+  sandbox?: 'read-only' | 'workspace-write' | undefined
+  /**
+   * The run's runtime proved both confinements (`RuntimeEvidence.sandboxedCommands` with its read
+   * confinement): only then may the sandboxed-command rule apply. Absent: it did not (a Codex Worker).
+   */
+  commandsSandboxed?: boolean | undefined
+  /**
+   * The mode of `agent-workers.enforce.sandboxedCommands` now, read at each call (ADR-0078): `on`
+   * applies the rule, `warn` records the verdict it would give and the call still asks, `off` ignores it.
+   * Absent: `off`.
+   */
+  sandboxedCommands?: (() => 'off' | 'warn' | 'on') | undefined
 }
 
 /** The call a run's gate deferred: the run stops there and does not complete. */
@@ -821,9 +1216,101 @@ function mismatch(request: ApprovalRequest, call: { ref: string; version: string
   return undefined
 }
 
+const execFileAsync = promisify(execFile)
+const GIT_ENV = { PATH: process.env.PATH ?? '/usr/bin:/bin', LC_ALL: 'C', GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }
+
+/**
+ * Whether `word` is a path a command rule allows under `scope` (`autonomy-policy@1.4`): relative to
+ * the worktree (the runtime starts a Worker's shell there) or absolute; no `..`, never git's own data
+ * (`.git`, as written or on disk), every symlink followed on disk. `run-worktree` is inside the
+ * worktree below its top, and never `.system`; `repository-read` is inside the worktree or the run's
+ * repository, read-only, `.system` included; `scratch-file` is `run-worktree` that is an untracked
+ * regular file (not a link, not a directory), as `git ls-files` says; `test-target` is `run-worktree`
+ * that names one test file or one directory as a test runner's filter selects it ({@link testTarget}).
+ */
+async function commandPath(workspace: string, repository: string | undefined, word: string, scope: CommandPathScope): Promise<boolean> {
+  if (word === '' || word.startsWith('-') || word.startsWith('~') || /^file:/i.test(word) || word.includes('\0')) return false
+  const segments = word.split('/').map((s) => s.toLowerCase())
+  if (segments.includes('..') || segments.includes('.git')) return false
+  if (scope !== 'repository-read' && segments.includes('.system')) return false
+  const worktree = resolve(workspace)
+  const absolute = isAbsolute(word) ? resolve(word) : resolve(worktree, word)
+  const roots = scope === 'repository-read' && repository !== undefined ? [worktree, resolve(repository)] : [worktree]
+  const root = roots.find((r) => inside(r, absolute) && within(r, absolute) && !gitData(r, absolute))
+  if (root === undefined) return false
+  if (scope === 'repository-read') return true
+  const rel = relative(worktree, absolute)
+  if (rel === '' || rel.split(sep).includes('.system')) return false
+  if (scope === 'run-worktree') return true
+  if (scope === 'test-target') return testTarget(worktree, word, absolute, rel)
+  try {
+    if (!lstatSync(absolute).isFile()) return false
+    await execFileAsync('git', ['--literal-pathspecs', '-C', worktree, '-c', 'core.fsmonitor=false', 'ls-files', '--error-unmatch', '--', rel], { env: GIT_ENV, timeout: 10_000, killSignal: 'SIGKILL' })
+    return false
+  } catch (error) {
+    // Exit 1: git knows no such tracked file, so it is untracked (or ignored). Any other failure refuses.
+    return code(error) === 1 && (() => {
+      try {
+        return lstatSync(absolute).isFile()
+      } catch {
+        return false
+      }
+    })()
+  }
+}
+
+/** The test files a worktree has at most for a `test-target` check (INV-9): past it, no word is one. */
+const TEST_TARGET_FILES = 20_000
+
+/**
+ * Whether `word` (a `run-worktree` path, `absolute` and `rel` its forms) names one test file or one
+ * directory of the worktree as a test runner's filter selects it, and nothing else. vitest takes a
+ * path word as a filter, not a path: a test file is selected when its path relative to the root
+ * holds the word (or its relative form) as a substring, or, for an absolute word, starts with it.
+ * So `tests` or `a.spec.ts` would select test files across the whole repository. The word must exist
+ * (a regular file with a test file's name, or a tests directory, `tests`, `test`, or `__tests__`, or
+ * a directory inside one; no link), and every test file of the
+ * worktree (`git ls-files`, tracked and untracked but not ignored) that the filter selects must be
+ * that file or under that directory.
+ */
+async function testTarget(worktree: string, word: string, absolute: string, rel: string): Promise<boolean> {
+  try {
+    const stat = lstatSync(absolute)
+    // A directory is a tests directory or one inside it: `packages` names what it selects, and that is a suite.
+    const testsDirectory = stat.isDirectory() && rel.split(sep).some((segment) => /^(tests?|__tests__)$/.test(segment))
+    if (!(testsDirectory || (stat.isFile() && TEST_FILE.test(absolute)))) return false
+  } catch {
+    return false
+  }
+  let listed: string
+  try {
+    listed = (await execFileAsync('git', ['--literal-pathspecs', '-C', worktree, '-c', 'core.fsmonitor=false', 'ls-files', '-z', '-c', '-o', '--exclude-standard'], { env: GIT_ENV, timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 32 * 1024 * 1024 })).stdout
+  } catch {
+    return false
+  }
+  const tests = listed.split('\0').filter((path) => path !== '' && TEST_FILE.test(path))
+  if (tests.length > TEST_TARGET_FILES) return false
+  const under = rel.split(sep).join('/')
+  // vitest keeps a word's trailing `/` on its relative form too.
+  const filters = [word.toLowerCase(), (word.endsWith('/') ? `${under}/` : under).toLowerCase()]
+  return tests.every((path) => {
+    const selected = filters.some((f) => path.toLowerCase().includes(f)) || (isAbsolute(word) && join(worktree, path).startsWith(word))
+    return !selected || path === under || path.startsWith(`${under}/`)
+  })
+}
+
 const RULE = { type: 'rule', id: 'agent-workers.tool-gate', version: '1' } as const
+/** The web access rule's decider (T262, ADR-0074): every web call of a research run it judges is one of its decisions. */
+export const WEB_RULE = { type: 'rule', id: 'agent-workers.web-access', version: '1' } as const
+
+/** Whether a `WebSearch` input is exactly the web probe's own search: its fixed query and no other field. */
+function isProbeSearch(input: unknown): boolean {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) return false
+  const keys = Object.keys(input)
+  return keys.length === 1 && keys[0] === 'query' && (input as { query?: unknown }).query === WEB_PROBE_QUERY
+}
 /** The checks a policy rule can require (`autonomy-policy@1.0`): the only ones a verdict may leave pending. */
-export const CHECKS: readonly Check[] = ['tests', 'typecheck', 'lint', 'schema', 'quote-check', 'review']
+export const CHECKS: readonly Check[] = ['tests', 'typecheck', 'lint', 'schema', 'quote-check', 'review', 'red-on-base']
 
 /**
  * The gate of one run. `ctx.approvals` is read when a call comes (optional: none, and every call is
@@ -838,7 +1325,7 @@ export function runGate(ctx: Context, run: GateRun): RunGate {
   /** The action classes this run already showed pending checks for: one event per class and run. */
   const pendingShown = new Set<ActionClass>()
 
-  const event = (kind: 'notified' | 'checks-pending' | 'denied' | 'deferred', call: ToolCall, decision: ArtifactRef | undefined, data: Record<string, unknown> = {}): void => {
+  const event = (kind: 'notified' | 'checks-pending' | 'denied' | 'deferred' | 'web', call: ToolCall, decision: ArtifactRef | undefined, data: Record<string, unknown> = {}): void => {
     try {
       ctx.get('eventLog')?.append({
         type: `agent-workers.tool.${kind}`, ...(run.workflowRunId ? { runId: run.workflowRunId } : {}), ...(run.sessionId ? { sessionId: run.sessionId } : {}),
@@ -872,6 +1359,41 @@ export function runGate(ctx: Context, run: GateRun): RunGate {
     }, { producer: { type: 'system', ref: 'agent-workers' }, ...(run.workflowRunId ? { runId: run.workflowRunId } : {}), classification: run.classification })
     deniedEvent(call, reason, decision.id as ArtifactRef, actionClass ? { actionClass } : {})
     return { decision: 'deny', reason: `${why} (decision ${decision.id})` }
+  }
+
+  /**
+   * Record that a command rule of `enforce: warn` would have allowed this command (T326): a `gate`
+   * decision naming the rule, deterministic, with the command's words as the call (the rule matched
+   * them whole, so none is a secret the call itself did not carry). The call is then judged as if no
+   * rule matched, so it still asks.
+   */
+  const warnWouldAllow = (call: ToolCall, ruleId: string, command: readonly string[]): void => {
+    ctx.artifacts.recordDecision({
+      decisionType: 'gate', question: `Would a command rule of the autonomy policy allow the ${call.tool} call ${run.worker} asked for in run ${run.runId}?`, inputs: [],
+      candidates: [
+        { option: 'allow', selected: false, reasons: [`would allow: command rule ${ruleId} matches the command, but its enforce is warn`] },
+        { option: 'ask', selected: true, reasons: [`command rule ${ruleId} grants nothing while its enforce is warn: the call asks the operator`] },
+      ],
+      decider: RULE, outcome: { option: 'ask', detail: { agentRun: run.runId, tool: call.tool.slice(0, 100), warnedRule: ruleId, command: clamp(command.join(' ')) } }, deterministic: true,
+    }, { producer: { type: 'system', ref: 'agent-workers' }, ...(run.workflowRunId ? { runId: run.workflowRunId } : {}), classification: run.classification })
+  }
+
+  /**
+   * Record the verdict the sandboxed-command rule would give a call (`enforce.sandboxedCommands` is
+   * warn, ADR-0080): a `gate` decision naming the rule, its outcome, and the shape that decided it.
+   * The call is then judged as if the rule did not exist, so it still asks.
+   */
+  const warnSandboxed = (call: ToolCall, would: SandboxedOutcome, command: readonly string[]): void => {
+    ctx.artifacts.recordDecision({
+      decisionType: 'gate', question: `Would the autonomy policy's sandboxed-command rule run the ${call.tool} call ${run.worker} asked for in run ${run.runId} without the operator?`, inputs: [],
+      candidates: [
+        { option: 'allow', selected: false, reasons: [`would be ${would.outcome}: sandboxed-command rule ${would.rule}${'by' in would ? `, shape ${would.by}` : ''}, but enforce.sandboxedCommands is warn`] },
+        { option: 'ask', selected: true, reasons: [`the rule grants nothing while enforce.sandboxedCommands is warn: the call asks the operator as before`] },
+      ],
+      decider: RULE,
+      outcome: { option: 'ask', detail: { agentRun: run.runId, tool: call.tool.slice(0, 100), sandboxedWould: would.outcome, sandboxedRule: would.rule, ...('by' in would ? { sandboxedBy: would.by } : {}), command: clamp(command.join(' ')) } },
+      deterministic: true,
+    }, { producer: { type: 'system', ref: 'agent-workers' }, ...(run.workflowRunId ? { runId: run.workflowRunId } : {}), classification: run.classification })
   }
 
   /** Deny on the policy's own decision: it is the record. */
@@ -947,7 +1469,11 @@ export function runGate(ctx: Context, run: GateRun): RunGate {
       const cause = request.resolution?.cause
       const how = cause === 'verdict' ? 'rejected by the operator' : cause === 'expired' ? 'unanswered when it expired' : 'withdrawn before a verdict (unanswered in time, its work ended, or the policy changed)'
       deniedEvent(call, cause === 'verdict' ? 'request-rejected' : cause === 'expired' ? 'request-expired' : 'request-withdrawn', request.resolution?.decision, { actionClass: action.class, requestId: request.requestId })
-      return { verdict: { decision: 'deny', reason: `approval request ${request.requestId} for exactly this call was ${how}, so it does not run; go on without it` } }
+      // The operator's own note on the verdict (what to run instead) is the tool result's, so the next try can follow it (T295).
+      const approval = request.resolution?.approval
+      const said = cause === 'verdict' && approval ? (ctx.artifacts.get(approval)?.body as { note?: unknown } | undefined)?.note : undefined
+      const note = typeof said === 'string' && said.trim() ? `. The operator's note: ${said.trim().slice(0, 2000)}` : ''
+      return { verdict: { decision: 'deny', reason: `approval request ${request.requestId} for exactly this call was ${how}, so it does not run; go on without it${note}` } }
     }
     const denial = workflowDenial(call, inputHash)
     if (denial) {
@@ -958,7 +1484,7 @@ export function runGate(ctx: Context, run: GateRun): RunGate {
   }
 
   /** An `ask`: the request already opened for this exact call in this session, or a new one. */
-  const ask = async (approvals: Approvals, call: ToolCall, action: ToolAction, verdict: AutonomyVerdict): Promise<ToolVerdict> => {
+  const ask = async (approvals: Approvals, call: ToolCall, action: ToolAction, verdict: AutonomyVerdict, ruledProject?: string): Promise<ToolVerdict> => {
     if (!run.sessionId) return refuse(call, `the policy asks the operator about this ${action.class} call, and run ${run.runId} has no session a later run could continue once approved, so it cannot wait`, 'no-session', [verdict.decision], action.class)
     const scope = `session:${run.sessionId}`
     const inputHash = contentId(call.input)
@@ -979,6 +1505,10 @@ export function runGate(ctx: Context, run: GateRun): RunGate {
       action: { class: action.class, summary: action.summary, consequences: action.consequences },
       requester: {
         component: 'worker', runId: run.runId, sessionId: run.sessionId,
+        // Judged again under the project its verdict was (a research run's, T262).
+        ...((researchProject() ?? ruledProject) !== undefined ? { projectId: (researchProject() ?? ruledProject)! } : {}),
+        // The board task it serves, so that task's project's lead may answer it (ADR-0076); never judged on.
+        ...(run.taskId ? { taskId: run.taskId } : {}),
         ...(call.callId && call.callId.length <= 128 ? { toolUseId: call.callId } : {}),
       },
       verdict, ...(action.command ? { command: action.command } : {}), classification: run.classification,
@@ -990,14 +1520,165 @@ export function runGate(ctx: Context, run: GateRun): RunGate {
     return defer(call, action, verdict, created.requestId)
   }
 
+  /** The project a research run's calls are judged under (T262), as its task's brief names it; none for any other run, judged under the studio policy as before. */
+  const researchProject = (): string | undefined => (run.profile === 'research' ? run.projectId : undefined)
+
+  /** The web calls this run made unasked under the web access grant (T262): at most its `maxWebCallsPerRun`. */
+  let webCalls = 0
+  /** The web calls of this run the web access rule judged, allowed or asked, in order: what each decision numbers. */
+  let webJudged = 0
+  /**
+   * The web access rule's turns (T262): one call is judged at a time, from its bound check to its
+   * recorded outcome, so concurrent calls never all pass a bound only one of them may take.
+   */
+  let webTurn: Promise<unknown> = Promise.resolve()
+  const serially = <T>(work: () => Promise<T>): Promise<T> => {
+    const next = webTurn.then(work, work)
+    webTurn = next.catch(() => undefined)
+    return next
+  }
+
+  /**
+   * The web access rule (T262, ADR-0074), for a research run's `WebSearch` or `WebFetch` call the
+   * policy said `ask` for: it runs unasked only under the grant in force for the research profile
+   * (the studio's, narrowed by the run's project's), for a tool the grant names, from a run whose
+   * content is classified at most as the grant allows, within the grant's calls per run, with a
+   * query or URL that names no path of this machine and passes the egress check (class `agent`: its
+   * classification permitted, no credential pattern). Every call it judges is a `gate` decision of
+   * rule `agent-workers.web-access` (its query or URL, the call's number, the bound, the egress
+   * decision, and why) and, but for a denial, an `agent-workers.tool.web` event (ids only); a call it
+   * does not let run asks as before (undefined: the caller asks). A call the grant would let run but
+   * that this session was denied stays denied: that is resolved first, recorded as a `deny` of the
+   * rule, and it takes no place in the bound. Run one call at a time ({@link serially}).
+   */
+  const webAccess = async (approvals: Approvals, call: ToolCall, action: ToolAction, verdict: AutonomyVerdict): Promise<ToolVerdict | undefined> => {
+    const target = webTarget(call.tool, call.input) ?? ''
+    const grant = webAccessOf((await approvals.policy(run.projectId)).policies, 'research')
+    let why: { code: string; reason: string } | undefined
+    let egress: { allowed: boolean; decision: ArtifactRef; reason: string } | undefined
+    if (!grant) why = { code: 'no-grant', reason: `the autonomy policy grants the research role no web access${run.projectId ? ` (for project ${run.projectId})` : ''}` }
+    else if (!grant.tools.includes(call.tool as WebTool)) why = { code: 'tool-not-granted', reason: `the web access grant names ${grant.tools.join(', ')}, not ${call.tool}` }
+    else if (!withinClassification(run.classification, grant.maxClassification)) why = { code: 'classification', reason: `the run's content is ${run.classification}, above the grant's ${grant.maxClassification}` }
+    else if (webCalls >= grant.maxWebCallsPerRun) why = { code: 'bound', reason: `the run already made ${webCalls} web calls unasked, the grant's bound (maxWebCallsPerRun ${grant.maxWebCallsPerRun})` }
+    else if (namesLocalPath(target, [resolve(run.workspace), homedir()])) why = { code: 'local-path', reason: `the ${call.tool === 'WebSearch' ? 'query' : 'URL'} names a path of this machine (the workspace or the home directory), which is local-private` }
+    else {
+      const checked = await ctx.egress.check({ payload: target, classification: run.classification, workerClass: 'agent' })
+      egress = { allowed: checked.allowed, decision: checked.decision as ArtifactRef, reason: checked.reason }
+      if (!checked.allowed) why = { code: 'egress', reason: `the egress check refused it: ${checked.reason}` }
+    }
+    const inputs = [verdict.decision, ...(egress ? [egress.decision] : [])]
+    // A call this session was denied stays denied, whatever the grant says (as under auto): resolved
+    // before anything is recorded as unasked, so it neither counts as one nor takes a place in the bound.
+    const prior = why === undefined ? (await priorOf(approvals, call, action, inputs)).verdict : undefined
+    const option: 'auto' | 'ask' | 'deny' = prior ? 'deny' : why === undefined ? 'auto' : 'ask'
+    if (option === 'auto') webCalls += 1
+    webJudged += 1
+    const bound = grant ? `${webCalls} of at most ${grant.maxWebCallsPerRun}` : 'no grant'
+    const denied = prior ? `this exact call was denied in session ${run.sessionId}, so it stays denied whatever the grant says` : ''
+    // Filed under the workflow run, its step named in the detail only: a step's decision chain stays the engine's.
+    const decision = ctx.artifacts.recordDecision({
+      decisionType: 'gate', question: `May ${run.worker}'s ${call.tool} call in run ${run.runId} go out unasked under the web access grant?`,
+      inputs,
+      candidates: [
+        {
+          option: 'auto', selected: option === 'auto',
+          reasons: option === 'auto' ? [`the research role's web access grant (${grant!.from.map((p) => `${p.id} version ${p.version}, webAccess ${p.webAccess}`).join('; ')}) names ${call.tool}`, `web call ${bound} this run`, `egress: ${egress!.reason}`]
+            : [`not auto: ${why?.reason ?? denied}`],
+        },
+        { option: 'ask', selected: option === 'ask', reasons: option === 'ask' ? [why!.reason, 'it asks the operator, as every external-send does'] : [option === 'auto' ? 'not ask: the grant holds and the egress check passed' : `not ask: ${denied}`] },
+        { option: 'deny', selected: option === 'deny', reasons: option === 'deny' ? [denied] : ['not deny: this session denied no such call'] },
+      ],
+      decider: WEB_RULE,
+      outcome: {
+        option,
+        detail: {
+          agentRun: run.runId, worker: run.worker, tool: call.tool, target: clamp(target), call: webJudged, unasked: webCalls, ...(grant ? { max: grant.maxWebCallsPerRun } : {}),
+          egress: egress ? (egress.allowed ? 'allow' : 'deny') : 'not-checked', ...(why ? { reason: why.code } : prior ? { reason: 'session-denied' } : {}), ...(run.nodeId ? { nodeId: run.nodeId } : {}),
+        },
+      },
+      deterministic: true,
+    }, { producer: { type: 'system', ref: 'agent-workers' }, ...(run.workflowRunId ? { runId: run.workflowRunId } : {}), classification: run.classification })
+    // A denied call's event is the denial's own (`agent-workers.tool.denied`, from priorOf).
+    if (option !== 'deny') {
+      event('web', call, decision.id as ArtifactRef, {
+        actionClass: 'external-send', verdict: option, egress: egress ? (egress.allowed ? 'allow' : 'deny') : 'not-checked', call: webJudged, unasked: webCalls,
+        ...(grant ? { max: grant.maxWebCallsPerRun } : {}), ...(why ? { reason: why.code } : {}), decision: decision.id,
+      })
+    }
+    return prior ?? (option === 'auto' ? { decision: 'allow' } : undefined)
+  }
+
   const judge = async (call: ToolCall): Promise<ToolVerdict> => {
     if (run.profile === 'review-member') return refuse(call, 'a review member answers from the material in its prompt alone: the review-member profile allows no tool call (ADR-0049)', 'review-member')
     if (deferred) return refuse(call, `the run stopped at its ${deferred.tool} call, which waits for approval request ${deferred.requestId}; no further call runs`, 'run-stopped')
     const approvals = ctx.get('approvals')
     if (!approvals) return refuse(call, 'no approval queue (ctx.approvals) is loaded, and no tool call runs without its autonomy decision', 'no-approvals')
-    const action = classify(call, run.workspace, { shellReads: run.shellReads === true, workspaceReads: run.workspaceReads === true })
-    if ('refused' in action) return refuse(call, action.refused, action.reason)
-    const verdict = await approvals.check({ class: action.class, ...(action.command ? { command: action.command } : {}) })
+    // The web probe makes one call, its own fixed search, and no other (./research.ts).
+    if (run.profile === 'research' && run.webProbe && !(call.tool === 'WebSearch' && isProbeSearch(call.input))) {
+      return refuse(call, `the web probe makes one call, WebSearch with the query ${JSON.stringify(WEB_PROBE_QUERY)} and nothing else; this ${call.tool.slice(0, 100)} call is not it`, 'research-role')
+    }
+    const classified = classify(call, run.workspace, { shellReads: run.shellReads === true, workspaceReads: run.workspaceReads === true, readTools: run.readTools, hostTools: run.hostTools })
+    if ('refused' in classified) return refuse(call, classified.refused, classified.reason)
+    let action: ToolAction = classified
+    // A research role reads and searches the web only (ADR-0074): its board task's dossier is System's own record, no file.
+    if (run.profile === 'research' && (action.class === 'workspace-write' || action.class === 'command') && !call.tool.startsWith(HOST_PREFIX)) {
+      return refuse(call, `a research role's run writes no file and runs no command; this ${call.tool.slice(0, 100)} call is ${action.class}`, 'research-role', [], action.class)
+    }
+    // A research run's calls are judged under its task's project's policy too (T262): the policy that
+    // gives the web grant also binds, so a project's forbid holds whatever the grant says.
+    let projectId = researchProject()
+    // A command a command rule of the policy allows (autonomy-policy@1.4) is judged as a workspace
+    // write, under the run's project's policy set when it has one (the studio's rules, narrowed by the
+    // project's): the decision names the rule.
+    let ruled: string | undefined
+    if (action.class === 'command' && action.historyRead !== true && action.command) {
+      const forProject = run.projectId ?? projectId
+      const policies = (await approvals.policy(forProject)).policies
+      const env = { path: (word: string, scope: CommandPathScope) => commandPath(run.workspace, run.repository, word, scope) }
+      const rule = await matchCommandRule(commandRulesOf(policies), action.command, env)
+      if (rule) {
+        ruled = rule.id
+        projectId = forProject
+      } else {
+        // A rule of `enforce: warn` grants nothing: record the rule that would have allowed the command, and let it ask (INV-13).
+        const warned = await matchCommandRule(warnedCommandRulesOf(policies), action.command, env)
+        if (warned) warnWouldAllow(call, warned.id, action.command)
+      }
+    }
+    // The sandboxed-command rule (ADR-0080) reaches a command no command rule allowed, in a workspace-write
+    // run whose runtime proved both confinements, never a review member's or a research run's. `on`
+    // lets the policy apply it; `warn` records the verdict it would give, and the call still asks.
+    let sandboxed = false
+    if (action.class === 'command' && !ruled && action.command && run.profile === undefined && run.sandbox === 'workspace-write' && run.commandsSandboxed === true) {
+      const mode = run.sandboxedCommands?.() ?? 'off'
+      const forProject = run.projectId ?? projectId
+      if (mode === 'on') {
+        sandboxed = true
+        projectId = forProject
+      } else if (mode === 'warn') {
+        const set = await approvals.policy(forProject)
+        const would = sandboxedCommandOf(set.policies, action.command)
+        if (would && set.effective.find((e) => e.actionClass === 'command')?.mode !== 'forbid') warnSandboxed(call, would, action.command)
+      }
+    }
+    let verdict = await approvals.check({ class: action.class, ...(action.command ? { command: action.command } : {}), ...(ruled ? { commandRule: ruled } : {}), ...(sandboxed ? { sandboxed: true } : {}), ...(projectId !== undefined ? { projectId } : {}) })
+    // The rule made it a workspace write unless commands are forbidden (then the verdict is forbid, and the class stays command).
+    if (ruled && verdict.mode !== 'forbid') action = { class: 'workspace-write', summary: action.summary, consequences: action.consequences, ...(action.command ? { command: action.command } : {}) }
+    // A git history read (T276) the policy asks about as a command is judged as a workspace write, as
+    // the policy judges a command on its commands list: it runs where writes run unasked; a forbidden
+    // command class, or writes that are not unasked, leave the command's own verdict.
+    if (action.historyRead === true && verdict.mode === 'ask') {
+      const write = await approvals.check({ class: 'workspace-write', ...(projectId !== undefined ? { projectId } : {}) })
+      if (write.mode === 'auto' || write.mode === 'notify') {
+        verdict = write
+        action = { class: 'workspace-write', summary: action.summary, consequences: action.consequences }
+      }
+    }
+    // A research run's web call the policy asks about goes out unasked only under the web access grant (T262).
+    if (run.profile === 'research' && action.class === 'external-send' && verdict.mode === 'ask' && Object.hasOwn(SENDS, call.tool)) {
+      const web = await serially(() => webAccess(approvals, call, action, verdict))
+      if (web) return web
+    }
     switch (verdict.mode) {
       case 'forbid':
         return denied(call, action, verdict, forbidden(action, verdict), await forbidReason(approvals, action))
@@ -1022,7 +1703,7 @@ export function runGate(ctx: Context, run: GateRun): RunGate {
         return { decision: 'allow' }
       }
       case 'ask':
-        return ask(approvals, call, action, verdict)
+        return ask(approvals, call, action, verdict, ruled || sandboxed ? projectId : undefined)
       default:
         return refuse(call, `the autonomy policy gave a mode the gate does not know (${String(verdict.mode)})`, 'unknown-mode', [verdict.decision], action.class)
     }

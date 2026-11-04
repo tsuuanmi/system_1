@@ -17,8 +17,7 @@ implementation: [ADR-0051, ADR-0052]
 The operator holds eight agent subscriptions: three Claude Code, two Codex CLI, and three
 Antigravity CLI accounts, all personal paid plans (operator, 2026-10-23, D24). They want each one
 to serve as a Worker, managed by provider and account, without naming accounts by hand.
-[PROP-0007](0007-account-pools.md) made this work for website accounts. Agent Workers cannot do it
-today (code read on `base/next`, 2026-10-23):
+PROP-0007 made this work for website accounts. Agent Workers cannot do it today:
 
 - **One account per runtime.** Each runtime row has one `home` (Claude Code's
   `CLAUDE_CONFIG_DIR`, Codex's `CODEX_HOME`, the Antigravity CLI's `HOME`; default
@@ -39,22 +38,14 @@ today (code read on `base/next`, 2026-10-23):
   by Worker id). Two Workers on one home run at once on one account. The `agents` source reports
   no `load` and has no `reserve`, so least-busy routing ([ADR-0033](../decisions/adr/0033-least-busy-routing.md))
   does not see agent accounts.
-- **Teams count one account twice.** A team member avoids the Workers another member holds,
-  through session affinity. For agents, affinity is the single Worker, so two agent Workers on one
-  home (a reviewer and a developer role) count as distinct accounts (REQ-TEAM-4). The source has
-  no `siblings`, so an unsent failover ([ADR-0034](../decisions/adr/0034-unsent-failover-to-a-sibling-account.md))
-  can land on another role of the same exhausted account.
+- **Teams count one account twice.** A team member avoids the Workers another member holds, through session affinity. For agents, affinity is the single Worker, so a reviewer and a developer role on one home count as distinct accounts (REQ-TEAM-4). With no `siblings`, an unsent failover ([ADR-0034](../decisions/adr/0034-unsent-failover-to-a-sibling-account.md)) can land on another role of the same exhausted account.
 - **A limit with no reading is forgotten.** A Codex or Antigravity run that fails
   `quota_exhausted` reports no limit observation, so the Worker's pool stays open and the next run
   hits the same limit.
 - **Schemas lag.** `worker-session@1.0` `binding.runtime` has no `antigravity-cli`: the engine
   records an Antigravity team member's session as `local-tool`. No schema describes an agent
   account.
-- **Terms.** All eight accounts are personal subscriptions. Rotating personal accounts to get
-  around usage limits is restricted or prohibited by the providers' terms (research H4), and
-  [PROP-0008](0008-studio-operating-model.md) already warns that pooling several accounts of one
-  personal plan may breach them. PROP-0007's failover moves unsent website work to a sibling
-  account when one hits its limit, which is exactly such a rotation.
+- **Terms.** All eight accounts are personal subscriptions. Rotating personal accounts around usage limits is restricted or prohibited by the providers' terms (research H4), and [PROP-0008](0008-studio-operating-model.md) already warns that pooling personal plans may breach them. PROP-0007's failover moves unsent website work to a sibling account at its limit, which is such a rotation.
 
 ## Goals
 
@@ -95,58 +86,11 @@ today (code read on `base/next`, 2026-10-23):
 
 ## Evidence and research
 
-- **Code facts on `base/next` (2026-10-23), checked again for this proposal:**
-  - `packages/plugins/agent-workers/src/index.ts`: `AgentWorkerConfig` (lines 42-75: `id`,
-    `runtime`, `workspace`, `sandbox`, `tools`, `model`, `maxTurns`, `tier`, `quotaClass`, `pool`,
-    `account`, `windows`, `worktreePerRun`, `limitCooldownSeconds`); the Worker id `agent:<id>`
-    (line 124); `describe()` gives `family: worker.runtime` and no `load` (lines 264-291); the
-    probe cached per `worker.runtime` (lines 386-389); `affinity` returns the session's single
-    Worker (lines 236-239); no `siblings`, no `reserve`; one `ProviderScheduler(1)` per Worker id
-    (lines 769-774); `observe()` records only reported limit observations (lines 736-765).
-  - `packages/plugins/agent-runtimes/src/index.ts` lines 89-90: a second provider of one kind is
-    refused. Lines 44 and 51: every coding agent's login and the DSH home are hidden from every
-    agent child.
-  - `packages/agent-runtime-core/src/index.ts` lines 120-134: `RunSpec` has no home and no
-    account.
-  - Runtime homes: `runtime-claude-agent-sdk/src/index.ts` line 137, `runtime-codex-sdk/src/index.ts`
-    line 136, `runtime-antigravity-cli/src/index.ts` line 150. Sign-in checks: `claude auth
-    status` (only `loggedIn` is read), `codex login status`, `agy models`.
-  - Website accounts: `turns/src/index.ts` derives `worker:<account>/<tier>` (line 145), keeps
-    cooldowns per `(account, feature)` (line 291), and gives `affinity` and `siblings` as the
-    account's tiers (lines 303-311); its family is the account's provider (lines 762-763).
-    `accounts/src/index.ts`: the catalog entry (lines 28-35), `identityHash` (line 61), and
-    `duplicateIdentities()` (lines 186-194, called by tests only). `login/src/index.ts` line 313:
-    the hash is `contentId({ provider, identity })` of the driver's identity hint.
-  - `workflow/src/teams.ts`: a member's distinct-account restriction is built from the other
-    members' `affinity` (lines 743-754); `runtimeOf()` maps an unknown kind to `local-tool`
-    (lines 23-28). `workflow/src/recovery.ts` line 147: a failover excludes the failed Worker's
-    `siblings`, which default to the Worker itself (`workers/src/index.ts` lines 102-108).
-  - `resources/src/index.ts` lines 129-139: pools are configuration `{ pool, account, kind,
-    windows, unknown }`; `account` is a free label.
-  - `schemas/worker-session.v1.json` line 22 and `worker-sessions/src/index.ts` line 37: the
-    runtime vocabulary lacks `antigravity-cli`.
-  - The live patch ([live-base.patch.yml](../operations/examples/live-base.patch.yml)) has three
-    hand-named read-only Workers on one checkout, `claude-review`, `codex-review`, and
-    `agy-review`, one per runtime home. The first experiment's record
-    ([review-worker-agnostic-1](../validation/experiments/records/review-worker-agnostic-1.experiment.json))
-    pins `agent:codex-review` and `agent:agy-review`.
-- **Brainstorm `run_60bb0779084119d1`** (ChatGPT website and Gemini API; both voted for option O1
-  with high confidence): ordinal enrollment slots are only isolated credential homes; the account
-  id is derived from the verified login principal (provider namespace and a stable hash); slots
-  are never identities; each principal is pinned to its home; a missing, changed, ambiguous, or
-  duplicate identity is quarantined; role templates are defined once and Workers are account ×
-  role; quota pools follow real entitlement boundaries; per-account concurrency, cooldowns, strict
-  session affinity, and failover only to a distinct verified account as a new attempt; family
-  separate from account; provider-policy eligibility before automation.
-- **Research `run_5297953ae346473d`:**
+- **Research:**
   - **H1 identity: insufficient.** Codex's auth storage exposes account ids (the best evidence).
     Claude account switchers match on email and organization. No way to read an Antigravity
     CLI identity was established. An account whose identity cannot be verified is not routed.
-  - **H2 homes: supported.** `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and a home directory per
-    Antigravity login separate the sign-ins. Separate directories are not isolation by
-    themselves (a Claude Code keychain collision was reported on macOS); OS-level confinement is
-    needed, which `system` already has (bubblewrap read confinement,
-    [ADR-0024](../decisions/adr/0024-agent-workers-confined-for-reads.md)).
+  - **H2 homes: supported.** `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and a home directory per Antigravity login separate the sign-ins. Separate directories are not isolation by themselves (a keychain collision was reported on macOS); OS-level confinement, which `system` has ([ADR-0024](../decisions/adr/0024-agent-workers-confined-for-reads.md)), is needed.
   - **H3 quota and routing:** the primitives exist elsewhere (window tracking, affinity,
     transcript counters), none complete. An observation is not an authorization, and stale or
     unknown quota never authorizes work.
@@ -154,11 +98,6 @@ today (code read on `base/next`, 2026-10-23):
     prohibited (OpenAI: circumventing rate limits; Google: bypassing protective limits; Anthropic:
     reported as prohibited, the clause still to be checked). Rotation must be opt-in per provider
     after the operator verifies it is allowed; unresolved is not permitted.
-- **Operator decision D24 (2026-10-23):** all eight accounts are personal paid subscriptions. No
-  limit-driven rotation: accounts are assigned, not pooled; each serves its own roles or
-  projects; a limit makes its work wait for its reset; website accounts get the same per-provider
-  setting, assigned by default.
-- **Operator decision D23** (this design) is open: this proposal is written for it.
 
 ## Proposed design
 
@@ -187,10 +126,7 @@ flowchart LR
 - The **provider** of an agent account is the runtime kind that signs it in and reads its identity
   (`claude-agent-sdk`, `codex-sdk`, `antigravity-cli`). It is the identity namespace: one person
   signed in through two runtimes is two accounts.
-- Homes stay under the DSH home, which the read confinement hides from every agent child. A run
-  binds back only its own account's home, so the accounts' homes are mutually invisible to the
-  agents without new code
-  ([credentials and egress](../design/agent-runtimes.md#credentials-and-egress)).
+- Homes stay under the DSH home, hidden from every agent child by the read confinement; a run binds back only its own account's home ([credentials and egress](../design/agent-runtimes.md#credentials-and-egress)).
 - The runtime row's `home` becomes the provider's default for a run that names none (the
   conformance suites and a probe without an account). Every Worker run names its account's home.
 
@@ -203,9 +139,9 @@ It never returns a token; the parts stay inside the runtime and only their hash 
 
 | Runtime | What it stores in its home | Principal read | State of evidence |
 |---|---|---|---|
-| Codex CLI (`codex-sdk`) | `auth.json` in `CODEX_HOME` with the ChatGPT sign-in's tokens, an account id beside them, and an id token whose claims name the user and the ChatGPT account | the ChatGPT account id and the user id, read from the file after `codex login status` succeeds in the same home | the research's best evidence; to be pinned per version (phase A) |
-| Claude Code (`claude-agent-sdk`) | its sign-in in `CLAUDE_CONFIG_DIR` (credentials, and the signed-in account and organization in its state file) | the account and organization ids, from `claude auth status` if its JSON names them on the pinned version, else from the home's state file; never the email alone, which can change | account switchers match on email and organization; the exact fields are pinned in phase A |
-| Antigravity CLI (`antigravity-cli`) | its sign-in under `~/.gemini/antigravity-cli` in its own `HOME` | **unknown**: no command or file was shown to name the signed-in Google account | not established: an [open question](#open-questions); until proven, its accounts are not routed |
+| Codex CLI (`codex-sdk`) | `auth.json` in `CODEX_HOME`: the ChatGPT tokens and an account id, plus an id token naming the user and the account | the ChatGPT account id and the user id, read after `codex login status` succeeds in the same home | the research's best evidence; pinned per version (phase A) |
+| Claude Code (`claude-agent-sdk`) | its sign-in and the signed-in account and organization, in `CLAUDE_CONFIG_DIR` | the account and organization ids, from `claude auth status` if it names them on the pinned version, else from the state file; never the email alone | switchers match on email and organization; exact fields pinned in phase A |
+| Antigravity CLI (`antigravity-cli`) | its sign-in under `~/.gemini/antigravity-cli`, in its own `HOME` | **unknown**: no command or file was shown to name the Google account | not established ([open question](#open-questions)); until proven, its accounts are not routed |
 
 - **The account id** is `<provider>:<h>`, where `h` is the first 16 hex characters of an HMAC-SHA256
   over the provider and the canonical principal parts, keyed by a per-install key kept in the
@@ -216,13 +152,11 @@ It never returns a token; the parts stay inside the runtime and only their hash 
   re-login, or a move to another slot. A different login gives a different id.
 - **Version-pinned, as the tool gate is.** A runtime's identity reader names the CLI versions a
   supervised check verified (as [ADR-0043](../decisions/adr/0043-antigravity-cli-workers-gated-on-a-version-verified-live.md)
-  pins agy's hook): which file and fields, that two accounts differ, and that a re-login of one
-  stays equal. On another version the principal is `unverified`. Codex and Claude Code readers
-  start with the versions phase A checks.
+  pins agy's hook): which file and fields, that two accounts differ, and that a re-login stays
+  equal. On another version the principal is `unverified`.
 - **Credentials land in the home.** A runtime child starts without D-Bus
   (`childEnvironment` drops `DBUS_SESSION_BUS_ADDRESS`), so a sign-in kept in the desktop keyring
-  would be unreadable to the run. The login flow starts the CLI without D-Bus too, so each home
-  holds its own sign-in in its own files. A home whose sign-in is not in its files is
+  would be unreadable to the run. Each home therefore holds its own sign-in in its own files. A home whose sign-in is not in its files is
   `unverified`.
 - **An API key or gateway token is not a login.** A home that signs in through a forwarded API key
   (`forwardEnv`) or the Responses gateway has no person behind it: see the
@@ -242,20 +176,18 @@ first letter and the domain of the email, when the runtime shows one), and a sta
 | `quarantined` | `changed`: the home now signs in as another principal; `ambiguous`: the principal cannot be read whole, or its short id collides with another; `duplicate`: two slots resolve to one principal (both are quarantined); `unverified`: the runtime or its version has no verified reader | no, `unavailable` with the reason |
 
 - The identity is read at enrollment, at each probe (`probeTtlMs`), and again before each run, as
-  the sandbox proof is today. A change between probe and run quarantines the account and fails the
+  the sandbox proof is. A change between probe and run quarantines the account and fails the
   run unsubmitted (`config_error`), and nothing runs ([INV-2](../architecture/invariants.md#inv-2-fail-closed)).
 - A quarantine never clears by itself. The operator resolves it: signs the slot in again as the
   pinned principal (`system account login <accountId>`), removes the account
   (`system account remove <accountId>`, which frees the slot), or, for `changed`, accepts the new
-  principal as a new account (the old id keeps its history; the slot's home now holds a new
-  account id).
+  principal as a new account (the old id keeps its history).
 - Every enrollment, verification that changes the status, and quarantine is a decision of the new
   type `enrollment` ([INV-13](../architecture/invariants.md#inv-13-every-decision-is-an-artifact)):
   inputs are the slot and the reader's evidence (never the principal), outcome the account id
   and status, detail the reason.
 - **Website accounts:** two catalog entries whose `identityHash` collides are treated the same way:
-  their Workers read `unavailable` with the reason `duplicate`, and health names both. Today they
-  are only listable.
+  their Workers read `unavailable` with the reason `duplicate`, and health names both.
 
 ### `system account login <provider>`
 
@@ -301,7 +233,7 @@ roles:
     worktreePerRun: true
     runtimes:                     # what differs per runtime, never a routing input
       claude-agent-sdk: { maxTurns: 4 }
-      antigravity-cli: { model: gemini-3.8-flash-high }
+      antigravity-cli: { model: "<standard model>" }
   - id: develop
     workspace: /home/me/src/project
     sandbox: workspace-write
@@ -336,11 +268,7 @@ The `agents` source does for agent accounts what `turns` does for website accoun
 - **Load and pending admissions.** The source reports each Worker's `load` (its account's running
   and queued runs) and implements `reserve`, so least-busy routing and its pending count
   ([ADR-0033](../decisions/adr/0033-least-busy-routing.md)) apply to agent accounts.
-- **Cooldowns.** A limit closes the account's pool, so every role of the account reads
-  `quota-exhausted` until it resets. New: a run that fails `quota_exhausted` with no limit
-  observation (Codex and the Antigravity CLI report none) records a `limited` reading on every
-  window of the account's pool for `limitCooldownSeconds`, as an unmapped `rejected` observation
-  already does. A limit is never retried on the same pool unseen.
+- **Cooldowns.** A limit closes the account's pool, so every role reads `quota-exhausted` until it resets. A run that fails `quota_exhausted` with no limit observation (Codex and the Antigravity CLI report none) records a `limited` reading on every window of the pool for `limitCooldownSeconds`, as an unmapped `rejected` observation already does. A limit is never retried on the same pool unseen.
 - **Session affinity.** A session stays on its Worker (account and role), whose home holds its
   native session. It never moves to another role (another sandbox) or another account.
 - **Siblings.** `siblings(worker)` returns every Worker of the account: a failover leaves the whole
@@ -354,8 +282,7 @@ website Workers the siblings are the account's tiers, which is what affinity giv
 nothing changes there. For agent Workers every role of one account is then one account, and two
 members can no longer share an account through two roles.
 
-This fix needs no new account model: on today's single home per runtime, the siblings of an agent
-Worker are every Worker of that runtime. It is phase C, before anything else.
+This fix needs no new account model: on today's single home per runtime, the siblings of an agent Worker are every Worker of that runtime.
 
 ### Family stays separate from account
 
@@ -438,13 +365,13 @@ a guarantee seam changes only by ADR, and here only by optional fields and new e
 
 | Seam (class) | Change | Additive |
 |---|---|---|
-| `agentRuntimes` (capability: Worker) | optional `RunSpec.home`; optional `home` on `probe`; optional `identity(home)` and `loginCommand(home)` on a provider; conformance: a provider that reads identity returns equal hashes for one login and different ones for two, and refuses a home it cannot read | yes; versioned definition and suite |
-| `workers` (core: gate) | descriptor `account` (optional); admission check `assignment`; `AdmissionFailure.limitUntil` (optional); the `assignment` rule applies only to Workers that declare an assigned `account` | yes, optional fields and an enum value; an ADR |
-| `workflow` (core: work state machine, runner) | `recovery` outcome `wait`; under `assigned`, a failover excludes the failed Worker's provider group; a team's held accounts from siblings; scenarios for each | yes, a new outcome value and rules that apply only to Workers with an assigned `account`; the team fix makes REQ-TEAM-4 hold; an ADR |
-| `resources` (core: resource ledger) | pool templates in configuration; optional `declare(accounts)` from a Worker source, instantiating templates only | yes, an optional method; an ADR |
-| `workerSessions` (core: work state machine) | `binding.runtime` gains `antigravity-cli` | yes, an enum value (`worker-session@1.1`) |
+| `agentRuntimes` (capability: Worker) | optional `RunSpec.home`; optional `home` on `probe`; optional `identity(home)` and `loginCommand(home)` on a provider; conformance: equal hashes for one login, different ones for two, and a home the runtime cannot read is refused | yes; versioned definition and suite |
+| `workers` (core: gate) | descriptor `account` (optional); admission check `assignment`; `AdmissionFailure.limitUntil` (optional); the rule applies only to Workers with an assigned `account` | yes: optional fields and an enum value; an ADR |
+| `workflow` (core: work state machine, runner) | `recovery` outcome `wait`; under `assigned`, failover excludes the failed Worker's provider group; a team's held accounts from siblings | yes: a new outcome and rules for assigned Workers; an ADR |
+| `resources` (core: resource ledger) | pool templates in configuration; optional `declare(accounts)` from a Worker source | yes: an optional method; an ADR |
+| `workerSessions` (core: work state machine) | `binding.runtime` gains `antigravity-cli` | yes: an enum value (`worker-session@1.1`) |
 | `accounts`, `turns` (capability: Worker) | per-provider `accounts` setting; descriptor `account`; duplicates' Workers `unavailable` | yes |
-| `agentWorkers` source (capability: Worker) | providers, slots, roles, assignments; account records; per-account scheduler, load, `reserve`, `siblings`; derived pools; `account_enroll`, `account_remove` MCP tools | the row's configuration changes shape (below) |
+| `agentWorkers` source (capability: Worker) | providers, slots, roles, assignments; account records; per-account scheduler, load, `reserve`, `siblings`; derived pools; `account_enroll`, `account_remove` | the row's configuration changes shape (below) |
 | `mcp` (surface) | `account_enroll`, `account_remove`, agent accounts in `account_list`, each with its schema ([ADR-0037](../decisions/adr/0037-schema-and-protocol-first.md)) | yes |
 
 **Schemas** ([versioning](../reference/schemas.md#versioning)):
@@ -459,27 +386,14 @@ a guarantee seam changes only by ADR, and here only by optional fields and new e
 
 ### Invariants and requirements
 
-- No invariant changes. The design applies
-  [INV-2](../architecture/invariants.md#inv-2-fail-closed) (an unknown identity or quota never
-  admits), [INV-4](../architecture/invariants.md#inv-4-restart-is-reconciliation-not-replay) (a
-  wait never resends a sent turn; it only delays an unsent node, and the wait survives a restart
-  on the node row), [INV-6](../architecture/invariants.md#inv-6-authority-comes-from-trusted-envelopes)
-  (assignments are configuration), [INV-8](../architecture/invariants.md#inv-8-credentials-never-cross-upward)
-  (only a keyed hash leaves a runtime), [INV-9](../architecture/invariants.md#inv-9-everything-is-bounded)
-  (slots and waits are bounded), [INV-11](../architecture/invariants.md#inv-11-no-tool-lock-in),
-  [INV-13](../architecture/invariants.md#inv-13-every-decision-is-an-artifact), and
-  [INV-14](../architecture/invariants.md#inv-14-every-record-has-a-versioned-schema).
+- No invariant changes. The design applies [INV-2](../architecture/invariants.md#inv-2-fail-closed) (an unknown identity or quota never admits), [INV-4](../architecture/invariants.md#inv-4-restart-is-reconciliation-not-replay) (a wait never resends a sent turn, and survives a restart on the node row), [INV-6](../architecture/invariants.md#inv-6-authority-comes-from-trusted-envelopes) (assignments are configuration), [INV-8](../architecture/invariants.md#inv-8-credentials-never-cross-upward) (only a keyed hash leaves a runtime), [INV-9](../architecture/invariants.md#inv-9-everything-is-bounded), [INV-11](../architecture/invariants.md#inv-11-no-tool-lock-in), [INV-13](../architecture/invariants.md#inv-13-every-decision-is-an-artifact), and [INV-14](../architecture/invariants.md#inv-14-every-record-has-a-versioned-schema).
 - **Requirements** ([SRS](../requirements/SRS.md)):
-  - REQ-ACC-1: agent accounts are identified by their verified login, not named; website accounts
-    keep catalog names.
+  - REQ-ACC-1: agent accounts are identified by their verified login, not named; website accounts keep catalog names.
   - REQ-ACC-7: accounts that resolve to one identity are quarantined, not only flagged.
-  - new REQ-ACC-10: each provider declares `accounts: assigned | pooled`, assigned by default;
-    pooled only on a recorded confirmation of its terms.
-  - new REQ-ACC-11: agent accounts are enrolled into slots; an account whose identity is missing,
-    changed, ambiguous, duplicate, or unverified takes no work.
+  - new REQ-ACC-10: each provider declares `accounts: assigned | pooled`, assigned by default; pooled only on a recorded confirmation of its terms.
+  - new REQ-ACC-11: agent accounts are enrolled into slots; an account whose identity is missing, changed, ambiguous, duplicate, or unverified takes no work.
   - REQ-WRK-8: under `assigned`, work refused for a limit waits for its reset, bounded.
-  - REQ-TEAM-4: distinct accounts are distinct verified principals, across every role of an
-    account.
+  - REQ-TEAM-4: distinct accounts are distinct verified principals, across every role of an account.
 
 ### Migration from hand-named rows
 
@@ -487,18 +401,12 @@ a guarantee seam changes only by ADR, and here only by optional fields and new e
    configuration from the old rows: each runtime's configured `home` becomes slot 1 of its
    provider (the directory is adopted, not moved); the three live rows become one role `review`
    (read-only, standard, the checkout) with per-runtime `maxTurns` and `model`; and an assignment
-   of `review` to each slot-1 account, by the id the command derives from that home now. An old
+   of `review` to each slot-1 account, by the id derived from that home. An old
    `pool` and `account` pair becomes a pool template with its windows.
-2. **At the upgrade**, an `agent-workers` row in the old shape fails startup with the exact path
-   and the migrate command (REQ-HOST-2). There is no second path: one implementation.
-3. **Store:** agent runs and sessions of an old Worker id are moved to the new id when the old row
-   maps to exactly one new Worker (same home, same role), so a continued session resumes in the
-   same home. Records already written keep the old ids and still explain.
-4. **Ledger:** usage and readings recorded under old pool ids stay; reports show them under those
-   ids.
-5. **Antigravity:** its slot-1 account is enrolled but `unverified` until its reader is verified.
-   Its Worker then reads `unavailable`, so `agy-review` stops at the cutover unless phase A proved
-   its identity ([open questions](#open-questions)).
+2. **At the upgrade**, an `agent-workers` row in the old shape fails startup with the exact path and the migrate command (REQ-HOST-2). There is no second path.
+3. **Store:** agent runs and sessions of an old Worker id move to the new id when the old row maps to exactly one new Worker (same home, same role), so a continued session resumes in the same home. Records already written keep the old ids.
+4. **Ledger:** usage and readings under old pool ids stay; reports show them under those ids.
+5. **Antigravity:** its slot-1 account is enrolled but `unverified` until its reader is verified, so `agy-review` stops at the cutover unless phase A proved its identity ([open questions](#open-questions)).
 6. **The first experiment** ([PROP-0011](0011-feedback-loop.md)) pins `agent:codex-review` and
    `agent:agy-review`. Its record is still `proposed`, so it is revised (`revision: 2`,
    `supersedes` 1) with the new ids before it is registered. A changed pin after registration
@@ -511,14 +419,7 @@ Each phase ends with its suites passing and its canonical documents updated.
 | Phase | Delivers | Depends on |
 |---|---|---|
 | **A** Evidence | a supervised check per runtime, on scratch homes and the operator's real accounts: which file and fields name the principal, on which version; equal across restart, token refresh, and re-login; different for two accounts. Fixtures with the principals redacted, as agy's hook fixture. For Antigravity: a principal source, or the record that none was found. The operator's record of each provider's terms (D24: personal, assigned) | — |
-| **B** Specification | the schemas above; the `agentRuntimes` definition and suite (`home`, `identity`, `loginCommand`); the ADRs below; `workers`, `workflow`, and `resources` suites extended and passed by their fakes | A for the identity fields |
-| **C** Correctness on today's homes | agent `siblings` (every Worker of the runtime, while there is one home); a team's held accounts from siblings; `antigravity-cli` session records; a `quota_exhausted` run with no observation closes its pool; website duplicates `unavailable` | — (can ship first) |
-| **D** Account mode | `accounts: assigned \| pooled` on website and agent providers; descriptor `account`; the `assignment` check; the `wait` outcome; failover inside the group off under `assigned`; `pooledTerms` | B |
-| **E** Enrollment and identity | slots and homes; `system account login <provider>`, `account_enroll`, `remove`, `list`; identity readers for Codex and Claude Code; quarantine; `enrollment` decisions; existing homes adopted as slot 1 | A, B |
-| **F** Workers = account × role | providers, roles, assignments; per-account scheduler, load, `reserve`; pool templates and `declare`; `system account migrate`; the cutover (old rows refused); the experiment record revised | D, E |
 | **G** Live, short first | a second Claude Code account enrolled; two roles on two accounts at once; a two-member review on two accounts of one runtime (a one-family team); a quarantine provoked by signing a slot in as another account; then the second Codex account; a limit's wait when the operator meets one; Antigravity accounts only once their identity is verified | F |
-
-Phase D lands before F: no provider has two routed agent accounts before the assigned rules hold.
 
 **ADRs on acceptance:**
 
@@ -530,88 +431,38 @@ Phase D lands before F: no provider has two routed agent accounts before the ass
 
 ## Alternatives considered
 
-- **Hand-named accounts per home** (`claude-1`, `claude-2`): the smallest change, but a name says
-  nothing about who is signed in. A home re-signed as someone else, or two homes as one person,
-  stays invisible, and teams would count them as distinct. Rejected (brainstorm O1, research H1).
-- **Slots as identities** (`claude-agent-sdk:1`): stable and simple, but the slot is where a login
-  lives, not who it is. Moving a login between slots would change its id and its history. Rejected.
-- **One unified accounts seam for websites and agents.** Both have accounts, but a website account
-  holds browser state in the vault and an agent account a CLI's own files in a home. One seam
-  would mix two storage and sign-in models for one consumer each. Rejected for now (ADR-0006): the
-  per-provider setting and the descriptor's `account` already give routing one view.
-- **A plain hash of the principal**: no key to keep, but an email or account id could be recovered
-  from it by guessing. Rejected for a keyed hash.
-- **Pooling by default, with rotation off by a flag**: the operator's plans are all personal, and
-  unresolved terms are not permission (H4). Rejected for `assigned` by default.
-- **Strict fixed scopes under `assigned`** (no two accounts of one provider may serve the same
-  role on one project): it removes every overlap at load time, but forbids parallel use the
-  operator kept (D24: accounts still serve parallel roles and team independence). Kept as an
-  [open question](#open-questions); the `assignment` check prevents the rotation either way.
-- **Treat an Antigravity login as verified by the operator's word**: research H1 says an
-  unverifiable account is not routed. Rejected.
+- **Hand-named accounts per home** (`claude-1`, `claude-2`): the smallest change, but a name says nothing about who is signed in. A home re-signed as someone else, or two homes as one person, would stay invisible, and teams would count them as distinct. Rejected (research H1).
+- **Slots as identities** (`claude-agent-sdk:1`): stable, but the slot is where a login lives, not who it is; moving a login would change its id and history. Rejected.
+- **One unified accounts seam for websites and agents.** The two hold accounts differently (vault state for websites, a CLI's files in a home for agents), so one seam would mix two storage and sign-in models. Rejected for now (ADR-0006): the per-provider setting and the descriptor's `account` already give routing one view.
+- **A plain hash of the principal**: an email or account id could be recovered by guessing. Rejected for a keyed hash.
+- **Pooling by default, with rotation off by a flag**: the operator's plans are all personal, and unresolved terms are not permission (H4). Rejected for `assigned` by default.
+- **Strict fixed scopes under `assigned`** (one account per provider for each role on a project): it removes overlap at load time, but forbids the parallel use the operator kept (D24). Kept as an [open question](#open-questions); the `assignment` check prevents rotation either way.
+- **An Antigravity login taken as verified by the operator's word**: an unverifiable account is not routed (H1). Rejected.
 
 ## Validation plan
 
-- **`agentRuntimes` conformance** (fake runtimes with scripted homes): one login gives one hash
-  across restart and refresh; two logins give two; an unreadable or partial principal is refused;
-  `RunSpec.home` is the only home a run's confinement binds back.
-- **`agents` source:** derived Worker ids; `unavailable` for every non-`ready` account with its
-  reason; a principal changed between probe and run fails the run unsubmitted; duplicates
-  quarantine both slots; per-account concurrency across two roles; `load` and `reserve`;
-  `siblings`; a limit with no observation closes the pool; pools declared per account.
-- **Routing and workflow** (fake Workers with accounts):
-  - under `assigned`, a limited account blocks its group's other accounts for that requirement and
-    admits other providers; the node waits until the reset and then runs on the same account; the
-    wait survives a restart; the bound fails it; no attempt is spent;
-  - under `assigned`, an unsent `challenge` fails over only outside the group; an unsent
-    `overloaded` retries on the same account;
-  - under `pooled`, PROP-0007's failover suite passes unchanged;
-  - a team with a reviewer and a developer role on one account gets distinct accounts, or a
-    `same-family-shared-account` record when only one account exists;
-  - Workers without `account` route exactly as before.
-- **Enrollment** (CLI and MCP, fake runtime): slot allocation, no free slot, re-login of the same
-  principal, a changed principal, removal freeing the slot, and an `enrollment` decision for each.
-- **Migration:** old rows refused with the migrate command; `migrate` output for the live patch;
-  sessions moved to the new ids; old runs still explain.
-- **Crash suite:** a crash between slot allocation and verification leaves `enrolled`, never
-  `ready`; a waiting node resumes its wait after a restart.
+- **Suites:** as named per seam in [seams and records touched](#seams-and-records-touched); the crash suite covers slots and waits.
 - **Live, short first** (phase G).
 
 ## Rollout and rollback
 
-- Phase C ships alone and changes only wrong outcomes (two roles of one home counted as two
-  accounts).
-- Phase D: with one account per provider, as on the live host, routing chooses exactly as before.
-  Website providers with two or more accounts become `assigned` on upgrade; the operator sets
-  `pooled` with `pooledTerms` only for a provider whose terms allow it.
-- Phase F is a cutover, prepared by `system account migrate` and the runbook. Rollback is a release
-  downgrade with the previous patch: slot 1 of each provider is the old home, so the old rows find
-  their sign-ins where they were. Homes of later slots stay hidden under the DSH home and unused.
+- Phase D: with one account per provider, as on the live host, routing chooses exactly as before. Website providers with two or more accounts become `assigned` on upgrade; the operator sets `pooled` with `pooledTerms` only for a provider whose terms allow it.
+- Phase F is a cutover, prepared by `system account migrate` and the runbook. Rollback is a release downgrade with the previous patch: slot 1 of each provider is the old home, so the old rows find their sign-ins where they were. Homes of later slots stay hidden under the DSH home and unused.
 
 ## Observability and operations
 
-- `system account list` and `/ui` show every account with provider, id, hint, status and reason,
-  roles, and pools. Health names quarantined accounts and duplicates.
-- `system explain` shows `enrollment` decisions, the `assignment` refusals with the limit's reset,
-  and `recovery` decisions with outcome `wait`.
-- **Runbook:** enroll an agent account; assign roles; resolve a quarantine; migrate hand-named
-  rows; confirm pooled terms for a provider.
-- **Playbook:** "work is waiting for an account's limit": which account, until when, and why it
-  does not move (the provider is assigned).
+- `system account list` and `/ui` show every account with provider, id, hint, status and reason, roles, and pools. Health names quarantined accounts and duplicates.
+- `system explain` shows `enrollment` decisions, `assignment` refusals with the limit's reset, and `recovery` decisions with outcome `wait`.
+- **Runbook:** enroll an agent account; assign roles; resolve a quarantine; migrate hand-named rows; confirm pooled terms for a provider.
+- **Playbook:** "work is waiting for an account's limit": which account, until when, and why it does not move (the provider is assigned).
 
 ## Security and privacy
 
-- Each account's home is hidden from every other account's runs by the existing confinement; a run
-  binds back only its own home.
-- The principal is read inside the runtime and leaves it only as a keyed hash; no token is read
-  beyond the fields named in the reader, logged, or stored. The masked hint stays local and is
-  never sent to a Worker.
-- Losing the per-install key changes every derived id: the accounts must be enrolled again (their
-  old ids keep their history). The key is backed up with the vault.
-- **Terms:** the default never moves work between personal accounts because of a limit. `pooled`
-  needs the operator's recorded confirmation per provider.
-- A home is writable by its own runs, so a run could alter its sign-in files. Re-reading the
-  identity before each run, and quarantining a change, bounds what such an alteration can do.
+- Each account's home is hidden from other accounts' runs by the existing confinement; a run binds back only its own home.
+- The principal is read inside the runtime and leaves it only as a keyed hash. No token is read beyond the fields named in the reader, logged, or stored. The masked hint stays local and is never sent to a Worker.
+- Losing the per-install key changes every derived id, so accounts must be enrolled again (their old ids keep their history). The key is backed up with the vault.
+- **Terms:** the default never moves work between personal accounts because of a limit. `pooled` needs the operator's recorded confirmation per provider.
+- A home is writable by its own runs, so a run could alter its sign-in files. Re-reading the identity before each run, and quarantining a change, bounds what such an alteration can do.
 
 ## Compatibility and migration
 
@@ -622,47 +473,25 @@ above and no compatibility path. Records keep their old Worker and pool ids.
 
 ## Open questions
 
-1. **Antigravity CLI identity.** No command or file was shown to name the signed-in Google
-   account. Phase A looks for one on the pinned agy version (its sign-in directory, its commands),
-   checked live as its hook was. Proposed: until a reader is verified, Antigravity accounts are
-   enrolled but `unverified` and route nothing. Since its Worker would then stop at the cutover,
-   and PROP-0011's first experiment needs it: does the cutover wait for Antigravity's reader, or
-   do Antigravity Workers stop until it exists? Proposed: the cutover waits, so Claude Code and
-   Codex get several accounts only once all three runtimes have readers or the operator chooses to
-   stop Antigravity.
-2. **Claude Code principal.** The account id and organization id (proposed), never the email
-   alone. Does `claude auth status` name them on the pinned version, or only the home's state
-   file?
-3. **Codex principal.** The ChatGPT account id with the user id (proposed): on a workspace plan the
-   account id is shared by its members. Is the account id alone enough for personal plans?
-4. **Homes signed in by an API key or the gateway.** They have no person behind them. Proposed: an
-   account kind `credential`, identified by the provider and the forwarded variable's name, always
-   metered, never a subscription. Or out of scope until such a Worker is needed?
-5. **Parallel use under `assigned`.** May two accounts of one provider serve the same role on one
-   project (parallel capacity, with the `assignment` check stopping rotation; proposed), or must
-   each role and project have exactly one account per provider (strict fixed scopes)?
-6. **The wait's bound.** `maxLimitWaitHours` 24 (proposed). A weekly limit would then fail to the
-   operator rather than hold a node for days. Is that right, or should a board task's attempt wait
-   longer?
-7. **Recording `pooledTerms`.** Configuration plus a `gate` decision at start (proposed), or a
-   `policy-change` through the approval queue
-   ([ADR-0041](../decisions/adr/0041-policy-changes-through-the-approval-queue.md))?
-8. **Project assignments.** Roles carry a workspace, so assigning a role assigns a project. Should
-   website accounts be assignable to projects too? That would carry the run's project into routing
-   from a trusted envelope, which no seam does today (ADR-0039 lists it as open).
-9. **The masked hint.** Keep a masked email for the operator to tell accounts apart (proposed), or
-   only the id?
+1. **Antigravity CLI identity.** No command or file was shown to name the signed-in Google account. Phase A looks for one. Proposed: until a reader is verified, its accounts are enrolled but `unverified` and route nothing. Does the cutover wait for that reader? Proposed: yes, so Claude Code and Codex get several accounts only once all three runtimes have readers, or the operator stops Antigravity.
+2. **Claude Code principal.** The account id and organization id (proposed), never the email alone. Does `claude auth status` name them on the pinned version, or only the home's state file?
+3. **Codex principal.** The ChatGPT account id with the user id (proposed). On a workspace plan the account id is shared by its members. Is the account id alone enough for personal plans?
+4. **Homes signed in by an API key or the gateway.** Proposed: an account kind `credential`, identified by the provider and the forwarded variable's name, always metered, never a subscription. Or out of scope until such a Worker is needed?
+5. **Parallel use under `assigned`.** May two accounts of one provider serve the same role on one project (proposed), or must each role and project have exactly one account per provider?
+6. **The wait's bound.** `maxLimitWaitHours` 24 (proposed). Should a board task's attempt wait longer?
+7. **Recording `pooledTerms`.** Configuration plus a `gate` decision at start (proposed), or a `policy-change` through the approval queue ([ADR-0041](../decisions/adr/0041-policy-changes-through-the-approval-queue.md))?
+8. **Project assignments.** Should website accounts be assignable to projects too? That would carry the run's project into routing from a trusted envelope, which no seam does today (ADR-0039 lists it as open).
+9. **The masked hint.** Keep a masked email for the operator to tell accounts apart (proposed), or only the id?
 
 ## Decision
 
 Accepted by the operator on 2026-10-23 (D23), with the answer D24: all eight accounts are personal
 paid subscriptions, so accounts are assigned, not pooled, and the website accounts take the same
-per-provider setting, assigned by default. Phase B wrote the two ADRs named above, proposed:
+per-provider setting, assigned by default. Phase B wrote the two ADRs, proposed:
 [ADR-0051](../decisions/adr/0051-agent-accounts-are-enrolled-slots-identified-by-their-login.md)
-and [ADR-0052](../decisions/adr/0052-accounts-are-assigned-unless-pooling-is-recorded.md). Where
-an open question below had a proposed answer that phase B or D needed, it was taken as proposed:
-parallel use under `assigned` (question 5), `maxLimitWaitHours` 24 (question 6), and `pooledTerms`
-as configuration with a `gate` decision at start (question 7).
+and [ADR-0052](../decisions/adr/0052-accounts-are-assigned-unless-pooling-is-recorded.md). Open questions 5, 6,
+and 7 were taken as proposed where phase B or D needed them: parallel use under `assigned`,
+`maxLimitWaitHours` 24, and `pooledTerms` as configuration with a `gate` decision at start.
 
 On 2026-10-24 the operator decided (D33) to pool `chatgpt-web`, `gemini-web`, and
 `claude-agent-sdk` although they are personal subscriptions, accepting the risk under their terms;
@@ -671,89 +500,20 @@ supersedes ADR-0052 in part for it: "personal subscriptions never qualify" above
 
 ## Implementation
 
-The state of each phase, and what remains, is in the [roadmap](roadmap.md#done-and-open-milestones). Built:
+The state of each phase is in the [roadmap](roadmap.md#done-and-open-milestones). The built parts are described in [agent runtimes](../design/agent-runtimes.md) and [teams](../design/teams.md#distinct-accounts).
 
-- **Phase B** (specification): `agent-account@1.0`, `capability-descriptor@1.5` (`account`),
-  `decision@1.8` (`enrollment`, the `recovery` outcome `wait`); the `agentRuntimes` additions
-  (`RunSpec.home`, `probe({ home })`, `identity(home, key)`, `loginCommand(home)`) with their
-  suite, passed by a fake with scripted homes, every runtime refusing a home it does not run in;
-  the `workers` and `workflow` (contract 1.5) suites extended. `worker-session@1.1`
-  (`antigravity-cli`) is phase C's, and the resource ledger's pool templates and `declare` are
-  phase F's.
-- **Phase D** (account mode): `accounts: assigned | pooled` on the `accounts` row (website
-  providers) and the `agent-workers` row (runtimes), `pooledTerms` required for pooled and recorded
-  at start as a `gate` decision; each website and agent Worker names its `account`; the
-  `assignment` check; the `wait` outcome bounded by `maxLimitWaitHours`; no failover inside an
-  assigned group.
-- **Phase C** (2026-10-23 and 2026-10-24):
-  - an Antigravity CLI member's session records `antigravity-cli` (`worker-session@1.1`, the
-    `workerSessions` contract 1.1,
-    [ADR-0015's amendment](../decisions/adr/0015-worker-sessions-and-peer-messaging.md#amendment-2026-10-23-contract-11-names-the-antigravity-cli-runtime));
-  - two catalog entries signed in as one person take no work, and health names them (REQ-ACC-7;
-    [runbook](../operations/runbooks.md#two-accounts-sign-in-as-one-person));
-  - a `quota_exhausted` run with no limit observation closes its Worker's pool, and with no pool
-    cools its runtime down ([agent Workers](../../packages/plugins/agent-workers/README.md));
-  - agent `siblings`: every Worker of a runtime, while there is one home per runtime, so a
-    failover leaves them all out, and a cooldown or a closed pool of any of them holds them all
-    (`quota-exhausted`, `limitUntil` the latest reset);
-  - a team's held accounts counted by sibling, and by the descriptor's `account`: two roles of one
-    home are one account, never two members; a member whose held account cannot be told apart is
-    refused with the cause (`workflow` contract 1.5,
-    [distinct accounts](../design/teams.md#distinct-accounts)).
-- **Phase E** (2026-10-24; [enrollment and quarantine](../design/agent-runtimes.md#enrollment-and-quarantine),
-  [runbook](../operations/runbooks.md#enroll-an-agent-account)):
-  - enrollment slots (`slots` on an `agent-workers` `providers` entry, default 1), each an
-    owner-only home; slot 1 adopts the runtime's own home where it is (the provider's optional
-    `home`), later slots are `<DSH_HOME>/system/agent-homes/<provider>/<n>`;
-  - `system account login <runtime>` (MCP `account_enroll`, `begin` then `verify`), `login
-    <accountId>`, `verify`, `remove`, and agent accounts in `system account list` (MCP
-    `account_agents`), operator scope, `mcp-agent-accounts@1.0`;
-  - identity readers: Codex (`tokens.account_id` of `auth.json`) and Claude Code
-    (`oauthAccount.accountUuid` and `organizationUuid` of `.claude.json`), each pinned to the
-    version it was seen on (0.164.0, 2.1.308), against redacted fixtures; Codex and Claude Code run
-    and probe in a named home; the Antigravity CLI gives its sign-in command and reads no identity;
-  - the account id `<provider>:<16 hex>` of an HMAC keyed by a per-install key in the vault;
-    quarantine (`changed`, `ambiguous`, `duplicate` of both slots, `unverified`) and `signed-out`,
-    each an `enrollment` decision first; re-read at each probe and before each run, never lifting
-    anything; health's `agent-accounts` check;
-  - open questions taken as proposed: Codex's principal is its ChatGPT account id alone (question
-    3; a workspace plan's shared id then reads as a duplicate, the safe side); Claude Code's is the
-    account and organization ids from the home's state file (question 2); the masked hint is kept
-    (question 9); an API-key sign-in names no person and is `ambiguous` (question 4, the account
-    kind `credential` not built).
-  - Until the operator applies phase F's move (its cutover), the hand-named Workers run in their
-    runtime's own home: they take work while no
-    slot holds it, or while its account is `ready` or `unverified` (Antigravity's slot 1, as before
-    enrollment); never beyond slot 1. Owed: phase A's supervised check of both readers on the
-    operator's real accounts.
-- **Phase F** (2026-10-24; [Workers = account × role](../design/agent-runtimes.md#workers--account--role),
-  [migration](../design/agent-runtimes.md#migration-from-hand-named-rows),
-  [runbook](../operations/runbooks.md#migrate-agent-workers-to-accounts--roles)):
-  - `roles` and `assignments` on the `agent-workers` row; Workers `agent:<accountId>/<role>`,
-    derived; admitted only while their account is `ready`; each run in its account's home;
-  - per account: `maxConcurrentRunsPerAccount` (default 1), `load` and `reserve`, `siblings`,
-    cooldowns; pools from the resources row's `templates` through the ledger's optional `declare`
-    (resources contract 1.1), one per template and ready account;
-  - `system account migrate` (MCP `account_migrate`, `mcp-agent-accounts@1.1`): planned by default,
-    `--apply` recorded as `enrollment` decisions (rule `agent-workers.migration`) with the old
-    Workers' agent sessions and runs moved, `--rollback` undoing exactly those moves.
-  - Departures, each the conservative reading:
-    - **The cutover** (migration step 2) refuses the hand-named rows only once the operator applied
-      the move, not at the upgrade: until then both shapes load (one per row), and the hand-named
-      Workers route and run exactly as before (tested), so a release with phase F changes nothing
-      on the live host by itself;
-    - the pool id is `<template>/<accountId>`, not `<template>@<accountId>`: `@` is not an id
-      character (`common@1`);
-    - open question 1 taken as proposed: the cutover waits for the Antigravity CLI's reader, unless
-      the operator stops its Workers at the cutover (`--stop antigravity-cli`);
-    - the pools declared are the ready assigned accounts' (ADR-0052), declared again whenever that
-      set changes;
-    - `maxConcurrentRunsPerAccount` of a migrated runtime is the number of its hand-named rows, so
-      as many of its runs run at once as did;
-    - **the first experiment's record** (step 6) is not revised here: its new ids are the live
-      accounts' keyed hashes, which only the operator's `system account migrate` prints; the
-      runbook revises it (`revision: 2`) before it is registered;
-    - the `workerSessions` records of team members keep the ids they were written with, as other
-      records do; only the `agents` source's own sessions and runs move.
+Still owed:
 
-The other phases are listed [above](#phased-plan).
+- phase A's supervised check of both readers on the operator's real accounts;
+- phase G's live checks.
+
+Choices taken where this proposal left room:
+
+- the cutover refuses hand-named rows only once the operator applies the move; until then both shapes load and run as before;
+- the pool id is `<template>/<accountId>`, since `@` is not an id character;
+- the cutover waits for the Antigravity CLI's reader unless the operator stops its Workers then (`--stop antigravity-cli`);
+- the pools declared are those of the ready assigned accounts (ADR-0052), declared again when that set changes;
+- `maxConcurrentRunsPerAccount` of a migrated runtime is its number of hand-named rows;
+- the first experiment's record is revised by the runbook, since its new ids are the live accounts' keyed hashes, which only `system account migrate` prints;
+- team members' `workerSessions` records keep their ids; only the `agents` source's sessions and runs move;
+- open questions 2, 3, 4, and 9 were taken as proposed in phase E.

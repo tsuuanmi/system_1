@@ -4,7 +4,7 @@
 - **Date:** 2026-10-11
 - **Supersedes in part:** [ADR-0001](0001-standalone-host.md) (no DSH packages),
   [ADR-0002](0002-typescript-on-bun.md) (Bun runtime)
-- **Related:** ADR-0007, ADR-0008, ADR-0010, [DSH analysis](../../research/dsh-analysis.md),
+- **Related:** ADR-0007, ADR-0008, ADR-0010, DSH analysis (removed; in Git history),
   [plugin model](../../architecture/plugin-model.md#dsh-core-reuse-map)
 
 ## Context
@@ -116,7 +116,7 @@ Option 3.
 
 ## Follow-up (2026-10-11): M0 spike results
 
-[Spike evidence](../../research/m0-dsh-core-spike.md):
+Spike evidence (removed; in Git history):
 
 1. A profile without `web-app` stays resident: **yes**.
 2. An MCP Streamable HTTP endpoint on `ctx.webServer` with loopback, a token, and

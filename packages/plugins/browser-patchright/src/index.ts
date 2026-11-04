@@ -7,7 +7,7 @@
  * driver's origins. A session-bound account's turns are pages of one persistent context on
  * its login profile instead (ADR-0030). Ported from tsuuanmi/internet `src/browser/runtime.ts` and
  * `chrome.ts`; launch and filter patterns from `@anweat/dsh-browser`
- * (docs/research/dsh-community-plugins-review.md#browser-runtime-second-pass-2026-10-11).
+ * (docs/engineering/dependencies.md).
  * @module @tsuuanmi/system-browser-patchright
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -19,9 +19,7 @@ import { discoverChrome } from './chrome.ts'
 import { ProfileContexts } from './profiles.ts'
 import { type StorageState, fromStorageState, toStorageState } from './state.ts'
 
-export { CHROME_LOCK, type ChromeChoice, type ChromeLock, discoverChrome, engineChromiumMajor, installManagedChrome, managedBrowsersDir, managedChromePath } from './chrome.ts'
-export { type CaptureOptions, type StorageState, fromStorageState, toStorageState } from './state.ts'
-
+export { CHROME_LOCK, type ChromeChoice, discoverChrome, installManagedChrome } from './chrome.ts'
 
 /** Pages render and update as if in the foreground (docs/design/browser-runtime.md#display-modes-ctxdisplay). */
 export const CHROME_ARGS = [

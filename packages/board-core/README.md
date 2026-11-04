@@ -1,15 +1,21 @@
 # @tsuuanmi/system-board-core
 
-Work state machine **seam definition**
+Work state machine **seam definitions**
 ([plugin model](../../docs/architecture/plugin-model.md#seam-catalog), plugin rule 2;
 [board](../../docs/design/board.md)). A guarantee seam: its contract changes only by an ADR
 ([ADR-0036](../../docs/decisions/adr/0036-guarantee-core-and-capability-plugins.md)).
 
+The plugin model's core table names the work state machine as the component of `board` and of
+`leases` (one writer per subject, [INV-15](../../docs/architecture/invariants.md#inv-15-one-writer-per-subject)),
+so `leases` is defined here too, and not in a package of its own (T316c).
+
 | Seam | Definition | Provider |
 |---|---|---|
-| `ctx.board` | abstract `Board` with `charter(input, at?)`, `project`, `projects`, `pause`, `resume`, `close`, `propose(input, at?)`, `task`, `tasks`, `claim`, `renew`, `start`, `submit`, `accept`, `reconcileRun`, `block` (its optional `funding`, 1.2, and `unreleased`, 1.3), `answer`, `cancel`, `sweep(at)`, and the optional `attachDigest(taskId, digest, at?)` (1.1); `Project`, `Charter`, `Milestone`, `BoardTask`, `Funding`, `UnreleasedHold`, `CharterInput`, `TaskInput`, `Claim`, `RunOutcome`, `BoardError`; `TERMINAL`, `fundingVersion`, `UNRELEASED_MAX`, `unreleasedProblem`, `unreleasedText`, `BOARD_CONTRACT` (1.3) | the fake `FakeBoard`; the store-backed [`board`](../plugins/board/README.md) |
+| `ctx.leases` ([`src/leases.ts`](src/leases.ts)) | abstract `Leases` with `acquire`, `hold`, `renew`, `release`, `fence`, `invalidate`, `current`; `Lease`, `Holding`, `Held`, and the errors `LeaseLost` and `StaleGeneration`; the suite [`conformance/leases.ts`](conformance/leases.ts), contract 1.1. Configuration (`maxTtlMs`) is the provider's | [`@tsuuanmi/system-leases`](../plugins/leases/README.md) |
+| `ctx.board` | abstract `Board` with `charter(input, at?)`, `project`, `projects`, `pause`, `resume`, `close`, `propose(input, at?)`, `task`, `tasks`, `claim`, `renew`, `start`, `submit`, `accept`, `reconcileRun`, `block` (its optional `funding`, 1.2, and `unreleased`, 1.3), `answer`, `cancel`, `sweep(at)`, and the optional `attachDigest(taskId, digest, at?)` (1.1) and `reopen(taskId, back, at?)` (1.4); `Project`, `Charter`, `Milestone`, `BoardTask`, `Funding`, `UnreleasedHold`, `Reopening`, `CharterInput`, `TaskInput`, `Claim`, `RunOutcome` (its failed run's optional `infrastructure`, 1.5), `InfrastructureFailure`, `BoardError`; `TERMINAL`, `fundingVersion`, `UNRELEASED_MAX`, `REOPEN_REASON_MAX`, `unreleasedProblem`, `unreleasedText`, `INFRASTRUCTURE_KINDS`, `INFRASTRUCTURE_REASON_MAX`, `infrastructureProblem`, `FREE_RETRIES_DEFAULT`, `FREE_RETRIES_MAX`, `freeRetriesOf`, `BOARD_CONTRACT` (1.5) | the fake `FakeBoard`; the store-backed [`board`](../plugins/board/README.md) |
 
-- The types mirror `project@1.0` and `board-task@1.1`; the schemas in `schemas/` are canonical.
+- The types mirror `project@1.0` and `board-task@1.2` (its `defect` link, `Defect`, set by the optional
+  `linkDefect`, beyond the contract versions, T277b); the schemas in `schemas/` are canonical.
 - `block` takes, from 1.2, an optional `funding` on a `budget-spent` wait: the lines the holder
   asks to raise the task's budget by. `fundingVersion(contentId)` is the version of the subject
   that binds a funding request to those lines (`budget-spent:<sha256 of their canonical JSON>`);
@@ -20,13 +26,21 @@ Work state machine **seam definition**
   count against the task's budget. `unreleasedProblem` is the one check every provider applies
   (`invalid` otherwise), and `unreleasedText` the one wording its request's consequences use; the
   subject and the wait do not change.
+- `reconcileRun` takes, from 1.5, an optional `infrastructure` on a failed run's outcome: the run
+  failed only on the infrastructure (`host-stopped`, `unsent`, or `worker-unavailable`, and a
+  reason of 1 to 500 characters; `infrastructureProblem` is the one check, `invalid` otherwise).
+  While the task has free retries left (`freeRetriesOf`: the provider's bound, default
+  `FREE_RETRIES_DEFAULT` 3, at most `FREE_RETRIES_MAX` 10; INV-9), the run is not counted: the
+  attempt is given back and the same attempt goes through the gate again, on a decision that says
+  why; past it, it counts, so a persistent one ends waiting for input (`retries-spent`) with the
+  reason ([ADR-0069](../../docs/decisions/adr/0069-an-attempt-is-not-spent-on-an-infrastructure-failure.md)).
 - `renderTasks(project, tasks, maxTasks)` is the board's `TASKS.md` projection, a pure function
   of those records, outside the seam's contract: the provider renders it on request, and the
   workflow engine into a task run's worktree, so both render the same text.
 - Depends on Cordis and the vocabulary of `@tsuuanmi/system-approvals-core`: the board asks
   for approvals through `ctx.approvals` and never decides one itself.
 - The conformance suite is [`conformance/board.ts`](conformance/board.ts), run through the
-  [conformance runner](../libs/conformance/runner.ts) at contract 1.3 over any `ctx.approvals`
+  [conformance runner](../libs/conformance/runner.ts) at contract 1.5 over any `ctx.approvals`
   provider:
   - a charter approved by the operator before anything starts; rejection or expiry abandons the
     project and cancels its open tasks; amendments held until approved;
@@ -57,14 +71,25 @@ Work state machine **seam definition**
     rejected, nothing raised; an ask past any bound a provider may set opening no request;
   - since 1.3, a spent budget's request naming the reservations its holder could not release,
     each run, step, and expiry, with or without a funding ask, its subject and the wait as without
-    them; a malformed list, or one on another wait, refused.
+    them; a malformed list, or one on another wait, refused;
+  - since 1.4, a done task's result that could not land sent back as another attempt
+    (`reopen`), through the gate again, its decision naming the landing's, no attempt counted; with
+    none left, a wait for input; one on another run or acceptance, with no reason or no stored
+    decision, or of a task not done, refused, nothing changed.
+  - since 1.5, a failed run that failed only on the infrastructure not counted as an attempt, for
+    each kind, within the default bound of free retries, each move's decision giving the reason;
+    past the bound counted, ending waiting for input with the reason; a malformed report refused.
 
-  It also exports `FakeBoard`, which passes it (its bound per task: `fundingMaxPercent`, default
-  100). Contract 1.0 is unreleased and amended in place
+  It also exports `FakeBoard`, which passes it (its bounds per task: `fundingMaxPercent`, default
+  100; `maxFreeRetries`, default 3). Contract 1.0 is unreleased and amended in place
   ([ADR-0039](../../docs/decisions/adr/0039-base-guarantee-seam-contract-changes.md)); 1.1 adds
   the optional `attachDigest`, a minor
   ([ADR-0040](../../docs/decisions/adr/0040-briefs-on-the-workers-and-workflow-seams.md)); 1.2
   the optional `funding` of a `budget-spent` block, a minor
   ([ADR-0044](../../docs/decisions/adr/0044-funding-raises-a-spent-task-budget.md)); 1.3 its
   optional `unreleased`, a minor
-  ([ADR-0054](../../docs/decisions/adr/0054-a-funding-request-names-the-holds-the-ledger-did-not-release.md)).
+  ([ADR-0054](../../docs/decisions/adr/0054-a-funding-request-names-the-holds-the-ledger-did-not-release.md));
+  1.4 the optional `reopen`, a minor
+  ([ADR-0068](../../docs/decisions/adr/0068-an-accepted-result-is-rebased-onto-its-target-and-checked-again-before-it-lands.md));
+  1.5 a failed run's optional `infrastructure`, a minor
+  ([ADR-0069](../../docs/decisions/adr/0069-an-attempt-is-not-spent-on-an-infrastructure-failure.md)).

@@ -15,7 +15,7 @@ are canonical.
 | language | TypeScript, `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax` |
 | typecheck | `tsc --noEmit` over the whole workspace (root [`tsconfig.json`](../../tsconfig.json), whose `paths` map each package to its `src/`) |
 | build | `tsc -p tsconfig.build.json` per package, into `lib/` ([`tsconfig.build.base.json`](../../tsconfig.build.base.json)) |
-| lint | `oxlint` over `scripts/`, `spikes/`, and `packages/`, with its default rules (no configuration file) |
+| lint | `oxlint` over `scripts/` and `packages/`, with its default rules (no configuration file) |
 | tests | Vitest; bare workspace imports resolve to `src/` ([`vitest.config.ts`](../../vitest.config.ts)) |
 | scripts | `tsx` for the checks and generators in [`scripts/`](../../scripts/), loaded in the process (`node --import tsx <script>`, never the `tsx` CLI, whose IPC pipe is a unix socket an agent's command sandbox refuses; [confined commands](../design/agent-runtimes.md#confined-commands)) |
 | browser automation | `patchright-core` against a system or pinned managed Chrome (CON-7) |
@@ -33,11 +33,11 @@ pnpm workspaces ([`pnpm-workspace.yaml`](../../pnpm-workspace.yaml)):
 | `schemas/` | the JSON Schemas, as the package `@tsuuanmi/system-schemas` |
 | `packages/libs` | pure shared libraries: canonical JSON, content ids, schema validation, durable files |
 | `packages/*-core` | seam definitions (abstract classes and conformance suites) and shared mechanisms, such as `provider-core`, `workers-core`, `agent-runtime-core`, and `gateway-core`; every package is in the [package graph](../architecture/packages.md) |
-| `packages/ui-ops`, `packages/gateway-turns`, `packages/statistics` | libraries: the UI engine, the gateways' shared text tool protocol, and the evaluation engine's statistics |
+| `packages/ui-ops`, `packages/gateway-turns` | libraries: the UI engine and the gateways' shared text tool protocol |
 | `packages/plugins/*` | every Cordis plugin, one package each |
 | `packages/system-bundle` | the bundle that mounts the plugins ([`cordis.patch.yml`](../../packages/system-bundle/cordis.patch.yml)) |
 | `packages/cli` | the `system` command |
-| `scripts/`, `spikes/` | repository checks and generators; the test groups ([testing](testing.md#test-groups)); the release scripts ([releasing](releasing.md)); the live install's update ([runbook](../operations/runbooks.md#update-the-live-install-from-e218ae7-to-the-base-release)); the experiments' helpers ([experiments](../validation/experiments/README.md)); the statistics goldens' generator ([golden tests](../design/statistics.md#golden-tests)); the M0 spike |
+| `scripts/` | repository checks and generators; the test groups ([testing](testing.md#test-groups)); the release scripts ([releasing](releasing.md)); the live install's update ([runbook](../operations/runbooks.md#update-the-live-install-from-e218ae7-to-the-base-release)); the experiments' helpers ([experiments](../validation/experiments/README.md)); the statistics goldens' generator ([golden tests](../design/statistics.md#golden-tests)) |
 
 Each package has a colocated `README.md` that says what it owns, what it does not
 own, its entry points, and its dependency direction, and links back to
@@ -67,6 +67,7 @@ pnpm gen:traceability   # regenerate docs/validation/traceability.md from test t
 pnpm test               # every *.spec.ts: unit, contract, driver, concurrency, and architecture tests: the whole suite
 pnpm test:group <name>  # one functional group of it (testing.md#test-groups); no name lists them
 pnpm test:affected      # the groups the change since origin/main affects (--base <ref>, --dry-run)
+pnpm test:related <files…>  # the tests related to those files (testing.md#tests-scale-with-the-change); a Worker runs this, never the full suite
 pnpm test:e2e           # build, then boot the real profile through dsh (packages/cli/tests)
 pnpm test:crash         # build, then SIGKILL the engine at each crash point and restart it (testing.md)
 pnpm changeset          # record a user-visible change for the next release (releasing.md)
@@ -105,11 +106,10 @@ After changing an MCP tool, regenerate its reference from a running profile:
 Work flows through two long-lived branches, `dev` and then `main`:
 
 - **`dev` integrates.** Workers' branches and the lead's batches merge into
-  `dev`. CI runs the full gate on every push to `dev`, as on `main`
+  `dev`. CI runs the full gate on every push to `dev`, and on nothing before the merge
   ([CI gates](testing.md#ci-gates)).
-- **The live install follows `dev`.** The automatic live update runs with
-  `--branch dev` ([runbook](../operations/runbooks.md#update-the-live-install-automatically)),
-  and only a commit whose CI passed reaches it, as a fast-forward.
+- **The live install follows `dev`.** The operator updates it to a `dev` commit
+  whose CI passed ([runbook](../operations/runbooks.md#update-the-live-install-from-e218ae7-to-the-base-release)).
 - **`main` takes `dev` only by the operator.** `dev` reaches `main` only when the
   operator merges a `dev` → `main` pull request: for a release, or for a point
   that needs the operator's permission. A release tag is cut from `main` only
@@ -118,11 +118,10 @@ Work flows through two long-lived branches, `dev` and then `main`:
 
 ## Give work to System Workers
 
-A lead can give a change to System itself, as the coordination did on 2026-10-25: a board task
-that one run of [`algorithm-development`](../reference/workflow-templates.md#algorithm-development)
-serves per attempt. The [board](../design/board.md), the
-[workflow engine's board tasks](../design/workflow-engine.md#board-tasks), and
-[approvals](../design/approvals.md) are canonical; this is the path through them.
+A lead can give a change to System itself: a board task that one run of
+[`algorithm-development`](../reference/workflow-templates.md#algorithm-development) serves per attempt.
+The [board](../design/board.md), the [workflow engine's board tasks](../design/workflow-engine.md#board-tasks),
+and [approvals](../design/approvals.md) are canonical; this is the path through them.
 
 1. **Propose** with MCP `board_propose`: the project, a `title`, a `goal`, the `acceptance`
    criteria (name each validation command in one, exactly as the policy lists it, with its
@@ -131,21 +130,21 @@ serves per attempt. The [board](../design/board.md), the
    propose just before running, after merging what the task builds on
    ([pilot](../operations/pilot.md#plan-the-work), [attempts](../design/board.md#attempts)).
 2. **Start an attempt** with MCP `run`: `template: algorithm-development`, `variant: docs` or
-   `tests` for docs or test work (none for code), and `task: { taskId }`, which claims the ready
-   task (CLI: `system run algorithm-development --variant docs --task <taskId> -`). The `input` is
-   the writing step's. Write it in two parts, "Develop step" and "Validation step", each saying
-   it binds only that step, so one step's orders never become another's. `validate:1` reads the
-   criteria from its brief, never the input, so a command not named in a criterion is not run
+   `tests` for docs or test work (none for code), and `task: { taskId }` (CLI: `system run
+   algorithm-development --variant docs --task <taskId> -`). Write the `input` in two parts, "Develop
+   step" and "Validation step", each saying it binds only that step. `validate:1` reads the criteria
+   from its brief, never the input, so a command not named in a criterion is not run
    ([which inputs reach which step](../reference/workflow-templates.md#which-inputs-reach-which-step)).
-   Point the develop step at [CONTRIBUTING](../../CONTRIBUTING.md): a writer takes the next free
-   ADR number, store migration version, and schema version, since runs written beside it take
-   "the next" from the same tree
+   Point the develop step at [CONTRIBUTING](../../CONTRIBUTING.md), so the writer takes the next free
+   ADR number, store migration version, and schema version
    ([what parallel changes collide on](testing.md#what-parallel-changes-collide-on)).
 3. **What a step may run.** Every tool call passes the run's gate
    ([a Worker's tool calls](../design/approvals.md#a-workers-tool-calls)). Edits inside the
    worktree are `workspace-write`. A command runs unasked only when its exact argv is in the
    studio policy's `commands`; for this repository list `corepack pnpm check`,
    `corepack pnpm test:affected`, and each `corepack pnpm gen:*` generator by its full name
+   (`corepack pnpm test:related <absolute paths inside the worktree>` is admitted by the gate itself,
+   as a write of the worktree, and needs no line)
    ([change the autonomy policy](../operations/runbooks.md#change-the-autonomy-policy)). Any
    other command waits on the approval queue in `develop:1`, and is denied, reported not run, in
    `validate:1`, which has no session. A fixed read-only inspection command (`cat`, `rg`, `ls`,
@@ -155,9 +154,9 @@ serves per attempt. The [board](../design/board.md), the
    need the worktree's offline setup
    ([ADR-0058](../decisions/adr/0058-a-run-worktree-is-set-up-offline-before-its-agent-starts.md),
    [runbook](../operations/runbooks.md#set-up-a-runs-worktree)).
-4. **Follow it**: `system explain <runId>` gives the task's admission, each step's route and
-   acceptance, the result's subject, and the report to the board; `system events --run <runId>`
-   (or `--type`) reads its events. MCP `board_task` gives the task's state and why it waits.
+4. **Follow it**: `system explain <runId>` gives the task's admission, each step's route and acceptance,
+   and the result's subject; `system events --run <runId>` reads its events; MCP `board_task` gives the
+   task's state and why it waits.
 5. **Answer a question.** A step that cannot finish without a person answers
    `{"questions": [...]}`, and the task waits for input. Answer every question, by index, with
    MCP `board_update` `answers`; the next attempt goes through the gate, its brief pointing at the

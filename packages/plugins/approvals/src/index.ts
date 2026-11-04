@@ -17,18 +17,16 @@ import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import {
-  type Action, type ActionClass, ALWAYS_ASK, type ApprovalRequest, Approvals, ApprovalsError, type ArtifactRef, type AutonomyPolicy, type AutonomyVerdict, type ContentHash, MODES,
+  type Action, type ActionClass, ALWAYS_ASK, type ApprovalRequest, Approvals, ApprovalsError, type ArtifactRef, type AutonomyPolicy, type AutonomyVerdict, type ContentHash, HOST_STOPPED_RECONCILIATION, MODES,
   type NewRequest, POLICY_SET_REF, type PolicyChange, type PolicyChangeOrigin, type PolicySetInForce, type RequestState, type Subject, type Verdict, type VerdictResult,
 } from '@tsuuanmi/system-approvals-core'
-import type {} from '@tsuuanmi/system-artifacts'
-import type {} from '@tsuuanmi/system-event-log'
-import type {} from '@tsuuanmi/system-gateway-core'
-import { SchemaRegistry } from '@tsuuanmi/system-libs'
-import type {} from '@tsuuanmi/system-store'
-import { ACTION_CLASSES, commandProblems, effectOf, PolicySet, policyProblems, proposedSet, rank } from './policy.ts'
+import type {} from '@tsuuanmi/system-ledger-core'
+import { LEAD_PROJECT, leadId, type LeadRemediation, leadMayDecide } from '@tsuuanmi/system-gateway-core'
+import { isRecord, SchemaRegistry } from '@tsuuanmi/system-libs'
+import { ACTION_CLASSES, commandProblems, effectOf, PolicySet, policyProblems, proposedSet, rank, webAccessEffect } from './policy.ts'
 import { registerTools } from './tools.ts'
 
-export { ACTION_CLASSES, PolicySet, policyProblems } from './policy.ts'
+export { ACTION_CLASSES, policyProblems } from './policy.ts'
 
 export interface Config {
   /** `autonomy-policy@1.x` records: exactly one studio policy, and project policies that narrow it. */
@@ -50,6 +48,36 @@ export interface Config {
    * (docs/design/approvals.md#the-queue-proposes-a-policy-change).
    */
   repeatedApprovals?: RepeatedApprovals
+  /**
+   * The dev branches of each project, by project id (ADR-0076): the branches where the project's lead,
+   * on its own token, may approve a merge and accept a result. A branch not listed (a protected one,
+   * `main`) stays the operator's; a project not listed has none, so its lead decides no merge or
+   * acceptance. Each name is a plain branch name, never `main` or `master`.
+   */
+  devBranches?: Record<string, string[]>
+}
+
+/** Branch names no project may list as a dev branch: the lead never decides on them (ADR-0076). */
+const PROTECTED_BRANCHES: readonly string[] = ['main', 'master']
+const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/
+
+/** Every problem of a `devBranches` value; none when it is absent or valid. */
+function devBranchProblems(value: unknown): string[] {
+  if (value === undefined) return []
+  if (!isRecord(value)) return ['devBranches must be an object: {<projectId>: [<branch>, …]}']
+  const problems: string[] = []
+  for (const [project, branches] of Object.entries(value)) {
+    if (!LEAD_PROJECT.test(project)) problems.push(`devBranches names project ${JSON.stringify(project)}, which is not a project id a lead token can be issued for`)
+    if (!Array.isArray(branches) || branches.some((b) => typeof b !== 'string')) {
+      problems.push(`devBranches.${project} must be a list of branch names`)
+      continue
+    }
+    for (const branch of branches as string[]) {
+      if (!BRANCH.test(branch) || branch.includes('..') || branch.endsWith('/') || branch.endsWith('.lock')) problems.push(`devBranches.${project}: ${JSON.stringify(branch)} is not a branch name`)
+      else if (PROTECTED_BRANCHES.includes(branch)) problems.push(`devBranches.${project}: ${branch} is a protected branch; only the operator decides on it, so it cannot be listed`)
+    }
+  }
+  return problems
 }
 
 /** When the queue proposes a policy change from repeated approvals of one shape. */
@@ -66,12 +94,12 @@ export interface RepeatedApprovals {
 interface Threshold { approvals: number; windowSeconds: number }
 
 /** The bounds and defaults of {@link RepeatedApprovals}: conservative, since a proposal asks the operator once more. */
-export const REPEATED_APPROVALS = { approvals: { min: 3, max: 100, default: 5 }, windowSeconds: { min: 3600, max: 7776000, default: 604800 } } as const
+const REPEATED_APPROVALS = { approvals: { min: 3, max: 100, default: 5 }, windowSeconds: { min: 3600, max: 7776000, default: 604800 } } as const
 
 /** Every problem of a `repeatedApprovals` value; none when it is absent or valid. */
 function repeatedProblems(value: unknown): string[] {
   if (value === undefined) return []
-  if (!isObject(value)) return ['repeatedApprovals must be an object: {enabled?, approvals?, windowSeconds?}']
+  if (!isRecord(value)) return ['repeatedApprovals must be an object: {enabled?, approvals?, windowSeconds?}']
   const problems: string[] = []
   for (const key of Object.keys(value)) if (key !== 'enabled' && key !== 'approvals' && key !== 'windowSeconds') problems.push(`repeatedApprovals.${key} is not an option`)
   if (value.enabled !== undefined && typeof value.enabled !== 'boolean') problems.push('repeatedApprovals.enabled must be true or false')
@@ -92,17 +120,54 @@ export interface ListFilter { states?: RequestState[]; batchId?: string; project
 /** A page of the queue, and the cursor of the next one (absent on the last). */
 export interface RequestPage { requests: ApprovalRequest[]; next?: string }
 
-export const REQUEST_STATES: readonly RequestState[] = ['open', 'batched', 'approved', 'rejected']
+const REQUEST_STATES: readonly RequestState[] = ['open', 'batched', 'approved', 'rejected']
+/** An artifact as the queue reads it for a lead's rights: its kind, run, inputs, and body. */
+type ReadArtifact = (ref: string) => { kind: string; runId?: string; inputs: readonly string[]; body?: unknown } | undefined
+
+/**
+ * Which routine remediation a request is, read from its own fields and the records they name, never
+ * its summary (ADR-0076, amended by T302). Fails closed: any other remediation is undefined.
+ * - `review-fix`: requester `workflow` with a run and a gate node; the subject is a `plan` artifact of
+ *   that run, which the action's one ref names, grown by a review's `workflow.remediation` decision
+ *   (`graph-growth`, `append`) of the same run, and holding one step, the fix, after that gate.
+ * - `host-stopped-retry`: requester `board` with a task; subject `board-task:<id>:attempt:<n>` at
+ *   version {@link HOST_STOPPED_RECONCILIATION}, the board's mark that the run's lease lapsed while the
+ *   host was stopped. A lost run without the mark (a holder that hung while the host ran, or blocked
+ *   itself) stays the operator's.
+ */
+function leadRemediationOf(request: ApprovalRequest, read: ReadArtifact): LeadRemediation | undefined {
+  const { requester, subject, action } = request
+  if (action.class !== 'remediation') return undefined
+  if (requester.component === 'board') {
+    return requester.taskId !== undefined && subject.type === 'content' && subject.version === HOST_STOPPED_RECONCILIATION
+      && subject.ref.startsWith(`board-task:${requester.taskId}:attempt:`) ? 'host-stopped-retry' : undefined
+  }
+  if (requester.component !== 'workflow' || requester.runId === undefined || requester.nodeId === undefined) return undefined
+  if (subject.type !== 'artifact' || action.refs?.length !== 1 || action.refs[0] !== subject.ref) return undefined
+  const plan = read(subject.ref)
+  if (plan?.kind !== 'plan' || plan.runId !== requester.runId) return undefined
+  const body = plan.body as { runId?: unknown; nodes?: Array<{ dependsOn?: unknown }> } | undefined
+  const fix = body?.nodes?.length === 1 ? body.nodes[0] : undefined
+  if (body?.runId !== requester.runId || !Array.isArray(fix?.dependsOn) || fix.dependsOn.length !== 1 || fix.dependsOn[0] !== requester.nodeId) return undefined
+  const grown = plan.inputs.some((ref) => {
+    const decision = read(ref)
+    const d = decision?.body as { decisionType?: unknown; decider?: { id?: unknown }; outcome?: { option?: unknown } } | undefined
+    return decision?.kind === 'decision' && decision.runId === requester.runId
+      && d?.decisionType === 'graph-growth' && d.decider?.id === 'workflow.remediation' && d.outcome?.option === 'append'
+  })
+  return grown ? 'review-fix' : undefined
+}
+
 /** Requests one `approvals_list` page holds unless asked otherwise, and at most (`mcp-approvals@1`). */
-export const DEFAULT_PAGE = 20
-export const MAX_PAGE = 100
+const DEFAULT_PAGE = 20
+const MAX_PAGE = 100
 /** Requests the sweep reads per statement; a protocol constant, not a deployment value. */
 const SWEEP_PAGE = 500
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/
 const CONTENT_ID = /^sha256:[0-9a-f]{64}$/
 /** Policy changes one `policyChanges` call returns unless asked otherwise, and at most. */
-export const DEFAULT_CHANGES = 20
-export const MAX_CHANGES = 100
+const DEFAULT_CHANGES = 20
+const MAX_CHANGES = 100
 const CHANGE_STATES: ReadonlyArray<PolicyChange['state']> = ['asked', 'applied', 'declined', 'retired']
 const OPEN: readonly RequestState[] = ['open', 'batched']
 /** Listing order: batched requests by batch, then the rest; within each, by expiry, then by insertion. */
@@ -145,10 +210,9 @@ const MIGRATIONS = [{
 }]
 
 const invalid = (message: string): ApprovalsError => new ApprovalsError('invalid', message)
-const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 const sameSubject = (a: Subject, b: Subject): boolean => a.type === b.type && a.ref === b.ref && a.version === b.version
 /** INV-5: a request's subject is exact: it names a version, unless it is an artifact by its content id. */
-const exactSubject = (subject: unknown): boolean => isObject(subject)
+const exactSubject = (subject: unknown): boolean => isRecord(subject)
   && ((typeof subject.version === 'string' && subject.version !== '') || (subject.type === 'artifact' && typeof subject.ref === 'string' && CONTENT_ID.test(subject.ref)))
 const sameList = (a: unknown, b: readonly string[]): boolean => Array.isArray(a) && a.length === b.length && a.every((x, i) => x === b[i])
 /** A window in words: whole days, else whole hours, else seconds. */
@@ -169,8 +233,19 @@ const clip = (text: string, max: number): string => { const chars = [...text]; r
 /** The fields of a recorded `autonomy` decision that `request` checks. */
 interface AutonomyDecision {
   decisionType?: string
-  outcome?: { option?: string; detail?: { actionClass?: unknown; policies?: unknown } }
+  outcome?: { option?: string; detail?: { actionClass?: unknown; policies?: unknown; sandboxedCommand?: unknown } }
   decider?: { type?: string; id?: string; version?: string; hash?: string }
+}
+
+/**
+ * The sandboxed-command rule's outcome a recorded `autonomy` decision names (ADR-0080), when it
+ * names one: the context its action was judged in (`sandboxed: true`), which the request's record
+ * does not keep. Read from the decision, this provider's own record, never from a caller's word.
+ */
+function sandboxedOutcomeOf(body: AutonomyDecision | undefined): { rule: string; outcome: string; by?: string } | undefined {
+  const named = body?.outcome?.detail?.sandboxedCommand
+  if (!isRecord(named) || typeof named.rule !== 'string' || typeof named.outcome !== 'string') return undefined
+  return { rule: named.rule, outcome: named.outcome, ...(typeof named.by === 'string' ? { by: named.by } : {}) }
 }
 
 /** Who resolved a request that no verdict resolved, and why: the decider rule and the reason it records. */
@@ -199,6 +274,7 @@ export function checkConfig(config: Partial<Config> = {}): string[] {
   const problems = policyProblems(config.policies)
   if (config.supersedes !== undefined && (typeof config.supersedes !== 'string' || !CONTENT_ID.test(config.supersedes))) problems.push('supersedes must be the sha256:… hash of a stored policy set')
   problems.push(...repeatedProblems(config.repeatedApprovals))
+  problems.push(...devBranchProblems(config.devBranches))
   return problems
 }
 
@@ -220,6 +296,8 @@ export class StoreApprovals extends Approvals {
         .description('The window in seconds: the requests made in it count, and none of the shape may have been rejected or have expired'),
     }).description('Off unless enabled. The queue proposes, never applies, a policy change adding one exact studio command (its argv, nothing more) to the studio policy\'s commands list, '
       + 'once the operator approved it often enough in the window and rejected or let expire none; never for a class that always asks, never again for a command whose proposal was rejected or expired, at most one proposal open'),
+    devBranches: z.dict(z.array(z.string())).description('The dev branches of each project, by project id: the branches where the project\'s lead, on its own token (`system lead-token issue`), may approve a merge and accept a result. '
+      + 'A branch not listed, and main and master always, stay the operator\'s; a project not listed has none (ADR-0076)'),
   }) as unknown as z<Config>
 
   private readonly schemas = new SchemaRegistry()
@@ -230,6 +308,8 @@ export class StoreApprovals extends Approvals {
   private readonly repeated: Threshold | undefined
   /** The set in force as last read from the store (see {@link current}). */
   private state: InForce | undefined
+  /** Each project's dev branches (ADR-0076). */
+  private readonly dev: Map<string, string[]>
 
   constructor(ctx: Context, config: Config) {
     super(ctx)
@@ -240,6 +320,9 @@ export class StoreApprovals extends Approvals {
     this.supersedes = config.supersedes
     const repeated = repeatedProblems(config.repeatedApprovals)
     if (repeated.length) throw new Error(`approvals: ${repeated.join('; ')}`)
+    const branches = devBranchProblems(config.devBranches)
+    if (branches.length) throw new Error(`approvals: ${branches.join('; ')}`)
+    this.dev = new Map(Object.entries(config.devBranches ?? {}).map(([project, list]) => [project, [...list]]))
     this.repeated = config.repeatedApprovals?.enabled !== true ? undefined : {
       approvals: config.repeatedApprovals.approvals ?? REPEATED_APPROVALS.approvals.default,
       windowSeconds: config.repeatedApprovals.windowSeconds ?? REPEATED_APPROVALS.windowSeconds.default,
@@ -304,9 +387,10 @@ export class StoreApprovals extends Approvals {
 
   async check(action: Action): Promise<AutonomyVerdict> {
     this.validAction(action)
-    const { actionClass, rule: { policy, mode, named, raised }, failedChecks, policies, forbidden } = this.set.judge(action)
+    const { actionClass, rule: { policy, mode, named, raised }, failedChecks, policies, forbidden, commandRule, sandboxedCommand } = this.set.judge(action)
     const source = named ? `${policy.id}'s rule for ${actionClass}` : `${policy.id}'s default, as no rule of it names ${actionClass}`
     const reason = (m: typeof mode): string => forbidden ? (m === mode ? `${forbidden}: forbidden whatever a rule says` : `not ${m}: ${forbidden}`)
+      : sandboxedCommand?.outcome === 'auto' && m === mode && mode === 'auto' ? `the sandboxed-command rule ${sandboxedCommand.rule}: the run's confinements are proved and no forbid or ask shape matches, so the call is auto, not ${policy.id}'s ${actionClass} mode`
       : raised ? (m === mode ? `${source} says ${raised}, raised to ask: ${actionClass} always asks` : rank(m) < rank(mode) ? `not ${m}: ${actionClass} always asks` : `not ${m}: nothing that applies to ${actionClass} is that strict`)
       : m === mode ? `the strictest that applies is ${source}`
       : rank(m) < rank(mode) ? `not ${m}: laxer than ${source} (${mode}), the strictest that applies`
@@ -315,7 +399,7 @@ export class StoreApprovals extends Approvals {
       schema: 'decision@1.4', decisionType: 'autonomy', question: `Which mode does the policy give a ${action.class} action?`, inputs: [],
       candidates: MODES.map((m) => ({ option: m, selected: m === mode, reasons: [reason(m)] })),
       decider: { type: 'policy', id: policy.id, version: String(policy.version), hash: this.set.hash(action.projectId) },
-      outcome: { option: mode, detail: { actionClass, policies: policies.map((p) => p.id), ...(failedChecks.length ? { failedChecks } : {}), ...(forbidden ? { forbidden } : {}) } }, deterministic: true,
+      outcome: { option: mode, detail: { actionClass, policies: policies.map((p) => p.id), ...(failedChecks.length ? { failedChecks } : {}), ...(forbidden ? { forbidden } : {}), ...(commandRule ? { commandRule } : {}), ...(sandboxedCommand ? { sandboxedCommand } : {}) } }, deterministic: true,
     }, { producer: { type: 'policy', ref: policy.id } })
     return { mode, ...(failedChecks.length ? { failedChecks } : {}), policy: { id: policy.id, version: policy.version }, decision: decision.id as ArtifactRef }
   }
@@ -324,7 +408,7 @@ export class StoreApprovals extends Approvals {
 
   async request(request: NewRequest, at: Date = new Date()): Promise<ApprovalRequest> {
     const when = this.instant(at)
-    if (!isObject(request) || !isObject(request.verdict) || !isObject(request.action) || !isObject(request.requester)) throw invalid('a request has a subject, an action, a requester, and the verdict that asked')
+    if (!isRecord(request) || !isRecord(request.verdict) || !isRecord(request.action) || !isRecord(request.requester)) throw invalid('a request has a subject, an action, a requester, and the verdict that asked')
     // Only the queue asks for its own policy changes (proposePolicy); a caller never names it.
     if (request.requester.component === 'approvals' || request.requester.policyChangeId !== undefined) throw invalid('only the queue requests a policy change of its own, through proposePolicy')
     return this.open(request, when, 'approval-request@1.0')
@@ -361,7 +445,7 @@ export class StoreApprovals extends Approvals {
       // Ids, the class, and the expiry only: never the summary, consequences, or command (a surface reads it).
       this.announce('approvals.requested', {
         requestId: created.requestId, actionClass: created.action.class, expiresAt: created.expiresAt, component: created.requester.component,
-        ...(projectId !== undefined ? { projectId } : {}), ...(created.requester.policyChangeId !== undefined ? { policyChangeId: created.requester.policyChangeId } : {}),
+        ...(projectId !== undefined ? { projectId } : {}), ...(created.requester.taskId !== undefined ? { taskId: created.requester.taskId } : {}), ...(created.requester.policyChangeId !== undefined ? { policyChangeId: created.requester.policyChangeId } : {}),
       })
       return structuredClone(created)
     })
@@ -425,21 +509,99 @@ export class StoreApprovals extends Approvals {
    * open request is judged again under a policy one would have approved only once all committed.
    */
   async decide(verdicts: Verdict[], at: Date = new Date(), check?: (results: VerdictResult[]) => void): Promise<VerdictResult[]> {
+    return this.decideBy(verdicts, this.instant(at), check)
+  }
+
+  /**
+   * A project's lead gives verdicts on its own token (ADR-0076): each is checked against the lead's
+   * closed list of rights first ({@link leadMayDecide}), and one outside it refuses the whole call,
+   * with the reason, before anything is decided. What is decided is recorded with the decider
+   * `lead:<project>`, never as the operator's.
+   */
+  async decideAsLead(project: string, verdicts: Verdict[], at: Date = new Date(), check?: (results: VerdictResult[]) => void): Promise<VerdictResult[]> {
     const when = this.instant(at)
+    if (typeof project !== 'string' || !LEAD_PROJECT.test(project)) throw invalid('a lead decides for a project')
+    if (!Array.isArray(verdicts)) throw invalid('verdicts is not a list')
+    verdicts.forEach((v, i) => this.validVerdict(v, i))
+    const refused: string[] = []
+    const outside: Array<{ requestId: string; actionClass: string }> = []
+    for (const v of verdicts) {
+      const request = this.read(v.requestId)?.request
+      if (!request) continue
+      const may = await this.leadMay(project, request)
+      if (!may.ok) {
+        refused.push(`${v.requestId} (${request.action.class}): ${may.reason}`)
+        outside.push({ requestId: v.requestId, actionClass: request.action.class })
+      }
+    }
+    if (refused.length) {
+      // The refusal is recorded (ids and classes only) so the project's lead inbox tells that the request needs the operator.
+      try {
+        for (const o of outside.slice(0, 50)) this.ctx.get('eventLog')?.append({ type: 'approvals.lead-refused', data: { projectId: project, requestId: o.requestId, actionClass: o.actionClass } })
+      } catch (error) {
+        this.ctx.logger.warn(`approvals: the lead refusal of project ${project} was not recorded: ${(error as Error).message}`)
+      }
+    }
+    if (refused.length) throw new ApprovalsError('forbidden', `${leadId(project)} may not give ${refused.length === 1 ? 'this verdict' : 'these verdicts'}; nothing was decided. ${refused.join(' | ')}`)
+    return this.decideBy(verdicts, when, check, project)
+  }
+
+  /**
+   * Whether the lead of `project` may decide `request` (ADR-0076), by the closed list of its rights
+   * ({@link leadMayDecide}): the one test `decideAsLead` applies and the lead brief reads, so what the
+   * brief shows as held on the lead is what the lead's token would be let decide.
+   */
+  async leadMay(project: string, request: ApprovalRequest): Promise<ReturnType<typeof leadMayDecide>> {
+    return leadMayDecide({
+      project, of: await this.projectOfRequest(request), action: request.action.class,
+      branch: request.action.class === 'merge' ? this.baseBranchOf(request) : undefined, devBranches: this.devBranches(project),
+      remediation: request.action.class === 'remediation' ? leadRemediationOf(request, (ref) => this.ctx.artifacts.get(ref as never)) : undefined,
+    })
+  }
+
+  /**
+   * The project a request belongs to, for a lead's rights (ADR-0076): the project its requester names;
+   * else, for a Worker's command (judged under the studio policy, so its requester names no project),
+   * the board project of the task the requester names, as the board holds it. Undefined when neither
+   * is known: then no lead decides it.
+   */
+  async projectOfRequest(request: ApprovalRequest): Promise<string | undefined> {
+    if (request.requester.projectId !== undefined) return request.requester.projectId
+    const taskId = request.requester.taskId
+    if (taskId === undefined) return undefined
+    const board = this.ctx.get('board' as never) as { task?: (taskId: string) => Promise<{ projectId?: string } | undefined> } | undefined
+    return (await board?.task?.(taskId))?.projectId
+  }
+
+  /** The branches a project lists as dev branches (ADR-0076); none for a project not listed. */
+  devBranches(project: string): string[] {
+    return [...(this.dev.get(project) ?? [])]
+  }
+
+  /** The branch a `merge` request merges into, read from the landing of its run (the workflow engine); undefined when it cannot be read. */
+  private baseBranchOf(request: ApprovalRequest): string | undefined {
+    const runId = request.requester.runId
+    if (runId === undefined) return undefined
+    const workflow = this.ctx.get('workflow' as never) as { landing?: (runId: string) => { base?: { branch?: string }; requestId?: string } | undefined } | undefined
+    const landing = workflow?.landing?.(runId)
+    return landing?.requestId === request.requestId ? landing.base?.branch : undefined
+  }
+
+  private decideBy(verdicts: Verdict[], when: Date, check?: (results: VerdictResult[]) => void, lead?: string): VerdictResult[] {
     if (!Array.isArray(verdicts)) throw invalid('verdicts is not a list')
     verdicts.forEach((v, i) => this.validVerdict(v, i))
     // A stored record that fails its schema refuses the whole call before any verdict applies.
     for (const v of verdicts) this.read(v.requestId)
-    if (!check) return this.applyVerdicts(verdicts, when)
+    if (!check) return this.applyVerdicts(verdicts, when, lead)
     return this.ctx.store.transaction(() => {
-      const results = this.applyVerdicts(verdicts, when)
+      const results = this.applyVerdicts(verdicts, when, lead)
       check(results)
       return results
     })
   }
 
   /** {@link decide}'s verdicts, each in its own transaction (a savepoint inside the caller's). */
-  private applyVerdicts(verdicts: Verdict[], when: Date): VerdictResult[] {
+  private applyVerdicts(verdicts: Verdict[], when: Date, lead?: string): VerdictResult[] {
     // Each verdict is its own transaction: a refused one changes nothing, and the others still
     // apply. One that fails (a busy store, a write that went stale) is reported as failed, never
     // hidden behind an error that drops the outcomes of the others.
@@ -458,11 +620,15 @@ export class StoreApprovals extends Approvals {
           const change = this.changeOf(request)
           if (change && v.verdict === 'approved' && change.baseHash !== this.set.setHash()) return { requestId: v.requestId, state: request.state, refused: 'subject-changed' }
           // INV-5: the verdict is written on the request's own subject, the one the operator saw.
+          // A lead's verdict is the lead's (ADR-0076): approval@1.0's `by` is closed to operator and policy, so the
+          // artifact says who gave it in its producer (system, `lead:<project>`) and its note, and the decision names the decider.
+          const note = lead !== undefined ? `[${leadId(lead)}] ${v.note ?? ''}`.trim().slice(0, 2000) : v.note
           const approval = this.ctx.artifacts.put({
-            kind: 'approval', bodySchema: 'approval@1.0', body: { schema: 'approval@1.0', subject: request.subject, verdict: v.verdict, by: 'operator', ...(v.note ? { note: v.note } : {}) },
-            classification: request.classification === 'local-private' ? 'local-private' : 'operator-shared', producer: { type: 'operator', ref: 'operator' }, subject: request.subject,
+            kind: 'approval', bodySchema: 'approval@1.0', body: { schema: 'approval@1.0', subject: request.subject, verdict: v.verdict, by: 'operator', ...(note ? { note } : {}) },
+            classification: request.classification === 'local-private' ? 'local-private' : 'operator-shared',
+            producer: lead !== undefined ? { type: 'system', ref: leadId(lead) } : { type: 'operator', ref: 'operator' }, subject: request.subject,
           }).id as ArtifactRef
-          const resolved = this.resolve(request, 'verdict', v.verdict, when, approval)
+          const resolved = this.resolve(request, 'verdict', v.verdict, when, approval, undefined, lead)
           if (change && v.verdict === 'approved') changed = true
           return { requestId: v.requestId, state: resolved.state, approval }
         })
@@ -509,7 +675,7 @@ export class StoreApprovals extends Approvals {
    */
   async proposePolicy(proposal: { policy: AutonomyPolicy; note?: string }, at: Date = new Date(), check?: (proposed: { change: PolicyChange; request: ApprovalRequest }) => void): Promise<{ change: PolicyChange; request: ApprovalRequest }> {
     const when = this.instant(at)
-    if (!isObject(proposal) || !isObject(proposal.policy)) throw invalid('a proposal is {policy, note?}: one autonomy-policy@1.0 record')
+    if (!isRecord(proposal) || !isRecord(proposal.policy)) throw invalid('a proposal is {policy, note?}: one autonomy-policy@1.0 record')
     const note = proposal.note
     if (note !== undefined && (typeof note !== 'string' || note.length > 2000)) throw invalid('note must be a string of at most 2000 characters')
     try {
@@ -549,6 +715,8 @@ export class StoreApprovals extends Approvals {
         ? `Change the autonomy policy ${policy.id}: version ${made.previous.version} to ${policy.version}`
         : `Add project ${String(projectId)}'s autonomy policy ${policy.id} (version ${policy.version})`
     const modes = effect.map((e) => `${e.projectId ?? 'studio'} ${e.actionClass} ${e.from} → ${e.to}`).join('; ')
+    // A web access grant moves no mode (external-send still asks), so the operator is shown it apart (ADR-0074).
+    const web = webAccessEffect(base.set, next)
     const listed = from && next.effective('workspace-write')
     const consequences = clip((from
       ? `Proposed by the queue, not by you: you approved this exact command ${from.requests.length} times among the requests of the last ${span(from.windowSeconds)}, and rejected none and let none expire. `
@@ -556,7 +724,7 @@ export class StoreApprovals extends Approvals {
         + `the set ${hash} replaces the set in force (${baseHash}) at once, and every open request is judged again under it (one made under ${policy.id} version ${made.previous!.version} is withdrawn, and its requester asks again). `
         + 'If rejected or unanswered: nothing changes, and the queue never proposes this command again.'
       : `If approved: the set ${hash} replaces the set in force (${baseHash}) at once, and every open request is judged again under it. `
-        + `If rejected or unanswered: nothing changes. ${effect.length ? `Effective modes: ${modes}.` : 'No effective mode moves (expiry, batching, commands, or required checks only).'}${note ? ` Note: ${note}` : ''}`), 2000)
+        + `If rejected or unanswered: nothing changes. ${effect.length ? `Effective modes: ${modes}.` : 'No effective mode moves (expiry, batching, commands, web access, or required checks only).'}${web ? ` Web access (external-send still asks; these web calls run unasked once the egress check passes): ${web}.` : ''}${note ? ` Note: ${note}` : ''}`), 2000)
     return this.ctx.store.transaction(() => {
       // The base is the set in force when the change is stored, never an older one (INV-5).
       if (this.current().key !== base.key) throw invalid('another policy change came into force while this one was proposed; propose it again on the set in force')
@@ -597,7 +765,7 @@ export class StoreApprovals extends Approvals {
 
   /** The policy changes, newest first: at most `limit` (default {@link DEFAULT_CHANGES}, at most {@link MAX_CHANGES}), in the given states (default all). */
   async policyChanges(filter: { states?: Array<PolicyChange['state']>; limit?: number } = {}): Promise<PolicyChange[]> {
-    if (!isObject(filter)) throw invalid('the filter is not an object')
+    if (!isRecord(filter)) throw invalid('the filter is not an object')
     const limit = filter.limit ?? DEFAULT_CHANGES
     if (!Number.isInteger(limit) || limit < 1 || limit > MAX_CHANGES) throw invalid(`limit must be a whole number from 1 to ${MAX_CHANGES}`)
     const states = filter.states ?? CHANGE_STATES
@@ -663,6 +831,9 @@ export class StoreApprovals extends Approvals {
     if (request.action.class !== 'command' || projectId !== undefined || request.classification === 'local-private' || argv === undefined || !argv.length) return undefined
     const line = argv.join(' ')
     if ([...line].length > 200 || commandProblems(line).length || !sameList(line.split(' '), argv)) return undefined
+    // A call the sandboxed-command rule judged (ADR-0080) is never counted: listing it would put it beyond its shapes.
+    const cited = typeof request.verdict.decision === 'string' ? this.ctx.artifacts.get(request.verdict.decision)?.body as AutonomyDecision | undefined : undefined
+    if (sandboxedOutcomeOf(cited) !== undefined) return undefined
     return this.set.judge({ class: 'command', command: argv }).actionClass === 'command' ? line : undefined
   }
 
@@ -969,17 +1140,21 @@ export class StoreApprovals extends Approvals {
    * candidate says why it was or was not the outcome. A resolution no verdict made names its
    * decider rule and reason (`by`).
    */
-  private resolve(request: ApprovalRequest, cause: 'verdict' | 'expired' | 'withdrawn', option: string, at: Date, approval?: ArtifactRef, by?: Withdrawal): ApprovalRequest {
+  private resolve(request: ApprovalRequest, cause: 'verdict' | 'expired' | 'withdrawn', option: string, at: Date, approval?: ArtifactRef, by?: Withdrawal, lead?: string): ApprovalRequest {
     const verdicts = ['approved', 'rejected']
-    const lost = (o: string): string => cause === 'verdict' ? (verdicts.includes(o) ? `the operator's verdict is ${option}` : 'a verdict came first')
+    const lost = (o: string): string => cause === 'verdict' ? (verdicts.includes(o) ? `${lead !== undefined ? `${leadId(lead)}'s` : 'the operator\'s'} verdict is ${option}` : 'a verdict came first')
       : cause === 'expired' ? (o === 'withdrawn' ? 'it was not withdrawn before it expired' : 'no verdict came before it expired')
       : o === 'denied:expired' ? `${by!.before} before it expired` : `${by!.before} before a verdict`
     const decision = this.ctx.artifacts.recordDecision({
-      schema: 'decision@1.4', decisionType: 'approval', question: `Is approval request ${request.requestId} approved?`, inputs: [request.policy.decision, ...(approval ? [approval] : [])],
+      // A lead's verdict has a `client` decider that is no vote: decision@1.10 (ADR-0076); every other is decision@1.4 as before.
+      schema: cause === 'verdict' && lead !== undefined ? 'decision@1.10' : 'decision@1.4', decisionType: 'approval', question: `Is approval request ${request.requestId} approved?`, inputs: [request.policy.decision, ...(approval ? [approval] : [])],
       candidates: ['approved', 'rejected', 'denied:expired', 'withdrawn'].map((o) => ({ option: o, selected: o === option, reasons: [o === option ? (by?.why ?? cause) : `not ${o}: ${lost(o)}`] })),
-      decider: cause === 'verdict' ? { type: 'operator', id: 'operator', version: '1' } : { type: 'rule', id: by!.rule, version: '1' },
+      // Who decided: the operator (version 2: a record at version 1 is from before the lead principal, when the lead's scripts
+      // used the operator's token), a project's lead (a `client` decider, `lead:<project>`), or the rule that withdrew it.
+      decider: cause !== 'verdict' ? { type: 'rule', id: by!.rule, version: '1' }
+        : lead !== undefined ? { type: 'client', id: leadId(lead), version: '1' } : { type: 'operator', id: 'operator', version: '2' },
       outcome: { option, detail: { requestId: request.requestId } }, deterministic: cause !== 'verdict',
-    }, { producer: { type: cause === 'verdict' ? 'operator' : 'system', ref: 'approvals' }, classification: request.classification === 'local-private' ? 'local-private' : 'operator-shared' })
+    }, { producer: { type: cause === 'verdict' && lead === undefined ? 'operator' : 'system', ref: cause === 'verdict' && lead !== undefined ? leadId(lead) : 'approvals' }, classification: request.classification === 'local-private' ? 'local-private' : 'operator-shared' })
     const next: ApprovalRequest = {
       ...request, state: option === 'approved' ? 'approved' : 'rejected', revision: request.revision + 1,
       resolution: { cause, ...(approval ? { approval } : {}), decision: decision.id as ArtifactRef, at: at.toISOString() },
@@ -1048,13 +1223,16 @@ export class StoreApprovals extends Approvals {
     if (body?.decisionType !== 'autonomy' || body.outcome?.option !== 'ask') throw notAsked('the verdict is not a recorded autonomy decision that says ask')
     const policy = { id: String(body.decider?.id), version: Number(body.decider?.version) }
     if (body.decider?.type !== 'policy' || envelope!.producer?.type !== 'policy' || envelope!.producer.ref !== policy.id) throw notAsked('the decision it cites was not made by a policy')
-    if (!isObject(verdict.policy) || verdict.policy.id !== policy.id || verdict.policy.version !== policy.version) throw notAsked('the verdict names another policy than the decision it cites')
+    if (!isRecord(verdict.policy) || verdict.policy.id !== policy.id || verdict.policy.version !== policy.version) throw notAsked('the verdict names another policy than the decision it cites')
     const of = projectId === undefined ? 'the studio' : `project ${projectId}`
     if (!this.set.current(policy, projectId)) throw notAsked(`the decision it cites is ${policy.id}'s at version ${policy.version}, which is not a policy of ${of} now`)
     if (!sameList(body.outcome.detail?.policies, this.set.of(projectId).map((p) => p.id)) || body.decider.hash !== this.set.hash(projectId)) {
       throw notAsked(`the decision it cites was made under other policies than ${of}'s, as loaded now`)
     }
-    const judged = this.set.judge({ class: request.action.class, ...(projectId !== undefined ? { projectId } : {}), ...(request.command !== undefined ? { command: request.command } : {}) })
+    // Judged again in the context the decision was: a call the sandboxed-command rule judged (ADR-0080)
+    // is judged with it again, so an ask shape still asks where the class alone would not.
+    const sandboxed = sandboxedOutcomeOf(body) !== undefined
+    const judged = this.set.judge({ class: request.action.class, ...(projectId !== undefined ? { projectId } : {}), ...(request.command !== undefined ? { command: request.command } : {}), ...(sandboxed ? { sandboxed: true } : {}) })
     if (judged.rule.mode !== 'ask') throw notAsked(`the policy now says ${judged.rule.mode}${judged.forbidden ? ` (${judged.forbidden})` : ''}`)
     if (body.outcome.detail?.actionClass !== judged.actionClass || judged.rule.policy.id !== policy.id) {
       throw notAsked(`the decision it cites is for ${String(body.outcome.detail?.actionClass)} by ${policy.id}, but the action is judged as ${judged.actionClass} by ${judged.rule.policy.id}`)
@@ -1078,11 +1256,17 @@ export class StoreApprovals extends Approvals {
       if (problems.length) return `the set it proposes no longer loads: ${problems[0]}`
     }
     if (!this.set.current(request.policy, projectId)) return `${request.policy.id} at version ${request.policy.version} is not a policy of ${projectId === undefined ? 'the studio' : `project ${projectId}`} now`
-    const judgedAs = (this.ctx.artifacts.get(request.policy.decision)?.body as AutonomyDecision | undefined)?.outcome?.detail?.actionClass
+    const decided = this.ctx.artifacts.get(request.policy.decision)?.body as AutonomyDecision | undefined
+    const judgedAs = decided?.outcome?.detail?.actionClass
     const classes = new Set<ActionClass>([request.action.class, ...(ACTION_CLASSES.includes(judgedAs as ActionClass) ? [judgedAs as ActionClass] : [])])
+    // A call an ask shape of the sandboxed-command rule asked for (ADR-0080) asks whatever laxer mode its
+    // class has: it stays while that shape is still an ask shape of the rule in force, and the class is not forbidden.
+    const shaped = sandboxedOutcomeOf(decided)
     for (const actionClass of classes) {
       const { mode } = this.set.effective(actionClass, projectId)
-      if (mode !== 'ask') return `it now gives ${actionClass} ${mode}`
+      if (mode === 'ask') continue
+      if (shaped?.outcome === 'ask' && shaped.by !== undefined && mode !== 'forbid' && this.set.sandboxedAskHolds({ rule: shaped.rule, by: shaped.by }, projectId)) continue
+      return `it now gives ${actionClass} ${mode}`
     }
     return undefined
   }
@@ -1098,7 +1282,7 @@ export class StoreApprovals extends Approvals {
   }
 
   private where(filter: ListFilter): { where: string; params: Array<string | null> } {
-    if (!isObject(filter)) throw invalid('the filter is not an object')
+    if (!isRecord(filter)) throw invalid('the filter is not an object')
     const states = filter.states ?? OPEN
     if (!Array.isArray(states) || states.some((s) => !REQUEST_STATES.includes(s))) throw invalid(`states must be a list of ${REQUEST_STATES.join(', ')}`)
     if (!states.length) return { where: '', params: [] }
@@ -1115,16 +1299,18 @@ export class StoreApprovals extends Approvals {
   }
 
   private validAction(action: Action): void {
-    if (!isObject(action)) throw invalid('the action is not an object')
+    if (!isRecord(action)) throw invalid('the action is not an object')
     if (!ACTION_CLASSES.includes(action.class)) throw invalid(`${String(action.class)} is not an action class`)
     if (action.projectId !== undefined && (typeof action.projectId !== 'string' || !ID.test(action.projectId))) throw invalid(`projectId ${JSON.stringify(action.projectId)} is not an id`)
     if (action.command !== undefined && (!Array.isArray(action.command) || action.command.some((word) => typeof word !== 'string'))) throw invalid('command must be an argv: a list of strings')
-    if (action.checks !== undefined && !isObject(action.checks)) throw invalid('checks must be an object of check names to whether they passed')
+    if (action.commandRule !== undefined && (typeof action.commandRule !== 'string' || !/^[a-z][a-z0-9.-]{0,63}$/.test(action.commandRule))) throw invalid('commandRule must be a command rule id')
+    if (action.sandboxed !== undefined && typeof action.sandboxed !== 'boolean') throw invalid('sandboxed must be a boolean')
+    if (action.checks !== undefined && !isRecord(action.checks)) throw invalid('checks must be an object of check names to whether they passed')
   }
 
   private validVerdict(v: Verdict, index: number): void {
-    const subject = isObject(v) ? v.subject : undefined
-    const ok = isObject(v) && typeof v.requestId === 'string' && isObject(subject) && typeof subject.type === 'string' && typeof subject.ref === 'string'
+    const subject = isRecord(v) ? v.subject : undefined
+    const ok = isRecord(v) && typeof v.requestId === 'string' && isRecord(subject) && typeof subject.type === 'string' && typeof subject.ref === 'string'
       && (subject.version === undefined || typeof subject.version === 'string') && (v.verdict === 'approved' || v.verdict === 'rejected')
       && (v.note === undefined || typeof v.note === 'string')
     if (!ok) throw invalid(`verdict ${index} is not {requestId, subject, verdict: approved | rejected, note?}: nothing was decided`)

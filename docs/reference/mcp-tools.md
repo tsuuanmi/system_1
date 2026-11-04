@@ -285,6 +285,27 @@ Scope: `client`
 | `clientRequestId` | string |  | Retry-safe request key |
 | `waitSeconds` | integer |  | Seconds to wait for the run to finish (default 45) |
 
+## `board_breaker_reset`
+
+Turn auto-accept on again for a project and landing branch whose breaker tripped, as the caller (the operator, else the lead): only once the line holds (fewer escapes than the line within its window now), refused otherwise. Recorded as a board decision naming the trip's.
+
+Scope: `client`
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `projectId` | string | yes |  |
+| `branch` | string | yes | The landing branch auto-accept turns on again for |
+
+## `board_breakers`
+
+List where the auto-accept circuit breaker turned auto-accept off: per project and landing branch, the escapes it counted, its decision, and whether the line holds now (fewer escapes than the line in its window). A breaker never resets by itself.
+
+Scope: `client`
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `projectId` | string |  | One project's breakers; every project's when absent |
+
 ## `board_brief`
 
 One page for an agent new to a project: its intent, what is in progress, what waits, what is next, and what to read first.
@@ -345,6 +366,18 @@ Scope: `operator`
 | `projectId` | string | yes |  |
 | `outcome` | "achieved" \| "stopped" | yes | achieved: its criteria are met; stopped: it ends without them |
 
+## `board_escape`
+
+Record a defect found after a result the auto-accept rule accepted (a done task whose last decision is rule board.auto-accept), once per task, as the caller (the operator, else the lead). At the line (board.autoAccept.breaker, default 2 escapes in 7 days) for the result's project and landing branch, auto-accept turns off for them: a board decision names every escape counted, and results are held for the operator until the operator or the lead turns it on again with board_breaker_reset. system metrics reads the escapes as escaped defects.
+
+Scope: `client`
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `taskId` | string | yes | The done task whose auto-accepted result held the defect |
+| `note` | string | yes | What escaped, and where it was found |
+| `foundAt` | string |  | When it was found (default now); never in the future |
+
 ## `board_pause`
 
 Pause an active project: until it is resumed no task of it is claimed or started and no proposed task is put to the policy; a running attempt goes on to its outcome, and every wait keeps its expiry. Recorded as a board decision.
@@ -383,10 +416,34 @@ Scope: `client`
 | `actionClass` | "read" \| "workspace-write" \| "merge" \| "command" \| "external-send" \| "deploy" \| "delete-data" \| "spend" \| "charter" \| "funding" \| "remediation" \| "policy-change" \| "promotion" | yes |  |
 | `milestone` | string |  |  |
 | `template` | string |  |  |
+| `variant` | string |  | The variant of its template every run of it starts with (algorithm-development: docs, tests), so the writing step's kind of work routes it; needs template |
 | `writes` | object |  |  |
 | `budget` | array |  |  |
 | `maxAttempts` | integer |  | Attempts the task gets (default: the board's for its template, else its maxAttempts, 3); each run that serves it is one, a rejected review included |
 | `clientRequestId` | string |  | Retry-safe request key |
+
+## `board_propose_plan`
+
+Propose a plan of tasks at once, such as a decompose run's answer: every task or none. Each item has a key; its dependsOn names other items by key, or the project's tasks by id. A cycle, a dependency on a key the plan does not have, or two items writing one subject is refused, and nothing is proposed. Each task is then proposed as board_propose proposes one.
+
+Scope: `client`
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `projectId` | string | yes |  |
+| `tasks` | array | yes |  |
+| `clientRequestId` | string |  | Retry-safe request key: a retry returns the tasks the first call proposed |
+
+## `board_reopen_review`
+
+Bring a task that waits for input as review-expired back to review, held for the operator for the policy's wait, as the caller (the operator, else the lead, for its own project). Only while the task has its result and its run's worktree is still recorded and on disk (refused otherwise). Recorded as a board decision; no attempt is counted.
+
+Scope: `client`
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `taskId` | string | yes | The task waiting for input as review-expired |
+| `reason` | string | yes | Why it is re-opened |
 
 ## `board_resume`
 
@@ -433,7 +490,7 @@ Scope: `client`
 | `taskId` | string | yes |  |
 | `generation` | integer |  | The lease generation the caller holds (a fence, INV-4) |
 | `note` | string |  | A progress line, not stored: the run that serves the task gives its result |
-| `answers` | array |  | Answers to a question wait, each item {question, answer}: question is the question's index from 0 in the task's waiting.questions (board_task), answer your text; every question once, e.g. [{"question": 0, "answer": "Use the v2 API"}]. Answering every one sends the task through the gate for its next attempt |
+| `answers` | array |  | Answers to a question wait, each item {question, answer}: question is the question's index from 0 in the task's waiting.questions (board_task), answer your text; every question once, e.g. [{"question": 0, "answer": "Use the v2 API"}]. Answering every one continues the attempt that asked, through the gate, its count unchanged |
 
 ## `brainstorm`
 
@@ -540,6 +597,19 @@ Scope: `client`
 
 No arguments.
 
+## `dossier_read`
+
+A board task's dossier (by taskId, or a runId serving it): its append-only entries whole, oldest first from `from`.
+
+Scope: `client`
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `taskId` | string |  |  |
+| `runId` | string |  |  |
+| `from` | integer |  |  |
+| `limit` | integer |  |  |
+
 ## `drain`
 
 Drain the host before a stop or upgrade: admit no new run, and report the runs still executing. Call again to poll.
@@ -584,6 +654,29 @@ Scope: `client`
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `id` | string | yes |  |
+
+## `hold_steps`
+
+Before a stop: each running run finishes its step in flight and starts no next one until released (release: true) or the host restarts. Returns the hold and the steps in flight.
+
+Scope: `operator`
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `reason` | string |  |  |
+| `release` | boolean |  |  |
+
+## `metrics`
+
+The maturity metrics of PROP-0016 §1, from recorded data only, over a rolling window (default the 30 days before now) for one project or every one: each metric's value, the sample it is over, and the records it read, or why it cannot be measured yet (never 0); a value the records only bound says so. Then the reading against the L3 lines (starting lines, D83): it holds only when every line is met over 30 days and 30 finished tasks. Reads only; changes nothing.
+
+Scope: `client`
+
+| Argument | Type | Required | Description |
+|---|---|---|---|
+| `projectId` | string |  | One project; absent: every project on the board |
+| `days` | integer |  | The window as the days before until (default 30, the window a level is read over) |
+| `until` | string |  | The window's end, ISO 8601 (exclusive); default now |
 
 ## `model_key`
 

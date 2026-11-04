@@ -15,11 +15,32 @@ import { CHROME_LOCK, type ChromeChoice, discoverChrome, installManagedChrome } 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
-import { type DrawFigure, drawFigureText, dshHome, sqliteRuntimeProblem } from '@tsuuanmi/system-libs'
+import { type DrawFigure, drawFigureText, dshHome, issueLeadToken, leadId, leadTokenFile, listLeads, revokeLeadToken, sqliteRuntimeProblem } from '@tsuuanmi/system-libs'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
+import { TEST_OFF_ROWS, testProfilePatch, testProfilePatchOf } from './test-profile.ts'
+
+export { stagePatch, TEST_OFF_ROWS, TEST_PORT, testProfilePatch, testProfilePatchOf, testRows } from './test-profile.ts'
 
 const require = createRequire(import.meta.url)
-const PROFILE = 'system'
+/** The live profile, and the test profile that every live update runs on first (T323). */
+export const LIVE_PROFILE = 'system'
+export const TEST_PROFILE = 'system-test'
+/** The profile the CLI acts on: `system` unless `--profile <name>` named another (see {@link useProfile}). */
+let PROFILE = LIVE_PROFILE
+
+/** Act on the other profile of this home: its profile directory, its data directory, its daemon. */
+export function useProfile(name: string): void {
+  if (name !== LIVE_PROFILE && name !== TEST_PROFILE) throw new Error(`no such profile '${name}': the profiles are ${LIVE_PROFILE} and ${TEST_PROFILE}`)
+  PROFILE = name
+}
+
+/**
+ * The data directory of the profile the CLI acts on: its store, vault, tokens, and discovery file.
+ * `<home>/system` for the live profile; `<home>/<name>` for another, so two profiles never share one.
+ */
+export function stateDir(home: string = dshHome()): string {
+  return join(home, PROFILE)
+}
 
 /** The `dsh` launcher entry of the pinned DSH installation. */
 function dshBin(): string {
@@ -41,7 +62,7 @@ export function profileDir(home: string = dshHome()): string {
  * Create or refresh the profile: its bundle list is exactly the system bundle, linked from
  * this installation; the operator's own `cordis.patch.yml` is created empty and never overwritten.
  */
-interface ProfileManifest {
+export interface ProfileManifest {
   name?: string
   private?: boolean
   dependencies?: Record<string, string>
@@ -74,11 +95,32 @@ export function mergeProfileManifest(current: Partial<ProfileManifest> | undefin
   const layer = preset === 'default' ? undefined : PRESETS[preset]
   return {
     ...current,
-    name: current?.name ?? 'dsh-profile-system',
+    name: current?.name ?? `dsh-profile-${PROFILE}`,
     private: true,
     dependencies: { ...dependencies, '@tsuuanmi/system-bundle': `link:${bundleDir}`, ...(layer ? { [layer]: `link:${join(bundleDir, 'presets', preset)}` } : {}) },
     dsh: { ...current?.dsh, profile: { ...current?.dsh?.profile, bundles: ['@tsuuanmi/system-bundle', ...(layer ? [layer] : []), ...bundles] } },
   }
+}
+
+/**
+ * The `system-test` profile's manifest (T323): the live profile's own, so the same bundles compose
+ * (its preset layer and every bundle the operator added), linked from this installation as `init`
+ * links any profile, under the test profile's name. `preset` overrides the live one's, as for `init`.
+ */
+export function testProfileManifest(live: Partial<ProfileManifest>, bundleDir: string, preset?: Preset): ProfileManifest {
+  return { ...mergeProfileManifest(live, bundleDir, preset ?? presetOf(live)), name: `dsh-profile-${TEST_PROFILE}` }
+}
+
+/** The packages of the rows the test profile turns off, as this installation's bundle names them: an inserted row of one of them signs in too. */
+export function testOffPackages(bundleDir: string = dirname(require.resolve('@tsuuanmi/system-bundle/package.json'))): Set<string> {
+  const off: readonly string[] = TEST_OFF_ROWS
+  const rows = (parseYaml(readFileSync(join(bundleDir, 'cordis.patch.yml'), 'utf8')) as Array<{ insert?: Array<{ id: string; name?: string }> }>).flatMap((p) => p.insert ?? [])
+  return new Set(rows.filter((r) => off.includes(r.id) && r.name).map((r) => r.name!))
+}
+
+/** The stage's patch of the test profile (scripts/canary.ts patch): the live patch's text as {@link testProfilePatchOf} takes it, with this bundle's off packages. */
+export function stagedTestPatch(state: string, liveText: string): string {
+  return testProfilePatchOf(state, liveText, testOffPackages())
 }
 
 /** Exit status for a child that exited normally or died from a signal (128 + signal number). */
@@ -112,14 +154,23 @@ function readIfPresent(path: string): string | undefined {
  */
 export function init(home: string = dshHome(), preset?: Preset): string {
   const dir = profileDir(home)
-  mkdirSync(dir, { recursive: true, mode: 0o700 })
   const bundleDir = dirname(require.resolve('@tsuuanmi/system-bundle/package.json'))
   const path = join(dir, 'package.json')
-  const current = readIfPresent(path)
-  writeFileSync(path, `${JSON.stringify(mergeProfileManifest(current === undefined ? undefined : JSON.parse(current) as Partial<ProfileManifest>, bundleDir, preset), null, 2)}\n`)
+  let manifest: ProfileManifest
+  if (PROFILE === TEST_PROFILE) {
+    // The test profile composes what the live one does, refreshed from it at every init (T323).
+    const live = readIfPresent(join(home, 'profiles', LIVE_PROFILE, 'package.json'))
+    if (live === undefined) throw new Error(`no ${LIVE_PROFILE} profile under ${home}/profiles to stage: the ${TEST_PROFILE} profile composes the live one's bundles, so run \`system init\` first`)
+    manifest = testProfileManifest(JSON.parse(live) as Partial<ProfileManifest>, bundleDir, preset)
+  } else {
+    const current = readIfPresent(path)
+    manifest = mergeProfileManifest(current === undefined ? undefined : JSON.parse(current) as Partial<ProfileManifest>, bundleDir, preset)
+  }
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`)
   // Created only when absent (`wx`, one atomic step): an operator's file is never overwritten.
   try {
-    writeFileSync(join(dir, 'cordis.patch.yml'), '# Operator overrides for the system profile.\n[]\n', { flag: 'wx' })
+    writeFileSync(join(dir, 'cordis.patch.yml'), PROFILE === TEST_PROFILE ? testProfilePatch(stateDir(home)) : '# Operator overrides for the system profile.\n[]\n', { flag: 'wx' })
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
   }
@@ -371,7 +422,7 @@ export interface BrowserDeps {
 
 const defaultBrowserDeps = (home: string): BrowserDeps => ({
   discover: () => discoverChrome(undefined),
-  install: () => installManagedChrome({ dir: join(home, 'system', 'browsers') }),
+  install: () => installManagedChrome({ dir: join(stateDir(home), 'browsers') }),
   hasXvfb: () => spawnSync('sh', ['-c', 'command -v Xvfb'], { stdio: 'ignore' }).status === 0,
   vnc: () => {
     const found = spawnSync('sh', ['-c', 'command -v x0vncserver || command -v x11vnc'], { encoding: 'utf8' })
@@ -425,7 +476,7 @@ interface Discovery { url: string; tokenFiles: Record<Scope, string>; pid?: numb
 
 /** The running profile's discovery file. */
 function discovery(home: string): Discovery {
-  const path = join(home, 'system', 'mcp.json')
+  const path = join(stateDir(home), 'mcp.json')
   const text = readIfPresent(path)
   if (text === undefined) throw new Error(`no discovery file at ${path}; is \`system start\` running?`)
   const found = JSON.parse(text) as Partial<Discovery>
@@ -433,6 +484,41 @@ function discovery(home: string): Discovery {
     throw new Error(`the running profile predates scoped tokens (${path}); run \`system shutdown\`, then \`system start\` with this version`)
   }
   return found as Discovery
+}
+
+/** Where the scope token files are: beside the running profile's operator token, else the default `<home>/system`. */
+function tokenDirOf(home: string): string {
+  try {
+    return dirname(discovery(home).tokenFiles.operator)
+  } catch {
+    return stateDir(home)
+  }
+}
+
+/**
+ * `system lead-token issue|revoke|list [<project>]` (ADR-0076): the operator's command for a project's
+ * lead principal. The token file `lead-<project>.token` sits beside `operator.token` with the same
+ * permissions; the host reads it on each request, so a revoked token is refused at once. The token
+ * itself is never printed. Returns the lines to print; refuses (throws) what cannot be done.
+ */
+export function leadToken(action: string | undefined, project: string | undefined, home: string = dshHome()): string[] {
+  const dir = tokenDirOf(home)
+  if (action === 'list' && project === undefined) {
+    const leads = listLeads(dir)
+    return leads.length ? leads.map((p) => `${p}  ${leadTokenFile(dir, p)}  decider ${leadId(p)}`) : ['no lead token is issued']
+  }
+  if ((action === 'issue' || action === 'revoke') && project !== undefined) {
+    if (action === 'revoke') {
+      if (!revokeLeadToken(dir, project)) throw new Error(`no lead token is issued for project ${project}`)
+      return [`revoked the lead token of project ${project}: requests with it are refused from now on`]
+    }
+    const { file, replaced } = issueLeadToken(dir, project)
+    return [
+      `issued the lead token of project ${project}: ${file} (owner-only, like the operator's)${replaced ? '; the one issued before no longer works' : ''}`,
+      `what it decides is recorded as ${leadId(project)}; its rights are a closed list System enforces, and everything else stays the operator's`,
+    ]
+  }
+  throw new Error('usage: system lead-token issue <project> | revoke <project> | list')
 }
 
 /** A runtime's own sign-in command for one home, as `account_enroll` gives it (ADR-0051). */
@@ -651,6 +737,176 @@ export function parseReport(args: readonly string[]): Record<string, string | nu
   return input
 }
 
+/**
+ * `system metrics` flags to the `metrics` tool's input (PROP-0016 I4): `--days <n>` (a whole number
+ * from 1 to 366), `--project <id>`, `--until <time>`, each at most once; undefined for an unknown
+ * flag, a missing value, or days that are not such a number.
+ */
+export function parseMetrics(args: readonly string[]): Record<string, string | number> | undefined {
+  const input: Record<string, string | number> = {}
+  const names: Record<string, string> = { '--project': 'projectId', '--days': 'days', '--until': 'until' }
+  for (let i = 0; i < args.length; i += 2) {
+    const name = names[args[i]!]
+    const value = args[i + 1]
+    if (!name || value === undefined || name in input) return undefined
+    if (name === 'days' && !/^[1-9]\d{0,2}$/.test(value)) return undefined
+    input[name] = name === 'days' ? Number(value) : value
+  }
+  if (typeof input['days'] === 'number' && input['days'] > 366) return undefined
+  return input
+}
+
+/** A notice of a project's lead inbox, as much of it as the CLI prints (`lead-notice@1.0`). */
+export interface LeadNoticeView { id: string; project: string; kind: string; title: string; text: string; act: string[] }
+
+/**
+ * `system lead wait [--project <id>] [--timeout <s>]`, `system lead inbox [--project <id>]`, and
+ * `system lead ack [--project <id>] <id>...` (D107), `system lead digest [--project <id>] [--day <date>]`
+ * and `system lead health [--project <id>]` (PROP-0019 2.10), each with `--json`; undefined for an unknown
+ * word, flag, or value. A timeout is a whole number of seconds from 1 to 86400.
+ */
+export function parseLead(rest: readonly string[]): { action: 'wait' | 'inbox' | 'ack' | 'digest' | 'health' | 'brief'; json: boolean; project?: string; day?: string; timeoutSeconds?: number; since?: string; ids: string[] } | undefined {
+  const [action, ...words] = rest
+  if (action !== 'wait' && action !== 'inbox' && action !== 'ack' && action !== 'digest' && action !== 'health' && action !== 'brief') return undefined
+  const out: { action: 'wait' | 'inbox' | 'ack' | 'digest' | 'health' | 'brief'; json: boolean; project?: string; day?: string; timeoutSeconds?: number; since?: string; ids: string[] } = { action, json: false, ids: [] }
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i]!
+    if (word === '--json') out.json = true
+    else if (word === '--project' && out.project === undefined && words[i + 1] && !words[i + 1]!.startsWith('--')) out.project = words[++i]!
+    else if (word === '--day' && action === 'digest' && out.day === undefined && /^\d{4}-\d{2}-\d{2}$/.test(words[i + 1] ?? '')) out.day = words[++i]!
+    else if (word === '--since' && action === 'brief' && out.since === undefined && words[i + 1] && !Number.isNaN(Date.parse(words[i + 1]!))) out.since = words[++i]!
+    else if (word === '--timeout' && action === 'wait' && out.timeoutSeconds === undefined && /^[1-9]\d{0,5}$/.test(words[i + 1] ?? '') && Number(words[i + 1]) <= 86_400) out.timeoutSeconds = Number(words[++i])
+    else if (action === 'ack' && !word.startsWith('--')) out.ids.push(word)
+    else return undefined
+  }
+  return action === 'ack' && !out.ids.length ? undefined : out
+}
+
+/** One notice as lines: its kind and title, what happened, and the command to act. */
+export const formatLeadNotice = (n: LeadNoticeView): string[] => [`[${n.kind}] ${n.title}  (${n.id})`, `  ${n.text}`, ...n.act.map((line) => `  → ${line}`)]
+
+/**
+ * `system lead brief --project <id> [--json] [--since <time>]` (PROP-0019 section 3): the one page a
+ * lead session reads at its start and when it is lost, from the `lead_brief` tool; `--json` prints the
+ * brief's record, else the page as the tool renders it. A refusal is thrown with its reason.
+ */
+export async function leadBrief(parsed: NonNullable<ReturnType<typeof parseLead>>, call: typeof callTool = callTool, print: (line: string) => void = console.log): Promise<number> {
+  const outcome = await call('lead_brief', { ...(parsed.project !== undefined ? { projectId: parsed.project } : {}), ...(parsed.since !== undefined ? { since: parsed.since } : {}) })
+  if (outcome.isError) throw new Error(outcome.text)
+  print(parsed.json ? JSON.stringify(outcome.structured) : outcome.text)
+  return 0
+}
+
+/**
+ * The lead's loop instead of polling: `wait` asks the inbox (`lead_inbox`, up to 55 s at a time) until a
+ * notice is unread or the timeout passes, and prints it; `inbox` prints what is unread; `ack` marks ids
+ * handled. Exit 0 when notices were printed or acked, 1 when the timeout passed with none.
+ */
+export async function leadInbox(parsed: NonNullable<ReturnType<typeof parseLead>>, call: typeof callTool = callTool, print: (line: string) => void = console.log, now: () => number = Date.now): Promise<number> {
+  const base = parsed.project !== undefined ? { projectId: parsed.project } : {}
+  if (parsed.action === 'digest' || parsed.action === 'health') {
+    // The day's digest and the health table (PROP-0019 2.10): a read; a lead token's own project when none is named.
+    const outcome = await call(parsed.action === 'digest' ? 'lead_digest' : 'lead_health', { ...base, ...(parsed.day !== undefined ? { day: parsed.day } : {}) })
+    if (outcome.isError) throw new Error(outcome.text)
+    print(parsed.json ? JSON.stringify(outcome.structured, null, 2) : outcome.text.trimEnd())
+    return 0
+  }
+  const deadline = parsed.timeoutSeconds !== undefined ? now() + parsed.timeoutSeconds * 1000 : Infinity
+  for (;;) {
+    const left = Math.max(0, Math.ceil((deadline - now()) / 1000))
+    const wait = parsed.action === 'wait' ? { waitSeconds: Math.min(55, left) } : {}
+    const outcome = await call('lead_inbox', { ...base, ...(parsed.action === 'ack' ? { ack: parsed.ids } : {}), ...wait })
+    if (outcome.isError) throw new Error(outcome.text)
+    const result = outcome.structured as unknown as { notices: LeadNoticeView[]; acked?: string[]; unknown?: string[] }
+    if (parsed.action === 'ack') {
+      print(parsed.json ? JSON.stringify(result) : `acked ${result.acked?.length ?? 0}${result.unknown?.length ? `; unknown or handled already: ${result.unknown.join(', ')}` : ''}`)
+      return 0
+    }
+    if (result.notices.length) {
+      for (const notice of result.notices) for (const line of parsed.json ? [JSON.stringify(notice)] : formatLeadNotice(notice)) print(line)
+      return 0
+    }
+    if (parsed.action === 'inbox') {
+      if (!parsed.json) print('no unread notice')
+      return 0
+    }
+    if (now() >= deadline) return 1
+  }
+}
+
+/** A decision as much as the CLI prints (`operator-decision@1.0`). */
+export interface DecisionView { id: string; state: string; projectId?: string; question: string; options?: string[]; recommendation?: string; links?: string[]; answer?: string; answeredBy?: string; source?: string; supersedes?: string }
+
+type DecisionsParsed = { json: boolean; tool: 'decisions_list' | 'decisions_show' | 'decisions_ask' | 'decisions_answer' | 'decisions_import'; args: Record<string, unknown>; file?: string }
+
+/**
+ * `system decisions list|show|ask|answer|import` (D109), each with `--json`; undefined for an unknown
+ * word, flag, or value. `list [--state asked|answered] [--project <id>] [--studio] [--after <n>] [--limit <n>]`,
+ * `show D<n>`, `ask <question> [--project <id>] [--option <text>]... [--recommend <text>] [--link <text>]... [--supersedes D<n>]`,
+ * `answer D<n> <answer> [--source <text>]`, `import <file>`.
+ */
+export function parseDecisions(rest: readonly string[]): DecisionsParsed | undefined {
+  const [action, ...words] = rest
+  const ID = /^D[1-9][0-9]{0,8}$/
+  const out: DecisionsParsed = { json: false, tool: 'decisions_list', args: {} }
+  const options: string[] = []
+  const links: string[] = []
+  const positional: string[] = []
+  const value = (i: number): string | undefined => (words[i + 1] !== undefined && !words[i + 1]!.startsWith('--') ? words[i + 1] : undefined)
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i]!
+    const v = value(i)
+    if (word === '--json') out.json = true
+    else if (word === '--studio' && action === 'list') out.args['studio'] = true
+    else if (word === '--state' && action === 'list' && (v === 'asked' || v === 'answered')) { out.args['state'] = v; i++ }
+    else if (word === '--project' && (action === 'list' || action === 'ask') && v !== undefined) { out.args['projectId'] = v; i++ }
+    else if ((word === '--after' || word === '--limit') && action === 'list' && /^[0-9]{1,9}$/.test(v ?? '')) { out.args[word.slice(2)] = Number(v); i++ }
+    else if (word === '--option' && action === 'ask' && v !== undefined) { options.push(v); i++ }
+    else if (word === '--link' && action === 'ask' && v !== undefined) { links.push(v); i++ }
+    else if (word === '--recommend' && action === 'ask' && v !== undefined) { out.args['recommendation'] = v; i++ }
+    else if (word === '--supersedes' && action === 'ask' && ID.test(v ?? '')) { out.args['supersedes'] = v; i++ }
+    else if (word === '--source' && action === 'answer' && v !== undefined) { out.args['source'] = v; i++ }
+    else if (!word.startsWith('--')) positional.push(word)
+    else return undefined
+  }
+  if (action === 'list' && !positional.length) return out
+  if (action === 'show' && positional.length === 1 && ID.test(positional[0]!)) return { ...out, tool: 'decisions_show', args: { id: positional[0] } }
+  if (action === 'ask' && positional.length === 1) return { ...out, tool: 'decisions_ask', args: { ...out.args, question: positional[0], ...(options.length ? { options } : {}), ...(links.length ? { links } : {}) } }
+  if (action === 'answer' && positional.length === 2 && ID.test(positional[0]!)) return { ...out, tool: 'decisions_answer', args: { ...out.args, id: positional[0], answer: positional[1] } }
+  if (action === 'import' && positional.length === 1) return { ...out, tool: 'decisions_import', args: {}, file: positional[0]! }
+  return undefined
+}
+
+/** One decision as lines: its number, state, and question; the answer under it. */
+export const formatDecision = (d: DecisionView): string[] => [
+  `${d.id}  ${d.state}  ${d.projectId ?? 'studio'}  ${d.question}`,
+  ...(d.options?.length ? d.options.map((o) => `    - ${o}`) : []),
+  ...(d.recommendation ? [`    recommends: ${d.recommendation}`] : []),
+  ...(d.answer !== undefined ? [`  → ${d.answer}${d.answeredBy ? `  (${d.answeredBy}${d.source ? `, ${d.source}` : ''})` : ''}`] : []),
+]
+
+/**
+ * The operator's decisions: `list` and `show` read, `ask` and `answer` record, `import` reads the lead's
+ * `decisions.json` and hands it to the row, once. Exit 0 when the tool answered; a refusal throws with its
+ * reason, so a registry with a gap or a duplicate names it and nothing is imported.
+ */
+export async function runDecisions(parsed: DecisionsParsed, call: typeof callTool = callTool, print: (line: string) => void = console.log, read: (file: string) => string = (file) => readFileSync(file, 'utf8')): Promise<number> {
+  const args = parsed.tool === 'decisions_import' ? { registry: JSON.parse(read(parsed.file!)) as unknown, file: parsed.file!.split('/').at(-1)! } : parsed.args
+  const outcome = await call(parsed.tool, args)
+  if (outcome.isError) throw new Error(outcome.text)
+  const result = outcome.structured as { decision?: DecisionView; decisions?: DecisionView[]; supersededBy?: string[]; next?: number; imported?: number; unchanged?: number; highest?: number }
+  if (parsed.json) print(JSON.stringify(outcome.structured))
+  else if (result.decisions) {
+    for (const d of result.decisions) for (const line of formatDecision(d)) print(line)
+    if (!result.decisions.length) print('no decision')
+    if (result.next !== undefined) print(`more: --after ${result.next}`)
+  } else if (result.decision) {
+    for (const line of formatDecision(result.decision)) print(line)
+    if (result.supersededBy?.length) print(`  superseded by ${result.supersededBy.join(', ')}`)
+  } else print(outcome.text)
+  return 0
+}
+
 /** One line per event: sequence, time, type, where, and its data. */
 export function formatEvents(events: readonly EventLine[]): string[] {
   return events.map((e) => [e.seq, e.at, e.type, e.runId ? `run=${e.runId}${e.nodeId ? `/${e.nodeId}` : ''}` : '', e.sessionId ? `session=${e.sessionId}` : '', e.data ? JSON.stringify(e.data) : '']
@@ -710,6 +966,53 @@ export async function hostRoster(json: boolean, call: typeof callTool = callTool
     return JSON.stringify(outcome.structured, null, 2)
   }
   return outcome.text
+}
+
+/**
+ * `system plugin [list|off <row> [reason…]|on <row>] [--json]` (ADR-0078): the MCP `plugin` tool's
+ * arguments, or undefined when the words are not one of these.
+ */
+export function parsePlugin(rest: readonly string[]): { args: Record<string, string>; json: boolean } | undefined {
+  const json = rest.includes('--json')
+  const [action = 'list', row, ...words] = rest.filter((a) => a !== '--json')
+  if (action === 'list') return row === undefined ? { args: { action }, json } : undefined
+  if ((action !== 'off' && action !== 'on') || !row || row.startsWith('--')) return undefined
+  if (action === 'on' && words.length) return undefined
+  return { args: { action, row, ...(words.length ? { reason: words.join(' ') } : {}) }, json }
+}
+
+/** A row as MCP `plugin` lists it (`RowState` of the plugin host, contract 1.2). */
+export interface PluginRowView { id: string; name: string; on: boolean; required: boolean; why: string; turned?: { on: boolean; reason?: string; since: string; decision: string } }
+
+/** `system plugin list` for a terminal: each row on or off, required or optional, and its last runtime turn with why. */
+export function formatPluginRows(rows: readonly PluginRowView[]): string[] {
+  return rows.map((r) => {
+    const turned = r.turned ? `; turned ${r.turned.on ? 'on' : 'off'} ${r.turned.since}${r.turned.reason ? `: ${r.turned.reason}` : ''} (decision ${r.turned.decision})` : ''
+    return `${r.on ? 'on ' : 'off'}  ${r.id} (${r.name}) ${r.required ? 'required' : 'optional'}${turned}`
+  })
+}
+
+/**
+ * `system enforce [list] | set <mechanism> <off|warn|on|configured> [reason…]` (ADR-0078): the MCP
+ * `enforce` tool's arguments, or undefined when the words are not one of these.
+ */
+export function parseEnforce(rest: readonly string[]): { args: Record<string, string>; json: boolean } | undefined {
+  const json = rest.includes('--json')
+  const [action = 'list', mechanism, mode, ...words] = rest.filter((a) => a !== '--json')
+  if (action === 'list') return mechanism === undefined ? { args: {}, json } : undefined
+  if (action !== 'set' || !mechanism || !mode || !['off', 'warn', 'on', 'configured'].includes(mode)) return undefined
+  return { args: { mechanism, mode, ...(words.length ? { reason: words.join(' ') } : {}) }, json }
+}
+
+/** A mechanism as MCP `enforce` gives it (`EnforceState` of the plugin host, contract 1.2). */
+export interface EnforceView { mechanism: string; row: string; modes: string[]; mode: string; configured: string; override?: { mode: string; reason?: string; since: string; decision: string }; what: string }
+
+/** `system enforce` for a terminal: each mechanism's mode in force, and why when it was set live. */
+export function formatEnforce(states: readonly EnforceView[]): string[] {
+  return states.map((s) => {
+    const how = s.override ? `set live ${s.override.since}${s.override.reason ? `: ${s.override.reason}` : ''} (decision ${s.override.decision}; configured ${s.configured})` : 'as configured'
+    return `${s.mechanism}: ${s.mode}, ${how}; takes ${s.modes.join('|')} (row ${s.row})`
+  })
 }
 
 /** Dispatch as MCP `dispatch_status`, `dispatch_pause`, and `dispatch_resume` give it (ADR-0064), as much as `system dispatch` prints. */
@@ -855,6 +1158,7 @@ export function hostProcessProblem(pid: number, home: string, proc = '/proc'): s
     return `it is not running, or not readable under ${proc}`
   }
   if (!argv.some((a) => a.endsWith('/@deepseek-ai/dsh/lib/bin.js')) || !argv.includes('--profile')) return 'it does not run a DSH profile'
+  if (argv[argv.indexOf('--profile') + 1] !== PROFILE) return `it runs the ${argv[argv.indexOf('--profile') + 1]} profile, not ${PROFILE}`
   const own = env.find((v) => v.startsWith('DSH_HOME='))?.slice('DSH_HOME='.length)
   const resolved = (p: string): string => resolve(p).replace(/\/$/, '')
   if (own ? resolved(own) !== resolved(home) : resolved(home) !== resolved(join(homedir(), '.dsh'))) return `its DSH_HOME is ${own ?? 'the default'}, not ${home}`
@@ -867,7 +1171,7 @@ export function hostProcessProblem(pid: number, home: string, proc = '/proc'): s
  */
 export async function shutdownHost(deadlineMs: number, options: { home?: string; call?: typeof callTool; pollMs?: number; onActive?: (active: string[]) => void; proc?: string } = {}): Promise<{ drained: boolean; active: string[]; pid: number; undrained?: string }> {
   const home = options.home ?? dshHome()
-  const path = join(home, 'system', 'mcp.json')
+  const path = join(stateDir(home), 'mcp.json')
   const text = readIfPresent(path)
   if (text === undefined) throw new Error(`no discovery file at ${path}; is \`system start\` running?`)
   const { pid } = JSON.parse(text) as Discovery
@@ -926,7 +1230,7 @@ function listFiles(dir: string, prefix = ''): string[] {
  * managed browser are not state: a new login recreates them.
  */
 export function backupHost(target: string, options: { home?: string; includeKey?: boolean } = {}): BackupManifest {
-  const state = join(options.home ?? dshHome(), 'system')
+  const state = stateDir(options.home)
   if (!existsSync(join(state, 'system.db'))) throw new Error(`no store at ${join(state, 'system.db')}`)
   if (existsSync(target) && readdirSync(target).length) throw new Error(`${target} is not empty`)
   mkdirSync(target, { recursive: true, mode: 0o700 })
@@ -974,7 +1278,7 @@ function profileRunning(state: string): boolean {
  * `keyFile` keeps it outside the state directory.
  */
 export function restoreHost(source: string, options: { home?: string; yes?: boolean; keyFile?: string } = {}): { manifest: BackupManifest; applied: boolean; keptAside?: string } {
-  const state = join(options.home ?? dshHome(), 'system')
+  const state = stateDir(options.home)
   // The manifest is written last, so a backup a crash interrupted has none and is refused.
   if (!existsSync(join(source, BACKUP_MANIFEST))) throw new Error(`${source} has no ${BACKUP_MANIFEST}: it is not a complete system backup`)
   const manifest = JSON.parse(readFileSync(join(source, BACKUP_MANIFEST), 'utf8')) as BackupManifest
@@ -1097,7 +1401,7 @@ export async function parseAsk(args: readonly string[], readStdin: () => Promise
   return prompt ? { prompt, ...request } : undefined
 }
 
-interface UsageNode { nodeId: string; state: string; minTier: string; tier?: string; worker?: string; quotaClass?: string; usage?: { inputTokens: number; outputTokens: number }; usageUnknown?: string }
+interface UsageNode { nodeId: string; state: string; minTier: string; tier?: string; model?: string; worker?: string; quotaClass?: string; usage?: { inputTokens: number; outputTokens: number }; usageUnknown?: string }
 interface UsageRun { runId: string; template: string; status: string; createdAt: string; nodes: UsageNode[] }
 
 /**
@@ -1108,7 +1412,7 @@ export function formatUsage(usage: { runs: UsageRun[]; draws?: UsageDraws }): st
   return [
     ...usage.runs.flatMap((run) => [
       `${run.runId}  ${run.template}  ${run.status}  ${run.createdAt}`,
-      ...run.nodes.map((n) => `  ${n.nodeId}  ${n.state}  ${n.tier ?? '-'}  ${n.quotaClass ?? '-'}  ${n.worker ?? '-'}${n.usage ? `  ${n.usage.inputTokens} in / ${n.usage.outputTokens} out tokens` : ''}${n.usageUnknown ? `  usage unknown (${n.usageUnknown})` : ''}`),
+      ...run.nodes.map((n) => `  ${n.nodeId}  ${n.state}  ${n.tier ?? '-'}${n.model ? ` (${n.model})` : ''}  ${n.quotaClass ?? '-'}  ${n.worker ?? '-'}${n.usage ? `  ${n.usage.inputTokens} in / ${n.usage.outputTokens} out tokens` : ''}${n.usageUnknown ? `  usage unknown (${n.usageUnknown})` : ''}`),
     ]),
     ...formatDraws(usage.draws),
   ]
@@ -1155,6 +1459,42 @@ export interface ExplainedLiveness {
 
 type ExplainedDecision = { id: string; type: string; outcome: string; reasons: string[]; result?: string }
 
+/** A review step's latest assessment (ADR-0075): its summary, then its findings by severity with their votes. */
+type ExplainedReview = {
+  assessment: string
+  verdict: string
+  summary: string
+  findings: Array<{ id?: string; severity: string; title: string; place?: string; class?: string; blocks: boolean; vote?: string; reason?: string; repeated?: string }>
+}
+
+/** A review's lines under its step: the summary, then each finding, a blocking one marked, its vote and why. */
+export function formatReview(review: ExplainedReview): string[] {
+  return [
+    `    review  ${review.verdict}  ${review.summary}  (${review.assessment})`,
+    ...review.findings.map((f) => `      ${f.blocks ? '!' : '-'} ${f.id ? `${f.id} ` : ''}${f.severity}  ${f.title}${f.place ? `  ${f.place}` : ''}${f.class ? `  [class ${f.class}]` : ''}${f.vote ? `  ${f.vote === 'confirm' ? 'confirmed' : f.vote === 'reject' ? 'rejected' : 'unverified'}${f.reason ? `: ${f.reason}` : ''}` : ''}${f.repeated ? `  repeats ${f.repeated}, not counted` : ''}`),
+  ]
+}
+
+/** The handbook slice a step's brief recorded (docs/design/handbook.md#what-a-brief-records). */
+interface ExplainedHandbook {
+  bound: { tokens: number; mode: string }
+  tokens: number
+  selection: { role: string; class?: string; tier: string; tierFrom: string; paths: string }
+  layers: Array<{ layer: number; version: string; renderedBy: string; parts: string[]; tokens: number; atMost?: boolean }>
+  /** What the Worker source recorded it rendered of its half for the execution: each part's version and size. */
+  source?: Array<{ layer: number; part: string; version: string; tokens: number; lessons?: number }>
+}
+
+/** A step's handbook slice: its size against the bound and the mode, what selected it, each layer's size, version, and parts, then what its Worker source rendered. */
+export function formatHandbook(h: ExplainedHandbook): string[] {
+  const s = h.selection
+  return [
+    `    handbook  ${h.tokens} of ${h.bound.tokens} tokens (${h.bound.mode} mode)  role ${s.role}${s.class ? `, class ${s.class}` : ''}, tier ${s.tier} (from ${s.tierFrom}), paths ${s.paths}`,
+    ...h.layers.map((l) => `      layer ${l.layer}  ${l.atMost ? 'at most ' : ''}${l.tokens} tokens  by ${l.renderedBy}  ${l.version}${l.parts.length ? `  parts ${l.parts.join(', ')}` : ''}`),
+    ...(h.source ?? []).map((r) => `      rendered ${r.part}  ${r.tokens} tokens  ${r.version}${r.lessons !== undefined ? `  ${r.lessons} lesson(s)` : ''}`),
+  ]
+}
+
 interface Explained {
   runId: string
   template: string
@@ -1162,9 +1502,35 @@ interface Explained {
   specHash: string
   /** The engine's decisions on the run as a whole (a board task's admission, subject, acceptance, report), which no step holds. */
   decisions?: ExplainedDecision[]
-  nodes: Array<{ nodeId: string; state: string; worker?: string; quotaClass?: string; turnId?: string; decisions: ExplainedDecision[] }>
+  /** The run's risk tier and why (ADR-0071), when its project's policy has a path map. */
+  risk?: { tier: string; reasons: string[]; decision: string; at?: string }
+  nodes: Array<{ nodeId: string; state: string; worker?: string; quotaClass?: string; turnId?: string; tier?: string; model?: string; decisions: ExplainedDecision[]; review?: ExplainedReview; handbook?: ExplainedHandbook }>
   liveness?: ExplainedLiveness[]
   livenessUnread?: Array<{ source: string; detail: string }>
+  /** The run's checks stalled now: no output for their bound, still running to their deadline (T235). */
+  stalledChecks?: Array<{ check: string; command: string; since: string; quietSince: string; stallSeconds: number }>
+  /** A research role's web calls (T262): how many, unasked, asked, and denied in their session, and each query or URL with its verdict and egress outcome. */
+  webCalls?: { count: number; auto: number; asked: number; denied?: number; calls: Array<{ at: string; nodeId?: string; tool: string; target: string; verdict: string; egress: string; reason?: string; decision: string }> }
+  /** Where the run's accepted result stands in its target's landing queue (PROP-0016 I3). */
+  landing?: { key: string; state: string; position?: number; length: number; holder?: { runId: string; taskId: string }; batch?: { size: number; limit: number; index: number } }
+}
+
+/** A run's place in its target's landing queue as `system explain` prints it. */
+export function formatLandingQueue(q: NonNullable<Explained['landing']>): string[] {
+  const place = q.position ? `position ${q.position} of ${q.length}` : `${q.length} in it`
+  return [
+    `landing queue  ${q.key}  ${q.state}  ${place}${q.holder ? `  behind task ${q.holder.taskId} (run ${q.holder.runId}), which holds the target` : q.state === 'queued' ? '' : '  holds the target'}`,
+    ...(q.batch ? [`  stack  result ${q.batch.index} of ${q.batch.size}  (batch size ${q.batch.limit})`] : []),
+  ]
+}
+
+/** A run's web calls as `system explain` prints them (T262): the counts, then one line per call. */
+export function formatWebCalls(web: NonNullable<Explained['webCalls']>): string[] {
+  return [
+    `web calls  ${web.count}: ${web.auto} unasked, ${web.asked} asked${web.denied ? `, ${web.denied} denied in their session` : ''}`,
+    ...web.calls.map((c) => `  ${c.at}  ${c.nodeId ?? '-'}  ${c.tool}  ${c.verdict}  egress ${c.egress}${c.reason ? `  (${c.reason})` : ''}  ${JSON.stringify(c.target)}  (${c.decision})`),
+    ...(web.calls.length < web.count ? [`  and ${web.count - web.calls.length} more`] : []),
+  ]
 }
 
 /** The words of each liveness state, as an operator reads them. */
@@ -1184,21 +1550,33 @@ export function formatLiveness(runs: readonly ExplainedLiveness[], unread: Reado
 }
 
 /**
- * `system explain <runId>`: the run's own decisions (a board task's admission, subject, acceptance,
- * report), then each step's (egress, tier, route, acceptance) with their reasons, then its
- * executions whose liveness needs a look.
+ * `system explain <runId>`: the run's risk tier and why (ADR-0071), when it has one; the run's own
+ * decisions (a board task's admission, subject, acceptance, report), then each step's handbook slice
+ * (its size, the bound's mode, each layer's version) and decisions (egress, tier, route, acceptance)
+ * with their reasons, a review step's findings by severity with their votes (ADR-0075), then its
+ * executions whose liveness needs a look, and its checks stalled now, and its research Workers' web
+ * calls (T262).
  */
 export function formatExplanation(explained: Explained): string[] {
   const liveness = explained.liveness?.length || explained.livenessUnread?.length ? ['liveness', ...formatLiveness(explained.liveness ?? [], explained.livenessUnread)] : []
+  const stalled = explained.stalledChecks?.length
+    ? ['checks', ...explained.stalledChecks.map((c) => `  ${c.check}  stalled since ${c.since}: no output since ${c.quietSince} (bound ${c.stallSeconds} s)  ${c.command}`)]
+    : []
   const line = (d: ExplainedDecision): string => `    ${d.type}  ${d.outcome}  ${d.reasons.join('; ')}  (${d.id})${d.result ? `  result ${d.result}` : ''}`
   return [
     `${explained.runId}  ${explained.template}  ${explained.status}  spec ${explained.specHash}`,
+    ...(explained.risk ? [`  risk tier ${explained.risk.tier}${explained.risk.at ? ` (at ${explained.risk.at})` : ''}  (${explained.risk.decision})`, ...explained.risk.reasons.map((r) => `    why   ${r}`)] : []),
     ...(explained.decisions?.length ? ['  run (decisions no step holds)', ...explained.decisions.map(line)] : []),
     ...explained.nodes.flatMap((n) => [
-      `  ${n.nodeId}  ${n.state}  ${n.worker ?? '-'}  ${n.quotaClass ?? '-'}  ${n.turnId ?? '-'}`,
+      `  ${n.nodeId}  ${n.state}  ${n.worker ?? '-'}  ${n.quotaClass ?? '-'}  ${n.turnId ?? '-'}${n.tier && n.model ? `  tier ${n.tier}, model ${n.model}` : ''}`,
+      ...(n.handbook ? formatHandbook(n.handbook) : []),
       ...n.decisions.map(line),
+      ...(n.review ? formatReview(n.review) : []),
     ]),
     ...liveness,
+    ...stalled,
+    ...(explained.webCalls?.count ? formatWebCalls(explained.webCalls) : []),
+    ...(explained.landing ? formatLandingQueue(explained.landing) : []),
   ]
 }
 

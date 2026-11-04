@@ -1,13 +1,12 @@
 # Pilot
 
 How the operator runs Base's pilot ([PROP-0010](../proposals/0010-base-version.md) B8): one
-algorithm-development project, chosen by the operator, run from its charter over at least five
-working days, through at least one restart, with Claude Code Workers writing every change (other
-agent Workers may validate and review), and measured against the baseline
-([Base exit criteria](../requirements/release-scope.md#base-exit-criteria) 3, 4, 5, and 7). The code it uses: the [`algorithm-development`](../reference/workflow-templates.md#algorithm-development)
-template, the board, the approval queue, the resource ledger, digests, and the
-[baseline report](../design/reports.md). Routine procedures it leans on are in the
-[runbooks](runbooks.md).
+algorithm-development project, run from its charter over at least five working days, through at least
+one restart, with Claude Code Workers writing every change, and measured against the baseline
+([Base exit criteria](../requirements/release-scope.md#base-exit-criteria) 3, 4, 5, and 7). It uses the
+[`algorithm-development`](../reference/workflow-templates.md#algorithm-development) template, the board,
+the approval queue, the resource ledger, digests, and the [baseline report](../design/reports.md). Routine
+procedures are in the [runbooks](runbooks.md).
 
 Roles: you are the investor (the operator): you approve the charter, answer the queue, accept or
 reject results, merge them, and pause or close the project. The lead is your own Claude Code session connected to `system`
@@ -17,25 +16,21 @@ Workers write every change; a Codex Worker may run the validation and review.
 
 ## The pilot: project `system`
 
-From 2026-10-25 the pilot is the project `system`, on the system repository itself. Its charter is
-version 2 of the project (proposed 2026-10-25); the board holds it, so read it there. The roles
-are the live install's split ([route work by kind](runbooks.md#route-work-by-kind)): a Claude Code
-Worker develops, with `kinds: [code, docs, tests]`; a Codex Worker takes the validation
+The current pilot is the project `system`, on the system repository itself; the board holds its
+charter. The roles are the live install's split ([route work by kind](runbooks.md#route-work-by-kind)):
+a Claude Code Worker develops, with `kinds: [code, docs, tests]`; a Codex Worker takes the validation
 (`kinds: [validation]`) and reviews. Read its progress on `/ui`'s **Board** (the project's header and its
-tasks by state, [web UI](../reference/web-ui.md)) and **Home** (what waits for you), and in `system report --project <its id>`
-([a working day](#a-working-day)). The sections below are the procedure for any pilot, with an
-example repository.
+tasks by state, [web UI](../reference/web-ui.md)) and **Home** (what waits for you), and in
+`system report --project <its id>` ([a working day](#a-working-day)). The sections below are the
+procedure for any pilot, with an example repository.
 
 ## Before you start
 
-1. **The host.** Claude Code installed, bubblewrap and `socat` installed, and the Workers' home
-   signed in ([agent Workers](runbooks.md#agent-workers)). Its commands must be proven confined
-   on this host (`executes`): where they cannot be, a writing Worker is unavailable ("commands
-   cannot be confined"), nothing proves `develop` or `validate`, and an attempt fails at its first
-   step with nothing sent.
-2. **The repository.** Its top level is a git repository with a commit, outside `~/.dsh`. Commands
-   in a Worker have no network: install the dependencies the tests and benchmarks need in the
-   repository first.
+1. **The host.** Claude Code, bubblewrap, and `socat` installed, and the Workers' home signed in
+   ([agent Workers](runbooks.md#agent-workers)). Its commands must be proven confined on this host
+   (`executes`); otherwise a writing Worker is unavailable and an attempt fails at its first step.
+2. **The repository.** A git repository with a commit, outside `~/.dsh`. Commands in a Worker have no
+   network, so install the dependencies the tests and benchmarks need first.
 3. **The validation commands.** The exact command lines that test and measure the work, from the
    repository's top level: `npm test`, `python -m pytest -q`, `cargo bench --bench align`. Each is
    matched word for word, never through a shell: no quotes, pipes, redirections, globs, or `~`
@@ -51,9 +46,8 @@ Edit your profile patch, `~/.dsh/profiles/system/cordis.patch.yml`. A patch that
 replaces its whole configuration, so each row below is complete. One row the pilot needs is off by
 default: `profile-software-development`, which contributes the `algorithm-development` template;
 its first two lines below turn it on. Every other row the pilot uses is on by default. Base ships
-that row off, as you decided on 2026-10-24, so this patch stays the switch
-([rows the pilot turns on](../requirements/release-scope.md#rows-the-pilot-turns-on)). For a
-repository at `/home/me/src/align`:
+that row off, so this patch is the switch ([rows the pilot turns on](../requirements/release-scope.md#rows-the-pilot-turns-on)).
+For a repository at `/home/me/src/align`:
 
 ```yaml
 # The template's profile, off by default.
@@ -68,7 +62,7 @@ repository at `/home/me/src/align`:
         kind: programmatic
         unknown: available
         windows:
-          - { id: five-hour, kind: rolling, seconds: 18000 }   # Claude: five-hour only (D70)
+          - { id: five-hour, kind: rolling, seconds: 18000 }   # Claude: five-hour only
 # Three Workers on the repository, each run of a workflow run in that run's own worktree.
 - id: agent-workers
   config:
@@ -112,13 +106,12 @@ repository at `/home/me/src/align`:
 ```
 
 Then `system check` until it says `ok`, `system shutdown`, `system start`, and `system health`:
-the three Workers `ready`. The developer proves `develop` and `validate`, the reviewer and the
-digester `review`. Keep `workspace-write`'s required checks: the engine never takes `tests` from a
-model's account of a command. It runs them itself on the result's exact tree when the
-repository's checks are configured, and a result whose checks pass no longer waits for you to run
-them ([ADR-0063](../decisions/adr/0063-a-runs-required-checks-run-on-its-exact-result.md),
-[let a run pass the required checks](runbooks.md#let-a-run-pass-the-required-checks)); otherwise
-every result waits for your acceptance, which is where the checks bind
+the three Workers `ready`. The developer proves `develop` and `validate`; the reviewer and the digester
+`review`. Keep `workspace-write`'s required checks: the engine never takes `tests` from a model's account
+of a command. It runs them on the result's exact tree when the repository's checks are configured
+([ADR-0063](../decisions/adr/0063-a-runs-required-checks-run-on-its-exact-result.md),
+[let a run pass the required checks](runbooks.md#let-a-run-pass-the-required-checks)); otherwise every
+result waits for your acceptance, which is where the checks bind
 ([accept or reject a review](runbooks.md#accept-or-reject-a-review)).
 
 On an install where other Workers are on too, such as the live install with its website and
@@ -160,8 +153,8 @@ For each milestone, the lead proposes tasks with `board_propose`, one hypothesis
 }
 ```
 
-- Name each validation command in the criteria exactly as the policy lists it: the validation step
-  runs what the criteria name, and nothing else.
+- Name each check command in the criteria exactly as the policy lists it: the developer runs what
+  the criteria name before its review and shows the output in the task's dossier, and nothing else.
 - `writes` binds the task's result to the exact tree its run leaves on that commit (INV-5), so the
   engine reports the review of that tree. One open task writes a commit at a time (INV-15):
   propose the next task on a commit once the one before it is done or cancelled.
@@ -173,16 +166,21 @@ For each milestone, the lead proposes tasks with `board_propose`, one hypothesis
 
 1. **The lead starts each ready task**: MCP `run` with `template: algorithm-development`, an
    `input` with what this attempt should try, and `task: { taskId }`. The input is the develop
-   step's alone: the review and the validation read the task's goal and criteria, never it
+   step's alone: the reviews read the task's goal and criteria, never it
    ([which inputs reach which step](../reference/workflow-templates.md#which-inputs-reach-which-step)).
    The run claims the task, and the board records it before anything runs. Then, in the run's own
    worktree:
-   - the developer states a hypothesis and changes the code (`develop:1`);
-   - the reviewer reviews that exact change (`review:1`); blocking findings put a fix to the queue,
-     and the fix and a re-review run once you approve it
-     ([remediation](runbooks.md#a-remediation-fix-waits-on-the-queue));
-   - the validation runs the criteria's commands, confined, and reports each command, its exit
-     code, and what it measured (`validate:1`). That report is the attempt's result;
+   - the developer states a hypothesis and changes the code (`develop:1`), runs the criteria's
+     commands, confined; the System records each command, its exit code, and the tail of its output
+     and lists them in the task's dossier as an evidence entry. The step is refused at its end when
+     no recorded command runs a required check; the first refusal continues its session once, and a
+     second fails it ("evidence refused twice");
+   - a fresh session of the developer's account reviews its own change (`selfreview:1`), and the
+     developer answers its confirmed important findings before anyone else reviews, with nothing for you to approve;
+   - the reviewer reviews that exact change (`review:1`), given the
+     [review guides](../review/README.md) of the areas it touches; important findings a second reviewer confirms put a fix to the
+     queue, and the fix and a re-review run once you approve it
+     ([remediation](runbooks.md#a-remediation-fix-waits-on-the-queue)). That review is the attempt's result;
    - when the repository's checks are configured, the run then runs `tests` and `lint` itself on
      the result's exact tree, confined ([let a run pass the required checks](runbooks.md#let-a-run-pass-the-required-checks)).
 2. **The result waits for you** in `review` (`tests` and `lint` pending) unless the run passed both
@@ -190,7 +188,7 @@ For each milestone, the lead proposes tasks with `board_propose`, one hypothesis
    digest is set on the task within minutes: the lead reads the digest, not the transcript
    (`board_task`, `board_brief`).
 3. **You decide, in batches**, on `/ui`: the queue's requests (charters, remediation fixes), and the
-   reviews held for you. For a review: read the digest and the validation's report, run the pending
+   reviews held for you. For a review: read the digest, the review, and the developer's evidence entry, run the pending
    checks in the run's worktree yourself ([worktree](runbooks.md#a-runs-worktree)), then Accept or
    Reject. A rejection makes another attempt, which resumes the developer's session from a brief
    pointing at this attempt's result and your decision; tell the lead your reason.
@@ -218,12 +216,11 @@ A task that waits for input, an expired request, or a run that failed each have 
 
 Exit criterion 3 asks for at least one restart during the pilot. Do it with work in flight:
 `system shutdown` (it drains, then stops), then `system start`. Runs resume; an agent run that had
-started is never run again (`reconciliation_failed`), and its task's next attempt goes through the
-gate; a request answered while the host was down still applies. Then check that nothing ran twice:
-`system explain <runId>` for the runs in flight, the queue on `/ui`, and the day's report (an
-attempt reported once, one usage record per agent run; an agent run the restart stopped before its
-runtime reported anything has none, and is counted once as a run whose usage the ledger could not
-count).
+started is never run again (`reconciliation_failed`), and its task's next attempt goes through the gate;
+a request answered while the host was down still applies. Then check that nothing ran twice: `system
+explain <runId>` for the runs in flight, the queue on `/ui`, and the day's report (an attempt reported
+once, one usage record per agent run; a run the restart stopped before its runtime reported anything is
+counted once as a run whose usage the ledger could not count).
 
 ## Five working days, then close
 
@@ -274,5 +271,5 @@ well-configured Claude Code session alone and through `system`
 3. **Before the pilot:** the runs of `system` on its own code are recorded in
    [self-build](../validation/self-build.md); the pilot is the measured version.
 4. **Compare:** accepted results per interruption must be clearly better through `system`, and
-   tokens per accepted result no worse. Quota lost at reset is not reported yet. Record both sides
-   in the [release checklist](../validation/release-checklist.md).
+   tokens per accepted result no worse. Record both sides in the
+   [release checklist](../validation/release-checklist.md).

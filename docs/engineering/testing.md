@@ -49,9 +49,8 @@ scenario of the suite, on the same provider, does not stay.
   so test directories, browser profiles, and child processes all land under it, and teardown
   removes it. A killed run cannot tear down; the next run removes the parents of runs that are
   gone, and nothing else. A test keeps using `tmpdir()`. A process that names a path under a
-  parent on its command line (an Xvfb's `-auth`, a Chrome profile) belongs to that run: it is
-  stopped when the parent is removed, so a host the crash suite kills, or a suite killed before
-  its close, leaves no display behind.
+  parent on its command line (an Xvfb's `-auth`, a Chrome profile) is stopped when the parent is
+  removed, so no display outlives a killed run.
 - **Built-artifact smoke test**
   ([`packages/cli/tests/profile.e2e.ts`](../../packages/cli/tests/profile.e2e.ts),
   [`api-first.e2e.ts`](../../packages/cli/tests/api-first.e2e.ts)).
@@ -114,13 +113,11 @@ scenario of the suite, on the same provider, does not stay.
     enrollment slot's allocation and its verification leaves the slot `enrolled`,
     never `ready`, until the operator verifies it
     ([ADR-0051](../decisions/adr/0051-agent-accounts-are-enrolled-slots-identified-by-their-login.md)).
-    A daemon killed between a carried worktree's `git worktree add --no-checkout` and the reading
-    of the earlier tree into it (a `git` on the harness's PATH whose `read-tree` never returns)
-    leaves that worktree marked, no agent run in it; past the retention it is put back to its base
-    and removed with nothing committed on its branch, and the run's agent later works on the base's
-    files ([ADR-0061](../decisions/adr/0061-a-tasks-next-attempt-starts-from-the-work-its-previous-attempt-left.md)).
+    A daemon killed while a carried worktree is being filled from the earlier tree leaves that worktree
+    marked, with no agent run in it, and it is later removed with nothing committed on its branch
+    ([ADR-0061](../decisions/adr/0061-a-tasks-next-attempt-starts-from-the-work-its-previous-attempt-left.md)).
     An engine killed between a team member's `resend` decision and its new attempt (the
-    decision, the session's reset, and the ready node one transaction) resends that step exactly
+    decision, the session's reset, and the ready node in one transaction) resends that step exactly
     once after a restart, in the new conversation, and the team completes
     ([ADR-0062](../decisions/adr/0062-a-team-members-first-step-is-resent-once-after-a-sites-own-error.md)).
 - **Architecture rules**
@@ -134,11 +131,6 @@ scenario of the suite, on the same provider, does not stay.
   plugin and asserts cleanup (plugin rule 3).
 - **Mock only the expensive boundary.** Keep the real registry, store, and
   engine downstream of a scripted provider.
-- **Golden fixtures.** The statistics library is checked against SciPy's results
-  on fixed datasets, generated once by hand
-  ([`scripts/statistics/`](../../scripts/statistics/sign-flip-goldens.py)) and
-  committed with the versions they ran with. No test runs Python
-  ([golden tests](../design/statistics.md#golden-tests)).
 - **Clean up with the test.** What a test or its helper starts (a store, a fake
   site, a browser) is released by `onTestFinished`, newest first, so a helper that
   boots something registers its own cleanup and a test file keeps no list of its
@@ -147,13 +139,10 @@ scenario of the suite, on the same provider, does not stay.
   it must see (a row's state, the next read of a poll or sweep), or runs a long
   timer on fake time. A fixed sleep stays only where a test shows that nothing
   happens during a window, and nothing it could wait for marks that window.
-- **A test's bound fits its work.** The 5 s default is for in-process tests. A test whose work
-  is real processes (a script end to end, the CLI started from source, a scripted agent or its
-  hook, bubblewrap) sets a bound for them, for the whole file when every test there does: under
-  load a process start costs several times what it does alone. So does a test whose point is time
-  passing on real timers (a stall bound firing, a slow stream). A test whose CPU outgrows the
-  default holds too much: it is split by its independent cases (one per golden dataset). A larger
-  bound never stands in for waiting on an event the test could wait for.
+- **A test's bound fits its work.** The 5 s default is for in-process tests. A test that runs real
+  processes (a script, the CLI from source, a scripted agent, bubblewrap), or whose point is time
+  passing on real timers, sets its own bound. A test whose CPU outgrows the default is split by its
+  independent cases. A larger bound never stands in for waiting on an event.
 - **An unhandled rejection is a failure.** vitest fails a run on one even when every test passed,
   and under the `dsh` launcher the same rejection exits the daemon. Find whose promise it is and
   fix it there: a dependency's, until a release of it does, with a [patch](dependencies.md#patches).
@@ -179,29 +168,16 @@ absence of automation leaks are properties of the real browser.
   mount `display-virtual`, as a profile's browsers share one display. Each test still launches
   its own Chrome. The fake passes the display conformance suite, and `display-virtual` itself is
   tested on its own real Xvfb.
-- A website driver's tests against its fake site are split by theme, one file each (pages, modes
-  or answers, the composer, stalls, conversations, deletion, Deep research), so they run side by
-  side: the suite's wall time is set by its slowest file. Each file launches one Chrome on its own
-  Xvfb through `fakeSite()` in the driver's `tests/site.ts`, and each test opens its own fake site
-  and browser context there, stopped when the test finishes. A test that expects the driver to give
-  up (a conversation that never renders, a send nothing confirms) sets that bound small rather than
-  waiting out the production default.
-- The turn runtime's and the workflow engine's browser specs are split by theme the same way
-  (turns: asks, sessions, sign-in, routing, limits, the session-bound login profile, the ChatGPT
-  one, kept tabs, a site's notice or check, a turn across a restart, a restarted turn that must
-  wait and its cancel, the runtime's bounds and stop, the conversation ledger, a conversation kept
-  or failing to delete; workflow: static DAGs, acceptance, plans, plan approval, the operator's
-  stop and supersede, deletion, failures, restarts, retention, explain and MCP, re-plans, team
-  votes, ties and their deciding vote, runs that wait on a vote, review findings, where a member
-  runs and what it may be sent, provider families, a member woken by a message, one that needs a
-  peer's input, one handed off to a new conversation), each file on its own Xvfb through its
-  package's `tests/stack.ts`. Those stacks do not pace page opens (the drivers' `pageGapMs` and the
-  runtime's `providerPageGapMs` are 0); the browser pool's own tests show the spacing. They also
-  set the drivers' answer-stable window (`stableMs`) to 300 ms, as the drivers' own specs do,
-  instead of production's 1.5 s. Production waits that long for a live site that pauses mid-answer.
-  The fake sites stream a word every 60 ms and then mark the answer done, so the longer window only
-  added idle time to every turn of every spec. The drivers' specs still cover completion on stable
-  text.
+- A website driver's tests against its fake site are split by theme, one file each, so they run side
+  by side. Each file launches one Chrome on its own Xvfb through `fakeSite()` in the driver's
+  `tests/site.ts`. A test that expects the driver to give up sets that bound small rather than waiting
+  out the production default.
+- The turn runtime's and the workflow engine's browser specs are split by theme the same way, each
+  file on its own Xvfb through its package's `tests/stack.ts`. Those stacks do not pace page opens
+  (the drivers' `pageGapMs` and the runtime's `providerPageGapMs` are 0). They also set the
+  drivers' answer-stable window (`stableMs`) to 300 ms instead of production's 1.5 s, because the
+  fake sites stream a word every 60 ms and then mark the answer done. The drivers' own specs still
+  cover completion on stable text.
 - They need Xvfb and a modern Chrome. The tests choose Chrome with the
   product's own `discoverChrome` and launch it with the product's arguments.
   The order is `CHROME_PATH`, then a system Chrome no older than the engine,
@@ -216,20 +192,82 @@ absence of automation leaks are properties of the real browser.
   `SYSTEM_REQUIRE_BROWSER=1`, so a missing browser **fails** the run instead of
   skipping silently.
 
+### A loaded host
+
+- **Workers.** `vitest.config.ts` sets `maxWorkers` by `testWorkers()`
+  ([`scripts/test-workers.ts`](../../scripts/test-workers.ts)): the host's cores less one, at most 32,
+  or the budget the environment gives (`SYSTEM_TEST_MAX_WORKERS`, or `SYSTEM_CHECK_MAX_WORKERS` for an
+  acceptance check, whichever is smaller). A writing step's own tests get `stepTests.coreBudget /
+  stepTests.runs` (see the [configuration reference](../reference/configuration.md)). A value that is not
+  a positive integer is ignored.
+- **Time.** `SYSTEM_TEST_TIME_FACTOR` (1 to 20, default 1) multiplies the waits of the browser and
+  real-Xvfb specs, through `scaled(ms)` in
+  [`provider-core/conformance/time.ts`](../../packages/provider-core/conformance/time.ts). It scales a
+  wait only, never an assertion: a bound a test asserts on is the product's own and is not loosened.
+  On a shared host at a load of thousands, set it to 3 or more.
+
+### Real-browser tests in a Worker's confinement
+
+The web UI's browser tests run a **headless** Chrome: they need Chrome, not Xvfb, and they run
+inside a Worker's confinement as on the host. What makes that so:
+
+- **Chrome is found there.** `DSH_HOME` is scrubbed inside the confinement, so `findTestChrome` in
+  [`support.ts`](../../packages/plugins/browser-patchright/tests/support.ts) looks for the managed build
+  and the developer cache in the account's own home (the password database's, not `HOME`). The
+  confinement binds `$DSH_HOME/system/browsers` back read-only and names it in `SYSTEM_BROWSERS_DIR`.
+  A Chrome elsewhere under a hidden directory needs `CHROME_PATH` and a `readOnly` entry.
+- **Chrome's own sandbox is off.** Patchright adds `--no-sandbox` unless a launch asks for
+  `chromiumSandbox`, which the headless tests never do: the confinement (its own PID namespace, no
+  network in a check, the host read-only) isolates it, and a nested setuid or user-namespace sandbox
+  is what a confinement may refuse. The product's own launches keep Chrome's sandbox
+  (`IGNORED_DEFAULT_ARGS`).
+- **`/dev/shm` and fonts are there.** `/dev/shm` is hidden as a private tmpfs, which Chrome writes
+  its shared memory to; fontconfig reads `/etc/fonts` and `/usr/share/fonts` on the read-only host.
+  Chrome's profile is a temporary directory in the private `/tmp`.
+- **Chrome writes nothing under `HOME`.** A test launches it with `headlessLaunchOptions()`: its
+  own `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, and `XDG_DATA_HOME` in the temporary directory. Chrome
+  keeps its crash database under `XDG_CONFIG_HOME` (default `~/.config`), not its profile, and where
+  `HOME` is read-only (a check's host, an agent's private home) its crash handler exits
+  (`chrome_crashpad_handler: --database is required`) and takes Chrome with it.
+- **A skip says why, loudly.** A headless browser test is declared with `headlessIt(name, fn)`. Where
+  no Chrome can run it, it is skipped with `browser tests did not run: <why>`, never silently. Whether
+  one can run is decided by doing it: a Chrome is started once, headless, on a blank page. A sandbox
+  that forbids what Chrome needs (an agent's Bash sandbox refuses unix sockets) skips the tests with
+  that reason. `SYSTEM_REQUIRE_BROWSER=1` (CI) makes them fail instead. The reporter
+  ([`scripts/browser-skips.ts`](../../scripts/browser-skips.ts)) prints `!!! BROWSER TESTS DID NOT RUN: …`
+  as the run's last line. In a run's check it also appends `browser-tests-not-run: <detail>` to the
+  report file at `SYSTEM_CHECK_REPORT_PATH`, so the check keeps its outcome and the review knows the
+  pass does not cover those tests ([a run's checks](../design/agent-runtimes.md#a-runs-checks)). A
+  report file that cannot be written fails the run (`!!! THE CHECK WAS NOT TOLD: …`).
+- **vite writes two places in the worktree:** its cache (`node_modules/.vite`) and its bundled
+  configuration (`node_modules/.vite-temp`). A check sees the worktree read-only, so a repository
+  whose checks run vitest names both in `checkScratch`, or vitest fails to start (`EROFS`).
+- [`confined-browser.spec.ts`](../../packages/plugins/web-ui/tests/confined-browser.spec.ts) runs
+  one web UI browser test under a check's own confinement and asserts it passed, not skipped. With
+  every Chrome hidden, it asserts the test was skipped with its reason, reported to the check. That
+  case needs the suite run under pnpm (`npm_execpath`), as CI and a check run it, plus real bubblewrap
+  and a Chrome on the host.
+- **In a Worker's own tool call**, `corepack pnpm exec vitest run <a web-ui browser spec>` runs in the
+  runtime's command sandbox, which makes the managed Chrome readable ([design](../design/agent-runtimes.md#credentials-and-egress)).
+  A run whose tests skipped gets `browser-tests-not-run: <why>` in its report file, result `notRun`,
+  and a review note. [`worker-tool-browser.spec.ts`](../../packages/plugins/web-ui/tests/worker-tool-browser.spec.ts)
+  runs that path end to end, with the model scripted to one Bash call.
+- **A test of a confinement's mask puts the masked path where the child sees it**: under a
+  directory the confinement binds back. The host's `/tmp` is a private tmpfs inside, so a socket
+  under the host's temporary directory that nothing binds back is rightly left unmasked.
+- **A sandbox's placeholders are not changes.** Inside a Worker's tool sandbox git lists the empty
+  placeholders the sandbox mounts in the worktree (`.bashrc`, `.gitconfig`, `.claude/settings.json`,
+  …) as untracked files. `pnpm test:affected` leaves an empty one out of the changed files
+  (`sandboxPlaceholder`), so it does not run the whole suite for them; one with content counts.
+
 ## Test groups
 
 `pnpm test` runs the whole suite, at most 32 test files at once, one per CPU but one on a smaller
-host ([`vitest.config.ts`](../../vitest.config.ts)): vitest's own default of one per CPU ran every
-file at once on a 256-CPU host, where in-process tests passed their bounds. Its wall time is the
-longer of its slowest file and the sum of its files over those 32, so the slow files must start
-first. vitest's own order reads its duration cache from the last run on that checkout; with none (a
-fresh worktree, every CI run) it starts the largest files first, so a short file of slow tests
-started among the last, and a cold run took about 40 s more than a warm one. The suite's sequencer
-([`scripts/test-durations.ts`](../../scripts/test-durations.ts)) orders by a committed table
-instead, [`scripts/test-durations.json`](../../scripts/test-durations.json) (each file's path →
-seconds): the files the table does not hold first (a new file is not known to be short), in
-vitest's own order, then the rest longest first, cache or none. Refresh the table after adding,
-splitting, or slowing files, from a full run on a quiet host, and commit it:
+host ([`vitest.config.ts`](../../vitest.config.ts)). Its sequencer
+([`scripts/test-durations.ts`](../../scripts/test-durations.ts)) orders files by a committed table,
+[`scripts/test-durations.json`](../../scripts/test-durations.json): files the table does not hold
+first, then the rest longest first. Refresh the table after adding, splitting, or slowing files, from
+a full run on a quiet host, and commit it:
 
 ```sh
 pnpm test --reporter=json --outputFile=$TMPDIR/vitest-report.json
@@ -254,24 +292,86 @@ a test file is in no group, or in two.
   changed package's data file. The `libs` group runs for every change, since the scripts' tests
   check the whole repository, and documentation reaches it alone. A schema reaches every package;
   a root configuration file, CI, or a path the script cannot place runs every group (fail
-  closed). A spike runs none: spikes are not part of the suite.
+  closed).
+
+### Tests scale with the change
+
+Running the full suite for every check made tests with a 5 s bound fail under load. The full suite
+now runs once per task, at the landing; everything before it runs what the change relates to.
+
+- `pnpm test:related <file>…` (`--dry-run` to print the selection only; vitest's options follow, with or without `--`, as in
+  `test:related a.ts --silent --reporter=dot`: the files end at the first word that starts with `-`) runs the test files related
+  to the files given: each given test file; and, for any other file, the tests of its package and of
+  every package that depends on it, through the same graph as `test:affected` (code, test helpers,
+  and the packages that locate its data files). The scripts' tests, which check the whole repository
+  (architecture, docs, manifests), run for any change but a test file's. A `package.json` (in any
+  directory), the lockfile, `pnpm-workspace.yaml`, `tsconfig*.json`, `vitest*.ts`, CI, or a path the
+  script cannot place widens to the whole suite (fail closed). Arguments after `--` go to vitest.
+- **A writing Worker** runs `pnpm test:related` on the files it changed, while it develops and in its
+  evidence, never the full suite. In its sandbox the command is admitted unasked when every path is
+  absolute and inside the worktree (the gate's `workspace-write`; it only runs tests there).
+- **The acceptance `tests` check** runs `pnpm test:affected`, told its scope
+  (`SYSTEM_CHECK_SCOPE=acceptance`) and the commit its run's worktree was cut at
+  (`SYSTEM_CHECK_BASE`): it runs the tests related to the files the result itself changed since that
+  commit, never what its branch gained before it, and the whole suite when the result changed shared
+  configuration, or when no such commit is recorded.
+- **The landing** runs the same command with `SYSTEM_CHECK_SCOPE=landing` on the tree it is to merge:
+  the rebased tree when the base moved, the committed tree when it did not. That is the whole suite,
+  once per landing, before the merge is asked, in the check queue like any check
+  ([running the suite inside a run's check](#running-the-suite-inside-a-runs-check)). A failure sends
+  the result back as another attempt, with its failing tests named in the reason and in the task's
+  dossier.
+- Run by hand without a scope, `pnpm test:affected` still runs the affected groups.
+
+#### Browser tests run only when the change touches what they exercise
+
+A browser test is marked by its gate in `browser-patchright/tests/support.ts`: `describe.runIf(canRunBrowser…)`,
+`headlessIt`, or `browserUnavailable`. The mark is per test, so a file that mixes plain and browser
+tests keeps its plain ones running. The related run, `pnpm test:affected` by hand, and the landing
+leave browser tests out unless the change is in the browser stack (`BROWSER_STACK`: browser-patchright,
+display-virtual, ui-ops, login, the two `provider-*-web` drivers, turns, web-ui), edits the spec's own
+file, or edits a helper in its tests directory. Left out, a test is skipped with `browser test left out: …`
+(not counted as a browser test that could not run) and sets `SYSTEM_SKIP_BROWSER_TESTS=1`. A change
+that affects everything runs them all, as does `pnpm test:affected --all-browser`. The landing reads
+the change from the commit its run's worktree was cut at (`SYSTEM_CHECK_BASE`); with none it runs
+every test. A rebased tree can add what dev gained, which counts as change: more browser tests run,
+never fewer.
+
+A daily run of every browser spec on dev's tip runs inside System. The workflow plugin's `dailyCheck`
+(off unless `enabled`; `ref` default `dev`, `hourUtc` 4, `timeoutMinutes` 180; see the
+[configuration reference](../reference/configuration.md)) asks the Worker source for the repository's
+`tests` check at scope `daily` (the whole suite with every browser test) on the ref's tip. It runs
+confined and read-only, only while the worktree is exactly that commit. A pass is recorded. An exit 0
+that reports skipped browser tests is an `error`, never a pass. A failure proposes one board task, unless
+an earlier one is open. A run that never reaches an exit code is recorded as an `error` and files
+nothing. `/ui` Home and `system metrics` show the last daily run.
+
+A check's command gets its scope, starting commit, and alone mark (`SYSTEM_CHECK_ALONE`, `1` only for
+the re-run alone after timeouts) from the source that runs it, never from the process that runs the
+source.
+
+The related set is wider than a file-level import graph (a package's whole test suite for one source
+file), so it never skips a test that imports a changed file.
 
 The rule:
 
-- **A change** runs its groups (`pnpm test:affected`) and `pnpm check`.
+- **A change** runs the tests related to its files (`pnpm test:related`) and `pnpm check`; the
+  landing runs the full suite.
 - **A big update** runs the full gate: `pnpm check`, `pnpm test`, `pnpm test:e2e`, and
   `pnpm test:crash`. A contract, seam, or schema change, a batch integration, and a release are
   big updates.
 
 ## CI gates
 
-[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) runs on every pull request, every
-push to `main` or `dev` (every merge; `dev` is where the lead integrates batches and the live install
-follows), nightly on `main`, and on each release tag (the
-[release workflow](releasing.md) calls it), on Node 24.18.1 (the floor), the latest 24, and the
-latest 26, with a real Xvfb, TigerVNC, bubblewrap, and Chrome installed. A pull request runs
-`pnpm check` and its affected [test groups](#test-groups); everything else runs the full gate.
-The job keeps one name on every trigger, so a required check names it whatever ran. Each gate is
+[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) runs the full gate only when work
+is merged: on every push to `dev` (every merge into it; `dev` is where the lead integrates batches
+and the live install follows), on each release tag (the [release workflow](releasing.md) calls
+it), and by hand (`workflow_dispatch`). A commit or a pull request runs none: run `pnpm check` and
+the affected [test groups](#test-groups) locally before merging. It runs on Node 24.18.1 (the
+floor), the latest 24, and the latest 26, with a real Xvfb, TigerVNC, bubblewrap, and Chrome
+installed. `main` takes `dev` only through a pull request, whose head is `dev`'s tip, so the
+checks `main`'s ruleset requires are the ones that ran on `dev`. The job keeps one name on every
+trigger, because the ruleset requires it by name. Each gate is
 a root [`package.json`](../../package.json) script:
 
 1. `pnpm check`:
@@ -303,6 +403,11 @@ a root [`package.json`](../../package.json) script:
    - `check:migrations` ([`scripts/check-migrations.ts`](../../scripts/check-migrations.ts)): within
      each owner's store migrations, across all its `migrate` calls, no version appears twice, and
      each list's versions strictly increase in list order ([store migrations](#store-migration-versions));
+   - `check:tiers` ([`scripts/check-risk-tiers.ts`](../../scripts/check-risk-tiers.ts)): the
+     `system` project's policy ([`policies/system.json`](../../policies/system.json)) is a valid
+     `autonomy-policy@1.1` whose path map matches every tracked path and names every package
+     directory with a rule of its own, so a new package is given a risk tier on purpose
+     ([ADR-0071](../decisions/adr/0071-a-changes-risk-tier-comes-from-the-policys-path-map.md));
    - `check:reference`, `check:packages`, and `check:traceability`: the generated
      [configuration catalog](../reference/configuration.md),
      [package graph](../architecture/packages.md), and
@@ -322,24 +427,22 @@ a root [`package.json`](../../package.json) script:
    The agent read confinement tests run against the real bubblewrap; locally they
    are skipped, with the reason, when `bwrap` is missing or cannot confine a command
    there, and in CI (`SYSTEM_REQUIRE_BWRAP=1`) such a one fails the run (see
-   [running the suite inside a run's check](#running-the-suite-inside-a-runs-check)). On a
-   pull request, `pnpm test:affected --base origin/<its base branch>` instead, with
-   the same environment.
+   [running the suite inside a run's check](#running-the-suite-inside-a-runs-check)).
 3. `pnpm test:e2e`: build, then every `*.e2e.ts`, one file at a time
    ([`vitest.e2e.config.ts`](../../vitest.e2e.config.ts)): boot the shipped
    profile and the `api-first` preset through `dsh`, and upgrade every seeded
-   store fixture. Not on a pull request.
+   store fixture.
 4. `pnpm test:crash`: build, then every `*.crash.ts`, one file at a time
    ([`vitest.crash.config.ts`](../../vitest.crash.config.ts)): the cases of
-   [crash injection](#conventions-adopted-from-dsh). Not on a pull request.
+   [crash injection](#conventions-adopted-from-dsh).
 
 [`.github/workflows/audit.yml`](../../.github/workflows/audit.yml) runs
 `pnpm audit:deps` (no high or critical advisory in a production dependency) once,
-outside the Node matrix, on the same triggers and daily. It fails closed: a
+outside the Node matrix, on every push to `dev` and daily. It fails closed: a
 registry error fails it like an advisory does, so it is never run with
 `--ignore-registry-errors`. The release checklist adds a full audit.
 [`.github/workflows/codeql.yml`](../../.github/workflows/codeql.yml) runs CodeQL's
-`security-extended` queries on the same triggers and weekly.
+`security-extended` queries on every push to `dev` and weekly.
 [`.github/dependabot.yml`](../../.github/dependabot.yml) proposes npm and Action
 updates weekly, each version once it is a week old, except `@deepseek-ai/*`, whose
 one exact pin moves by hand after the conformance and composition suites pass
@@ -351,10 +454,10 @@ CI cannot prove account-bound flows. The
 
 ### What parallel changes collide on
 
-Parallel runs each take "the next" number from the same tree, and each passes alone. Landing
-them side by side on `dev` on 2026-10-26: two runs wrote ADR-0065, two added agent-workers store
-migration 18, and one made a field of `mcp-roster@1.7` optional in place instead of adding a
-version. Three checks in `pnpm check` refuse these, each with a test of a fixture that fails and of
+Parallel runs each take "the next" number from the same tree, and each passes alone. When they
+land side by side on `dev`, they collide: two runs write the same ADR number, two add the same
+store migration version, or one changes a released schema in place instead of adding a version.
+Three checks in `pnpm check` refuse these, each with a test of a fixture that fails and of
 the real tree that passes ([`scripts/collisions.spec.ts`](../../scripts/collisions.spec.ts)). A
 writer takes the next free number, version, and schema version
 ([CONTRIBUTING](../../CONTRIBUTING.md)); after a collision, the change that lands second renumbers.
@@ -391,33 +494,57 @@ its `required` list, and its property names. `check:schemas` compares each schem
 a change fails when it requires a property, stops requiring one, removes a property or a
 subschema, changes an existing subschema's constraints (narrows or relaxes it), or adds a
 constraint subschema to an existing one (a `not`, `items`, `if`, or `dependentSchemas` entry that
-was not there), unless the
-schema's version moved past the snapshot's. A schema's version is the highest `<major>.<minor>` of
-its file's major among the version notes in its descriptions (`1.9 adds …`, `1.4: …`, `(1.1)`,
-`<name>@1.9 …`; `other@1.3` names another schema and does not count). Only descriptions count: a
-`<name>@<major>.<minor>` tag elsewhere, such as an advanced `properties.schema.const`, is not a
-note, so a contract change needs its note in a description.
+was not there), unless the schema's version moved past the snapshot's. A schema's version is the
+highest `<major>.<minor>` of its file's major among the version notes in its descriptions (`1.9 adds …`,
+`1.4: …`, `(1.1)`, `<name>@1.9 …`; `other@1.3` names another schema and does not count). Only
+descriptions count: a `<name>@<major>.<minor>` tag elsewhere, such as an advanced
+`properties.schema.const`, is not a note, so a contract change needs its note in a description.
 Adding an optional property or a `$defs` entry is not a change in place.
 
 `pnpm gen:reference` rewrites the snapshot: every schema's current contract, except a schema
 changed in place, whose old entry it keeps, so regenerating never hides the change. The check also
 fails while the snapshot is out of date, so every versioned change commits its new entry.
 
-A snapshot, not a diff against the merge base with `main`: work lands on `dev` and `main` takes it
-only at the operator's merge ([branches](development.md#branches-dev-and-main)), so the merge base
-is a different, older tree on each branch, and a shallow checkout may not hold it. The snapshot is
-in the tree, so the check answers the same everywhere, offline. Two changes that both version one
-schema both rewrite its entry, and meet as a merge conflict in the snapshot. Its limit: a version
-note anywhere in a schema admits a change anywhere in it, so the note must say what changed.
+The check compares against the snapshot, not a diff against the merge base with `main`: the merge base
+differs on each branch ([branches](development.md#branches-dev-and-main)), and a shallow checkout may
+not hold it. Two changes that both version one schema meet as a merge conflict in the snapshot. Limit:
+a version note anywhere in a schema admits a change anywhere in it, so the note must say what changed.
+
+## Removability matrix
+
+When a plugin is removed, System still works normally. The
+[plugin model](../architecture/plugin-model.md#required-and-optional-rows) lists which bundle rows
+are required (the host and the guarantee seams) and which are optional (capability and surface
+rows). The matrix ([`packages/system-bundle/tests/removability/`](../../packages/system-bundle/tests/removability/matrix.ts))
+covers every optional row, including those that ship off (for those, with the software-development
+profile on). For each, it mounts the bundle's rows in this process with that row off, and a scripted
+Worker as the one fake. The smoke scenario, step by step:
+
+- `start`: every mounted row started;
+- `health`: MCP `status` is not down, the plugin host's manifest check finds nothing and does not list
+  the row as mounted (with `mcp-server` off, there is no endpoint: `/healthz` answers 404 and runs go
+  through the engine);
+- `tools`: the tools every composition has are listed, none appears that the baseline lacked, and the
+  read tools still listed answer;
+- `ask` and `algorithm-development`: a run on the fake Worker completes. Only when the row is the
+  profile that contributes the template does the run fail, with the unknown template as its reason.
+
+A step either succeeds or fails with the documented absence of the removed row's seam
+(`ABSENT` in `matrix.ts`); a crash, a hang (each wait is bounded), or any other failure is reported as
+`row <id>, step <name>: <what>`. The matrix runs by `pnpm test:removability` (no build) and daily in
+[`removability.yml`](../../.github/workflows/removability.yml), not on a pull request or a push: it boots
+the bundle once per row. `removability.spec.ts` runs in every `pnpm test`: it checks that each bundle
+row is in exactly one of the two lists, and smokes the bundle as shipped and with `digest` and the
+profile row off.
 
 ## Running the suite inside a run's check
 
 A workflow run's `tests` check ([ADR-0063](../decisions/adr/0063-a-runs-required-checks-run-on-its-exact-result.md))
-runs `pnpm test:affected` inside the run's confinement: bubblewrap, the host read-only but the
-check's scratch paths, the worktree read-only too, a private `/tmp`, no network but loopback, its
-own PID namespace and `/dev`, and the daemon's umask (077 when
-[`scripts/live-update.sh`](../../scripts/live-update.sh) started it). The suite gives the verdict
-there that it gives on the host (T174):
+runs `pnpm test:affected` inside the run's confinement (the scope decides what runs:
+[tests scale with the change](#tests-scale-with-the-change)): bubblewrap, the host and the worktree
+read-only but the check's scratch paths, a private `/tmp`, no network but loopback, its own PID namespace and `/dev`, and the daemon's
+umask (077 when [`scripts/live-update.sh`](../../scripts/live-update.sh) started it). The suite gives
+the same verdict there as on the host:
 
 - **One helper decides what the environment can do, by doing it:**
   [`packages/agent-runtime-core/tests/host.ts`](../../packages/agent-runtime-core/tests/host.ts).

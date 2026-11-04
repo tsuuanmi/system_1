@@ -5,15 +5,15 @@
  */
 import { createHash, randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
-import type {} from '@tsuuanmi/system-artifacts'
+import type {} from '@tsuuanmi/system-ledger-core'
 import { canonicalJson, contentId, SchemaRegistry } from '@tsuuanmi/system-libs'
 import { expect } from 'vitest'
 import { type Action, type ApprovalRequest, type AutonomyPolicy, waitSeconds } from '@tsuuanmi/system-approvals-core'
 import { POLICIES } from '../../approvals-core/conformance/approvals.ts'
 import { defineSuite, type Scenario } from '../../libs/conformance/runner.ts'
 import {
-  type ActionClass, type ArtifactRef, Board, BoardError, type BoardTask, type BudgetLine, type CancelReason, type Charter, type CharterInput, type Claim, fundingVersion, type Project, type RunOutcome,
-  type ProjectState, type Subject, type TaskInput, type TaskState, TERMINAL, UNRELEASED_MAX, type UnreleasedHold, unreleasedProblem, unreleasedText, type WaitReason,
+  type ActionClass, type ArtifactRef, Board, BoardError, type BoardTask, type BudgetLine, type CancelReason, type Charter, type CharterInput, type Claim, FREE_RETRIES_DEFAULT, freeRetriesOf, fundingVersion, infrastructureProblem, type Project, type RunOutcome,
+  type ProjectState, REOPEN_REASON_MAX, type Reopening, type Subject, type TaskInput, type TaskState, TERMINAL, UNRELEASED_MAX, type UnreleasedHold, unreleasedProblem, unreleasedText, type WaitReason,
 } from '../src/index.ts'
 
 export type Boot = () => Promise<{
@@ -116,7 +116,7 @@ const digestOf = (ctx: Context, sources: ArtifactRef[], summary = 'the result in
   body: { schema: 'digest@1.0', sources, status: 'passed', summary, claims: [{ id: 'C1', kind: 'finding', text: 'it ran', citation: { artifact: sources[0]!, quote: 'attempt' } }] },
 }).id as ArtifactRef
 
-const scenario = (id: string, title: string, run: (ctx: Context, booted: { changePolicies: (policies: readonly AutonomyPolicy[]) => Promise<void> }) => Promise<void>, since: '1.0' | '1.1' | '1.2' | '1.3' = '1.0'): Scenario<Boot> => ({
+const scenario = (id: string, title: string, run: (ctx: Context, booted: { changePolicies: (policies: readonly AutonomyPolicy[]) => Promise<void> }) => Promise<void>, since: '1.0' | '1.1' | '1.2' | '1.3' | '1.4' | '1.5' = '1.0'): Scenario<Boot> => ({
   id: `board.${id}`, since, title,
   run: async (boot) => {
     const { ctx, dispose, changePolicies } = await boot()
@@ -130,7 +130,7 @@ const scenario = (id: string, title: string, run: (ctx: Context, booted: { chang
 
 export const boardSuite = defineSuite<Boot>({
   seam: 'board',
-  contract: '1.3',
+  contract: '1.5',
   scenarios: [
     scenario('charter-approved-activates', 'starts work only under a charter the operator approved, bound to that charter version, with every milestone planned (INV-5, INV-6)', async (ctx) => {
       expect(await failureOf(ctx.board.charter({ projectId: 'p1', title: 'Kernel', charter: CHARTER, milestones: [{ id: 'm1', title: 'First', state: 'funded', funding: `sha256:${'1'.repeat(64)}` }] }, T0))).toBe('invalid')
@@ -458,6 +458,52 @@ export const boardSuite = defineSuite<Boot>({
       await ctx.board.start(f.taskId, claim.generation, { runId: 'run-2' }, at(12))
       expect(validTask(await ctx.board.reconcileRun(f.taskId, 'run-2', { status: 'failed' }, at(13)))).toMatchObject({ state: 'ready', attempts: { count: 1 } })
     }),
+    scenario('infrastructure-failure-not-counted', 'does not count a run that failed only on the infrastructure as an attempt, within the default bound of free retries, and says why; past the bound it counts, so a persistent one ends waiting for input with the reason; a malformed report changes nothing (INV-9, INV-13)', async (ctx) => {
+      await active(ctx)
+      const t = await ready(ctx, task('p1', 'infra', { maxAttempts: 1 }))
+      let minute = 3
+      const started = async (runId: string): Promise<void> => {
+        const { generation } = await ctx.board.claim(t.taskId, 'lead', 600_000, at(minute))
+        await ctx.board.start(t.taskId, generation, { runId }, at(minute))
+        minute += 2
+      }
+      const reasonsOf = (ref: ArtifactRef | undefined): string => JSON.stringify((ctx.artifacts.get(ref!)?.body as { candidates?: unknown })?.candidates)
+      await started('run-0')
+      for (const bad of [{ kind: 'gremlins', reason: 'x' }, { kind: 'unsent', reason: '' }, { kind: 'unsent', reason: 'x'.repeat(501) }, { kind: 'unsent', reason: 'x', extra: 1 }]) {
+        expect(await failureOf(ctx.board.reconcileRun(t.taskId, 'run-0', { status: 'failed', infrastructure: bad } as unknown as RunOutcome, at(minute))), JSON.stringify(bad)).toBe('invalid')
+      }
+      expect(await ctx.board.task(t.taskId)).toMatchObject({ state: 'running', attempts: { count: 1 } })
+      const kinds = ['host-stopped', 'unsent', 'worker-unavailable'] as const
+      for (const [i, kind] of kinds.entries()) {
+        if (i > 0) await started(`run-${i}`)
+        const reason = `the ${kind} of run-${i}`
+        const back = validTask(await ctx.board.reconcileRun(t.taskId, `run-${i}`, { status: 'failed', infrastructure: { kind, reason } }, at(minute)))
+        expect(back, kind).toMatchObject({ state: 'ready', attempts: { count: 0, max: 1 } })
+        expect(decisionOf(ctx, back.lastDecision).decisionType).toBe('board')
+        expect(reasonsOf(back.lastDecision)).toContain(reason)
+      }
+      // The bound (default 3) is used: a fourth one counts, and with no attempt left the task waits for input, saying why.
+      await started('run-3')
+      const persistent = validTask(await ctx.board.reconcileRun(t.taskId, 'run-3', { status: 'failed', infrastructure: { kind: 'host-stopped', reason: 'the host restarted again' } }, at(minute)))
+      expect(persistent).toMatchObject({ state: 'waiting-for-input', waiting: { reason: 'retries-spent' }, attempts: { count: 1, max: 1 } })
+      expect(reasonsOf(persistent.lastDecision)).toContain('the host restarted again')
+    }, '1.5'),
+    scenario('infrastructure-failure-after-lost-run-wait', 'still takes, from a lost run the sweep left waiting for input (the policy gave remediation no ask), its owner\'s report that it failed only on the infrastructure, and gives the attempt back; any other report to that wait is refused and changes nothing (INV-4, INV-9)', async (ctx, { changePolicies }) => {
+      await active(ctx, 'p2')
+      const [studio, ...rest] = POLICIES
+      await changePolicies([{ ...studio!, version: studio!.version + 1, rules: [...studio!.rules.filter((r) => r.actionClass !== 'remediation'), { actionClass: 'remediation', mode: 'forbid' }] }, ...rest])
+      const t = await ready(ctx, task('p2', 'lost-then-infra', { maxAttempts: 1 }))
+      const { generation } = await ctx.board.claim(t.taskId, 'lead', 60_000, at(3))
+      await ctx.board.start(t.taskId, generation, { runId: 'run-1' }, at(3))
+      await ctx.board.sweep(at(10))
+      const lost = validTask((await ctx.board.task(t.taskId))!)
+      expect(lost).toMatchObject({ state: 'waiting-for-input', waiting: { reason: 'rejected' }, run: { runId: 'run-1' }, attempts: { count: 1 } })
+      expect(await failureOf(ctx.board.reconcileRun(t.taskId, 'run-1', { status: 'failed' }, at(11)))).toBe('invalid-transition')
+      expect(await ctx.board.task(t.taskId)).toEqual(lost)
+      const back = validTask(await ctx.board.reconcileRun(t.taskId, 'run-1', { status: 'failed', infrastructure: { kind: 'host-stopped', reason: 'the host was down past the lease' } }, at(11)))
+      expect(back).toMatchObject({ state: 'ready', attempts: { count: 0, max: 1 } })
+      expect(JSON.stringify(ctx.artifacts.get(back.lastDecision!)?.body)).toContain('the host was down past the lease')
+    }, '1.5'),
     scenario('withdrawn-wait-kept', 'keeps a lost run waiting on a request withdrawn before its move committed, so its owner\'s later report still applies (INV-4)', async (ctx) => {
       await active(ctx)
       const t = await ready(ctx, task('p1', 't'))
@@ -545,20 +591,62 @@ export const boardSuite = defineSuite<Boot>({
       expect(decisionOf(ctx, abandoned.lastDecision)).toMatchObject({ decisionType: 'board', outcome: { option: 'closed' } })
       expect((await ctx.board.task(early.taskId))?.cancellation?.reason).toBe('project-closed')
     }),
-    scenario('review-expires', 'bounds review: a reviewer whose lease lapses with no decision leaves the task waiting for input, which expires in turn (INV-9)', async (ctx) => {
+    scenario('review-expires', 'bounds review by the policy\'s wait, never by a lease: a holder whose lease lapses (its process gone across a host stop) leaves the result held for the operator; with no decision by that wait the task waits for input, which expires in turn (INV-9, T286)', async (ctx) => {
       await active(ctx)
       const t = await ready(ctx, task('p1', 't'))
       const { generation } = await ctx.board.claim(t.taskId, 'lead', 60_000, at(3))
       await ctx.board.start(t.taskId, generation, { runId: 'run-1' }, at(3))
+      // Submitted inside the 60 s lease, which ends at at(4).
       await ctx.board.submit(t.taskId, generation, { artifacts: [result(ctx, 'r')], subject: HEAD }, at(3.5))
+      expect(await stateOf(ctx, t.taskId)).toBe('review')
+      // The holder is gone past its lease: the review is held for the operator, for the policy's wait from the sweep that saw it.
       await ctx.board.sweep(at(10))
+      const held = validTask((await ctx.board.task(t.taskId))!)
+      expect(held).toMatchObject({ state: 'review', waiting: { reason: 'operator-review' }, result: { subject: HEAD } })
+      expect(held.holder).toBeUndefined()
+      expect(Date.parse(held.waiting!.expiresAt)).toBeGreaterThan(at(10).getTime())
+      // Not before the wait ends.
+      await ctx.board.sweep(new Date(Date.parse(held.waiting!.expiresAt) - 1000))
+      expect(await stateOf(ctx, t.taskId)).toBe('review')
+      await ctx.board.sweep(new Date(Date.parse(held.waiting!.expiresAt)))
       const expired = validTask((await ctx.board.task(t.taskId))!)
       expect(expired).toMatchObject({ state: 'waiting-for-input', waiting: { reason: 'review-expired' } })
       expect(expired.holder).toBeUndefined()
-      expect(await failureOf(ctx.board.answer(t.taskId, [], at(11)))).toBe('invalid')
-      expect(await failureOf(ctx.board.accept(t.taskId, acceptance(ctx, 'accept', t.taskId, result(ctx, 'r')), at(11)))).toBe('invalid-transition')
+      const after = Date.parse(held.waiting!.expiresAt)
+      expect(await failureOf(ctx.board.answer(t.taskId, [], new Date(after + 1000)))).toBe('invalid')
+      expect(await failureOf(ctx.board.accept(t.taskId, acceptance(ctx, 'accept', t.taskId, result(ctx, 'r')), new Date(after + 1000)))).toBe('invalid-transition')
       await ctx.board.sweep(new Date(Date.parse(expired.waiting!.expiresAt)))
       expect((await ctx.board.task(t.taskId))?.cancellation?.reason).toBe('input-expired')
+    }),
+    scenario('review-reopened', 're-opens a review-expired task to review with its result, held for the operator again, by the lead or the operator, recorded as a decision and counting no attempt (T286)', async (ctx) => {
+      await active(ctx)
+      expect(ctx.board.reopenReview, 'a provider that re-opens an expired review').toBeTypeOf('function')
+      const reopen = (taskId: string, by: 'operator' | 'lead', reason: string, when: Date): Promise<BoardTask> => ctx.board.reopenReview!(taskId, by, reason, when)
+      const t = await ready(ctx, task('p1', 't'))
+      const { generation } = await ctx.board.claim(t.taskId, 'lead', 60_000, at(3))
+      await ctx.board.start(t.taskId, generation, { runId: 'run-1' }, at(3))
+      const r = result(ctx, 'r')
+      await ctx.board.submit(t.taskId, generation, { artifacts: [r], subject: HEAD }, at(3.5))
+      // Only a review-expired wait is re-opened.
+      expect(await failureOf(reopen(t.taskId, 'lead', 'too early', at(3.6)))).toBe('invalid-transition')
+      await ctx.board.sweep(at(10))
+      const held = validTask((await ctx.board.task(t.taskId))!)
+      const ended = Date.parse(held.waiting!.expiresAt)
+      await ctx.board.sweep(new Date(ended))
+      expect(validTask((await ctx.board.task(t.taskId))!)).toMatchObject({ state: 'waiting-for-input', waiting: { reason: 'review-expired' } })
+      // Refused, nothing changes: no reason, or one who is neither the lead nor the operator.
+      const when = new Date(ended + 60_000)
+      expect(await failureOf(reopen(t.taskId, 'lead', '', when))).toBe('invalid')
+      expect(await failureOf(reopen(t.taskId, 'worker' as 'lead', 'x', when))).toBe('invalid')
+      expect(await stateOf(ctx, t.taskId)).toBe('waiting-for-input')
+      const back = validTask(await reopen(t.taskId, 'lead', 'approved by two families before a host restart', when))
+      expect(back).toMatchObject({ state: 'review', waiting: { reason: 'operator-review' }, result: { artifacts: [r], subject: HEAD }, run: { runId: 'run-1' }, attempts: { count: 1 } })
+      expect(back.holder).toBeUndefined()
+      expect(Date.parse(back.waiting!.expiresAt)).toBeGreaterThan(when.getTime())
+      expect(back.lastDecision).not.toBe(held.lastDecision)
+      expect(decisionOf(ctx, back.lastDecision)).toMatchObject({ decisionType: 'board' })
+      // Once back in review it is not re-opened again.
+      expect(await failureOf(reopen(t.taskId, 'operator', 'again', new Date(when.getTime() + 1000)))).toBe('invalid-transition')
     }),
     scenario('retries-bounded', 'waits for input once review rejected the last attempt allowed, a wait no input revives, which expires (INV-9)', async (ctx) => {
       await active(ctx)
@@ -594,18 +682,20 @@ export const boardSuite = defineSuite<Boot>({
       await ctx.board.sweep(at(6))
       expect(await stateOf(ctx, merge.taskId)).toBe('ready')
     }),
-    scenario('spent-never-ready', 'never makes a task ready once its attempts are spent: an answer or an approval to go on leaves it waiting for input, which expires (INV-9)', async (ctx) => {
+    scenario('spent-never-ready', 'never makes a task ready once its attempts are spent by a failure: an approval to go on leaves it waiting for input, which expires; an answered question spends nothing, so its attempt continues (INV-9, T291)', async (ctx) => {
       await active(ctx)
       const asks = await ready(ctx, task('p1', 'asks', { maxAttempts: 1 }))
       let claim = await ctx.board.claim(asks.taskId, 'lead', 600_000, at(3))
       await ctx.board.start(asks.taskId, claim.generation, { runId: 'run-1' }, at(3))
       await ctx.board.block(asks.taskId, claim.generation, { reason: 'question', questions: ['Keep the API?'] }, at(4))
       const answered = validTask(await ctx.board.answer(asks.taskId, ['yes'], at(5)))
-      expect(answered).toMatchObject({ state: 'waiting-for-input', waiting: { reason: 'retries-spent' }, attempts: { count: 1, max: 1 } })
+      expect(answered).toMatchObject({ state: 'ready', attempts: { count: 1, max: 1 } })
       const decision = ctx.artifacts.get(answered.lastDecision!)?.body as { candidates: Array<{ reasons: string[] }> }
       for (const candidate of decision.candidates) expect(candidate.reasons.some((r) => r.trim() !== '')).toBe(true)
-      await ctx.board.sweep(new Date(Date.parse(answered.waiting!.expiresAt)))
-      expect((await ctx.board.task(asks.taskId))?.cancellation?.reason).toBe('input-expired')
+      claim = await ctx.board.claim(asks.taskId, 'lead', 600_000, at(6))
+      expect(await ctx.board.continuing(asks.taskId)).toBe(true)
+      expect(validTask(await ctx.board.start(asks.taskId, claim.generation, { runId: 'run-1b' }, at(6)))).toMatchObject({ state: 'running', attempts: { count: 1, max: 1 } })
+      expect(await ctx.board.continuing(asks.taskId)).toBe(false)
 
       const spent = await ready(ctx, task('p1', 'spent', { maxAttempts: 1 }))
       claim = await ctx.board.claim(spent.taskId, 'lead', 600_000, at(3))
@@ -615,7 +705,32 @@ export const boardSuite = defineSuite<Boot>({
       await ctx.board.sweep(at(5))
       expect(validTask((await ctx.board.task(spent.taskId))!)).toMatchObject({ state: 'waiting-for-input', waiting: { reason: 'retries-spent' } })
     }),
-    scenario('block-and-answer', 'interrupts a running task: spent budget waits for approval, a question for input; answering every question makes it ready', async (ctx) => {
+    scenario('answer-continues-attempt', 'continues the attempt that asked once its question is answered: the count after the answer is the count before it, also on the last attempt, and the next start runs that attempt again; only a failure spends one (T291)', async (ctx) => {
+      await active(ctx)
+      const asks = await ready(ctx, task('p1', 'asks late', { maxAttempts: 3 }))
+      // Attempts 1 and 2 are spent by failures.
+      for (const n of [1, 2]) {
+        const c = await ctx.board.claim(asks.taskId, 'lead', 600_000, at(2 + n))
+        await ctx.board.start(asks.taskId, c.generation, { runId: `run-${n}` }, at(2 + n))
+        await ctx.board.reconcileRun(asks.taskId, `run-${n}`, { status: 'failed' }, at(2 + n))
+        expect(await ctx.board.task(asks.taskId)).toMatchObject({ state: 'ready', attempts: { count: n } })
+      }
+      // Attempt 3 asks; each answer leaves it attempt 3, and it completes as attempt 3.
+      let c = await ctx.board.claim(asks.taskId, 'lead', 600_000, at(5))
+      await ctx.board.start(asks.taskId, c.generation, { runId: 'run-3' }, at(5))
+      for (const [n, question] of [[6, 'Band width?'], [8, 'Keep the API?']] as const) {
+        const before = validTask(await ctx.board.block(asks.taskId, c.generation, { reason: 'question', questions: [question] }, at(n)))
+        const answered = validTask(await ctx.board.answer(asks.taskId, ['yes'], at(n + 0.5)))
+        expect(answered).toMatchObject({ state: 'ready', attempts: before.attempts })
+        expect(answered.attempts).toEqual({ count: 3, max: 3 })
+        c = await ctx.board.claim(asks.taskId, 'lead', 600_000, at(n + 1))
+        expect(validTask(await ctx.board.start(asks.taskId, c.generation, { runId: `run-3-${n}` }, at(n + 1)))).toMatchObject({ state: 'running', attempts: { count: 3, max: 3 } })
+      }
+      const r = result(ctx, 'answered')
+      await ctx.board.submit(asks.taskId, c.generation, { artifacts: [r], subject: HEAD }, at(10))
+      expect(validTask(await ctx.board.accept(asks.taskId, acceptance(ctx, 'accept', asks.taskId, r), at(11)))).toMatchObject({ state: 'done', attempts: { count: 3, max: 3 } })
+    }),
+    scenario('block-and-answer','interrupts a running task: spent budget waits for approval, a question for input; answering every question makes it ready', async (ctx) => {
       await active(ctx)
       const spent = await ready(ctx, task('p1', 'spent'))
       let { generation } = await ctx.board.claim(spent.taskId, 'lead', 600_000, at(3))
@@ -749,6 +864,45 @@ export const boardSuite = defineSuite<Boot>({
       expect(asked.action.summary).toContain('+1 runs of max.programmatic')
       expect(asked.action.consequences).toContain(unreleasedText(stuck.slice(0, 1)))
     }, '1.3'),
+    scenario('reopen-sends-back', 'sends a done task\'s result that could not land back as another attempt, through the gate again, naming the decision that sent it, and counting no attempt; with none left it waits for input; one on another run or acceptance, with no reason or no stored decision, or of a task not done is refused and changes nothing (ADR-0068, INV-2, INV-13)', async (ctx) => {
+      expect(ctx.board.reopen, 'a provider at contract 1.4 reopens a done task').toBeTypeOf('function')
+      const reopen = (taskId: string, back: Reopening, when: Date): Promise<BoardTask> => ctx.board.reopen!(taskId, back, when)
+      await active(ctx)
+      const done = async (title: string, maxAttempts: number): Promise<{ taskId: string; runId: string; accepted: ArtifactRef }> => {
+        const t = await ready(ctx, task('p1', title, { maxAttempts }))
+        const runId = `run-${title}`
+        const { generation } = await ctx.board.claim(t.taskId, 'lead', 600_000, at(3))
+        await ctx.board.start(t.taskId, generation, { runId }, at(3))
+        const r = result(ctx, title)
+        await ctx.board.submit(t.taskId, generation, { artifacts: [r], subject: HEAD }, at(4))
+        const accepted = acceptance(ctx, 'accept', t.taskId, r)
+        expect(validTask(await ctx.board.accept(t.taskId, accepted, at(5)))).toMatchObject({ state: 'done' })
+        return { taskId: t.taskId, runId, accepted }
+      }
+      const cause = acceptance(ctx, 'reject', 'landing', result(ctx, 'why it goes back'))
+      const t = await done('t', 2)
+      const before = (await ctx.board.task(t.taskId))!
+      const back: Reopening = { runId: t.runId, acceptance: t.accepted, decision: cause, reason: 'a conflict with the target the Worker could not resolve' }
+      expect(await failureOf(reopen(t.taskId, { ...back, runId: 'run-other' }, at(6)))).toBe('invalid-transition')
+      expect(await failureOf(reopen(t.taskId, { ...back, acceptance: cause }, at(6)))).toBe('invalid-transition')
+      expect(await failureOf(reopen(t.taskId, { ...back, reason: '' }, at(6)))).toBe('invalid')
+      expect(await failureOf(reopen(t.taskId, { ...back, reason: 'x'.repeat(REOPEN_REASON_MAX + 1) }, at(6)))).toBe('invalid')
+      expect(await failureOf(reopen(t.taskId, { ...back, decision: `sha256:${'9'.repeat(64)}` }, at(6)))).toBe('invalid')
+      expect(await ctx.board.task(t.taskId)).toEqual(before)
+      const again = validTask(await reopen(t.taskId, back, at(6)))
+      expect(again).toMatchObject({ state: 'ready', attempts: { count: 1, max: 2 } })
+      expect(again.holder).toBeUndefined()
+      expect(again.run).toBeUndefined()
+      expect(decisionOf(ctx, again.lastDecision)).toMatchObject({ decisionType: 'board', outcome: { option: 'ready' } })
+      expect(ctx.artifacts.get(again.lastDecision!)!.body).toMatchObject({ inputs: expect.arrayContaining([cause]) })
+      // Not done any more: reopened once, never twice.
+      expect(await failureOf(reopen(t.taskId, back, at(7)))).toBe('invalid-transition')
+
+      const last = await done('last', 1)
+      const spent = validTask(await reopen(last.taskId, { runId: last.runId, acceptance: last.accepted, decision: cause, reason: 'its required tests failed on the rebased tree' }, at(8)))
+      expect(spent).toMatchObject({ state: 'waiting-for-input', waiting: { reason: 'retries-spent' }, attempts: { count: 1, max: 1 } })
+      expect(ctx.artifacts.get(spent.lastDecision!)!.body).toMatchObject({ inputs: expect.arrayContaining([cause]) })
+    }, '1.4'),
     scenario('cancel-cascades', 'cancels a task not running, withdraws the approval it waited on, and cancels the tasks that depended on it', async (ctx) => {
       await active(ctx, 'p2')
       const merge = await ctx.board.propose(task('p2', 'merge', { actionClass: 'merge' }), at(2))
@@ -830,9 +984,16 @@ export class FakeBoard extends Board {
   /** Pending charter requests: request id → project, the version it would approve, and when it expires. */
   private readonly charters = new Map<string, { projectId: string; version: number; expiresAt: string }>()
   private generations = new Map<string, number>()
+  /** Failed runs per task not counted as attempts: they failed only on the infrastructure (1.5). */
+  private readonly freeRetries = new Map<string, number>()
+  /** Tasks a lost run left waiting for input, the policy giving remediation no ask: task id → the decision that made the wait (1.5). */
+  private readonly lostWaits = new Map<string, ArtifactRef>()
+  /** Tasks whose answered question continues the attempt that asked: the next start runs that attempt again (T291). */
+  private readonly continues = new Set<string>()
 
-  constructor(ctx: Context, private readonly config: { inputExpirySeconds?: number; fundingMaxPercent?: number } = {}) {
+  constructor(ctx: Context, private readonly config: { inputExpirySeconds?: number; fundingMaxPercent?: number; maxFreeRetries?: number } = {}) {
     super(ctx)
+    freeRetriesOf(config.maxFreeRetries)
   }
 
   /** Whether adding `lines` keeps every line of the task's budget within the bound, over all its raises. */
@@ -1025,9 +1186,11 @@ export class FakeBoard extends Board {
     const task = this.taskOf(taskId)
     this.held(task, generation, at)
     this.expect(task, 'claimed')
+    // An answered question's attempt runs again, not another one (T291).
+    const continues = this.continues.delete(taskId) && task.attempts.count > 0
     return this.save(task, at, {
       state: 'running', run: { runId: run.runId, ...(run.brief ? { brief: run.brief } : {}), startedAt: at.toISOString() },
-      attempts: { ...task.attempts, count: task.attempts.count + 1 }, result: undefined,
+      attempts: { ...task.attempts, count: continues ? task.attempts.count : task.attempts.count + 1 }, result: undefined,
       lastDecision: this.decide(taskId, 'claimed', 'running', at, `run ${run.runId} recorded before it starts`),
     })
   }
@@ -1086,10 +1249,17 @@ export class FakeBoard extends Board {
 
   async reconcileRun(taskId: string, runId: string, outcome: RunOutcome, at: Date = new Date()) {
     const task = this.taskOf(taskId)
-    if (!(task.state === 'running' || (task.state === 'waiting-for-approval' && task.waiting?.reason === 'reconciliation-failed'))) {
+    // A lost run the sweep left waiting for input takes only a free retry's report (1.5).
+    const lostWait = task.state === 'waiting-for-input' && task.waiting?.reason === 'rejected' && task.lastDecision !== undefined && this.lostWaits.get(taskId) === task.lastDecision
+    if (!(task.state === 'running' || (task.state === 'waiting-for-approval' && task.waiting?.reason === 'reconciliation-failed') || lostWait)) {
       throw new BoardError('invalid-transition', `${taskId} is ${task.state}, not waiting on a run`)
     }
     if (task.run?.runId !== runId) throw new BoardError('invalid', `${taskId} recorded run ${task.run?.runId}, not ${runId}`)
+    if (lostWait) {
+      const free = outcome.status === 'failed' && outcome.infrastructure !== undefined && !infrastructureProblem(outcome.infrastructure)
+        && (this.freeRetries.get(taskId) ?? 0) < (this.config.maxFreeRetries ?? FREE_RETRIES_DEFAULT) && task.attempts.count > 0
+      if (!free) throw new BoardError('invalid-transition', `${taskId} waits for input on its lost run ${runId}: only a failure only on the infrastructure, with a free retry left, is reported to it`)
+    }
     const pending = task.waiting?.approvalRequest
     let moved: BoardTask
     if (outcome.status === 'completed') {
@@ -1097,10 +1267,25 @@ export class FakeBoard extends Board {
       this.writes(task, outcome.result.subject)
       moved = await this.applyAcceptance({ ...task, result: outcome.result }, outcome.acceptance, at, task)
     } else {
-      const failed = this.decide(taskId, task.state, task.attempts.count < task.attempts.max ? 'ready' : 'waiting-for-input', at, `run ${runId} failed`)
-      moved = task.attempts.count < task.attempts.max
-        ? await this.again(task, at, `run ${runId} failed`)
-        : this.save(task, at, { state: 'waiting-for-input', holder: undefined, waiting: this.inputWait('retries-spent', at), lastDecision: failed })
+      const infrastructure = outcome.infrastructure
+      if (infrastructure !== undefined) {
+        const problem = infrastructureProblem(infrastructure)
+        if (problem) throw new BoardError('invalid', problem)
+      }
+      const used = this.freeRetries.get(taskId) ?? 0
+      const max = this.config.maxFreeRetries ?? FREE_RETRIES_DEFAULT
+      if (infrastructure && used < max && task.attempts.count > 0) {
+        // Not counted (1.5): the attempt is given back, and the same attempt goes through the gate again.
+        this.freeRetries.set(taskId, used + 1)
+        task.attempts = { ...task.attempts, count: task.attempts.count - 1 }
+        moved = await this.again(task, at, `run ${runId} failed only on the infrastructure, not counted (free retry ${used + 1} of ${max}); ${infrastructure.kind}: ${infrastructure.reason}`)
+      } else {
+        const why = `run ${runId} failed${infrastructure ? `; all ${max} free retries are used, so this failure on the infrastructure counts (${infrastructure.kind}: ${infrastructure.reason})` : ''}`
+        const failed = this.decide(taskId, task.state, task.attempts.count < task.attempts.max ? 'ready' : 'waiting-for-input', at, why)
+        moved = task.attempts.count < task.attempts.max
+          ? await this.again(task, at, why)
+          : this.save(task, at, { state: 'waiting-for-input', holder: undefined, waiting: this.inputWait('retries-spent', at), lastDecision: failed })
+      }
     }
     // The move first, the request withdrawn after: nothing waits on it any more.
     if (pending) await this.ctx.approvals.withdraw(pending, at)
@@ -1119,7 +1304,9 @@ export class FakeBoard extends Board {
   private async gate(task: BoardTask, actionClass: ActionClass, reason: 'approval-needed' | 'budget-spent' | 'reconciliation-failed', at: Date, funding?: BudgetLine[], unreleased?: UnreleasedHold[]): Promise<BoardTask> {
     const verdict = await this.ctx.approvals.check({ class: actionClass, projectId: task.projectId })
     if (verdict.mode !== 'ask') {
-      return this.save(task, at, { state: 'waiting-for-input', holder: undefined, waiting: this.inputWait('rejected', at), lastDecision: this.decide(task.taskId, task.state, 'waiting-for-input', at, `${reason}: the policy gives ${actionClass} ${verdict.mode}, so no approval can be asked`) })
+      const decision = this.decide(task.taskId, task.state, 'waiting-for-input', at, `${reason}: the policy gives ${actionClass} ${verdict.mode}, so no approval can be asked`)
+      if (reason === 'reconciliation-failed') this.lostWaits.set(task.taskId, decision)
+      return this.save(task, at, { state: 'waiting-for-input', holder: undefined, waiting: this.inputWait('rejected', at), lastDecision: decision })
     }
     const request = await this.ctx.approvals.request(this.request(task, actionClass, reason, verdict, funding, unreleased), at)
     return this.save(task, at, {
@@ -1129,10 +1316,10 @@ export class FakeBoard extends Board {
   }
 
   /** The request on `board-task:<id>:attempt:<n>`: its version the reason, or a funding ask's lines bound by {@link fundingVersion}. */
-  private request(task: BoardTask, actionClass: ActionClass, reason: 'approval-needed' | 'budget-spent' | 'reconciliation-failed', verdict: Awaited<ReturnType<Context['approvals']['check']>>, funding?: BudgetLine[], unreleased?: UnreleasedHold[]) {
+  private request(task: BoardTask, actionClass: ActionClass, reason: 'approval-needed' | 'budget-spent' | 'reconciliation-failed', verdict: Awaited<ReturnType<Context['approvals']['check']>>, funding?: BudgetLine[], unreleased?: UnreleasedHold[], answeredWait?: string) {
     const raise = funding?.map((l) => `+${l.amount} ${l.unit} of ${l.pool}`).join(', ')
     return {
-      subject: { type: 'content' as const, ref: `board-task:${task.taskId}:attempt:${task.attempts.count}`, version: funding ? fundingVersion(contentId(funding)) : reason },
+      subject: { type: 'content' as const, ref: `board-task:${task.taskId}:attempt:${task.attempts.count}${answeredWait ? `:answered:${answeredWait}` : ''}`, version: funding ? fundingVersion(contentId(funding)) : reason },
       action: {
         class: actionClass, summary: `${reason}: ${task.title}${raise ? `; raise its budget by ${raise}` : ''}`.slice(0, 500),
         ...(unreleased?.length ? { consequences: unreleasedText(unreleased).slice(0, 2000) } : {}),
@@ -1143,12 +1330,12 @@ export class FakeBoard extends Board {
   }
 
   /** Back for a new attempt, through the gate again: one approval never covers a later attempt. A `cause` decision is named by the move's. */
-  private async again(task: BoardTask, at: Date, why: string, cause?: ArtifactRef): Promise<BoardTask> {
+  private async again(task: BoardTask, at: Date, why: string, cause?: ArtifactRef, answeredWait?: string): Promise<BoardTask> {
     const verdict = await this.ctx.approvals.check({ class: task.actionClass, projectId: task.projectId })
     if (verdict.mode === 'forbid') return this.cancelTask(task, 'forbidden', at, verdict.decision)
     if (verdict.mode === 'ask') {
       const request = await this.ctx.approvals.request({
-        subject: { type: 'content', ref: `board-task:${task.taskId}:attempt:${task.attempts.count}`, version: 'approval-needed' },
+        subject: { type: 'content', ref: `board-task:${task.taskId}:attempt:${task.attempts.count}${answeredWait ? `:answered:${answeredWait}` : ''}`, version: 'approval-needed' },
         action: { class: task.actionClass, summary: `approval-needed: ${task.title}`.slice(0, 500) },
         requester: { component: 'board', projectId: task.projectId, taskId: task.taskId }, verdict, classification: this.projectOf(task.projectId).classification ?? 'operator-shared',
       }, at)
@@ -1181,15 +1368,20 @@ export class FakeBoard extends Board {
       ? { ready: 'auto or notify', 'waiting-for-approval': 'ask', cancelled: 'forbid' }
       : { 'waiting-for-approval': 'ask', 'waiting-for-input': 'auto, notify, or forbid' }
     const to = verdict.mode === 'ask' ? 'waiting-for-approval' : reason !== 'approval-needed' ? 'waiting-for-input' : verdict.mode === 'forbid' ? 'cancelled' : 'ready'
-    // A spent budget's funding ask is asked again as it was: the same lines, the same subject.
-    const request = verdict.mode === 'ask' ? await this.ctx.approvals.request(this.request(task, actionClass, reason, verdict, task.waiting!.funding), at) : undefined
+    // A spent budget's funding ask is asked again as it was: the same lines, the same subject; an answered question's on its own wait (T291).
+    const prefix = `board-task:${task.taskId}:attempt:${task.attempts.count}:answered:`
+    const answered = reason === 'approval-needed' && withdrawn.subject.ref.startsWith(prefix) ? withdrawn.subject.ref.slice(prefix.length) : undefined
+    const request = verdict.mode === 'ask' ? await this.ctx.approvals.request(this.request(task, actionClass, reason, verdict, task.waiting!.funding, undefined, answered || undefined), at) : undefined
     const decision = this.decide(task.taskId, task.state, to, at, `the policy change withdrew ${withdrawn.requestId}; the policy now gives ${actionClass} ${verdict.mode}`, {
       inputs: [withdrawn.resolution!.decision, verdict.decision],
       others: Object.entries(options).filter(([o]) => o !== to).map(([option, modes]) => ({ option, whyNot: `only on ${modes}, and the policy gives ${actionClass} ${verdict.mode}` })),
     })
     if (to === 'cancelled') return this.cancelTask(task, 'forbidden', at, decision)
     if (to === 'ready') return this.save(task, at, { state: 'ready', holder: undefined, run: undefined, waiting: undefined, lastDecision: decision })
-    if (to === 'waiting-for-input') return this.save(task, at, { state: 'waiting-for-input', holder: undefined, waiting: this.inputWait('rejected', at), lastDecision: decision })
+    if (to === 'waiting-for-input') {
+      if (reason === 'reconciliation-failed') this.lostWaits.set(task.taskId, decision)
+      return this.save(task, at, { state: 'waiting-for-input', holder: undefined, waiting: this.inputWait('rejected', at), lastDecision: decision })
+    }
     return this.save(task, at, { waiting: { reason, approvalRequest: request!.requestId, ...(task.waiting!.funding ? { funding: task.waiting!.funding } : {}), since: at.toISOString(), expiresAt: request!.expiresAt }, lastDecision: decision })
   }
 
@@ -1253,9 +1445,15 @@ export class FakeBoard extends Board {
     const task = this.taskOf(taskId)
     this.expect(task, 'waiting-for-input')
     if (task.waiting?.reason !== 'question' || answers.length !== (task.waiting.questions?.length ?? 0)) throw new BoardError('invalid', 'answer every question of a question wait')
-    if (task.attempts.count < task.attempts.max) return this.again(task, at, 'answered')
-    // No attempt left: a ready task could never start and would never expire, so it waits for input (INV-9).
-    return this.save(task, at, { state: 'waiting-for-input', run: undefined, waiting: this.inputWait('retries-spent', at), lastDecision: this.decide(taskId, 'ready', 'waiting-for-input', at, 'answered, but no attempt is left') })
+    // An answer continues the attempt that asked (T291): the count does not move, the next start continues it,
+    // and the gate asks on a request naming the wait it answers.
+    const moved = await this.again(task, at, `answered: attempt ${task.attempts.count} continues`, undefined, task.waiting.since)
+    if (moved.state !== 'cancelled') this.continues.add(taskId)
+    return moved
+  }
+
+  override async continuing(taskId: string): Promise<boolean> {
+    return this.continues.has(taskId)
   }
 
   private async cancelTask(task: BoardTask, reason: CancelReason, at: Date, decision?: ArtifactRef, note?: string): Promise<BoardTask> {
@@ -1287,6 +1485,31 @@ export class FakeBoard extends Board {
       throw new BoardError('invalid', `${digest} is not a digest@1.0 report of exactly the result's artifacts`)
     }
     return this.save(task, at, { result: { ...task.result, digest } })
+  }
+
+  async reopen(taskId: string, back: Reopening, at: Date = new Date()) {
+    const task = this.taskOf(taskId)
+    this.expect(task, 'done')
+    if (task.run?.runId !== back.runId || task.result?.acceptance !== back.acceptance) throw new BoardError('invalid-transition', `${taskId} is not done on run ${back.runId}'s result accepted by ${back.acceptance}`)
+    if (typeof back.reason !== 'string' || !back.reason.trim() || back.reason.length > REOPEN_REASON_MAX) throw new BoardError('invalid', `a reopening says why, in 1 to ${REOPEN_REASON_MAX} characters`)
+    if (this.ctx.artifacts.get(back.decision)?.kind !== 'decision') throw new BoardError('invalid', `${back.decision} is not a stored decision`)
+    const why = `run ${back.runId}'s accepted result could not land (decision ${back.decision}): ${back.reason}`
+    if (task.attempts.count < task.attempts.max) return this.again(task, at, why, back.decision)
+    return this.save(task, at, { state: 'waiting-for-input', holder: undefined, waiting: this.inputWait('retries-spent', at), lastDecision: this.decide(taskId, 'done', 'waiting-for-input', at, `${why}; no attempt is left`, { inputs: [back.decision] }) })
+  }
+
+  async reopenReview(taskId: string, by: 'operator' | 'lead', reason: string, at: Date = new Date()) {
+    const task = this.taskOf(taskId)
+    if (by !== 'operator' && by !== 'lead') throw new BoardError('invalid', 'an expired review is re-opened by the operator or the lead')
+    if (typeof reason !== 'string' || !reason.trim() || reason.length > REOPEN_REASON_MAX) throw new BoardError('invalid', `a re-opening says why, in 1 to ${REOPEN_REASON_MAX} characters`)
+    if (task.state !== 'waiting-for-input' || task.waiting?.reason !== 'review-expired') throw new BoardError('invalid-transition', `${taskId} is not a review-expired wait`)
+    if (!task.result || !task.run) throw new BoardError('invalid-transition', `${taskId} has no run's result to put back to review`)
+    const { policies } = await this.ctx.approvals.policy(task.projectId)
+    return this.save(task, at, {
+      state: 'review', holder: undefined,
+      waiting: { reason: 'operator-review', pendingChecks: [], since: at.toISOString(), expiresAt: new Date(at.getTime() + waitSeconds(policies, task.actionClass) * 1000).toISOString() },
+      lastDecision: this.decide(taskId, 'waiting-for-input', 'review held for the operator', at, `the ${by} re-opened the expired review: ${reason}`),
+    })
   }
 
   async sweep(at: Date) {
@@ -1341,13 +1564,18 @@ export class FakeBoard extends Board {
         // The run's outcome is unknown here; its owner may still report it (reconcileRun), which withdraws the request.
         moved.set(task.taskId, await this.gate(task, 'remediation', 'reconciliation-failed', at))
       } else if (task.state === 'review' && task.waiting) {
-        // A review held for the operator ends at its wait's expiry, as one whose reviewer's lease lapsed does.
+        // A review held for the operator ends at its wait's expiry, and only then (INV-9).
         if (Date.parse(task.waiting.expiresAt) <= now) {
           moved.set(task.taskId, this.save(task, at, { state: 'waiting-for-input', waiting: this.inputWait('review-expired', at), lastDecision: this.decide(task.taskId, 'review', 'waiting-for-input', at, 'review-expired: the operator gave no acceptance decision in time') }))
         }
       } else if (task.state === 'review' && Date.parse(task.holder!.leaseExpiresAt) <= now) {
-        // Review is bounded: no acceptance decision came while the reviewer held the task (INV-9).
-        moved.set(task.taskId, this.save(task, at, { state: 'waiting-for-input', holder: undefined, waiting: this.inputWait('review-expired', at), lastDecision: this.decide(task.taskId, 'review', 'waiting-for-input', at, 'review-expired') }))
+        // A lapsed lease never expires a review: the result is held for the operator for the policy's wait (INV-9, T286).
+        const { policies } = await this.ctx.approvals.policy(task.projectId)
+        moved.set(task.taskId, this.save(task, at, {
+          holder: undefined,
+          waiting: { reason: 'operator-review', pendingChecks: [], since: at.toISOString(), expiresAt: new Date(at.getTime() + waitSeconds(policies, task.actionClass) * 1000).toISOString() },
+          lastDecision: this.decide(task.taskId, 'review', 'review held for the operator', at, 'the holder\'s lease lapsed with no acceptance decision'),
+        }))
       } else if (task.state === 'waiting-for-approval') {
         const request = await this.ctx.approvals.get(task.waiting!.approvalRequest!)
         // A request the queue withdrew on a policy change: the wait's gate runs again under the policy now.
@@ -1375,7 +1603,7 @@ export class FakeBoard extends Board {
           this.save(task, at, { schema: 'board-task@1.1', budget, funding: [...(task.funding ?? []), { lines: funding, approval, decision, at: at.toISOString() }], lastDecision: decision })
           moved.set(task.taskId, await this.again(task, at, `the operator approved going on, the budget raised (${decision})`, decision))
         } else if (request.state === 'approved' && task.waiting!.reason !== 'approval-needed' && task.attempts.count < task.attempts.max) moved.set(task.taskId, await this.again(task, at, 'the operator approved going on'))
-        else if (request.state === 'approved' && task.attempts.count >= task.attempts.max) {
+        else if (request.state === 'approved' && task.attempts.count >= task.attempts.max && !this.continues.has(task.taskId)) {
           moved.set(task.taskId, this.save(task, at, { state: 'waiting-for-input', waiting: this.inputWait('retries-spent', at), lastDecision: request.resolution.decision }))
         } else if (request?.state === 'approved') moved.set(task.taskId, this.save(task, at, { state: 'ready', waiting: undefined, run: undefined, lastDecision: request.resolution!.decision }))
         else if (request?.state === 'rejected') moved.set(task.taskId, this.save(task, at, { state: 'waiting-for-input', waiting: this.inputWait('rejected', at), lastDecision: request.resolution!.decision }))

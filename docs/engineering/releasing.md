@@ -2,7 +2,7 @@
 
 How a version of `system` is made, built, and verified
 ([ADR-0026](../decisions/adr/0026-versioned-releases-with-provenance.md),
-[PROP-0003 M6d](../proposals/0003-production-readiness.md#m6d-supply-chain-and-release)).
+PROP-0003 M6d).
 
 ## Versions
 

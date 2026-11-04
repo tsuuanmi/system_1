@@ -28,9 +28,9 @@ describe('architecture rules', () => {
   it('routing, workflows, profiles, presets, the models seam, the client edge, and the gateways\' shared turns name capabilities, never a model, vendor, client, or browser, and set no provider family (INV-11, QA-13, ADR-0027)', () => {
     const governed = [
       join(packages, 'workers-core', 'src'), join(plugins, 'workers', 'src'), join(plugins, 'workflow', 'src'), join(packages, 'gateway-turns', 'src'),
-      join(packages, 'models-core', 'src'), join(plugins, 'models', 'src'),
-      // The feedback loop's seams compare provider families for independence; they never name one.
-      join(packages, 'experiments-core', 'src'), join(packages, 'evaluations-core', 'src'),
+      join(packages, 'models-core', 'src'), join(plugins, 'models', 'src'), join(packages, 'decision-core', 'src'),
+      // The landing seam and its local provider name no code host; a host's provider is its own plugin (PROP-0017).
+      join(packages, 'landing-core', 'src'), join(plugins, 'landing-local', 'src'),
       // The client edge and the other control-plane plugins: one MCP interface for every client (ADR-0011).
       join(packages, 'gateway-core', 'src'), join(plugins, 'mcp-server', 'src'), join(plugins, 'egress', 'src'), join(plugins, 'turns', 'src'),
       join(plugins, 'accounts', 'src'), join(plugins, 'agent-workers', 'src'), join(packages, 'agent-runtime-core', 'src'),
@@ -122,16 +122,17 @@ describe('architecture rules', () => {
       if (defines) expect(readdirSync(join(packages, core, 'conformance')).filter((f) => f.endsWith('.ts')).length, core).toBeGreaterThan(0)
     }
     expect(existsSync(join(plugins, 'workflow', 'conformance', 'profiles.ts'))).toBe(true)
+    expect(existsSync(join(packages, 'decision-core', 'conformance', 'dispatch-advisor.ts'))).toBe(true)
+    expect(existsSync(join(packages, 'landing-core', 'conformance', 'landing.ts'))).toBe(true)
   })
 
   it('holds every guarantee seam to a conformance suite at a pinned contract, so a worse provider cannot pass unnoticed (ADR-0036, ADR-0037)', () => {
     const suites: Record<string, string> = {
-      store: 'plugins/store/conformance/store.ts', eventLog: 'plugins/event-log/conformance/event-log.ts', artifacts: 'plugins/artifacts/conformance/artifacts.ts',
-      turnReceipts: 'plugins/turn-receipts/conformance/turn-receipts.ts', leases: 'plugins/leases/conformance/leases.ts', egress: 'plugins/egress/conformance/egress.ts',
+      store: 'ledger-core/conformance/store.ts', eventLog: 'ledger-core/conformance/event-log.ts', artifacts: 'ledger-core/conformance/artifacts.ts',
+      turnReceipts: 'plugins/turn-receipts/conformance/turn-receipts.ts', leases: 'board-core/conformance/leases.ts', egress: 'workers-core/conformance/egress.ts',
       workerSessions: 'plugins/worker-sessions/conformance/worker-sessions.ts', workflow: 'plugins/workflow/conformance/workflow.ts', workers: 'workers-core/conformance/workers.ts',
       board: 'board-core/conformance/board.ts', approvals: 'approvals-core/conformance/approvals.ts', resources: 'resources-core/conformance/resources.ts',
-      pluginHost: 'plugin-host-core/conformance/plugin-host.ts', experiments: 'experiments-core/conformance/experiments.ts',
-      evaluations: 'evaluations-core/conformance/evaluations.ts',
+      pluginHost: 'plugin-host-core/conformance/plugin-host.ts', landing: 'landing-core/conformance/landing.ts',
     }
     for (const [seam, file] of Object.entries(suites)) {
       const source = readFileSync(join(packages, file), 'utf8')

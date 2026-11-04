@@ -3,9 +3,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
-import type { Action, ApprovalRequest, NewRequest } from '@tsuuanmi/system-approvals-core'
+import { type Action, type ApprovalRequest, HOST_STOPPED_RECONCILIATION, type NewRequest } from '@tsuuanmi/system-approvals-core'
 import Artifacts from '@tsuuanmi/system-artifacts'
-import { type ArtifactRef, BoardError, type BoardTask, type BudgetLine, type Subject, type TaskInput } from '@tsuuanmi/system-board-core'
+import { type ArtifactRef, BoardError, type BoardTask, type BudgetLine, freeRetriesOf, type Subject, type TaskInput } from '@tsuuanmi/system-board-core'
 import EventLog from '@tsuuanmi/system-event-log'
 import { McpTools, type ToolHandler, type ToolSpec } from '@tsuuanmi/system-gateway-core'
 import Leases from '@tsuuanmi/system-leases'
@@ -15,7 +15,7 @@ import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { z as zod } from 'zod'
 import { FakeApprovals, POLICIES } from '../../../approvals-core/conformance/approvals.ts'
 import { CHARTER } from '../../../board-core/conformance/board.ts'
-import StoreBoard, { type Config } from '../src/index.ts'
+import StoreBoard, { autoAcceptOf, type Config } from '../src/index.ts'
 import { BOARD_TOOLS, INPUTS } from '../src/tools.ts'
 
 const T0 = new Date('2026-10-22T09:00:00Z')
@@ -61,8 +61,8 @@ interface Booted {
   board: () => StoreBoard
   approvals: () => FlakyApprovals
   mcp: () => RecordingMcp
-  /** Dispose the board and plug a new one into the same context: the same store, leases, and approvals. */
-  restartBoard: (config?: Config) => Promise<void>
+  /** Dispose the board and plug a new one into the same context: the same store, leases, and approvals; `whileDown` runs between the two. */
+  restartBoard: (config?: Config, whileDown?: () => void) => Promise<void>
   stop: () => Promise<void>
 }
 
@@ -87,8 +87,9 @@ async function boot(options: { dir?: string; board?: Config; eventLog?: boolean 
     board: () => ctx.board as StoreBoard,
     approvals: () => ctx.approvals as FlakyApprovals,
     mcp: () => ctx.mcp as RecordingMcp,
-    restartBoard: async (config?: Config) => {
+    restartBoard: async (config?: Config, whileDown?: () => void) => {
       await fiber.dispose()
+      whileDown?.()
       fiber = ctx.plugin(StoreBoard, { sweepSeconds: 0, ...options.board, ...config })
       await fiber
     },
@@ -135,6 +136,128 @@ const acceptance = (ctx: Context, option: 'accept' | 'reject', taskId: string, o
   decider: { type: 'rule', id: 'acceptance.test', version: '1' }, outcome: { option, detail: { taskId, subject, ...(checks ? { checks } : {}) } }, deterministic: true,
 }, { producer: { type: 'policy', ref: 'test' } }).id as ArtifactRef
 const open = (ctx: Context, projectId: string): Promise<ApprovalRequest[]> => ctx.approvals.list({ projectId, states: ['open', 'batched'] })
+
+describe('ctx.board (store-backed): a writing result\'s checks bind before any acceptance (T293, T311)', () => {
+  /** A writing result: an agent result naming its worktree at HEAD, submitted by run `runId` of a workspace-write task, the run's own acceptance recording `checks`. */
+  const heldWriting = async (ctx: Context, title: string, minute: number, checks: Action['checks']): Promise<{ taskId: string; r: ArtifactRef; run: ArtifactRef }> => {
+    const t = await ready(ctx, task('p2', title, { actionClass: 'workspace-write' }), at(minute))
+    const runId = `run-${title.replaceAll(' ', '-')}`
+    const { generation } = await ctx.board.claim(t.taskId, 'lead', 600_000, at(minute))
+    await ctx.board.start(t.taskId, generation, { runId }, at(minute))
+    const r = ctx.artifacts.put({
+      kind: 'report', bodySchema: 'agent-result@1.1', classification: 'operator-shared', producer: { type: 'worker', ref: 'test' },
+      body: { schema: 'agent-result@1.1', worker: 'w', runtime: 'fake', runId: 'r', promptHash: `sha256:${'0'.repeat(64)}`, sandbox: 'workspace-write', text: title, workspace: '/work/tree', subject: HEAD },
+    }).id as ArtifactRef
+    await ctx.board.submit(t.taskId, generation, { artifacts: [r], subject: HEAD }, at(minute))
+    // The run owner's acceptance: a rule's decision the system produced, under the run.
+    const run = ctx.artifacts.recordDecision({
+      decisionType: 'acceptance', question: `Does ${runId}'s result complete ${t.taskId}?`, inputs: [r],
+      candidates: [{ option: 'accept', selected: true, reasons: ['its steps were accepted'] }, { option: 'reject', selected: false, reasons: ['not reject'] }],
+      decider: { type: 'rule', id: 'workflow.task-acceptance', version: '4' }, outcome: { option: 'accept', detail: { taskId: t.taskId, subject: HEAD, checks } }, deterministic: true,
+    }, { producer: { type: 'system', ref: 'workflow' }, runId }).id as ArtifactRef
+    // Held for the operator while a required check has not passed; accepted, it waits for its landing.
+    expect(await ctx.board.accept(t.taskId, run, at(minute))).toMatchObject({ state: 'review', waiting: { reason: checks?.tests && checks.lint ? 'landing' : 'operator-review' } })
+    return { taskId: t.taskId, r, run }
+  }
+  const byLead = (ctx: Context, taskId: string, r: ArtifactRef, checks: Action['checks']): ArtifactRef => ctx.artifacts.recordDecision({
+    schema: 'decision@1.10', decisionType: 'acceptance', question: `Does lead:p2 accept ${taskId}?`, inputs: [r],
+    candidates: [{ option: 'accept', selected: true, reasons: ['the lead accepts'] }, { option: 'reject', selected: false, reasons: ['not reject'] }],
+    decider: { type: 'client', id: 'lead:p2', version: '1' }, outcome: { option: 'accept', detail: { taskId, subject: HEAD, checks } }, deterministic: false,
+  }, { producer: { type: 'system', ref: 'lead:p2' } }).id as ArtifactRef
+  const byOperator = (ctx: Context, taskId: string, r: ArtifactRef, checksNotRun?: Record<string, string>): ArtifactRef => ctx.artifacts.recordDecision({
+    decisionType: 'acceptance', question: `Does the operator accept ${taskId}?`, inputs: [r],
+    candidates: [{ option: 'accept', selected: true, reasons: ['the operator accepts'] }, { option: 'reject', selected: false, reasons: ['not reject'] }],
+    decider: { type: 'operator', id: 'operator.review', version: '2' }, outcome: { option: 'accept', detail: { taskId, subject: HEAD, ...(checksNotRun ? { checksNotRun } : {}) } }, deterministic: false,
+  }, { producer: { type: 'operator', ref: 'operator' } }).id as ArtifactRef
+
+  it('refuses the lead\'s acceptance over a check the run recorded failed on the result, whatever the lead claims, and the operator\'s too', async () => {
+    const { ctx } = await boot()
+    await active(ctx)
+    const { taskId, r } = await heldWriting(ctx, 'lint failed', 3, { tests: true, lint: false })
+    const refused = ctx.board.accept(taskId, byLead(ctx, taskId, r, { tests: true, lint: true }), at(4))
+    await expect(refused).rejects.toThrow(/run recorded its lint check\(s\) failed on git-head HEAD at abc123/)
+    expect(await failureOf(ctx.board.accept(taskId, byOperator(ctx, taskId, r), at(4)))).toBe('invalid')
+    expect(await ctx.board.task(taskId)).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: ['lint'] } })
+  })
+
+  it('refuses any acceptance while a required check is pending, naming it and since when; only the operator accepts past it, naming the check with a note, on a decision of its own', async () => {
+    const { ctx } = await boot()
+    await active(ctx)
+    const { taskId, r, run } = await heldWriting(ctx, 'lint pending', 3, { tests: true })
+    const held = (await ctx.board.task(taskId))!
+    // The lead's own claim that lint passed does not count: the run recorded none.
+    const lead = ctx.board.accept(taskId, byLead(ctx, taskId, r, { tests: true, lint: true }), at(4))
+    await expect(lead).rejects.toThrow(new RegExp(`required check\\(s\\) lint have not passed on it \\(pending since ${held.waiting!.since}; the run's acceptance ${run}\\)`))
+    expect(await failureOf(ctx.board.accept(taskId, byOperator(ctx, taskId, r), at(4)))).toBe('invalid')
+    expect(await failureOf(ctx.board.accept(taskId, byOperator(ctx, taskId, r, { lint: '  ' }), at(4)))).toBe('invalid')
+    const accepted = byOperator(ctx, taskId, r, { lint: 'no lint command is configured on this host' })
+    const landing = await ctx.board.accept(taskId, accepted, at(5))
+    // A writing result is never done by its acceptance: it waits for its landing.
+    expect(landing).toMatchObject({ state: 'review', waiting: { reason: 'landing' }, result: { acceptance: accepted } })
+    expect(ctx.artifacts.get(landing.lastDecision!)?.body).toMatchObject({
+      inputs: [accepted],
+      candidates: [{ option: 'landing', reasons: [`the operator's acceptance ${accepted} accepted with check lint not run: no lint command is configured on this host`] }, expect.anything()],
+      outcome: { option: 'landing', detail: { reason: 'checks-not-run', checksNotRun: [{ check: 'lint', note: 'no lint command is configured on this host' }] } },
+    })
+  })
+
+  it('makes an accepted writing result done only when its landing ends merged or not needed: no acceptance ends the wait, and unlanded it expires (T293, INV-9)', async () => {
+    const { ctx } = await boot()
+    await active(ctx)
+    const board = ctx.board as StoreBoard
+    const { taskId, r } = await heldWriting(ctx, 'lands', 3, { tests: true, lint: true })
+    const waiting = (await ctx.board.task(taskId))!
+    // Its checks passed, so the run owner's acceptance applied at once: it waits for its landing, not done.
+    expect(waiting).toMatchObject({ schema: 'board-task@1.3', state: 'review', waiting: { reason: 'landing' } })
+    expect(waiting.holder).toBeUndefined()
+    expect(await failureOf(ctx.board.accept(taskId, byOperator(ctx, taskId, r), at(4)))).toBe('invalid-transition')
+    const merge = ctx.artifacts.recordDecision({
+      decisionType: 'gate', question: 'Is it merged?', inputs: [waiting.result!.acceptance!],
+      candidates: [{ option: 'merge', selected: true, reasons: ['merged'] }, { option: 'refuse', selected: false, reasons: ['not refused'] }],
+      decider: { type: 'rule', id: 'workflow.landing', version: '1' }, outcome: { option: 'merge', detail: { taskId } }, deterministic: true,
+    }, { producer: { type: 'system', ref: 'workflow' } }).id as ArtifactRef
+    const end = { runId: waiting.run!.runId, acceptance: waiting.result!.acceptance!, outcome: 'merged' as const, decision: merge }
+    expect(await failureOf(board.landed(taskId, { ...end, runId: 'run-other' }, at(5)))).toBe('invalid-transition')
+    expect(await failureOf(board.landed(taskId, { ...end, decision: `sha256:${'e'.repeat(64)}` }, at(5)))).toBe('invalid')
+    const done = await board.landed(taskId, end, at(5))
+    expect(done).toMatchObject({ state: 'done', result: { acceptance: end.acceptance } })
+    expect(done.waiting).toBeUndefined()
+    expect(ctx.artifacts.get(done.lastDecision!)?.body).toMatchObject({ decider: { id: 'board.landed' }, inputs: expect.arrayContaining([merge, end.acceptance]), outcome: { option: 'done', detail: { outcome: 'merged', accepted: end.acceptance, landing: merge } } })
+    expect(await failureOf(board.landed(taskId, end, at(6)))).toBe('invalid-transition')
+
+    // One whose landing never ends waits 14 days, then waits for input (review-expired).
+    const late = await heldWriting(ctx, 'never lands', 7, { tests: true, lint: true })
+    const since = Date.parse((await ctx.board.task(late.taskId))!.waiting!.expiresAt)
+    await ctx.board.sweep(new Date(since - 1))
+    expect(await ctx.board.task(late.taskId)).toMatchObject({ state: 'review', waiting: { reason: 'landing' } })
+    await ctx.board.sweep(new Date(since))
+    expect(await ctx.board.task(late.taskId)).toMatchObject({ state: 'waiting-for-input', waiting: { reason: 'review-expired' } })
+  })
+
+  it('takes a report result done on an accepting decision: only a writing result waits for its landing', async () => {
+    const { ctx } = await boot()
+    await active(ctx)
+    const t = await ready(ctx, task('p2', 'report'))
+    const { generation } = await ctx.board.claim(t.taskId, 'lead', 600_000, at(3))
+    await ctx.board.start(t.taskId, generation, { runId: 'run-report' }, at(3))
+    const r = result(ctx, 'a report')
+    await ctx.board.submit(t.taskId, generation, { artifacts: [r], subject: HEAD }, at(3))
+    expect(await ctx.board.accept(t.taskId, acceptance(ctx, 'accept', t.taskId, r), at(4))).toMatchObject({ state: 'done' })
+  })
+
+  it('keeps the checks the run recorded on a review it holds again after a re-opening, never showing them pending (T311)', async () => {
+    const { ctx } = await boot()
+    await active(ctx)
+    // The run recorded tests passed (and lint failed): on the hold it is given again, only lint is pending.
+    const { taskId, run } = await heldWriting(ctx, 'tests passed', 3, { tests: true, lint: false })
+    await ctx.board.sweep(at(3 + 61))
+    const expired = (await ctx.board.task(taskId))!
+    expect(expired).toMatchObject({ state: 'waiting-for-input', waiting: { reason: 'review-expired' } })
+    const reopened = await ctx.board.reopenReview!(taskId, 'operator', 'look at it again', at(3 + 62))
+    expect(reopened).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: ['lint'] } })
+    expect((ctx.artifacts.get(reopened.lastDecision!)!.body as { inputs: string[] }).inputs).toContain(run)
+  })
+})
 
 describe('ctx.board (store-backed): restart', () => {
   it('a new provider over the same store sees the same projects, tasks, holders, and waits, and continues sweeping (INV-4)', async () => {
@@ -341,18 +464,18 @@ describe('ctx.board (store-backed): the approval queue', () => {
     asked.push(await approveCurrent(merge.taskId, at(11)))
     expect(await ctx.board.task(merge.taskId)).toMatchObject({ state: 'ready' })
 
-    // A question: answering it makes another attempt, which is asked about too.
+    // A question: answering it continues the attempt that asked (T291), which is asked about too, on its own subject.
     claim = await ctx.board.claim(merge.taskId, 'lead', 600_000, at(12))
     await ctx.board.start(merge.taskId, claim.generation, { runId: 'run-2' }, at(12))
     await ctx.board.block(merge.taskId, claim.generation, { reason: 'question', questions: ['Squash?'] }, at(12))
     const answered = await ctx.board.answer(merge.taskId, ['yes'], at(13))
     expect(answered).toMatchObject({ state: 'waiting-for-approval', waiting: { reason: 'approval-needed' }, attempts: { count: 2 } })
-    expect(ctx.artifacts.get(answered.lastDecision!)?.body).toMatchObject({ outcome: { option: 'waiting-for-approval', detail: { answers: ['yes'], attempt: 3 } } })
+    expect(ctx.artifacts.get(answered.lastDecision!)?.body).toMatchObject({ outcome: { option: 'waiting-for-approval', detail: { answers: ['yes'], attempt: 2, continues: true } } })
     asked.push(await approveCurrent(merge.taskId, at(13)))
 
-    // A rejected review whose move loses a race: the request it opened is withdrawn.
+    // A rejected review whose move loses a race: the request it opened is withdrawn. The run is attempt 2 continued.
     claim = await ctx.board.claim(merge.taskId, 'lead', 600_000, at(14))
-    await ctx.board.start(merge.taskId, claim.generation, { runId: 'run-3' }, at(14))
+    expect(await ctx.board.start(merge.taskId, claim.generation, { runId: 'run-3' }, at(14))).toMatchObject({ attempts: { count: 2 } })
     const r = result(ctx, 'merged')
     await ctx.board.submit(merge.taskId, claim.generation, { artifacts: [r], subject: HEAD }, at(14))
     const rejecting = ctx.board.accept(merge.taskId, acceptance(ctx, 'reject', merge.taskId, r), at(15))
@@ -360,11 +483,13 @@ describe('ctx.board (store-backed): the approval queue', () => {
     expect(await failureOf(rejecting)).toBe('conflict')
     expect(await open(ctx, 'p2')).toEqual([])
     const rejected = await ctx.board.accept(merge.taskId, acceptance(ctx, 'reject', merge.taskId, r), at(15))
-    expect(rejected).toMatchObject({ state: 'waiting-for-approval', waiting: { reason: 'approval-needed' }, attempts: { count: 3 } })
+    expect(rejected).toMatchObject({ state: 'waiting-for-approval', waiting: { reason: 'approval-needed' }, attempts: { count: 2 } })
     asked.push(rejected.waiting!.approvalRequest!)
     const subjects = await Promise.all(asked.map(async (id) => (await ctx.approvals.get(id))!.subject))
     expect(new Set(subjects.map((x) => `${x.ref}#${x.version}`)).size).toBe(asked.length)
-    expect(subjects.at(-1)).toMatchObject({ ref: `board-task:${merge.taskId}:attempt:3`, version: 'approval-needed' })
+    expect(subjects.at(-1)).toMatchObject({ ref: `board-task:${merge.taskId}:attempt:2`, version: 'approval-needed' })
+    // The answered question's request named the wait it answered, so its approval never covers the later gate of the same attempt.
+    expect(subjects.at(-2)!.ref).toMatch(new RegExp(`^board-task:${merge.taskId}:attempt:2:answered:`))
   })
 
   it('founds a project under a client request key at an id derived from it, so a retry after a crash adopts the request, also one approved meanwhile (M2, M6)', async () => {
@@ -426,7 +551,7 @@ describe('ctx.board (store-backed): the approval queue', () => {
   })
 
   it('starts nothing with no attempt left, even when the operator approves going on (INV-9)', async () => {
-    const { ctx } = await boot()
+    const { ctx } = await boot({ eventLog: true })
     await active(ctx)
     const t = await ready(ctx, task('p2', 't', { maxAttempts: 1 }))
     const { generation } = await ctx.board.claim(t.taskId, 'lead', 600_000, at(3))
@@ -438,6 +563,12 @@ describe('ctx.board (store-backed): the approval queue', () => {
     const stopped = (await ctx.board.task(t.taskId))!
     expect(stopped).toMatchObject({ state: 'waiting-for-input', waiting: { reason: 'retries-spent' }, attempts: { count: 1, max: 1 } })
     expect(ctx.artifacts.get(stopped.lastDecision!)?.body).toMatchObject({ decisionType: 'approval' })
+    // The wait is an event (the project's lead inbox tells it: D107), and its end is another.
+    const waits = ctx.eventLog.query({ type: 'board.waiting', limit: 10 })
+    expect(waits.at(-1)!.data).toEqual({ taskId: t.taskId, projectId: 'p2', reason: 'retries-spent', expiresAt: stopped.waiting!.expiresAt })
+    expect(ctx.eventLog.query({ type: 'board.waiting.ended', limit: 10 })).toEqual([])
+    await ctx.board.sweep(new Date(Date.parse(stopped.waiting!.expiresAt)))
+    expect(ctx.eventLog.query({ type: 'board.waiting.ended', limit: 10 }).map((e) => e.data)).toEqual([{ taskId: t.taskId, projectId: 'p2', reason: 'retries-spent', state: 'cancelled' }])
   })
 
   it('commits a move before it withdraws the request the task waited on: a withdrawal that fails after it leaves an open request that changes nothing (S7)', async () => {
@@ -529,6 +660,44 @@ describe('ctx.board (store-backed): the approval queue', () => {
     expect((await open(ctx, 'p2')).map((r) => r.requestId)).toEqual([orphan.requestId])
   })
 
+  it('asks again on an answered question\'s own subject after a policy change, so a later answer on the same attempt never adopts its approval (INV-2, T291)', async () => {
+    const { ctx, approvals } = await boot()
+    await active(ctx)
+    const spend = await ctx.board.propose(task('p2', 'spend', { actionClass: 'spend' }), at(2))
+    await ctx.board.sweep(at(2))
+    await decide(ctx, (await ctx.board.task(spend.taskId))!.waiting!.approvalRequest!, 'approved', at(2))
+    await ctx.board.sweep(at(2))
+    const [studio, ...rest] = POLICIES
+    let version = studio!.version
+    const reload = (when: Date) => approvals().reload([{ ...studio!, version: ++version }, ...rest], when)
+    const answeredOnce = async (runId: string, question: string, when: number): Promise<{ withdrawn: string; asked: string }> => {
+      const { generation } = await ctx.board.claim(spend.taskId, 'lead', 600_000, at(when))
+      await ctx.board.start(spend.taskId, generation, { runId }, at(when))
+      await ctx.board.block(spend.taskId, generation, { reason: 'question', questions: [question] }, at(when + 0.5))
+      const answered = await ctx.board.answer(spend.taskId, ['yes'], at(when + 1))
+      const withdrawn = answered.waiting!.approvalRequest!
+      expect(reload(at(when + 1.5)).map((r) => r.requestId)).toEqual([withdrawn])
+      await ctx.board.sweep(at(when + 1.5))
+      const regated = (await ctx.board.task(spend.taskId))!
+      expect(regated).toMatchObject({ state: 'waiting-for-approval', waiting: { reason: 'approval-needed' }, attempts: { count: 1 } })
+      return { withdrawn, asked: regated.waiting!.approvalRequest! }
+    }
+    // The first answer's gate, withdrawn by a policy change, is asked again on its own subject, and approved.
+    const first = await answeredOnce('run-1', 'Which band?', 3)
+    const [was, again] = await Promise.all([ctx.approvals.get(first.withdrawn), ctx.approvals.get(first.asked)])
+    expect(again!.subject.ref).toMatch(new RegExp(`^board-task:${spend.taskId}:attempt:1:answered:`))
+    expect(again!.subject).toEqual(was!.subject)
+    await decide(ctx, first.asked, 'approved', at(5))
+    await ctx.board.sweep(at(5))
+    expect(await ctx.board.task(spend.taskId)).toMatchObject({ state: 'ready', attempts: { count: 1 } })
+    // A second answer on the same attempt, withdrawn and asked again too: a new request on its own subject, never the first one's approval.
+    const second = await answeredOnce('run-1b', 'Which width?', 6)
+    expect(second.asked).not.toBe(first.asked)
+    const asked = (await ctx.approvals.get(second.asked))!
+    expect(asked.state).toBe('open')
+    expect(asked.subject.ref).not.toBe(again!.subject.ref)
+  })
+
   it('withdraws the request it asked again on a policy change when the task changed meanwhile, and leaves a wait the board withdrew itself as it is (S7)', async () => {
     const { ctx, approvals } = await boot()
     await active(ctx)
@@ -617,7 +786,9 @@ describe('ctx.board (store-backed): the protocol\'s guards', () => {
     expect(ctx.leases.current(`board-task:${t.taskId}`)).toBeUndefined()
     expect(ctx.artifacts.get(held.lastDecision!)?.body).toMatchObject({ decisionType: 'board', inputs: expect.arrayContaining([first]), outcome: { option: 'operator-review', detail: { pendingChecks: ['lint'] } } })
     const refused = await ctx.board.accept(t.taskId, acceptance(ctx, 'accept', t.taskId, r, branch, { tests: true, lint: false }), at(5)).catch((e: unknown) => e as BoardError)
-    expect(refused).toMatchObject({ failure: 'invalid', message: expect.stringMatching(/the review is the operator's/) })
+    // The refusal names the check that failed and the autonomy decision (T330); the hold's decision says the same.
+    expect(refused).toMatchObject({ failure: 'invalid', message: expect.stringMatching(/required check\(s\) lint have not passed \(autonomy decision sha256:[0-9a-f]+\): the review is the operator's$/) })
+    expect((ctx.artifacts.get(held.lastDecision!)!.body as { outcome: { detail: { holdReason?: string } } }).outcome.detail.holdReason).toMatch(/^required check\(s\) lint have not passed \(autonomy decision sha256:[0-9a-f]+\)$/)
     expect(await failureOf(ctx.board.accept(t.taskId, acceptance(ctx, 'accept', t.taskId, r, branch, { tests: 'yes' } as unknown as Action['checks']), at(5)))).toBe('invalid')
     expect(await ctx.board.accept(t.taskId, acceptance(ctx, 'accept', t.taskId, r, branch, { tests: true, lint: true }), at(5))).toMatchObject({ state: 'done' })
   })
@@ -650,6 +821,466 @@ describe('ctx.board (store-backed): the protocol\'s guards', () => {
     expect(events('board.review.held')).toHaveLength(2)
   })
 
+  describe('the auto-accept rule (board.autoAccept, D80, ADR-0067)', () => {
+    const TREE: Subject = { type: 'git-head', ref: 'c0ffee', version: 'sha256:tree' }
+    const AUTO: Config = { autoAccept: { projects: ['p2'], branches: ['dev'] } }
+    /** An `assessment@1.0` of `on`, as the engine's exact-subject review stores it. */
+    const assessed = (ctx: Context, verdict: 'approve' | 'changes-requested', blocking = 0, on: Subject = TREE): ArtifactRef => ctx.artifacts.put({
+      kind: 'assessment', bodySchema: 'assessment@1.0', classification: 'operator-shared', producer: { type: 'system', ref: 'workflow' },
+      body: { schema: 'assessment@1.0', subject: on, verdict, findings: Array.from({ length: blocking }, (_, i) => ({ severity: 'blocking', title: `defect ${i + 1}` })) },
+    }).id as ArtifactRef
+    /** A `check-run@1.0` record of `on`, as the agents source records the run's required checks. */
+    const checkRun = (ctx: Context, outcomes: Record<string, 'passed' | 'failed' | 'error'>, on: Subject = TREE): ArtifactRef => ctx.artifacts.put({
+      kind: 'evidence', bodySchema: 'check-run@1.0', classification: 'operator-shared', producer: { type: 'system', ref: 'agents' },
+      body: {
+        schema: 'check-run@1.0', runId: 'run-1', repository: '/repo', workspace: '/repo/wt', subject: on, setup: `sha256:${'5'.repeat(64)}`,
+        checks: Object.entries(outcomes).map(([check, outcome]) => ({ check, outcome, ...(outcome === 'error' ? {} : { exitCode: outcome === 'passed' ? 0 : 1 }), reason: outcome })),
+      },
+    }).id as ArtifactRef
+    /** The engine's `acceptance` decision (`workflow.task-acceptance` 3): its checks, its last review, its check-run record, and where it lands. */
+    const engineAcceptance = (ctx: Context, taskId: string, on: ArtifactRef, named: { checks?: Action['checks']; review?: ArtifactRef; cycle?: number; evidence?: ArtifactRef; results?: Array<Record<string, unknown>>; branch?: string }): ArtifactRef => ctx.artifacts.recordDecision({
+      decisionType: 'acceptance', question: `Does the run's result complete its attempt of ${taskId}?`, inputs: [on, ...(named.evidence ? [named.evidence] : []), ...(named.review ? [named.review] : [])],
+      candidates: [{ option: 'accept', selected: true, reasons: ['every step was accepted'] }, { option: 'reject', selected: false, reasons: ['not reject: no check failed'] }],
+      decider: { type: 'rule', id: 'workflow.task-acceptance', version: '3' },
+      outcome: {
+        option: 'accept',
+        detail: {
+          taskId, subject: TREE, checks: named.checks ?? {},
+          ...(named.review ? { review: { assessment: named.review, cycle: named.cycle ?? 1, maxCycles: 3 } } : {}),
+          ...(named.evidence ? { checkRun: { evidence: named.evidence, ...(named.results ? { results: named.results } : {}) } } : {}),
+          ...(named.branch ? { landing: { repository: '/repo', branch: named.branch } } : {}),
+        },
+      },
+      deterministic: true,
+    }, { producer: { type: 'system', ref: 'workflow' } }).id as ArtifactRef
+    /** A `workspace-write` task of `projectId` in review on a result on TREE. */
+    const inReview = async (ctx: Context, title: string, projectId = 'p2'): Promise<{ taskId: string; r: ArtifactRef }> => {
+      const t = await ready(ctx, task(projectId, title, { actionClass: 'workspace-write' }))
+      const { generation } = await ctx.board.claim(t.taskId, 'lead', 600_000, at(3))
+      await ctx.board.start(t.taskId, generation, { runId: `run-${title}` }, at(3))
+      const r = result(ctx, title)
+      await ctx.board.submit(t.taskId, generation, { artifacts: [r], subject: TREE }, at(4))
+      return { taskId: t.taskId, r }
+    }
+    const autoReasons = (ctx: Context, held: BoardTask): string[] => {
+      const body = ctx.artifacts.get(held.lastDecision!)?.body as { outcome?: { detail?: { autoAccept?: string[] } } } | undefined
+      return body?.outcome?.detail?.autoAccept ?? []
+    }
+
+    it('accepts a result whose last review approved it and whose required checks passed on it, landing on a listed branch, on a decision naming the review and the check-run record (INV-13)', async () => {
+      const { ctx } = await boot({ board: AUTO, eventLog: true })
+      await active(ctx)
+      const { taskId, r } = await inReview(ctx, 'lands')
+      const review = assessed(ctx, 'approve')
+      const evidence = checkRun(ctx, { tests: 'passed', lint: 'passed' })
+      const accepting = engineAcceptance(ctx, taskId, r, { checks: { review: true, tests: true, lint: true }, review, evidence, branch: 'dev' })
+      const done = await ctx.board.accept(taskId, accepting, at(5))
+      expect(done).toMatchObject({ state: 'done', result: { acceptance: accepting, subject: TREE } })
+      expect(done.waiting).toBeUndefined()
+      expect(ctx.artifacts.get(done.lastDecision!)?.body).toMatchObject({
+        decisionType: 'board', decider: { type: 'rule', id: 'board.auto-accept' }, inputs: expect.arrayContaining([accepting, review, evidence]),
+        outcome: { option: 'done', detail: { reason: 'auto-accept', acceptance: accepting, review, checkRun: evidence, checks: ['tests', 'lint'], branch: 'dev' } },
+      })
+      expect(ctx.eventLog.query({ type: 'board.review.held', limit: 10 })).toEqual([])
+    })
+
+    it('holds for the operator, with the reason, a result whose last review left a blocking finding at the cycle bound', async () => {
+      const { ctx } = await boot({ board: AUTO })
+      await active(ctx)
+      const evidence = checkRun(ctx, { tests: 'passed', lint: 'passed' })
+      const checks = { tests: true, lint: true }
+      const bound = await inReview(ctx, 'bound')
+      const held = await ctx.board.accept(bound.taskId, engineAcceptance(ctx, bound.taskId, bound.r, { checks, review: assessed(ctx, 'changes-requested', 1), cycle: 3, evidence, branch: 'dev' }), at(5))
+      expect(held).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: [] } })
+      expect(autoReasons(ctx, held)).toEqual([expect.stringMatching(/did not approve \(changes-requested\) and left 1 blocking finding\(s\) \(review cycle 3 of 3, the cycle bound\)$/)])
+      // An approval that still lists a blocking finding is no approval either; nor is one with no review at all, or of another tree.
+      const left = await inReview(ctx, 'left')
+      expect(autoReasons(ctx, await ctx.board.accept(left.taskId, engineAcceptance(ctx, left.taskId, left.r, { checks, review: assessed(ctx, 'approve', 2), evidence, branch: 'dev' }), at(5)))).toEqual([expect.stringMatching(/left 2 blocking finding/)])
+      const none = await inReview(ctx, 'none')
+      expect(autoReasons(ctx, await ctx.board.accept(none.taskId, engineAcceptance(ctx, none.taskId, none.r, { checks, evidence, branch: 'dev' }), at(5)))).toEqual([expect.stringMatching(/names no review of the run/)])
+      const other = await inReview(ctx, 'other')
+      expect(autoReasons(ctx, await ctx.board.accept(other.taskId, engineAcceptance(ctx, other.taskId, other.r, { checks, review: assessed(ctx, 'approve', 0, { ...TREE, version: 'sha256:older' }), evidence, branch: 'dev' }), at(5))))
+        .toEqual([expect.stringMatching(/is not of the result's exact tree/)])
+      // Held, only the operator's acceptance accepts it now: another of the run owner's the rule does not apply to is refused.
+      const again = await ctx.board.accept(bound.taskId, engineAcceptance(ctx, bound.taskId, bound.r, { checks, review: assessed(ctx, 'changes-requested', 1), cycle: 3, evidence, branch: 'dev' }), at(6)).catch((e: unknown) => e as BoardError)
+      expect(again).toMatchObject({ failure: 'invalid', message: expect.stringMatching(/the auto-accept rule \(board\.autoAccept, D80\) does not apply: .* \(autonomy decision sha256:[0-9a-f]+\): the review is the operator's$/) })
+      const operator = ctx.artifacts.recordDecision({
+        decisionType: 'acceptance', question: 'Accept it?', inputs: [bound.r], candidates: [{ option: 'accept', selected: true, reasons: ['the operator accepts it'] }],
+        decider: { type: 'operator', id: 'operator.review', version: '1' }, outcome: { option: 'accept', detail: { taskId: bound.taskId, subject: TREE } }, deterministic: false,
+      }, { producer: { type: 'operator', ref: 'operator' } }).id as ArtifactRef
+      expect(await ctx.board.accept(bound.taskId, operator, at(6))).toMatchObject({ state: 'done', lastDecision: operator })
+    })
+
+    it('never holds a result for nits, a pre-existing finding, or an important finding its verifier rejected; holds it for a confirmed one (ADR-0075)', async () => {
+      const { ctx } = await boot({ board: AUTO })
+      await active(ctx)
+      const evidence = checkRun(ctx, { tests: 'passed', lint: 'passed' })
+      const checks = { review: true, tests: true, lint: true }
+      /** An `assessment@1.1`, as the engine stores a review's verified findings. */
+      const verified = (verdict: 'approve' | 'changes-requested', findings: Array<Record<string, unknown>>): ArtifactRef => ctx.artifacts.put({
+        kind: 'assessment', bodySchema: 'assessment@1.1', classification: 'operator-shared', producer: { type: 'system', ref: 'workflow' },
+        body: { schema: 'assessment@1.1', subject: TREE, verdict, findings, summary: 'counted' },
+      }).id as ArtifactRef
+      const vote = (v: string) => ({ vote: v, reason: `scripted ${v}`, node: 'review:1:verify' })
+      const nits = await inReview(ctx, 'nits')
+      const review = verified('approve', [
+        { id: 'f1', severity: 'nit', title: 'rename x' }, { id: 'f2', severity: 'nit', title: 'wording' },
+        { id: 'f3', severity: 'pre-existing', title: 'sub() subtracts wrong', file: 'calc.py', line: 4, evidence: 'line 4' },
+        { id: 'f4', severity: 'important', title: 'off by one', file: 'calc.py', line: 2, evidence: 'line 2', verification: vote('reject') },
+      ])
+      expect(await ctx.board.accept(nits.taskId, engineAcceptance(ctx, nits.taskId, nits.r, { checks, review, evidence, branch: 'dev' }), at(5))).toMatchObject({ state: 'done' })
+      const confirmed = await inReview(ctx, 'confirmed')
+      const blocking = verified('changes-requested', [{ id: 'f1', severity: 'important', title: 'off by one', file: 'calc.py', line: 2, evidence: 'line 2', verification: vote('confirm') }])
+      const held = await ctx.board.accept(confirmed.taskId, engineAcceptance(ctx, confirmed.taskId, confirmed.r, { checks, review: blocking, cycle: 3, evidence, branch: 'dev' }), at(5))
+      expect(held).toMatchObject({ state: 'review', waiting: { reason: 'operator-review' } })
+      expect(autoReasons(ctx, held)).toEqual([expect.stringMatching(/did not approve \(changes-requested\) and left 1 blocking finding\(s\)/)])
+    })
+
+    it('holds a result with a required check pending or failed, and one whose check-run record does not show it passed on that tree', async () => {
+      const { ctx } = await boot({ board: AUTO })
+      await active(ctx)
+      const review = assessed(ctx, 'approve')
+      // Pending: lint did not run to an exit code, so the policy's own hold stands.
+      const pending = await inReview(ctx, 'pending')
+      expect(await ctx.board.accept(pending.taskId, engineAcceptance(ctx, pending.taskId, pending.r, { checks: { review: true, tests: true }, review, evidence: checkRun(ctx, { tests: 'passed', lint: 'error' }), branch: 'dev' }), at(5)))
+        .toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: ['lint'] } })
+      // Failed, though the decision says otherwise: the record decides, never the decision's own account.
+      const failed = await inReview(ctx, 'failed')
+      const held = await ctx.board.accept(failed.taskId, engineAcceptance(ctx, failed.taskId, failed.r, { checks: { review: true, tests: true, lint: true }, review, evidence: checkRun(ctx, { tests: 'passed', lint: 'failed' }), branch: 'dev' }), at(5))
+      expect(held).toMatchObject({ state: 'review', waiting: { reason: 'operator-review' } })
+      expect(autoReasons(ctx, held)).toEqual([expect.stringMatching(/does not show lint passed$/)])
+      // Passed on another tree, or with no record at all.
+      const elsewhere = await inReview(ctx, 'elsewhere')
+      expect(autoReasons(ctx, await ctx.board.accept(elsewhere.taskId, engineAcceptance(ctx, elsewhere.taskId, elsewhere.r, { checks: { tests: true, lint: true }, review, evidence: checkRun(ctx, { tests: 'passed', lint: 'passed' }, { ...TREE, version: 'sha256:older' }), branch: 'dev' }), at(5))))
+        .toEqual([expect.stringMatching(/is not of the result's exact tree/)])
+      const unrecorded = await inReview(ctx, 'unrecorded')
+      expect(autoReasons(ctx, await ctx.board.accept(unrecorded.taskId, engineAcceptance(ctx, unrecorded.taskId, unrecorded.r, { checks: { tests: true, lint: true }, review, branch: 'dev' }), at(5))))
+        .toEqual([expect.stringMatching(/have no check-run record among its inputs/)])
+    })
+
+    describe('the circuit breaker (D93, ADR-0067 amendment)', () => {
+      const day = (n: number): Date => at(n * 24 * 60)
+      const booted = async (board: Config = AUTO) => {
+        const b = await boot({ board })
+        const { ctx } = b
+        await active(ctx)
+        const review = assessed(ctx, 'approve')
+        const evidence = checkRun(ctx, { tests: 'passed', lint: 'passed' })
+        /** A result the rule accepts on its own, or the task held when the rule does not apply. */
+        const accepted = async (title: string): Promise<BoardTask> => {
+          const t = await inReview(ctx, title)
+          return ctx.board.accept(t.taskId, engineAcceptance(ctx, t.taskId, t.r, { checks: { review: true, tests: true, lint: true }, review, evidence, branch: 'dev' }), at(5))
+        }
+        return { b, ctx, accepted }
+      }
+
+      it('trips at two escaped defects of auto-accepted results in 7 days, on a decision naming the escapes it counted, and holds the next result for the operator with the reason', async () => {
+        const { ctx, accepted } = await booted()
+        const [a, b, c] = [await accepted('a'), await accepted('b'), await accepted('c')]
+        expect([a.state, b.state, c.state]).toEqual(['done', 'done', 'done'])
+        const first = await ctx.board.recordEscape!({ taskId: a.taskId, by: 'lead', note: 'the fix named npm_config_ only' }, day(1))
+        expect(first.breaker).toBeUndefined()
+        expect(await ctx.board.breakers!('p2', day(1))).toEqual([])
+        // A second escape 6 days later is inside the window of the first: the line (2 in 7 days) is reached.
+        const second = await ctx.board.recordEscape!({ taskId: b.taskId, by: 'operator', note: 'the report channel cannot be reopened' }, day(7))
+        expect(second.breaker).toMatchObject({ state: 'tripped', projectId: 'p2', branch: 'dev', line: { escapes: 2, days: 7 }, trippedAt: day(7).toISOString(), now: { counted: 2, lineHolds: false } })
+        expect(second.breaker!.escapes.map((e) => [e.taskId, e.recordedBy])).toEqual([[a.taskId, 'lead'], [b.taskId, 'operator']])
+        const decision = ctx.artifacts.get(second.breaker!.decision)?.body as { decisionType: string; decider: { id: string }; inputs: string[]; outcome: { option: string; detail: { escapes: Array<{ taskId: string; note: string }> } } }
+        expect(decision).toMatchObject({ decisionType: 'board', decider: { id: 'board.auto-accept-breaker' }, outcome: { option: 'auto-accept off' } })
+        expect(decision.outcome.detail.escapes.map((e) => e.taskId)).toEqual([a.taskId, b.taskId])
+        expect(decision.inputs).toEqual(expect.arrayContaining([a.lastDecision, b.lastDecision]))
+        // Auto-accept for the project and branch is off: the next result is held, saying why.
+        const held = await accepted('d')
+        expect(held).toMatchObject({ state: 'review', waiting: { reason: 'operator-review' } })
+        expect(autoReasons(ctx, held)).toEqual([expect.stringMatching(/the auto-accept breaker is tripped for p2 on dev since .*: 2 escaped defect\(s\) counted \(decision .*only the operator or the lead turns it on again/)])
+        // Recording a third does not trip it twice.
+        expect((await ctx.board.recordEscape!({ taskId: c.taskId, by: 'lead', note: 'a third' }, day(7))).breaker).toBeUndefined()
+        expect(await ctx.board.breakers!('p2', day(7))).toHaveLength(1)
+        expect((await ctx.board.escapes!('p2')).map((e) => e.taskId)).toEqual([a.taskId, b.taskId, c.taskId])
+      })
+
+      it('does not trip on escapes further apart than the window, or on a task the rule did not accept, or twice for one task', async () => {
+        const { ctx, accepted } = await booted()
+        const [a, b] = [await accepted('a'), await accepted('b')]
+        await ctx.board.recordEscape!({ taskId: a.taskId, by: 'lead', note: 'one' }, day(1))
+        expect((await ctx.board.recordEscape!({ taskId: b.taskId, by: 'lead', note: 'two, 8 days later' }, day(9))).breaker).toBeUndefined()
+        expect(await ctx.board.breakers!('p2', day(9))).toEqual([])
+        await expect(ctx.board.recordEscape!({ taskId: a.taskId, by: 'lead', note: 'again' }, day(9))).rejects.toMatchObject({ failure: 'invalid', message: expect.stringMatching(/already recorded/) })
+        const held = await inReview(ctx, 'held')
+        await expect(ctx.board.recordEscape!({ taskId: held.taskId, by: 'lead', note: 'not accepted' }, day(9))).rejects.toMatchObject({ failure: 'invalid', message: expect.stringMatching(/was not accepted by the auto-accept rule/) })
+        await expect(ctx.board.recordEscape!({ taskId: held.taskId, by: 'agent' as 'lead', note: 'x' }, day(9))).rejects.toMatchObject({ failure: 'invalid' })
+      })
+
+      it('never turns itself on again: not with time, not on a sweep; the operator or the lead does, once the line holds, on a decision naming the trip', async () => {
+        const { ctx, accepted } = await booted()
+        const [a, b] = [await accepted('a'), await accepted('b')]
+        await ctx.board.recordEscape!({ taskId: a.taskId, by: 'lead', note: 'one' }, day(1))
+        const { breaker } = await ctx.board.recordEscape!({ taskId: b.taskId, by: 'lead', note: 'two' }, day(2))
+        // Sixty days on and a sweep later the line holds, and auto-accept is still off.
+        await ctx.board.sweep(day(60))
+        expect(await ctx.board.breakers!('p2', day(60))).toMatchObject([{ breakerId: breaker!.breakerId, state: 'tripped', now: { counted: 0, lineHolds: true } }])
+        expect(await accepted('after-sweep')).toMatchObject({ state: 'review', waiting: { reason: 'operator-review' } })
+        // While the line does not hold, not even the operator turns it on.
+        await expect(ctx.board.resetBreaker!('p2', 'dev', 'operator', day(3))).rejects.toMatchObject({ failure: 'invalid', message: expect.stringMatching(/the line does not hold: 2 escaped defect\(s\) in the last 7 days/) })
+        // Only the operator or the lead; and only a breaker that is tripped.
+        await expect(ctx.board.resetBreaker!('p2', 'dev', 'agent' as 'lead', day(60))).rejects.toMatchObject({ failure: 'invalid' })
+        await expect(ctx.board.resetBreaker!('p2', 'main', 'lead', day(60))).rejects.toMatchObject({ failure: 'invalid-transition' })
+        const reset = await ctx.board.resetBreaker!('p2', 'dev', 'lead', day(60))
+        expect(reset).toMatchObject({ state: 'reset', reset: { at: day(60).toISOString(), by: 'lead' } })
+        expect(ctx.artifacts.get(reset.reset!.decision)?.body).toMatchObject({ decider: { id: 'board.auto-accept-breaker' }, inputs: [breaker!.decision], outcome: { option: 'auto-accept on', detail: { by: 'lead', trip: breaker!.decision } } })
+        expect(await ctx.board.breakers!('p2', day(60))).toEqual([])
+        expect(await accepted('after-reset')).toMatchObject({ state: 'done' })
+        await expect(ctx.board.resetBreaker!('p2', 'dev', 'lead', day(60))).rejects.toMatchObject({ failure: 'invalid-transition' })
+      })
+
+      it('is reached through the board tools: the lead or the operator records an escape and resets the breaker as the caller, every output valid against mcp-board 1.3, and a refused call changes nothing', async () => {
+        const { b, ctx, accepted } = await booted()
+        const call = caller(b)
+        const [a, c] = [await accepted('a'), await accepted('c')]
+        // The tools read now: only Date is faked, at fixed instants after the results were accepted.
+        vi.useFakeTimers({ toFake: ['Date'] })
+        onTestFinished(() => {
+          vi.useRealTimers()
+        })
+        vi.setSystemTime(new Date('2026-10-27T00:00:00.000Z'))
+        // The lead's token records it as the lead's; the operator's as the operator's.
+        const first = await ok(call('board_escape', { taskId: a.taskId, note: 'pnpm 12 ignores the npm_config_ name', foundAt: '2026-10-26T09:00:00.000Z' }))
+        expect(first).toMatchObject({ taskId: a.taskId, projectId: 'p2', branch: 'dev', foundAt: '2026-10-26T09:00:00.000Z', recordedBy: 'lead' })
+        expect(first).not.toHaveProperty('breaker')
+        expect(await ok(call('board_breakers', { projectId: 'p2' }))).toEqual({ breakers: [] })
+        const second = await ok(call('board_escape', { taskId: c.taskId, note: 'the report channel cannot be reopened', foundAt: '2026-10-26T10:00:00.000Z' }, 'operator'))
+        expect(second).toMatchObject({ recordedBy: 'operator', breaker: { projectId: 'p2', branch: 'dev', state: 'tripped', line: { escapes: 2, days: 7 }, escapes: [{ taskId: a.taskId }, { taskId: c.taskId }] } })
+        expect(ctx.artifacts.get(second.breaker.decision)?.body).toMatchObject({ decider: { id: 'board.auto-accept-breaker' }, outcome: { option: 'auto-accept off' } })
+        const listed = await ok(call('board_breakers', {}))
+        expect(listed.breakers).toHaveLength(1)
+        expect(listed.breakers[0]).toMatchObject({ breakerId: second.breaker.breakerId, counted: 2, lineHolds: false })
+        // Refused, nothing changes: a task the rule did not accept, a second escape of one task, an input its schema refuses.
+        const held = await inReview(ctx, 'held')
+        expect((await call('board_escape', { taskId: held.taskId, note: 'x' })).content[0]?.text).toMatch(/^invalid: .*was not accepted by the auto-accept rule/)
+        expect((await call('board_escape', { taskId: a.taskId, note: 'again' })).content[0]?.text).toMatch(/^invalid: an escape of .* is already recorded/)
+        expect((await call('board_escape', { taskId: a.taskId, note: '' })).content[0]?.text).toMatch(/^invalid input, nothing done/)
+        expect((await call('board_escape', { taskId: a.taskId, note: 'x', by: 'operator' })).content[0]?.text).toMatch(/^invalid input, nothing done/)
+        expect(await ctx.board.escapes!('p2')).toHaveLength(2)
+        // A reset while the line does not hold is refused, the breaker still tripped; a branch with none tripped too.
+        expect((await call('board_breaker_reset', { projectId: 'p2', branch: 'dev' })).content[0]?.text).toMatch(/^invalid: the line does not hold/)
+        expect((await call('board_breaker_reset', { projectId: 'p2', branch: 'main' }, 'operator')).content[0]?.text).toMatch(/^invalid-transition: /)
+        expect(await ctx.board.breakers!('p2')).toHaveLength(1)
+        // A sweep two weeks on leaves it tripped; once the window has passed and the line holds, the operator's token turns it on, recorded as the operator's.
+        vi.setSystemTime(new Date('2026-11-10T00:00:00.000Z'))
+        await ctx.board.sweep(new Date())
+        expect(await ok(call('board_breakers', { projectId: 'p2' }))).toMatchObject({ breakers: [{ state: 'tripped', counted: 0, lineHolds: true }] })
+        const reset = await ok(call('board_breaker_reset', { projectId: 'p2', branch: 'dev' }, 'operator'))
+        expect(reset).toMatchObject({ state: 'reset', reset: { by: 'operator', at: '2026-11-10T00:00:00.000Z' }, counted: 0, lineHolds: true })
+        expect(ctx.artifacts.get(reset.reset.decision)?.body).toMatchObject({ outcome: { option: 'auto-accept on', detail: { by: 'operator' } } })
+        expect(await ok(call('board_breakers', { projectId: 'p2' }))).toEqual({ breakers: [] })
+      })
+
+      it('uses the configured line, refuses a malformed one, and keeps the default of 2 in 7 days without one', async () => {
+        const { ctx, accepted } = await booted({ autoAccept: { projects: ['p2'], branches: ['dev'], breaker: { escapes: 1, days: 1 } } })
+        const a = await accepted('a')
+        expect((await ctx.board.recordEscape!({ taskId: a.taskId, by: 'lead', note: 'one is the line' }, day(1))).breaker).toMatchObject({ line: { escapes: 1, days: 1 } })
+        expect(autoAcceptOf({ projects: ['p'], branches: ['dev'] })).toEqual({ projects: ['p'], branches: ['dev'] })
+        for (const breaker of [{ escapes: 0, days: 7 }, { escapes: 2, days: 91 }, { escapes: 1.5, days: 7 }]) expect(() => autoAcceptOf({ projects: ['p'], branches: ['dev'], breaker })).toThrow(TypeError)
+      })
+    })
+
+    it('holds for the lead or the operator a result whose check passed without running its browser tests, naming the check and what did not run; a plain pass is accepted as before (T247, T255)', async () => {
+      const { ctx } = await boot({ board: AUTO, eventLog: true })
+      await active(ctx)
+      const review = assessed(ctx, 'approve')
+      const evidence = checkRun(ctx, { tests: 'passed', lint: 'passed' })
+      const checks = { review: true, tests: true, lint: true }
+      const unrun = await inReview(ctx, 'unrun')
+      const results = [
+        { check: 'tests', outcome: 'passed', exitCode: 0, notRun: 'its browser tests (12 browser tests skipped: no usable Chrome)' },
+        { check: 'lint', outcome: 'passed', exitCode: 0 },
+      ]
+      const held = await ctx.board.accept(unrun.taskId, engineAcceptance(ctx, unrun.taskId, unrun.r, { checks, review, evidence, results, branch: 'dev' }), at(5))
+      expect(held).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: [] } })
+      expect(autoReasons(ctx, held)).toEqual(['checks passed, browser tests not run: its tests check passed without running its browser tests (12 browser tests skipped: no usable Chrome), so its pass says nothing of those'])
+      const hold = ctx.artifacts.get(held.lastDecision!)!.body as { candidates: Array<{ reasons: string[] }> }
+      expect(hold.candidates[0]!.reasons[0]).toMatch(/does not apply: checks passed, browser tests not run: its tests check passed without running its browser tests/)
+      expect(ctx.eventLog.query({ type: 'board.review.held', limit: 10 })).toHaveLength(1)
+      // The same records without notRun: a plain pass, done by the rule.
+      const plain = await inReview(ctx, 'plain')
+      const accepting = engineAcceptance(ctx, plain.taskId, plain.r, { checks, review, evidence, results: [{ check: 'tests', outcome: 'passed', exitCode: 0 }, results[1]!], branch: 'dev' })
+      const done = await ctx.board.accept(plain.taskId, accepting, at(5))
+      expect(done).toMatchObject({ state: 'done', result: { acceptance: accepting } })
+      expect(ctx.artifacts.get(done.lastDecision!)?.body).toMatchObject({ decider: { id: 'board.auto-accept' } })
+      // Held, the run owner's acceptance does not accept it again; the operator's does.
+      const operator = ctx.artifacts.recordDecision({
+        decisionType: 'acceptance', question: 'Accept it?', inputs: [unrun.r], candidates: [{ option: 'accept', selected: true, reasons: ['the operator accepts it'] }],
+        decider: { type: 'operator', id: 'operator.review', version: '1' }, outcome: { option: 'accept', detail: { taskId: unrun.taskId, subject: TREE } }, deterministic: false,
+      }, { producer: { type: 'operator', ref: 'operator' } }).id as ArtifactRef
+      expect(await ctx.board.accept(unrun.taskId, operator, at(6))).toMatchObject({ state: 'done', lastDecision: operator })
+    })
+
+    it('holds a result that lands on another branch, or on none known; another project\'s result, and every one with the setting off, go as before', async () => {
+      const { ctx } = await boot({ board: AUTO })
+      await active(ctx)
+      const review = assessed(ctx, 'approve')
+      const evidence = checkRun(ctx, { tests: 'passed', lint: 'passed' })
+      const checks = { review: true, tests: true, lint: true }
+      const main = await inReview(ctx, 'main')
+      expect(autoReasons(ctx, await ctx.board.accept(main.taskId, engineAcceptance(ctx, main.taskId, main.r, { checks, review, evidence, branch: 'main' }), at(5)))).toEqual(['it lands on main, not on a listed branch (dev)'])
+      const nowhere = await inReview(ctx, 'nowhere')
+      expect(autoReasons(ctx, await ctx.board.accept(nowhere.taskId, engineAcceptance(ctx, nowhere.taskId, nowhere.r, { checks, review, evidence }), at(5)))).toEqual([expect.stringMatching(/no landing target is known/)])
+      // Not the run owner's: a decision the system did not produce never applies by the rule.
+      const forged = await inReview(ctx, 'forged')
+      const notOwners = ctx.artifacts.recordDecision({
+        decisionType: 'acceptance', question: 'q', inputs: [forged.r, review, evidence], candidates: [{ option: 'accept', selected: true, reasons: ['looks fine'] }],
+        decider: { type: 'rule', id: 'workflow.task-acceptance', version: '3' },
+        outcome: { option: 'accept', detail: { taskId: forged.taskId, subject: TREE, checks, review: { assessment: review }, checkRun: { evidence }, landing: { repository: '/repo', branch: 'dev' } } }, deterministic: true,
+      }, { producer: { type: 'policy', ref: 'test' } }).id as ArtifactRef
+      expect(autoReasons(ctx, await ctx.board.accept(forged.taskId, notOwners, at(5)))).toEqual([expect.stringMatching(/is not the run owner's/)])
+      // A project not listed: as before the setting, the policy alone decides.
+      await active(ctx, 'p3')
+      const unlisted = await inReview(ctx, 'unlisted', 'p3')
+      const plain = engineAcceptance(ctx, unlisted.taskId, unlisted.r, { checks: { tests: true, lint: true }, branch: 'main' })
+      expect(await ctx.board.accept(unlisted.taskId, plain, at(5))).toMatchObject({ state: 'done', lastDecision: plain })
+
+      const off = await boot()
+      await active(off.ctx)
+      const before = await inReview(off.ctx, 'off')
+      const accepting = engineAcceptance(off.ctx, before.taskId, before.r, { checks: { tests: true, lint: true } })
+      expect(await off.ctx.board.accept(before.taskId, accepting, at(5))).toMatchObject({ state: 'done', lastDecision: accepting })
+    })
+
+    it('never applies an acceptance of a heavy result unattended, by the rule or by the policy alone; the tier is read from the record it names (ADR-0071, INV-2)', async () => {
+      const { ctx } = await boot({ board: AUTO })
+      await active(ctx)
+      const review = assessed(ctx, 'approve')
+      const evidence = checkRun(ctx, { tests: 'passed', lint: 'passed' })
+      const checks = { review: true, tests: true, lint: true }
+      /** The engine's `workflow.risk-tier` decision of a tier. */
+      const tiered = (tier: 'light' | 'heavy'): ArtifactRef => ctx.artifacts.recordDecision({
+        decisionType: 'gate', question: `What risk tier is the change (${tier})?`, inputs: [],
+        candidates: [{ option: tier, selected: true, reasons: [`the change is ${tier}`] }, { option: tier === 'heavy' ? 'light' : 'heavy', selected: false, reasons: ['not it'] }],
+        decider: { type: 'rule', id: 'workflow.risk-tier', version: '1' }, outcome: { option: tier }, deterministic: true,
+      }, { producer: { type: 'system', ref: 'workflow' } }).id as ArtifactRef
+      /** The engine's acceptance (version 4) naming a tier: `inInputs` false leaves its decision out of the inputs. */
+      const withRisk = (taskId: string, r: ArtifactRef, tier: 'light' | 'heavy', decision: ArtifactRef, inInputs = true): ArtifactRef => ctx.artifacts.recordDecision({
+        decisionType: 'acceptance', question: `Does the run's result complete its attempt of ${taskId}?`, inputs: [r, evidence, review, ...(inInputs ? [decision] : [])],
+        candidates: [{ option: 'accept', selected: true, reasons: ['every step was accepted'] }, { option: 'reject', selected: false, reasons: ['not reject'] }],
+        decider: { type: 'rule', id: 'workflow.task-acceptance', version: '4' },
+        outcome: { option: 'accept', detail: { taskId, subject: TREE, checks, review: { assessment: review, cycle: 1, maxCycles: 3 }, checkRun: { evidence }, landing: { repository: '/repo', branch: 'dev' }, risk: { tier, decision } } },
+        deterministic: true,
+      }, { producer: { type: 'system', ref: 'workflow' } }).id as ArtifactRef
+      const heavyOf = (held: BoardTask): string | undefined => (ctx.artifacts.get(held.lastDecision!)!.body as { outcome?: { detail?: { heavy?: string } } }).outcome?.detail?.heavy
+
+      const heavy = await inReview(ctx, 'heavy')
+      const held = await ctx.board.accept(heavy.taskId, withRisk(heavy.taskId, heavy.r, 'heavy', tiered('heavy')), at(5))
+      expect(held).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: [] } })
+      expect(heavyOf(held)).toMatch(/is heavy-tier \(risk decision sha256:[0-9a-f]+\): a heavy change is never accepted automatically/)
+      // The hold decision carries its reason, which /ui shows (T330).
+      expect((ctx.artifacts.get(held.lastDecision!)!.body as { outcome: { detail: { holdReason?: string } } }).outcome.detail.holdReason).toMatch(/^the result is heavy-tier \(risk decision sha256:[0-9a-f]+\).* \(autonomy decision sha256:[0-9a-f]+\)$/)
+      // A tier the decision claims but does not back with its record, or a claim the record contradicts, is held too.
+      const unbacked = await inReview(ctx, 'unbacked')
+      expect(heavyOf(await ctx.board.accept(unbacked.taskId, withRisk(unbacked.taskId, unbacked.r, 'light', tiered('light'), false), at(5)))).toMatch(/no workflow.risk-tier decision among its inputs/)
+      const claimed = await inReview(ctx, 'claimed')
+      expect(heavyOf(await ctx.board.accept(claimed.taskId, withRisk(claimed.taskId, claimed.r, 'light', tiered('heavy')), at(5)))).toMatch(/heavy-tier/)
+      // A light one the rule applies to is done, as before.
+      const light = await inReview(ctx, 'light')
+      expect(await ctx.board.accept(light.taskId, withRisk(light.taskId, light.r, 'light', tiered('light')), at(5))).toMatchObject({ state: 'done' })
+      // On a project the rule does not list, the policy alone would let a heavy result apply: it is held all the same.
+      await active(ctx, 'p3')
+      const unlisted = await inReview(ctx, 'unlisted', 'p3')
+      expect(heavyOf(await ctx.board.accept(unlisted.taskId, withRisk(unlisted.taskId, unlisted.r, 'heavy', tiered('heavy')), at(5)))).toMatch(/heavy-tier/)
+      // The lead's acceptance of it is refused, naming heavy and its risk decision, not a check that failed (T330).
+      const risk = tiered('heavy')
+      const byLead = ctx.artifacts.recordDecision({
+        schema: 'decision@1.10', decisionType: 'acceptance', question: `Does lead:p2 accept ${heavy.taskId}?`, inputs: [heavy.r, evidence, review, risk],
+        candidates: [{ option: 'accept', selected: true, reasons: ['the lead accepts'] }, { option: 'reject', selected: false, reasons: ['not reject'] }],
+        decider: { type: 'client', id: 'lead:p2', version: '1' },
+        outcome: { option: 'accept', detail: { taskId: heavy.taskId, subject: TREE, checks, risk: { tier: 'heavy', decision: risk } } }, deterministic: false,
+      }, { producer: { type: 'system', ref: 'lead:p2' } }).id as ArtifactRef
+      const refused = await ctx.board.accept(heavy.taskId, byLead, at(5)).catch((e: unknown) => e as BoardError)
+      expect(refused).toMatchObject({ failure: 'invalid', message: expect.stringMatching(new RegExp(`the result is heavy-tier \\(risk decision ${risk}\\).*: the review is the operator's$`)) })
+      expect((refused as BoardError).message).not.toMatch(/required checks? have not passed|required check\(s\)/)
+      // Only the operator's acceptance accepts it.
+      const operator = ctx.artifacts.recordDecision({
+        decisionType: 'acceptance', question: 'Accept it?', inputs: [heavy.r], candidates: [{ option: 'accept', selected: true, reasons: ['the operator accepts it'] }],
+        decider: { type: 'operator', id: 'operator.review', version: '1' }, outcome: { option: 'accept', detail: { taskId: heavy.taskId, subject: TREE } }, deterministic: false,
+      }, { producer: { type: 'operator', ref: 'operator' } }).id as ArtifactRef
+      expect(await ctx.board.accept(heavy.taskId, operator, at(6))).toMatchObject({ state: 'done', lastDecision: operator })
+    })
+
+    it('holds an acceptance that names no risk tier when a policy of the task\'s project carries a path map: its silence is no tier (ADR-0071, INV-2)', async () => {
+      const { ctx, approvals } = await boot({ board: AUTO })
+      await active(ctx, 'p3')
+      const tiered = POLICIES.map((p) => p.projectId === 'p3' ? { ...p, schema: 'autonomy-policy@1.1' as const, riskTiers: { version: 1, rules: [{ paths: ['**'], tier: 'light' as const, note: 'everything' }] } } : p)
+      approvals().reload(tiered, at(4))
+      const silent = await inReview(ctx, 'silent', 'p3')
+      const held = await ctx.board.accept(silent.taskId, engineAcceptance(ctx, silent.taskId, silent.r, { checks: { tests: true, lint: true }, branch: 'main' }), at(5))
+      expect(held).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: [] } })
+      expect((ctx.artifacts.get(held.lastDecision!)!.body as { outcome?: { detail?: { heavy?: string } } }).outcome?.detail?.heavy).toMatch(/names no risk tier .* carries a path map/)
+      // With no map, the same acceptance applies as before.
+      approvals().reload(POLICIES, at(5))
+      const plain = await inReview(ctx, 'plain', 'p3')
+      const accepting = engineAcceptance(ctx, plain.taskId, plain.r, { checks: { tests: true, lint: true }, branch: 'main' })
+      expect(await ctx.board.accept(plain.taskId, accepting, at(6))).toMatchObject({ state: 'done', lastDecision: accepting })
+    })
+
+    it('validates the setting: distinct project ids and plain branch names within the bound; off unless both lists name one', () => {
+      expect(autoAcceptOf(undefined)).toBeUndefined()
+      expect(autoAcceptOf({ projects: ['system'], branches: [] })).toBeUndefined()
+      expect(autoAcceptOf({ projects: [], branches: ['dev'] })).toBeUndefined()
+      expect(autoAcceptOf({ projects: ['system'], branches: ['dev', 'release/1.0'] })).toEqual({ projects: ['system'], branches: ['dev', 'release/1.0'] })
+      for (const branches of [['dev*'], ['de v'], ['-dev'], ['a..b'], ['dev/'], ['dev', 'dev'], [''], Array.from({ length: 65 }, (_, i) => `b${i}`)]) {
+        expect(() => autoAcceptOf({ projects: ['system'], branches }), JSON.stringify(branches)).toThrow(TypeError)
+      }
+      for (const projects of [['sys tem'], ['system', 'system'], [7 as unknown as string]]) expect(() => autoAcceptOf({ projects, branches: ['dev'] })).toThrow(TypeError)
+    })
+  })
+
+  describe('an attempt not spent on an infrastructure failure (ADR-0069)', () => {
+    /** A run of the task recorded and failed only on the infrastructure, as its owner reports it. */
+    const infraFailed = async (ctx: Context, taskId: string, runId: string, when: Date, reason = `${runId} stopped by a restart`): Promise<BoardTask> => {
+      const { generation } = await ctx.board.claim(taskId, 'lead', 600_000, when)
+      await ctx.board.start(taskId, generation, { runId }, when)
+      return ctx.board.reconcileRun(taskId, runId, { status: 'failed', infrastructure: { kind: 'host-stopped', reason } }, when)
+    }
+
+    it('validates the bound: a whole number from 0 to 10, default 3; the configuration schema refuses any other (INV-2, INV-9)', () => {
+      expect(freeRetriesOf(undefined)).toBe(3)
+      expect(freeRetriesOf(0)).toBe(0)
+      expect(freeRetriesOf(10)).toBe(10)
+      for (const bad of [-1, 11, 1.5, '2', null]) expect(() => freeRetriesOf(bad), String(bad)).toThrow(/board.maxFreeRetries is a whole number from 0 to 10/)
+      const row = { autoAccept: { projects: [], branches: [] } }
+      expect(StoreBoard.Config(row).maxFreeRetries).toBe(3)
+      expect(StoreBoard.Config({ ...row, maxFreeRetries: 0 }).maxFreeRetries).toBe(0)
+      for (const bad of [-1, 11, 1.5]) expect(() => StoreBoard.Config({ ...row, maxFreeRetries: bad }), String(bad)).toThrow()
+    })
+
+    it('keeps the free retries it gave beside the record, across a restart, so the bound holds over the task\'s whole life', async () => {
+      const { ctx, restartBoard } = await boot({ board: { maxFreeRetries: 2 } })
+      await active(ctx)
+      const t = await ready(ctx, task('p2', 'restarts', { maxAttempts: 1 }))
+      expect(await infraFailed(ctx, t.taskId, 'run-1', at(3))).toMatchObject({ state: 'ready', attempts: { count: 0 } })
+      await restartBoard()
+      expect(await infraFailed(ctx, t.taskId, 'run-2', at(4))).toMatchObject({ state: 'ready', attempts: { count: 0 } })
+      // The third is past the bound of 2: it counts, and with no attempt left the task waits for input.
+      const ended = await infraFailed(ctx, t.taskId, 'run-3', at(5), 'the host restarted a third time')
+      expect(ended).toMatchObject({ state: 'waiting-for-input', waiting: { reason: 'retries-spent' }, attempts: { count: 1, max: 1 } })
+      const body = ctx.artifacts.get(ended.lastDecision!)!.body as { candidates: Array<{ selected: boolean; reasons: string[] }>; outcome: { detail: Record<string, unknown> } }
+      expect(body.candidates.find((c) => c.selected)!.reasons.join(' ')).toMatch(/2 free retries are used .*counts \(host-stopped: the host restarted a third time\)/)
+      expect(body.outcome.detail).toMatchObject({ infrastructure: { kind: 'host-stopped' }, freeRetry: { used: 2, max: 2, counted: true } })
+    })
+
+    it('with a bound of 0 counts every failure; a plain failure always counts', async () => {
+      const { ctx } = await boot({ board: { maxFreeRetries: 0 } })
+      await active(ctx)
+      const t = await ready(ctx, task('p2', 'none free', { maxAttempts: 2 }))
+      expect(await infraFailed(ctx, t.taskId, 'run-1', at(3))).toMatchObject({ state: 'ready', attempts: { count: 1 } })
+      const plain = await boot()
+      await active(plain.ctx)
+      const p = await ready(plain.ctx, task('p2', 'plain', { maxAttempts: 2 }))
+      const { generation } = await plain.ctx.board.claim(p.taskId, 'lead', 600_000, at(3))
+      await plain.ctx.board.start(p.taskId, generation, { runId: 'run-1' }, at(3))
+      expect(await plain.ctx.board.reconcileRun(p.taskId, 'run-1', { status: 'failed' }, at(3))).toMatchObject({ state: 'ready', attempts: { count: 1 } })
+    })
+  })
+
   it('gives a task the attempts its proposal names, else its template\'s from the configuration, else the default 3 (T99 D6)', async () => {
     const { ctx, mcp } = await boot({ board: { templateAttempts: { 'algorithm-development': 6 } } })
     await active(ctx)
@@ -663,6 +1294,47 @@ describe('ctx.board (store-backed): the protocol\'s guards', () => {
     expect(proposed.isError).toBeFalsy()
     expect((await ctx.board.task(proposed.structuredContent!.taskId))!.attempts).toEqual({ count: 0, max: 5 })
     for (const maxAttempts of [0, 11, 2.5]) expect((await propose({ maxAttempts })).isError, String(maxAttempts)).toBe(true)
+  })
+
+  it('holds a lead token to its own project: another project\'s project and tasks are refused with the reason, its own pass (T285)', async () => {
+    const { ctx, mcp } = await boot()
+    await active(ctx, 'p2')
+    await active(ctx, 'p3')
+    const own = await ready(ctx, task('p2', 'mine'))
+    const theirs = await ready(ctx, task('p3', 'theirs'))
+    type Reply = { isError?: boolean; content: Array<{ text: string }>; structuredContent?: Record<string, unknown> }
+    // A lead token of project p2; null calls as the operator.
+    const call = (name: string, args: Record<string, unknown>, lead: string | null = 'p2') => mcp().tools.get(name)!.handler(args, lead === null ? { scope: 'operator' } : { scope: 'client', lead }) as unknown as Promise<Reply>
+    const refusal = /the lead token of project p2 reaches only project p2; .* belongs to project p3, so nothing was done/
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ['board_claim', { taskId: theirs.taskId, owner: 'lead' }], ['board_cancel', { taskId: theirs.taskId }], ['board_update', { taskId: theirs.taskId, generation: 1 }],
+      ['board_update', { taskId: theirs.taskId, answers: [{ question: 0, answer: 'x' }] }], ['board_task', { taskId: theirs.taskId }], ['board_escape', { taskId: theirs.taskId, note: 'n' }],
+      ['board_brief', { projectId: 'p3' }], ['board_tasks', { projectId: 'p3' }], ['board_breakers', { projectId: 'p3' }], ['board_breaker_reset', { projectId: 'p3', branch: 'dev' }],
+      ['board_propose', { ...task('p3', 'sneaked') }], ['board_propose', { ...task('p2', 'depends', { dependsOn: [theirs.taskId] }) }],
+      ['board_charter', { projectId: 'p3', title: 't', charter: CHARTER }], ['board_reopen_review', { taskId: theirs.taskId, reason: 'r' }],
+      ['board_defect', { taskId: theirs.taskId, fixes: own.taskId, sha: 'a'.repeat(40) }], ['board_defect', { taskId: own.taskId, fixes: theirs.taskId, sha: 'a'.repeat(40) }],
+    ]
+    for (const [name, args] of calls) {
+      const refused = await call(name, args)
+      expect(refused.isError, name).toBe(true)
+      expect(refused.content[0]!.text, name).toMatch(refusal)
+    }
+    // Nothing of p3 moved.
+    expect((await ctx.board.task(theirs.taskId))!.state).toBe('ready')
+    expect((await ctx.board.tasks({ projectId: 'p3' })).map((t) => t.title)).toEqual(['theirs'])
+    // A lead founds no project.
+    expect((await call('board_charter', { title: 't', charter: CHARTER })).content[0]!.text).toMatch(/founds no project/)
+    // The same calls on its own project pass; the project list and the breakers are its own only.
+    expect((await call('board_task', { taskId: own.taskId })).isError).toBeFalsy()
+    expect((await call('board_tasks', { projectId: 'p2' })).isError).toBeFalsy()
+    expect((await call('board_brief', { projectId: 'p2' })).isError).toBeFalsy()
+    expect((await call('board_claim', { taskId: own.taskId, owner: 'lead' })).isError).toBeFalsy()
+    expect((await call('board_projects', {})).structuredContent!.projects).toEqual([expect.objectContaining({ projectId: 'p2' })])
+    expect((await call('board_breakers', {})).isError).toBeFalsy()
+    // The operator, and a client token with no project, reach both.
+    expect((await call('board_projects', {}, null)).structuredContent!.projects).toHaveLength(2)
+    expect((await mcp().tools.get('board_task')!.handler({ taskId: theirs.taskId }, { scope: 'client' })).isError).toBeFalsy()
+    expect((await call('board_claim', { taskId: theirs.taskId, owner: 'op' }, null)).isError).toBeFalsy()
   })
 
   it('checks a lost run\'s reported outcome before it withdraws the request the task waits on, so a refused report changes nothing (INV-4)', async () => {
@@ -682,6 +1354,48 @@ describe('ctx.board (store-backed): the protocol\'s guards', () => {
     expect(await ctx.board.reconcileRun(t.taskId, 'run-1', { status: 'completed', result: { artifacts: [r], subject: HEAD }, acceptance: acceptance(ctx, 'reject', t.taskId, r) }, at(11)))
       .toMatchObject({ state: 'ready', attempts: { count: 1 } })
     expect(ctx.leases.current(`board-task:${t.taskId}`)).toBeUndefined()
+  })
+
+  it('marks a lost run host-stopped only when its lease expired between the board\'s recorded clean stop and its next start, never one that lapsed while the host ran (T302)', async () => {
+    // The board reads its start and its stop from the clock: only Date is faked, to fixed instants.
+    vi.useFakeTimers({ toFake: ['Date'], now: at(0) })
+    onTestFinished(() => {
+      vi.useRealTimers()
+    })
+    const { ctx, restartBoard } = await boot()
+    await active(ctx)
+    const versionOf = async (taskId: string) => (await ctx.approvals.get((await ctx.board.task(taskId))!.waiting!.approvalRequest!))!.subject.version
+    const running = async (title: string, ttlMs: number, from: number) => {
+      const t = await ready(ctx, task('p2', title))
+      const { generation } = await ctx.board.claim(t.taskId, 'lead', ttlMs, at(from))
+      await ctx.board.start(t.taskId, generation, { runId: `run-${title}` }, at(from))
+      return t
+    }
+    // Its lease lapses at minute 4 while the host runs, and a sweep finds it: unmarked, the operator's.
+    const hung = await running('hung', 60_000, 3)
+    await ctx.board.sweep(at(10))
+    expect(await versionOf(hung.taskId)).toBe('reconciliation-failed')
+    // Its lease lapses at minute 12 while the host still runs, and the host restarts before any sweep finds it: unmarked.
+    const lapsedFirst = await running('lapsed-first', 60_000, 11)
+    // Its lease is live when the board stops cleanly at minute 15, and lapses at 18, before the start at 20: marked.
+    const stopped = await running('stopped', 300_000, 13)
+    vi.setSystemTime(at(15))
+    await restartBoard(undefined, () => vi.setSystemTime(at(20)))
+    await ctx.board.sweep(at(25))
+    expect(await ctx.board.task(lapsedFirst.taskId)).toMatchObject({ state: 'waiting-for-approval', waiting: { reason: 'reconciliation-failed' } })
+    expect(await versionOf(lapsedFirst.taskId)).toBe('reconciliation-failed')
+    expect(await ctx.board.task(stopped.taskId)).toMatchObject({ state: 'waiting-for-approval', waiting: { reason: 'reconciliation-failed' } })
+    expect(await versionOf(stopped.taskId)).toBe(HOST_STOPPED_RECONCILIATION)
+    expect(await versionOf(hung.taskId)).toBe('reconciliation-failed')
+    // A crash records no clean stop: a lease that lapsed while the host was down is not marked, as nothing shows when it stopped.
+    const crashed = await running('crashed', 300_000, 26)
+    vi.setSystemTime(at(28))
+    await restartBoard(undefined, () => {
+      ctx.store.db.prepare('DELETE FROM board_host_stop').run()
+      vi.setSystemTime(at(40))
+    })
+    await ctx.board.sweep(at(41))
+    expect(await versionOf(crashed.taskId)).toBe('reconciliation-failed')
   })
 
   it('starts nothing in a paused project, not even a task claimed before the pause (fail-closed rule 1)', async () => {
@@ -911,7 +1625,7 @@ const caller = (b: Booted): Call => async (tool, args, scope = 'client') => {
   expect(registered, tool).toBeDefined()
   const reply = await registered!.handler(args, { scope }) as Awaited<ReturnType<Call>>
   // Every structured output is checked against its definition in schemas/mcp-board.v1.json, with Ajv.
-  if (!reply.isError) schemas.assertDef('mcp-board@1.1', `${tool.replaceAll('_', '-')}-output`, reply.structuredContent)
+  if (!reply.isError) schemas.assertDef('mcp-board@1.7', `${tool.replaceAll('_', '-')}-output`, reply.structuredContent)
   return reply
 }
 const ok = async (reply: ReturnType<Call>): Promise<Record<string, any>> => {
@@ -922,6 +1636,57 @@ const ok = async (reply: ReturnType<Call>): Promise<Record<string, any>> => {
 const example = (name: string): Record<string, any> => JSON.parse(readFileSync(fileURLToPath(new URL(`../../../../schemas/examples/${name}.json`, import.meta.url)), 'utf8')) as Record<string, any>
 
 describe('ctx.board (store-backed): board_* MCP tools', () => {
+  it('re-opens a review-expired task through board_reopen_review, as the caller, only while its run\'s worktree is recorded and on disk (T286)', async () => {
+    const b = await boot()
+    const { ctx } = b
+    const call = caller(b)
+    await active(ctx)
+    const t = await ready(ctx, task('p2', 'lapse', { actionClass: 'workspace-write', maxAttempts: 2 }))
+    const { generation } = await ctx.board.claim(t.taskId, 'lead', 60_000, at(3))
+    await ctx.board.start(t.taskId, generation, { runId: 'run-lapse' }, at(3))
+    const r = result(ctx, 'lapse')
+    // Submitted inside the 60 s lease (it ends at at(4)); then the holder is gone past it.
+    await ctx.board.submit(t.taskId, generation, { artifacts: [r], subject: HEAD }, at(3.5))
+    expect(await ctx.board.task(t.taskId)).toMatchObject({ state: 'review' })
+    await ctx.board.sweep(at(30))
+    const held = (await ctx.board.task(t.taskId))!
+    // Held for the operator, with the class's required checks still pending: none was reported.
+    expect(held).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: expect.arrayContaining(['tests', 'lint']) } })
+    expect(held.holder).toBeUndefined()
+    // Nobody decides by the policy's wait: it expires.
+    await ctx.board.sweep(new Date(Date.parse(held.waiting!.expiresAt)))
+    expect(await ctx.board.task(t.taskId)).toMatchObject({ state: 'waiting-for-input', waiting: { reason: 'review-expired' } })
+    // The tool reads now: only Date is faked, at a fixed instant after the review expired.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    onTestFinished(() => {
+      vi.useRealTimers()
+    })
+    vi.setSystemTime(new Date(Date.parse(held.waiting!.expiresAt) + 60_000))
+    // No worktree recorded for its run: refused, nothing changes.
+    expect((await call('board_reopen_review', { taskId: t.taskId, reason: 'approved twice' })).content[0]?.text).toMatch(/^invalid-transition: .*has no worktree left/)
+    expect(await ctx.board.task(t.taskId)).toMatchObject({ state: 'waiting-for-input', waiting: { reason: 'review-expired' } })
+    // Recorded, but gone from disk: refused too.
+    ctx.store.db.prepare('CREATE TABLE agent_worktrees (repository TEXT, workflow_run_id TEXT, path TEXT, branch TEXT, removed_at TEXT)').run()
+    const dir = mkdtempSync(join(tmpdir(), 'board-worktree-'))
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }))
+    ctx.store.db.prepare('INSERT INTO agent_worktrees VALUES (?, ?, ?, ?, NULL)').run('/repo', 'run-lapse', join(dir, 'gone'), 'system/run/run-lapse')
+    expect((await call('board_reopen_review', { taskId: t.taskId, reason: 'approved twice' })).content[0]?.text).toMatch(/^invalid-transition: .*has no worktree left/)
+    // Removed by the retention: refused.
+    ctx.store.db.prepare('UPDATE agent_worktrees SET path = ?, removed_at = ?').run(dir, '2026-10-26T00:00:00.000Z')
+    expect((await call('board_reopen_review', { taskId: t.taskId, reason: 'approved twice' })).content[0]?.text).toMatch(/^invalid-transition: .*has no worktree left/)
+    // An input its schema refuses: nothing done.
+    ctx.store.db.prepare('UPDATE agent_worktrees SET removed_at = NULL').run()
+    expect((await call('board_reopen_review', { taskId: t.taskId, reason: '' })).content[0]?.text).toMatch(/^invalid input, nothing done/)
+    expect(await ctx.board.task(t.taskId)).toMatchObject({ state: 'waiting-for-input' })
+    // Its worktree exists: back to review with its result, held for the operator, recorded as the operator's decision.
+    const back = await ok(call('board_reopen_review', { taskId: t.taskId, reason: 'approved twice' }, 'operator'))
+    expect(back).toMatchObject({ taskId: t.taskId, state: 'review' })
+    expect(ctx.artifacts.get(back.decision)?.body).toMatchObject({ decisionType: 'board', outcome: { option: 'operator-review', detail: { reopenedBy: 'operator', runId: 'run-lapse' } } })
+    expect(await ctx.board.task(t.taskId)).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: expect.arrayContaining(['tests', 'lint']) }, result: { artifacts: [r] }, attempts: { count: 1 } })
+    // In review, it is not re-opened again.
+    expect((await call('board_reopen_review', { taskId: t.taskId, reason: 'again' })).content[0]?.text).toMatch(/^invalid-transition: /)
+  })
+
   it('contributes the lead\'s board tools at client scope and the operator\'s project moves at operator scope, each input shape taking what its schema definition takes (INV-6)', async () => {
     const b = await boot()
     expect([...b.mcp().tools.keys()].sort()).toEqual([...BOARD_TOOLS].sort())
@@ -1167,6 +1932,45 @@ describe('ctx.board (store-backed): board_* MCP tools', () => {
   })
 })
 
+describe('ctx.board (store-backed): the defect link (PROP-0016 I4)', () => {
+  const finished = async (ctx: Context, title: string): Promise<BoardTask> => {
+    const t = await ready(ctx, task('p2', title))
+    const { generation } = await ctx.board.claim(t.taskId, 'lead', 600_000, at(3))
+    await ctx.board.start(t.taskId, generation, { runId: `run-${title}` }, at(3))
+    const r = result(ctx, title)
+    await ctx.board.submit(t.taskId, generation, { artifacts: [r], subject: HEAD }, at(4))
+    return ctx.board.accept(t.taskId, acceptance(ctx, 'accept', t.taskId, r), at(5))
+  }
+
+  it('files a task with the defect it fixes, and links an existing task once, as the lead, the reviewer, or the operator, only to a done task of its project', async () => {
+    const b = await boot()
+    const { ctx } = b
+    const call = caller(b)
+    await active(ctx)
+    const landed = await finished(ctx, 'landed')
+    const filed = await ctx.board.propose(task('p2', 'fix', { fixes: { taskId: landed.taskId, sha: 'abc1234' } }), at(6))
+    expect(filed).toMatchObject({ schema: 'board-task@1.2', defect: { fixes: landed.taskId, sha: 'abc1234', by: 'filed', at: at(6).toISOString() } })
+    expect((await ctx.board.task(filed.taskId))?.defect).toEqual(filed.defect)
+    // Refused: a task not done, an unknown one, a bad sha.
+    const open = await ctx.board.propose(task('p2', 'open'), at(6))
+    expect(await failureOf(ctx.board.propose(task('p2', 'x', { fixes: { taskId: open.taskId, sha: 'abc1234' } }), at(6)))).toBe('invalid')
+    expect(await failureOf(ctx.board.propose(task('p2', 'x', { fixes: { taskId: 'task-nope', sha: 'abc1234' } }), at(6)))).toBe('invalid')
+    expect(await failureOf(ctx.board.propose(task('p2', 'x', { fixes: { taskId: landed.taskId, sha: 'xyz' } }), at(6)))).toBe('invalid')
+    // Linked later, as the lead (the default), once.
+    const later = await ctx.board.propose(task('p2', 'later'), at(7))
+    expect(await ok(call('board_defect', { taskId: later.taskId, fixes: landed.taskId, sha: 'abc1234' }))).toMatchObject({ taskId: later.taskId })
+    expect((await ctx.board.task(later.taskId))?.defect).toMatchObject({ fixes: landed.taskId, by: 'lead' })
+    expect((await call('board_defect', { taskId: later.taskId, fixes: landed.taskId, sha: 'abc1234' })).content[0]?.text).toMatch(/^invalid: .*already fixes/)
+    const reviewed = await ctx.board.propose(task('p2', 'reviewed'), at(7))
+    await ok(call('board_defect', { taskId: reviewed.taskId, fixes: landed.taskId, sha: 'abc1234', as: 'reviewer' }))
+    expect((await ctx.board.task(reviewed.taskId))?.defect?.by).toBe('reviewer')
+    const byOperator = await ctx.board.propose(task('p2', 'operator'), at(7))
+    await ok(call('board_defect', { taskId: byOperator.taskId, fixes: landed.taskId, sha: 'abc1234', as: 'lead' }, 'operator'))
+    expect((await ctx.board.task(byOperator.taskId))?.defect?.by).toBe('operator')
+    expect((await call('board_defect', { taskId: open.taskId, fixes: open.taskId, sha: 'abc1234' })).content[0]?.text).toMatch(/^invalid/)
+  })
+})
+
 describe('ctx.board (store-backed): the TASKS.md projection', () => {
   it('renders one project\'s board deterministically: ids, titles, states, acceptance checkboxes, dependencies, holders, and why a task waits, with its questions or the funding it asks for', async () => {
     const b = await boot()
@@ -1226,5 +2030,120 @@ describe('ctx.board (store-backed): the TASKS.md projection', () => {
     expect(md).not.toContain('### gone')
     expect(md).toContain('1 more task(s) are not listed here (at most 2 are)')
     expect(await failureOf(b.board().tasksMarkdown('nope'))).toBe('unknown-project')
+  })
+})
+
+describe('ctx.board (store-backed): a plan of tasks (board_propose_plan, PROP-0023 change 5)', () => {
+  const item = (key: string, extra: Record<string, unknown> = {}) => ({ key, title: `do ${key}`, goal: `do ${key}`, acceptance: [{ id: 'a1', statement: 'tests pass', check: 'tests' }], actionClass: 'read', ...extra })
+  type Reply = { isError?: boolean; content: Array<{ text: string }>; structuredContent?: { tasks: Array<{ key: string; taskId: string; state: string; revision: number }> } }
+  const plan = (b: Booted, args: Record<string, unknown>, context: Record<string, unknown> = { scope: 'client' }) =>
+    b.mcp().tools.get('board_propose_plan')!.handler({ projectId: 'p2', ...args }, context as never) as unknown as Promise<Reply>
+
+  it('proposes every task of the plan in dependency order, each key\'s dependents depending on the task proposed for it, and its output valid against mcp-board 1.6', async () => {
+    const b = await boot()
+    await active(b.ctx)
+    const before = await ready(b.ctx, task('p2', 'existing'))
+    // Listed before what it depends on: the board proposes the dependency first all the same.
+    const reply = await plan(b, { tasks: [item('docs', { dependsOn: ['code'] }), item('code', { dependsOn: ['tests', before.taskId] }), item('tests')] })
+    expect(reply.isError, reply.content[0]?.text).toBeFalsy()
+    schemas.assertDef('mcp-board@1.6', 'board-propose-plan-output', reply.structuredContent)
+    const out = reply.structuredContent!.tasks
+    // The output is in the plan's own order.
+    expect(out.map((t) => t.key)).toEqual(['docs', 'code', 'tests'])
+    expect(out.every((t) => t.state === 'proposed' && t.revision === 0)).toBe(true)
+    const id = Object.fromEntries(out.map((t) => [t.key, t.taskId]))
+    expect((await b.ctx.board.task(id.docs!))!.dependsOn).toEqual([id.code])
+    expect((await b.ctx.board.task(id.code!))!.dependsOn).toEqual([id.tests, before.taskId])
+    expect((await b.ctx.board.task(id.tests!))!.dependsOn).toEqual([])
+    // The board's own gate takes them as it takes any proposal: only the one with nothing left to wait for is ready.
+    await b.ctx.board.sweep(at(3))
+    expect((await b.ctx.board.task(id.tests!))!.state).toBe('ready')
+    expect((await b.ctx.board.task(id.code!))!.state).toBe('proposed')
+  })
+
+  it('refuses a cycle, a key named twice, an unknown dependency, two items writing one subject, or an empty plan, and proposes none of it', async () => {
+    const b = await boot()
+    await active(b.ctx)
+    const refusals: Array<[unknown[], RegExp]> = [
+      [[item('a', { dependsOn: ['b'] }), item('b', { dependsOn: ['c'] }), item('c', { dependsOn: ['a'] })], /^invalid: the plan's dependencies form a cycle: a -> b -> c -> a/],
+      [[item('a'), item('a')], /^invalid: the plan names key a twice/],
+      [[item('a'), item('b', { dependsOn: ['task-unknown'] })], /^invalid: dependency task-unknown is not a task of p2/],
+      [[item('a', { writes: HEAD }), item('b', { writes: HEAD })], /^conflict: plan items a and b both write git-head:HEAD \(INV-15\)/],
+      [[], /^invalid input, nothing done/],
+    ]
+    for (const [tasks, why] of refusals) {
+      const reply = await plan(b, { tasks })
+      expect(reply.isError, String(why)).toBe(true)
+      expect(reply.content[0]!.text).toMatch(why)
+    }
+    // The item proposed before the unknown dependency was refused is not on the board either.
+    expect(await b.ctx.board.tasks({ projectId: 'p2' })).toEqual([])
+  })
+
+  it('is retry-safe under clientRequestId: a retry returns the tasks the first call proposed, and proposes no more', async () => {
+    const b = await boot()
+    await active(b.ctx)
+    const args = { tasks: [item('a'), item('b', { dependsOn: ['a'] })], clientRequestId: 'plan-1' }
+    const first = await plan(b, args)
+    const again = await plan(b, args)
+    expect(again.structuredContent).toEqual(first.structuredContent)
+    expect(await b.ctx.board.tasks({ projectId: 'p2' })).toHaveLength(2)
+    // A plan item's key is the plan's: board_propose naming it is refused, never given that task.
+    const single = await b.mcp().tools.get('board_propose')!.handler({ ...task('p2', 'single'), clientRequestId: 'plan-1#a' }, { scope: 'client' }) as unknown as { isError?: boolean; content: Array<{ text: string }> }
+    expect(single.isError).toBe(true)
+    expect(single.content[0]!.text).toMatch(/^conflict: client request plan-1#a was used for another call/)
+    expect(await b.ctx.board.tasks({ projectId: 'p2' })).toHaveLength(2)
+  })
+
+  it('holds a lead token to its own project: a plan of another project, or one depending on another project\'s task, is refused whole (T285)', async () => {
+    const b = await boot()
+    await active(b.ctx, 'p2')
+    await active(b.ctx, 'p3')
+    const theirs = await ready(b.ctx, task('p3', 'theirs'))
+    const lead = { scope: 'client', lead: 'p2' }
+    expect((await plan(b, { projectId: 'p3', tasks: [item('a')] }, lead)).content[0]!.text).toMatch(/the lead token of project p2 reaches only project p2/)
+    expect((await plan(b, { tasks: [item('a', { dependsOn: [theirs.taskId] })] }, lead)).content[0]!.text).toMatch(/belongs to project p3, so nothing was done/)
+    // A key of its own plan is no task of another project.
+    expect((await plan(b, { tasks: [item('a'), item('b', { dependsOn: ['a'] })] }, lead)).isError).toBeFalsy()
+    expect((await b.ctx.board.tasks({ projectId: 'p3' })).map((t) => t.title)).toEqual(['theirs'])
+  })
+
+  it('validates its schema example, and its input shape matches the schema', () => {
+    const ex = example('mcp-board.propose-plan')
+    schemas.assertDef('mcp-board@1.6', 'board-propose-plan-input', ex.input)
+    schemas.assertDef('mcp-board@1.6', 'board-propose-plan-output', ex.output)
+    expect(zod.object(INPUTS.board_propose_plan).safeParse(ex.input).success).toBe(true)
+    expect(zod.object(INPUTS.board_propose_plan).safeParse({ ...ex.input, tasks: [{ ...ex.input.tasks[0], fixes: { taskId: 't', sha: 'a'.repeat(40) } }] }).success).toBe(false)
+  })
+})
+
+describe('ctx.board (store-backed): a task\'s template variant (board-task@1.5, PROP-0023 change 1)', () => {
+  it('keeps the variant a proposal names, tagged board-task@1.5 through its later moves, and refuses one without a template', async () => {
+    const b = await boot()
+    await active(b.ctx)
+    const docs = await b.ctx.board.propose(task('p2', 'docs', { template: 'algorithm-development', variant: 'docs' }), at(2))
+    expect(docs).toMatchObject({ schema: 'board-task@1.5', template: 'algorithm-development', variant: 'docs' })
+    schemas.assertRecord(docs)
+    // A later move that needs an older tag keeps 1.4: the record still carries its variant.
+    const done = await ready(b.ctx, task('p2', 'shipped'))
+    const { generation } = await b.ctx.board.claim(done.taskId, 'lead', 600_000, at(3))
+    await b.ctx.board.start(done.taskId, generation, { runId: 'run-shipped' }, at(3))
+    const r = result(b.ctx, 'shipped')
+    await b.ctx.board.submit(done.taskId, generation, { artifacts: [r], subject: HEAD }, at(4))
+    await b.ctx.board.accept(done.taskId, acceptance(b.ctx, 'accept', done.taskId, r), at(5))
+    const linked = await b.board().linkDefect(docs.taskId, { fixes: done.taskId, sha: 'a'.repeat(40), by: 'lead' }, at(6))
+    expect(linked).toMatchObject({ schema: 'board-task@1.5', variant: 'docs', defect: { fixes: done.taskId } })
+    expect(await failureOf(b.ctx.board.propose(task('p2', 'loose', { variant: 'docs' }), at(2)))).toBe('invalid')
+  })
+
+  it('takes a variant on board_propose and on each item of board_propose_plan (mcp-board 1.7)', async () => {
+    const b = await boot()
+    await active(b.ctx)
+    const call = caller(b)
+    const one = await ok(call('board_propose', { ...task('p2', 'one'), template: 'algorithm-development', variant: 'tests' }))
+    expect((await b.ctx.board.task(one.taskId as string))!.variant).toBe('tests')
+    const plan = await ok(call('board_propose_plan', { projectId: 'p2', tasks: [{ key: 'd', title: 'd', goal: 'd', acceptance: [{ id: 'a1', statement: 's', check: 'review' }], actionClass: 'read', template: 'algorithm-development', variant: 'docs' }] }))
+    expect((await b.ctx.board.task((plan.tasks as Array<{ taskId: string }>)[0]!.taskId))!.variant).toBe('docs')
+    expect((await call('board_propose', { ...task('p2', 'bad'), template: 'algorithm-development', variant: 'Docs' })).isError).toBe(true)
   })
 })

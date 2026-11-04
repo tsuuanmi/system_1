@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-17 (accepted 2026-10-17, by the operator, in Researcher's session)
-- **Related:** [PROP-0006](../../proposals/0006-model-worker-sessions.md),
+- **Related:** PROP-0006 (removed; in Git history),
   [ADR-0015](0015-worker-sessions-and-peer-messaging.md),
   [ADR-0025](0025-api-first-composition.md),
   [ADR-0029](0029-opt-in-same-family-fallback.md), INV-4, INV-9, INV-11, INV-12

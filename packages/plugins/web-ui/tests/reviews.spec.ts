@@ -3,7 +3,7 @@ import { SchemaRegistry } from '@tsuuanmi/system-libs'
 import type { WorkChange } from '@tsuuanmi/system-workers-core'
 import { chromium } from 'patchright-core'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
-import { canRunBrowser, testChrome } from '../../browser-patchright/tests/support.ts'
+import { headlessIt, headlessLaunchOptions } from '../../browser-patchright/tests/support.ts'
 import type { ArtifactRef } from '@tsuuanmi/system-board-core'
 import { activeProject } from '../../workflow/conformance/workflow.ts'
 import { acceptanceOf, checkStates, requiredChecks } from '../src/index.ts'
@@ -62,6 +62,85 @@ describe('web UI: the operator accepts or rejects a board review held for the op
       outcome: { option: 'accept', detail: { taskId: task.taskId, subject: task.result!.subject } }, inputs: [run.result],
     })
     expect((await call('reviews')).value.reviews).toEqual([])
+  })
+
+  it('accepts a writing result past a check that did not run only when the operator names it with why, on a decision of its own, and then it waits for its landing (T293)', async () => {
+    const { ctx, call } = await boot()
+    await activeProject(ctx)
+    // A writing result (an agent result names the run's worktree at its tree), whose run recorded tests passed and lint not run.
+    const proposed = await ctx.board.propose({ projectId: 'p1', title: 'lint never ran', goal: 'change it', acceptance: [{ id: 'a1', statement: 'tests pass', check: 'tests' }], actionClass: 'workspace-write' })
+    await ctx.board.sweep(new Date())
+    const { generation } = await ctx.board.claim(proposed.taskId, 'lead', 600_000)
+    await ctx.board.start(proposed.taskId, generation, { runId: 'run-lint' })
+    const subject = { type: 'git-head' as const, ref: 'a'.repeat(40), version: 'b'.repeat(64) }
+    const result = ctx.artifacts.put({
+      kind: 'report', bodySchema: 'agent-result@1.1', classification: 'operator-shared', producer: { type: 'worker', ref: 'test' },
+      body: { schema: 'agent-result@1.1', worker: 'w', runtime: 'fake', runId: 'r', promptHash: `sha256:${'0'.repeat(64)}`, sandbox: 'workspace-write', text: 'changed it', workspace: '/work/tree', subject },
+    }).id as ArtifactRef
+    await ctx.board.submit(proposed.taskId, generation, { artifacts: [result], subject })
+    const own = ctx.artifacts.recordDecision({
+      decisionType: 'acceptance', question: 'Does run-lint complete it?', inputs: [result],
+      candidates: [{ option: 'accept', selected: true, reasons: ['its steps were accepted'] }, { option: 'reject', selected: false, reasons: ['not reject'] }],
+      decider: { type: 'rule', id: 'workflow.task-acceptance', version: '4' }, outcome: { option: 'accept', detail: { taskId: proposed.taskId, subject, checks: { tests: true } } }, deterministic: true,
+    }, { producer: { type: 'system', ref: 'workflow' }, runId: 'run-lint' }).id as ArtifactRef
+    expect(await ctx.board.accept(proposed.taskId, own)).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: ['lint'] } })
+
+    // A plain acceptance is refused, naming the check: nothing is decided.
+    const plain = await call(`reviews/${proposed.taskId}/decide`, { verdict: 'accept', subject })
+    expect(plain.status).toBe(409)
+    expect(plain.value.error).toMatch(/required check\(s\) lint have not passed on it/)
+    // A check named wrongly, or with no why, is refused before anything is decided.
+    expect((await call(`reviews/${proposed.taskId}/decide`, { verdict: 'accept', subject, checksNotRun: { lint: '  ' } })).status).toBe(400)
+    expect((await call(`reviews/${proposed.taskId}/decide`, { verdict: 'accept', subject, checksNotRun: { review: 'no' } })).status).toBe(400)
+    expect((await call(`reviews/${proposed.taskId}/decide`, { verdict: 'reject', subject, checksNotRun: { lint: 'why' } })).status).toBe(400)
+    expect(await ctx.board.task(proposed.taskId)).toMatchObject({ state: 'review', waiting: { reason: 'operator-review' } })
+
+    const decided = await call(`reviews/${proposed.taskId}/decide`, { verdict: 'accept', subject, checksNotRun: { lint: 'no lint command is configured for this repository' } })
+    expect(decided.status).toBe(200)
+    expect(decided.value.task).toMatchObject({ state: 'review', waiting: { reason: 'landing' }, result: { acceptance: decided.value.decision } })
+    expect(ctx.artifacts.get(decided.value.decision as string)!.body).toMatchObject({ decider: { type: 'operator' }, outcome: { option: 'accept', detail: { checksNotRun: { lint: 'no lint command is configured for this repository' } } } })
+    const task = (await ctx.board.task(proposed.taskId))!
+    schemas.assertRecord(task)
+    expect(ctx.artifacts.get(task.lastDecision!)!.body).toMatchObject({ outcome: { detail: { reason: 'checks-not-run', checksNotRun: [{ check: 'lint', note: 'no lint command is configured for this repository' }] } } })
+  })
+
+  it('lists a result accepted and waiting for its landing as accepted, never as a review to decide, and leaves it out of the counts (T334)', async () => {
+    const { ctx, call } = await boot()
+    await activeProject(ctx)
+    // A real run gives the landing its row; the writing task below is served by that run's id.
+    const { task: carrier, run } = await reviewed(ctx, 'carrier')
+    const proposed = await ctx.board.propose({ projectId: 'p1', title: 'lands later', goal: 'change it', acceptance: [{ id: 'a1', statement: 'tests pass', check: 'tests' }], actionClass: 'workspace-write' })
+    await ctx.board.sweep(new Date())
+    const { generation } = await ctx.board.claim(proposed.taskId, 'lead', 600_000)
+    await ctx.board.start(proposed.taskId, generation, { runId: run.runId })
+    const subject = { type: 'git-head' as const, ref: 'a'.repeat(40), version: 'b'.repeat(64) }
+    const result = ctx.artifacts.put({
+      kind: 'report', bodySchema: 'agent-result@1.1', classification: 'operator-shared', producer: { type: 'worker', ref: 'test' },
+      body: { schema: 'agent-result@1.1', worker: 'w', runtime: 'fake', runId: 'r', promptHash: `sha256:${'0'.repeat(64)}`, sandbox: 'workspace-write', text: 'changed it', workspace: '/work/tree', subject },
+    }).id as ArtifactRef
+    await ctx.board.submit(proposed.taskId, generation, { artifacts: [result], subject })
+    const own = ctx.artifacts.recordDecision({
+      decisionType: 'acceptance', question: 'Does the run complete it?', inputs: [result],
+      candidates: [{ option: 'accept', selected: true, reasons: ['its steps were accepted'] }, { option: 'reject', selected: false, reasons: ['not reject'] }],
+      decider: { type: 'rule', id: 'workflow.task-acceptance', version: '4' }, outcome: { option: 'accept', detail: { taskId: proposed.taskId, subject, checks: { tests: true } } }, deterministic: true,
+    }, { producer: { type: 'system', ref: 'workflow' }, runId: run.runId }).id as ArtifactRef
+    expect(await ctx.board.accept(proposed.taskId, own)).toMatchObject({ state: 'review', waiting: { reason: 'operator-review' } })
+    // Held for the operator it is a review to decide, as before.
+    const held = await call('reviews')
+    expect((held.value.reviews as Array<{ taskId: string }>).map((r) => r.taskId)).toContain(proposed.taskId)
+    // The operator accepts it: it waits for its landing.
+    const decided = await call(`reviews/${proposed.taskId}/decide`, { verdict: 'accept', subject, checksNotRun: { lint: 'no lint command is configured' } })
+    expect(decided.status).toBe(200)
+    expect(await ctx.board.task(proposed.taskId)).toMatchObject({ state: 'review', waiting: { reason: 'landing' } })
+    ctx.store.db.prepare('UPDATE workflow_tasks SET landing = ? WHERE run_id = ?').run(JSON.stringify({ branch: `system/run/${run.runId}`, at: '2026-10-28T10:00:00.000Z', state: 'committed', head: 'b'.repeat(40), base: { branch: 'main', sha: 'a'.repeat(40) } }), run.runId)
+
+    const listed = await call('reviews')
+    const ids = (list: unknown) => (list as Array<{ taskId: string }>).map((r) => r.taskId)
+    expect(ids(listed.value.reviews)).toEqual([carrier.taskId])
+    expect(ids(listed.value.accepted)).toContain(proposed.taskId)
+    expect((listed.value.accepted as Array<{ taskId: string; landing: { state: string } }>).find((a) => a.taskId === proposed.taskId)!.landing.state).toBe('committed')
+    // Home's count and the held reviews' expiry leave it out: only the carrier's review is counted.
+    expect((await call('waiting')).value.reviews).toEqual({ value: 1, firstExpires: carrier.waiting!.expiresAt })
   })
 
   it('takes the operator\'s rejection as another attempt, through the gate', async () => {
@@ -123,6 +202,20 @@ describe('web UI: each required check of a review with its state, from what the 
     const refused = { checks: {}, checkRun: { asked: ['tests'], source: 'agents', outcome: 'refused', cause: 'confinement' } }
     expect(checkStates(['tests'], ['tests'], acceptanceOf({ lastDecision: ACCEPTANCE }, ledger(refused)))).toEqual([
       { check: 'tests', state: 'not-run', why: 'the Worker source agents refused to run it (confinement)' },
+    ])
+  })
+
+  it('says a check that passed without running its browser tests passed with what did not run: checks passed, browser tests not run (T247, T255)', () => {
+    const detail = {
+      checks: { tests: true, lint: true },
+      checkRun: { asked: ['tests', 'lint'], source: 'agents', outcome: 'checked', results: [
+        { check: 'tests', outcome: 'passed', exitCode: 0, notRun: 'its browser tests (12 browser tests skipped: no usable Chrome)' },
+        { check: 'lint', outcome: 'passed', exitCode: 0 },
+      ] },
+    }
+    expect(checkStates(['tests', 'lint'], [], acceptanceOf({ lastDecision: HOLD }, ledger(detail)))).toEqual([
+      { check: 'tests', state: 'passed', exitCode: 0, notRun: 'its browser tests (12 browser tests skipped: no usable Chrome)' },
+      { check: 'lint', state: 'passed', exitCode: 0 },
     ])
   })
 
@@ -233,7 +326,7 @@ describe('web UI: what the operator reads before a review verdict (T122)', () =>
     expect(assessments.moreAtLeast).toBeUndefined()
   })
 
-  it.runIf(canRunBrowser)('reads a review that failed once per run and result: the 5-second refresh never reads it again, the operator\'s Read it again does (T128a)', async () => {
+  headlessIt('reads a review that failed once per run and result: the 5-second refresh never reads it again, the operator\'s Read it again does (T128a)', async () => {
     const booted = await boot()
     const { ctx } = booted
     await activeProject(ctx)
@@ -249,7 +342,7 @@ describe('web UI: what the operator reads before a review verdict (T122)', () =>
     }
     onTestFinished(() => void (artifacts.list = list))
     const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
     await page.goto(`${origin}/ui/#token=${OPERATOR}`)
@@ -264,7 +357,7 @@ describe('web UI: what the operator reads before a review verdict (T122)', () =>
     await expect.poll(() => reads, { timeout: 15_000 }).toBe(2)
   }, 90_000)
 
-  it.runIf(canRunBrowser)('shows a review card with what changed (the stat, each file folded, a long one with show all), the reviewer\'s verdict, the run\'s report, and the checks not run in warning; after Accept, where the result stands on its way in (T122, ADR-0060)', async () => {
+  headlessIt('shows a review card with what changed (the stat, each file folded, a long one with show all), the reviewer\'s verdict, the run\'s report, and the checks not run in warning; after Accept, where the result stands on its way in (T122, ADR-0060)', async () => {
     const booted = await boot()
     const { ctx } = booted
     await activeProject(ctx)
@@ -272,7 +365,7 @@ describe('web UI: what the operator reads before a review verdict (T122)', () =>
     changes(ctx, run.runId)
     assessment(ctx, run.runId)
     const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
     await page.goto(`${origin}/ui/#token=${OPERATOR}`)
@@ -283,7 +376,13 @@ describe('web UI: what the operator reads before a review verdict (T122)', () =>
     expect(await card.getByRole('list', { name: 'Required checks' }).innerText()).toBe('tests: ▲ Pending\nlint: ▲ Pending')
     expect(await card.getByRole('list', { name: 'Reviewers\' verdicts' }).innerText()).toBe('● Approved · w:standard')
     expect(await card.locator(':scope > .actions').getByRole('button').allInnerTexts()).toEqual(['Accept', 'Send back'])
-    expect(await card.locator('.line').innerText()).toMatch(/^Keep the rate-limit header\s+Project project p1 · Expires in .+ · No response: it waits for input$/)
+    // Its title, then one line of context (T239): when it expires; its project is its group's heading on Home, so the line
+    // does not say it again (T256), and it is under its Details with what no response does.
+    expect(await card.locator('.line').innerText()).toBe('Keep the rate-limit header')
+    expect(await card.locator('.meta').innerText()).toMatch(/^Expires in .+$/)
+    expect(await page.getByRole('region', { name: 'Project project p1', exact: true }).getByRole('article', { name: 'Keep the rate-limit header' }).count()).toBe(1)
+    expect(await card.locator('details.card-details').textContent()).toContain('project project p1 · task ')
+    expect(await card.locator('details.card-details').textContent()).toContain('No response: it waits for input')
     // The long texts are under one Details, closed by default: the diff, the findings, the report, why each check is pending.
     expect(await card.locator('details.card-details').getAttribute('open')).toBeNull()
     for (const folded of ['The header name is matched case-sensitively', 'reported this, in its own words', 'the run recorded no result of it']) expect(await card.innerText(), folded).not.toContain(folded)
@@ -299,7 +398,7 @@ describe('web UI: what the operator reads before a review verdict (T122)', () =>
     expect(await card.innerText()).toContain('tests: ▲ Pending — the run recorded no result of it')
     expect(await card.innerText()).toContain('lint: ▲ Pending — the run recorded no result of it')
     const change = card.getByRole('group', { name: `Change on system/run/${run.runId}` })
-    expect(await change.locator('.stat').innerText()).toBe(`3 files changed +251 −1 · on system/run/${run.runId}, against main at aaaaaaaaaaaa`)
+    expect(await change.locator('.stat').innerText()).toBe(`3 files changed +251 −1 · on system/run/${run.runId}, against main at aaaaaaaa…`)
     // Each file folded: opened, its diff in lines; a long one shows its first 200 lines, then all.
     expect(await change.innerText()).not.toContain('return { limit, header }')
     await change.locator('summary', { hasText: 'src/limits.ts' }).click()
@@ -327,7 +426,8 @@ describe('web UI: what the operator reads before a review verdict (T122)', () =>
     expect(await decisionsIn(card)).toEqual([
       { label: 'Accept', description: 'marks it done' },
       { label: 'Send back', description: 'sends it back for another attempt, if it has one left' }])
-    expect(await card.locator('.actions').first().innerText()).toMatch(/Accept\s+marks it done\s+Send back\s+sends it back for another attempt, if it has one left/)
+    // Said as each button's tooltip (T239), on hover and on keyboard focus, not as text beside it.
+    expect(await card.locator('.actions').first().innerText()).toMatch(/^Accept\s+Send back$/)
     await card.getByRole('button', { name: 'Accept', exact: true }).click()
     await expect.poll(async () => (await ctx.board.task(task.taskId))?.state).toBe('done')
     // Where the accepted result stands (ADR-0060), as its landing moves: committed on its branch, then its merge asked, linked.
@@ -335,7 +435,7 @@ describe('web UI: what the operator reads before a review verdict (T122)', () =>
     landing({ state: 'committed', head: 'b'.repeat(40), base: { branch: 'main', sha: 'a'.repeat(40) } })
     const accepted = page.getByRole('region', { name: 'Accepted, on their way in' }).getByRole('article', { name: 'Accepted: Keep the rate-limit header' })
     await expect.poll(() => accepted.count(), { timeout: 15_000 }).toBe(1)
-    expect(await accepted.innerText()).toContain(`Accepted and committed on system/run/${run.runId} as bbbbbbbbbbbb; its merge request comes next`)
+    expect(await accepted.innerText()).toContain(`Accepted and committed on system/run/${run.runId} as bbbbbbbb…; its merge request comes next`)
     landing({ state: 'asked', head: 'b'.repeat(40), base: { branch: 'main', sha: 'a'.repeat(40) }, requestId: 'apr-merge-1' })
     await expect.poll(() => accepted.innerText(), { timeout: 15_000 }).toContain('Accepted — waiting to merge into main: approve')
     expect(await accepted.getByRole('link', { name: 'approve', exact: true }).getAttribute('href')).toBe('/ui/?request=apr-merge-1')
@@ -354,7 +454,7 @@ describe('web UI: what the operator reads before a review verdict (T122)', () =>
     expect(await page.getByRole('region', { name: 'Accepted, on their way in' }).count()).toBe(0)
   }, 90_000)
 
-  it.runIf(canRunBrowser)('says a required check the run recorded as failed, and the board still holds pending, failed — never also not run (T160)', async () => {
+  headlessIt('says a required check the run recorded as failed, and the board still holds pending, failed — never also not run (T160)', async () => {
     const booted = await boot()
     const { ctx } = booted
     await activeProject(ctx)
@@ -374,7 +474,7 @@ describe('web UI: what the operator reads before a review verdict (T122)', () =>
     }
     onTestFinished(() => void (store.get = get))
     const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
-    const browser = await chromium.launch({ executablePath: testChrome!, headless: true })
+    const browser = await chromium.launch(headlessLaunchOptions())
     onTestFinished(() => browser.close())
     const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
     await page.goto(`${origin}/ui/#token=${OPERATOR}`)
@@ -388,5 +488,57 @@ describe('web UI: what the operator reads before a review verdict (T122)', () =>
     const pending = card.locator('p.pending-checks')
     expect(await pending.innerText()).toMatch(/^Checks that failed: tests\. Checks not run: lint\. Accepting counts them as passed — fix the failed ones and run the others first\./)
     expect(await pending.innerText()).not.toMatch(/not run: [^.]*tests/)
+  }, 90_000)
+
+  /** A review held by the auto-accept rule: its acceptance records tests and lint passed, tests without its browser tests (T255). */
+  const unrunReview = async (): Promise<Awaited<ReturnType<typeof boot>>> => {
+    const booted = await boot()
+    const { ctx } = booted
+    await activeProject(ctx)
+    const { task } = await reviewed(ctx, 'Keep the header test')
+    const store = ctx.artifacts as unknown as { get: (ref: string) => { body?: unknown } | undefined }
+    const get = store.get.bind(store)
+    const hold = get(task.lastDecision!)?.body as { inputs?: string[] }
+    const acceptanceRef = [task.lastDecision!, ...(hold.inputs ?? [])].find((ref) => (get(ref)?.body as { decisionType?: string } | undefined)?.decisionType === 'acceptance')!
+    store.get = (ref) => {
+      const found = get(ref)
+      if (ref !== acceptanceRef || !found) return found
+      const body = found.body as { outcome: { detail?: Record<string, unknown> } }
+      return { ...found, body: { ...body, outcome: { ...body.outcome, detail: { ...body.outcome.detail,
+        checks: { tests: true, lint: true }, checkRun: { asked: ['tests', 'lint'], source: 'agents', outcome: 'checked', results: [
+          { check: 'tests', outcome: 'passed', exitCode: 0, notRun: 'its browser tests (12 browser tests skipped: no usable Chrome)' },
+          { check: 'lint', outcome: 'passed', exitCode: 0 },
+        ] } } } } }
+    }
+    onTestFinished(() => void (store.get = get))
+    // The board no longer holds them pending: the hold is the auto-accept rule's.
+    ctx.store.db.prepare('UPDATE board_tasks SET record = json_set(record, \'$.waiting.pendingChecks\', json(\'[]\')) WHERE task_id = ?').run(task.taskId)
+    return booted
+  }
+
+  it('lists a review whose checks passed without their browser tests with each passed check and what it did not run (T247, T255)', async () => {
+    const { call } = await unrunReview()
+    expect(((await call('reviews')).value.reviews as Array<Record<string, unknown>>)[0]!.checks).toEqual({ value: [
+      { check: 'tests', state: 'passed', exitCode: 0, notRun: 'its browser tests (12 browser tests skipped: no usable Chrome)' },
+      { check: 'lint', state: 'passed', exitCode: 0 },
+    ] })
+  })
+
+  headlessIt('says a review whose checks passed without their browser tests: checks passed, browser tests not run, with the check and what did not run (T247, T255)', async () => {
+    const { ctx } = await unrunReview()
+    const origin = `http://127.0.0.1:${(ctx as unknown as { webServer: { port: number } }).webServer.port}`
+    const browser = await chromium.launch(headlessLaunchOptions())
+    onTestFinished(() => browser.close())
+    const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
+    await page.goto(`${origin}/ui/#token=${OPERATOR}`)
+    const card = page.getByRole('region', { name: 'Reviews' }).getByRole('article', { name: 'Keep the header test' })
+    const required = card.getByRole('list', { name: 'Required checks' })
+    await expect.poll(() => required.count(), { timeout: 15_000 }).toBe(1)
+    expect(await required.innerText()).toBe('tests: ▲ Passed, browser tests not run · exit code 0\nlint: ● Passed · exit code 0')
+    const unrun = card.locator('p.unrun-tests')
+    expect(await unrun.innerText()).toMatch(/^Checks passed, browser tests not run: tests \(its browser tests \(12 browser tests skipped: no usable Chrome\) did not run\)\. Their pass says nothing of those tests, so the result was not accepted automatically/)
+    expect(await card.locator('p.pending-checks').count()).toBe(0)
+    await card.getByText('Details', { exact: true }).click()
+    expect(await card.getByRole('list', { name: 'Each required check' }).innerText()).toBe('tests: ▲ Passed, browser tests not run · exit code 0 — its browser tests (12 browser tests skipped: no usable Chrome) did not run\nlint: ● Passed · exit code 0')
   }, 90_000)
 })

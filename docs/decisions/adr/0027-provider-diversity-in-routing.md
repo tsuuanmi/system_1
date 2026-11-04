@@ -2,7 +2,7 @@
 
 - **Status:** Accepted; superseded in part by [ADR-0029](0029-opt-in-same-family-fallback.md)
 - **Date:** 2026-10-16 (accepted 2026-10-16)
-- **Related:** [PROP-0004](../../proposals/0004-claude-code-lead-mvp.md),
+- **Related:** PROP-0004 (removed; in Git history),
   [INV-11](../../architecture/invariants.md#inv-11-no-tool-lock-in),
   [INV-13](../../architecture/invariants.md#inv-13-every-decision-is-an-artifact),
   [ADR-0008](0008-tool-agnostic.md)

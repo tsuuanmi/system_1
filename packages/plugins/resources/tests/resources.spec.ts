@@ -14,7 +14,7 @@ import { SchemaRegistry } from '@tsuuanmi/system-libs'
 import { type LimitState, type PoolConfig, type PoolTemplate, ResourcesError, type UsageRecord } from '@tsuuanmi/system-resources-core'
 import Store from '@tsuuanmi/system-store'
 import { describe, expect, it, onTestFinished } from 'vitest'
-import StoreResources, { type Config, MAX_POOLS, MAX_WINDOWS, validatePools, validateQuota, validateTemplates } from '../src/index.ts'
+import StoreResources, { type Config, covers, MAX_POOLS, MAX_WINDOWS, validatePools, validateQuota, validateTemplates } from '../src/index.ts'
 
 /** A `ctx.mcp` that keeps contributed tools, so a test calls a handler as a scope would. */
 class RecordingMcp extends McpTools {
@@ -378,6 +378,35 @@ describe('paging and the MCP tools', () => {
     expect((await page.handler({ after: 'not-a-cursor' }, { scope: 'client' })).isError).toBe(true)
   })
 
+  it('holds a lead token to its own project\'s usage: its project, task, and run pass, another project\'s are refused (T285)', async () => {
+    const ctx = await boot()
+    // The board and the engine as the ledger reads them: a task's project, and a run's.
+    const provided = (name: string, value: object) => ctx.plugin({ name, apply: (c: Context) => void (c as unknown as { provide(n: string, v: unknown): void }).provide(name, value) })
+    const fibers = [
+      provided('board', { task: async (taskId: string) => ({ 't-a': { projectId: 'pa' }, 't-b': { projectId: 'pb' } } as Record<string, { projectId: string }>)[taskId] }),
+      provided('workflow', { projectOfRun: async (runId: string) => ({ 'r-a': 'pa', 'r-b': 'pb' } as Record<string, string>)[runId] }),
+    ]
+    await Promise.all(fibers)
+    onTestFinished(async () => {
+      for (const fiber of fibers) await fiber.dispose()
+    })
+    const mcp = await withMcp(ctx)
+    await ctx.resources.record(usage('ua', { projectId: 'pa', taskId: 't-a', runId: 'r-a' }))
+    await ctx.resources.record(usage('ub', { projectId: 'pb', taskId: 't-b', runId: 'r-b' }))
+    const page = (args: Record<string, unknown>, context: { scope: 'client'; lead?: string } = { scope: 'client', lead: 'pa' }) =>
+      mcp.tools.get('resources_usage')!.handler(args, context) as unknown as Promise<{ isError?: boolean; content: Array<{ text: string }>; structuredContent?: { records: UsageRecord[] } }>
+    for (const args of [{ projectId: 'pb' }, { taskId: 't-b' }, { runId: 'r-b' }, { taskId: 't-unknown' }]) {
+      const refused = await page(args)
+      expect(refused.isError, JSON.stringify(args)).toBe(true)
+      expect(refused.content[0]!.text, JSON.stringify(args)).toMatch(/^forbidden: the lead token of project pa reaches only project pa; .* belongs to (project pb|no project)/)
+    }
+    for (const args of [{}, { projectId: 'pa' }, { taskId: 't-a' }, { runId: 'r-a' }]) {
+      expect((await page(args)).structuredContent!.records.map((r) => r.requestId), JSON.stringify(args)).toEqual(['ua'])
+    }
+    // A client token with no project reads every project's.
+    expect((await page({}, { scope: 'client' })).structuredContent!.records.map((r) => r.requestId)).toEqual(['ua', 'ub'])
+  })
+
   it('bounds a page to 100 records and usage() to maxRecords, refusing more than either (INV-9)', async () => {
     const ctx = await boot(undefined, { pools: POOLS, maxRecords: 3, pageSize: 2 })
     for (let i = 0; i < 4; i++) await ctx.resources.record(usage(`u${i}`, { runId: i < 2 ? 'r1' : 'r2', observedAt: at(i).toISOString() }))
@@ -466,5 +495,66 @@ describe('a cap and usage the ledger could not count (ADR-0065)', () => {
     await ready(ctx)
     ctx.eventLog.append({ type: 'usage.unknown', data: { kind: 'not-reported', pool: 'a.programmatic' } })
     expect((await ctx.resources.reserve({ runId: 'r3', taskId: 't1', lines: line(0.1), caps: caps(1) }, at(1))).reasons).toEqual([expect.stringContaining('1 usage.unknown entry is not a valid usage-unknown@1 record')])
+  })
+})
+
+describe('a line on a template\'s pools (ADR-0083, PROP-0023)', () => {
+  const plan: PoolTemplate = { template: 'plan', group: 'runtime', kind: 'programmatic', windows: [{ id: 'w', kind: 'rolling' }], unknown: 'available' }
+  const spend = (requestId: string, account: string, amount: number, extra: Partial<UsageRecord> = {}): UsageRecord =>
+    usage(requestId, { account, pool: `plan/${account}`, taskId: 't1', runId: `run-${requestId}`, cost: { amount, currency: 'USD', basis: 'runtime-estimate' }, ...extra })
+
+  it('counts a pool and the pools a template makes of it for each account, and no other', () => {
+    expect(covers('plan', 'plan')).toBe(true)
+    expect(covers('plan', 'plan/acc-1')).toBe(true)
+    expect(covers('plan', 'planner/acc-1')).toBe(false)
+    expect(covers('plan/acc-1', 'plan/acc-2')).toBe(false)
+  })
+
+  it('caps a task across every account\'s pool of the template, and reserves while one of them is available', async () => {
+    const ctx = await boot(undefined, { pools: POOLS, templates: [plan] })
+    await ctx.resources.declare!('agents', [{ account: 'acc-1', group: 'runtime' }, { account: 'acc-2', group: 'runtime' }])
+    await ctx.resources.record(spend('u1', 'acc-1', 4))
+    await ctx.resources.record(spend('u2', 'acc-2', 3))
+    // Spent on another task, or another template, it does not count.
+    await ctx.resources.record(spend('u3', 'acc-1', 50, { taskId: 't2' }))
+    const ask = (cap: number) => ctx.resources.reserve({ runId: 'r-next', taskId: 't1', lines: [{ pool: 'plan', unit: 'usd', amount: 0.000001 }], caps: [{ pool: 'plan', unit: 'usd', amount: cap }] }, at(1))
+    const refused = await ask(6)
+    expect(refused.state).toBe('refused')
+    expect(refused.reasons!.join(' ')).toMatch(/cap 6 usd of plan would be exceeded: 7 used/)
+    const held = await ask(10)
+    expect(held.state).toBe('reserved')
+    // A line on one account's pool still counts that pool alone.
+    expect((await ctx.resources.reserve({ runId: 'r-one', taskId: 't1', lines: [{ pool: 'plan/acc-2', unit: 'usd', amount: 0.000001 }], caps: [{ pool: 'plan/acc-2', unit: 'usd', amount: 3.5 }] }, at(1))).state).toBe('reserved')
+  })
+
+  it('still refuses a group cap on usage it could not count on an account no longer declared (INV-2, ADR-0065)', async () => {
+    const ctx = await boot(undefined, { pools: POOLS, templates: [plan] })
+    await ctx.resources.declare!('agents', [{ account: 'acc-1', group: 'runtime' }, { account: 'acc-2', group: 'runtime' }])
+    // A lower bound only: the run was cut before its runtime's count.
+    await ctx.resources.record(spend('u1', 'acc-1', 1, { schema: 'usage-record@1.1', partial: 'the run stopped before its result' } as Partial<UsageRecord>))
+    // The account goes; its pool is no longer listed, and its usage is still the task's.
+    await ctx.resources.declare!('agents', [{ account: 'acc-2', group: 'runtime' }])
+    const refused = await ctx.resources.reserve({ runId: 'r-next', taskId: 't1', lines: [{ pool: 'plan', unit: 'usd', amount: 0.000001 }], caps: [{ pool: 'plan', unit: 'usd', amount: 100 }] }, at(1))
+    expect(refused.state).toBe('refused')
+    expect(refused.reasons!.join(' ')).toMatch(/cap of plan\/acc-1 cannot be held: run run-u1 .*only a lower bound counted/)
+  })
+
+  it('counts a line on a pool that exists as that pool alone, even with pools named under it', async () => {
+    // A template whose id is also a configured pool's: the configured pool's lines keep their meaning.
+    const ctx = await boot(undefined, { pools: POOLS, templates: [{ ...plan, template: 'local' }] })
+    await ctx.resources.declare!('agents', [{ account: 'acc-1', group: 'runtime' }])
+    await ctx.resources.record(spend('u1', 'acc-1', 9, { pool: 'local/acc-1' }))
+    await ctx.resources.record(usage('u2', { account: 'here', pool: 'local', taskId: 't1', runId: 'run-u2', cost: { amount: 1, currency: 'USD', basis: 'runtime-estimate' } }))
+    const reserved = await ctx.resources.reserve({ runId: 'r-next', taskId: 't1', lines: [{ pool: 'local', unit: 'usd', amount: 0.000001 }], caps: [{ pool: 'local', unit: 'usd', amount: 2 }] }, at(1))
+    expect(reserved.state).toBe('reserved')
+  })
+
+  it('refuses a line on a name no pool is under, and one whose every pool is unavailable', async () => {
+    const ctx = await boot(undefined, { pools: POOLS, templates: [{ ...plan, unknown: 'unavailable' }] })
+    const none = await ctx.resources.reserve({ runId: 'r1', taskId: 't1', lines: [{ pool: 'plan', unit: 'usd', amount: 1 }] }, at(1))
+    expect(none.reasons!.join(' ')).toMatch(/pool plan is not configured/)
+    await ctx.resources.declare!('agents', [{ account: 'acc-1', group: 'runtime' }])
+    const closed = await ctx.resources.reserve({ runId: 'r1', taskId: 't1', lines: [{ pool: 'plan', unit: 'usd', amount: 1 }] }, at(1))
+    expect(closed.reasons!.join(' ')).toMatch(/no pool of plan is available \(plan\/acc-1\)/)
   })
 })

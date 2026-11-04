@@ -1,5 +1,6 @@
 /**
- * Work state machine seam definition: `ctx.board`, projects with charters and board tasks that
+ * Work state machine seam definitions: `ctx.board` and `ctx.leases` (the one-writer fence, INV-15).
+ * `ctx.board`: projects with charters and board tasks that
  * outlive a run (docs/design/board.md). The types mirror `project@1.0` and `board-task@1.1`; the
  * schemas in `schemas/` are canonical. Only the board moves a task, each move naming the decision
  * behind it (INV-13). A guarantee seam: it fails closed (INV-2), and its contract changes only by
@@ -11,6 +12,7 @@ import type { ActionClass, ArtifactRef, Check, Classification, Subject } from '@
 
 export type { ActionClass, ArtifactRef, Check, Classification, Subject }
 export { renderTasks } from './projection.ts'
+export * from './leases.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -25,8 +27,74 @@ declare module '@deepseek-ai/cordis' {
  * bound to the request's subject and applied, exactly, once the operator approves it. 1.3 adds the
  * optional `unreleased` of a `budget-spent` {@link Board.block}: the ledger's reservations the
  * holder could not release, which still count against the task's budget, named in the request.
+ * 1.4 adds the optional {@link Board.reopen} (ADR-0068): a done task's result that could not land
+ * on its target as it is now goes back as another attempt. 1.5 adds the optional `infrastructure`
+ * of a failed {@link RunOutcome}: a run that failed only on the infrastructure (the host stopped
+ * it, nothing of it was sent, or a Worker became unavailable) is not counted as an attempt, within
+ * a bound of free retries per task (ADR-0069, INV-9).
  */
-export const BOARD_CONTRACT = '1.3'
+export const BOARD_CONTRACT = '1.5'
+
+/** The longest reason a {@link Board.reopen} carries (INV-9). */
+export const REOPEN_REASON_MAX = 2000
+
+/** How long an accepted writing result waits for its landing before it ends review-expired (T293, INV-9): 14 days. */
+export const LANDING_WAIT_SECONDS = 14 * 24 * 3600
+
+/**
+ * How the landing of a task's accepted writing result ended ({@link Board.landed}, T293): the run whose
+ * result it is, the acceptance it was accepted by, `merged` (its merge request was merged) or
+ * `not-needed` (the accepted tree holds no change the target lacks), and the landing's decision that
+ * says so.
+ */
+export interface LandingEnd {
+  runId: string
+  acceptance: ArtifactRef
+  outcome: 'merged' | 'not-needed'
+  decision: ArtifactRef
+}
+
+/** What sends a done task's result back ({@link Board.reopen}, 1.4): the run whose result it is, its acceptance, the decision that sends it back, and why. */
+export interface Reopening {
+  runId: string
+  acceptance: ArtifactRef
+  decision: ArtifactRef
+  reason: string
+}
+
+/** The line of the auto-accept circuit breaker (ADR-0067, D93): it trips at `escapes` escaped defects within `days` days. */
+export interface BreakerLine { escapes: number; days: number }
+/** The default line: 2 escaped defects in 7 days. */
+export const BREAKER_DEFAULT: BreakerLine = { escapes: 2, days: 7 }
+/** A defect found after an auto-accepted result landed, recorded by the operator or the lead against the task whose result it was in. */
+export interface Escape {
+  escapeId: string
+  projectId: string
+  branch: string
+  taskId: string
+  /** The auto-accepting `board` decision of the task (rule `board.auto-accept`). */
+  acceptance: ArtifactRef
+  foundAt: string
+  recordedAt: string
+  recordedBy: 'operator' | 'lead'
+  note: string
+}
+/** Where auto-accept stands for one project and branch once the breaker has tripped. */
+export interface Breaker {
+  breakerId: string
+  projectId: string
+  branch: string
+  state: 'tripped' | 'reset'
+  line: BreakerLine
+  trippedAt: string
+  /** The `board` decision (rule `board.auto-accept-breaker`) that turned auto-accept off, naming the escapes it counted. */
+  decision: ArtifactRef
+  /** The escapes it counted. */
+  escapes: Escape[]
+  /** Escapes of the project and branch within the line's window now, and whether the line holds (fewer than the line). */
+  now?: { counted: number; lineHolds: boolean }
+  reset?: { at: string; by: 'operator' | 'lead'; decision: ArtifactRef }
+}
 
 export type Unit = 'tokens' | 'usd' | 'turns' | 'runs' | 'minutes'
 export interface BudgetLine { pool: string; unit: Unit; amount: number }
@@ -66,7 +134,7 @@ export interface Project {
 export type TaskState = 'proposed' | 'ready' | 'claimed' | 'running' | 'review' | 'waiting-for-input' | 'waiting-for-approval' | 'done' | 'cancelled'
 export const TERMINAL: readonly TaskState[] = ['done', 'cancelled']
 /** `operator-review`: a task in review whose acceptance only the operator can give now (a required check not passed); the board holds it, not a lease. */
-export type WaitReason = 'approval-needed' | 'budget-spent' | 'reconciliation-failed' | 'retries-spent' | 'question' | 'rejected' | 'review-expired' | 'operator-review'
+export type WaitReason = 'approval-needed' | 'budget-spent' | 'reconciliation-failed' | 'retries-spent' | 'question' | 'rejected' | 'review-expired' | 'operator-review' | 'landing'
 export type CancelReason = 'operator' | 'lead' | 'project-closed' | 'input-expired' | 'superseded' | 'forbidden' | 'dependency-cancelled'
 
 /**
@@ -115,9 +183,20 @@ export function unreleasedText(unreleased: readonly UnreleasedHold[]): string {
   return `The resource ledger did not release ${named}: ${unreleased.length === 1 ? 'it still counts' : 'they still count'} against the task's budget until ${unreleased.length === 1 ? 'it expires' : 'they expire'}, so the next attempt may be refused again before then.`
 }
 
-/** `board-task@1.0`; `board-task@1.1` once it carries a funding ask (`waiting.funding`) or a raise (`funding`). */
+/** Who set a {@link Defect} link: the task's filer, the lead, the reviewer, or the operator. */
+export type DefectBy = 'filed' | 'lead' | 'reviewer' | 'operator'
+/** The shortest and longest landing sha a {@link Defect} names (a git abbreviation to a SHA-256 object id). */
+export const DEFECT_SHA = { min: 7, max: 64 } as const
+/**
+ * The `defect` link of a task (`board-task@1.2`): it fixes a defect of `fixes`, a done task, in the
+ * change that landed at `sha`. Set when the task is filed (`TaskInput.fixes`) or later by the lead or
+ * the reviewer ({@link Board.linkDefect}); `system metrics` counts the fixed tasks as escaped defects.
+ */
+export interface Defect { fixes: string; sha: string; at: string; by: DefectBy }
+
+/** `board-task@1.0`; `board-task@1.1` once it carries a funding ask (`waiting.funding`) or a raise (`funding`); `board-task@1.2` once it carries a `defect` link; `board-task@1.3` once it waits for its landing (`waiting.reason` `landing`, T293); `board-task@1.5` once it names a template `variant`. */
 export interface BoardTask {
-  schema: 'board-task@1.0' | 'board-task@1.1'
+  schema: 'board-task@1.0' | 'board-task@1.1' | 'board-task@1.2' | 'board-task@1.3' | 'board-task@1.5'
   taskId: string
   projectId: string
   milestone?: string
@@ -127,6 +206,8 @@ export interface BoardTask {
   dependsOn: string[]
   actionClass: ActionClass
   template?: string
+  /** The template variant its runs start with (`board-task@1.5`). */
+  variant?: string
   writes?: Subject
   budget?: BudgetLine[]
   state: TaskState
@@ -139,6 +220,8 @@ export interface BoardTask {
   cancellation?: { reason: CancelReason; note?: string; at: string }
   /** 1.1: every raise of `budget` an approved funding request applied, oldest first. */
   funding?: Funding[]
+  /** 1.2: the task this one fixes a defect of, and the landing sha of the change that held it. */
+  defect?: Defect
   createdAt: string
   updatedAt?: string
   lastDecision?: ArtifactRef
@@ -165,21 +248,78 @@ export interface TaskInput {
   actionClass: ActionClass
   milestone?: string
   template?: string
+  /** The variant of its template a run of it starts with (`board-task@1.5`), so the writing step's kind of work routes it (ADR-0057). */
+  variant?: string
   writes?: Subject
   budget?: BudgetLine[]
   /** Attempts allowed (default 3, at most 10). */
   maxAttempts?: number
+  /** The defect this task fixes: a done task of the project and the sha its change landed at (the task's `defect` link). */
+  fixes?: { taskId: string; sha: string }
 }
 
 export interface Claim { taskId: string; generation: number; leaseExpiresAt: string }
 
 /**
+ * Why a failed run failed only on the infrastructure, as its owner found it (1.5, ADR-0069): the
+ * host stopped it (`host-stopped`: a drain or restart interrupted it), nothing of it was sent
+ * (`unsent`: a Worker's own failure before the send, nothing submitted to any Worker; never a
+ * refusal by the task's own budget, policy, or input), or a Worker it needed
+ * became unavailable while it ran (`worker-unavailable`). `reason` says what happened, in words.
+ */
+export interface InfrastructureFailure { kind: 'host-stopped' | 'unsent' | 'worker-unavailable'; reason: string }
+
+/** The kinds of {@link InfrastructureFailure}. */
+export const INFRASTRUCTURE_KINDS: readonly InfrastructureFailure['kind'][] = ['host-stopped', 'unsent', 'worker-unavailable']
+
+/** The most characters an {@link InfrastructureFailure}'s reason holds. */
+export const INFRASTRUCTURE_REASON_MAX = 500
+
+/**
+ * Failed runs of one task that a board does not count as attempts, at most, by default (1.5, INV-9):
+ * past it, an infrastructure failure counts as any failed run does, so one that persists still ends
+ * the task waiting for input (`retries-spent`), with the reason.
+ */
+export const FREE_RETRIES_DEFAULT = 3
+/** The most a board may be configured to allow (INV-9). */
+export const FREE_RETRIES_MAX = 10
+
+/**
+ * Why `infrastructure` is not what a failed run's outcome may carry ({@link RunOutcome}, 1.5), or
+ * undefined: a known kind and a reason of 1 to {@link INFRASTRUCTURE_REASON_MAX} characters, nothing
+ * else. A provider refuses such a report as `invalid`.
+ */
+export function infrastructureProblem(infrastructure: unknown): string | undefined {
+  const i = infrastructure as Partial<Record<keyof InfrastructureFailure, unknown>> | null
+  if (typeof infrastructure !== 'object' || i === null || Array.isArray(infrastructure)) return 'a failed run\'s infrastructure is an object with its kind and reason'
+  if (Object.keys(i).some((k) => k !== 'kind' && k !== 'reason')) return 'a failed run\'s infrastructure names only its kind and reason'
+  if (!INFRASTRUCTURE_KINDS.includes(i.kind as InfrastructureFailure['kind'])) return `a failed run's infrastructure kind is one of ${INFRASTRUCTURE_KINDS.join(', ')}`
+  if (typeof i.reason !== 'string' || i.reason.length === 0 || [...i.reason].length > INFRASTRUCTURE_REASON_MAX) return `a failed run's infrastructure reason is 1 to ${INFRASTRUCTURE_REASON_MAX} characters`
+  return undefined
+}
+
+/**
+ * The free retries a board allows per task, as configured: {@link FREE_RETRIES_DEFAULT} when unset,
+ * else a whole number from 0 to {@link FREE_RETRIES_MAX}; anything else is refused (TypeError), so a
+ * malformed bound never starts a board (INV-2, INV-9).
+ */
+export function freeRetriesOf(configured: unknown): number {
+  if (configured === undefined) return FREE_RETRIES_DEFAULT
+  if (typeof configured !== 'number' || !Number.isInteger(configured) || configured < 0 || configured > FREE_RETRIES_MAX) {
+    throw new TypeError(`board.maxFreeRetries is a whole number from 0 to ${FREE_RETRIES_MAX}, not ${JSON.stringify(configured)}`)
+  }
+  return configured
+}
+
+/**
  * A run's outcome as its owner (the workflow engine) reconciled it: completed, with its result and
- * the `acceptance` decision on it, or failed. An unknown outcome is never reported.
+ * the `acceptance` decision on it, or failed. An unknown outcome is never reported. A failed run may
+ * say it failed only on the infrastructure (`infrastructure`, 1.5): the board then does not count it
+ * as an attempt while the task has free retries left ({@link FREE_RETRIES_DEFAULT}), and says so.
  */
 export type RunOutcome =
   | { status: 'completed'; result: { artifacts: ArtifactRef[]; digest?: ArtifactRef; subject: Subject; files?: string[]; next?: string }; acceptance: ArtifactRef }
-  | { status: 'failed' }
+  | { status: 'failed'; infrastructure?: InfrastructureFailure }
 
 /** Why a board call was refused. Nothing changed. */
 export type BoardFailure = 'unknown-project' | 'unknown-task' | 'invalid' | 'invalid-transition' | 'stale-generation' | 'conflict'
@@ -215,6 +355,11 @@ export abstract class Board extends Service {
   abstract propose(input: TaskInput, at?: Date): Promise<BoardTask>
 
   abstract task(taskId: string): Promise<BoardTask | undefined>
+  /**
+   * Whether the task's next start continues the attempt whose question was answered (T291): that
+   * run is attempt `attempts.count` again, not `count + 1`. False for a board that keeps no such mark.
+   */
+  async continuing(_taskId: string): Promise<boolean> { return false }
   abstract tasks(filter: { projectId: string; states?: TaskState[] }): Promise<BoardTask[]>
 
   /** Take a ready task's lease (ready → claimed). */
@@ -250,6 +395,18 @@ export abstract class Board extends Service {
    * only the operator may accept now, a review held for the operator, as in `accept`), a failed
    * run counts as an attempt. A pending `reconciliation-failed` approval is withdrawn once
    * the move committed. Fenced by the run id: an outcome for another run is refused.
+   *
+   * `infrastructure` (1.5, optional, failed only): the run failed only on the infrastructure. While
+   * the task has free retries left (the provider's bound, {@link FREE_RETRIES_DEFAULT} unless
+   * configured, at most {@link FREE_RETRIES_MAX}), the board does not count it: `attempts.count` goes
+   * back down by one, the free retry is counted instead, and the task goes back for the same attempt
+   * through the gate, on a `board` decision that names the kind, the reason, and the free retries
+   * used and allowed (`outcome.detail.infrastructure`, `outcome.detail.freeRetry`). Past the bound it
+   * counts as any failed run, and its decision says why, with the reason, so one that persists ends
+   * waiting for input (`retries-spent`). Malformed (see {@link infrastructureProblem}), the report is
+   * `invalid` and nothing changes. A task the sweep left waiting for input (`rejected`) on its lost
+   * run, the policy giving `remediation` no ask, still takes such a report while a free retry is
+   * left; any other report to that wait is `invalid-transition`, and nothing changes.
    */
   abstract reconcileRun(taskId: string, runId: string, outcome: RunOutcome, at?: Date): Promise<BoardTask>
 
@@ -295,6 +452,68 @@ export abstract class Board extends Service {
    * is made: the digest's own settling decision records it, and a digest never accepts anything.
    */
   abstract attachDigest?(taskId: string, digest: ArtifactRef, at?: Date): Promise<BoardTask>
+
+  /**
+   * Send a done task's accepted result back as another attempt (contract 1.4, ADR-0068; optional: a
+   * provider at 1.3 has none, and a result that cannot land then stays done for the operator). Only
+   * while the task is `done`, or waits for its landing (T293), on exactly `back.runId`'s result, accepted by `back.acceptance`
+   * (`invalid-transition` otherwise), and only on a stored `back.decision` with a `reason` of 1 to
+   * {@link REOPEN_REASON_MAX} characters (`invalid` otherwise); nothing changes when refused. The move
+   * is the one a rejected attempt makes: through the gate again for the next attempt when one is
+   * left (ready, waiting for approval, or cancelled when the policy now forbids the class), else a
+   * wait for input (`retries-spent`). Its `board` decision names `back.decision` among its inputs and
+   * says why. The attempt the result was made in is already counted; the reopening counts none.
+   */
+  abstract reopen?(taskId: string, back: Reopening, at?: Date): Promise<BoardTask>
+
+  /**
+   * End the landing wait of a task whose accepted writing result waits for its landing (optional;
+   * T293): a writing result (on a git tree its run's worktree holds) is never done by its acceptance,
+   * but waits in `review` (`waiting.reason` `landing`, {@link LANDING_WAIT_SECONDS}) until its landing
+   * says how it ended. Only while the task waits so on exactly `end.runId`'s result accepted by
+   * `end.acceptance` (`invalid-transition` otherwise), on a stored `end.decision` (`invalid`
+   * otherwise). The task is then `done` on a `board` decision of rule `board.landed` naming the
+   * landing's decision and the acceptance, `detail.accepted` the decision that accepted it.
+   */
+  landed?(taskId: string, end: LandingEnd, at?: Date): Promise<BoardTask>
+
+  /**
+   * Bring a `review-expired` task back to review, held for the operator for the policy's wait for its
+   * class (optional; T286). By the operator or the lead, with a reason of 1 to
+   * {@link REOPEN_REASON_MAX} characters (`invalid` otherwise), while the task has its run and result
+   * (`invalid-transition` otherwise); recorded as a `board` decision; no attempt is counted.
+   */
+  abstract reopenReview?(taskId: string, by: 'operator' | 'lead', reason: string, at?: Date): Promise<BoardTask>
+
+  /**
+   * Record a defect found after a task's auto-accepted result landed (optional; not yet in a contract
+   * version, ADR-0067 amendment, D93). Only for a done task whose last decision is the auto-accept
+   * rule's (`invalid` otherwise, and once per task). When the project and branch have escapes at the
+   * line within its window, auto-accept for them turns off (the breaker trips) on a `board` decision
+   * naming every escape it counted, in the same transaction.
+   */
+  recordEscape?(input: { taskId: string; by: 'operator' | 'lead'; note: string; foundAt?: string }, at?: Date): Promise<{ escape: Escape; breaker?: Breaker }>
+
+  /**
+   * Link a task to the defect it fixes (optional; `board-task@1.2`): `fixes` is a done task of the same
+   * project, `sha` the landing sha of its change. Once per task (`invalid` otherwise, and for a task
+   * that is not of the project's, a `fixes` that is not done, a sha that is not 7 to 64 hex characters,
+   * or a task fixing itself); `by` is who set it. No state moves and no decision is made.
+   */
+  linkDefect?(taskId: string, defect: { fixes: string; sha: string; by: Exclude<DefectBy, 'filed'> }, at?: Date): Promise<BoardTask>
+
+  /** The escapes recorded (of one project, or all), oldest first: what `system metrics` reads as escaped defects. */
+  escapes?(projectId?: string): Promise<Escape[]>
+
+  /** The tripped breakers (of one project, or all), each with the count now; a breaker never resets by itself. */
+  breakers?(projectId?: string, at?: Date): Promise<Breaker[]>
+
+  /**
+   * Turn auto-accept on again for a project and branch, by the operator or the lead, and only once
+   * the line holds: fewer escapes than the line within its window as of `at` (`invalid` otherwise).
+   * Recorded as a `board` decision naming the trip's. Nothing else turns it on: not the sweep, not time.
+   */
+  resetBreaker?(projectId: string, branch: string, by: 'operator' | 'lead', at?: Date): Promise<Breaker>
 
   /**
    * Make every move that is due at `at`: tasks whose dependencies are done become ready or wait

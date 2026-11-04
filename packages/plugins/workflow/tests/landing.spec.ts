@@ -2,38 +2,41 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Context, type Fiber } from '@deepseek-ai/cordis'
-import StoreApprovals, { checkConfig } from '@tsuuanmi/system-approvals'
-import type { AutonomyPolicy, Mode } from '@tsuuanmi/system-approvals-core'
+import { Context, type Fiber, type Plugin } from '@deepseek-ai/cordis'
+import StoreApprovals from '@tsuuanmi/system-approvals'
+import type { AutonomyPolicy, Check, Mode } from '@tsuuanmi/system-approvals-core'
 import Artifacts from '@tsuuanmi/system-artifacts'
 import StoreBoard from '@tsuuanmi/system-board'
 import type { ArtifactRef } from '@tsuuanmi/system-board-core'
 import Egress from '@tsuuanmi/system-egress'
 import EventLog from '@tsuuanmi/system-event-log'
+import { Landing, type LandingStatus, type LandingTarget, type Prepared } from '@tsuuanmi/system-landing-core'
+import LocalLanding from '@tsuuanmi/system-landing-local'
 import Leases from '@tsuuanmi/system-leases'
 import { captureGitSubject, sha256 } from '@tsuuanmi/system-libs'
 import Store from '@tsuuanmi/system-store'
 import WorkerSessions from '@tsuuanmi/system-worker-sessions'
 import WorkerRouter from '@tsuuanmi/system-workers'
-import type { Landed, LandStep, WorkerExecution } from '@tsuuanmi/system-workers-core'
+import type { Checked, CheckStep, Landed, LandStep, WorkerExecution } from '@tsuuanmi/system-workers-core'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { activeProject, CONFIG, readyTask, ScriptedWorkers, TEMPLATES } from '../conformance/workflow.ts'
-import Workflow, { type TaskLanding } from '../src/index.ts'
+import Workflow, { type NodeTemplate, type TaskLanding } from '../src/index.ts'
 
 // The engine's landing of an accepted result (ADR-0060) over the store-backed board and approval
 // queue; the source that holds the tree is scripted, so each step's answer is the test's.
 vi.setConfig({ testTimeout: 60_000 })
 
-const policy = (merge: Mode): AutonomyPolicy => ({
+const policy = (merge: Mode, requires: Check[] = []): AutonomyPolicy => ({
   schema: 'autonomy-policy@1.0', id: 'studio', version: 1, scope: 'studio',
-  rules: [{ actionClass: 'read', mode: 'auto' }, { actionClass: 'merge', mode: merge }],
+  rules: [{ actionClass: 'read', mode: 'auto', ...(requires.length ? { requires } : {}) }, { actionClass: 'merge', mode: merge }],
   default: 'ask', expiry: { defaultSeconds: 3600, maxSeconds: 86400 },
 })
 
 /** Scripted Workers whose results name a git working tree and the subject it is at, as an agent's do. */
 class TreeWorkers extends ScriptedWorkers {
   private readonly results = new Map<string, ArtifactRef>()
-  constructor(private readonly tree: string, private readonly artifacts: () => Context['artifacts']) {
+  /** `tree`: the working tree every result names, or the one a result's text (its run's input) picks. */
+  constructor(private readonly tree: string | ((text: string) => string), private readonly artifacts: () => Context['artifacts']) {
     super()
   }
 
@@ -42,9 +45,10 @@ class TreeWorkers extends ScriptedWorkers {
     if (!execution?.result) return execution
     if (!this.results.has(id)) {
       const text = (this.artifacts().get(execution.result)!.body as { text: string }).text
+      const tree = typeof this.tree === 'string' ? this.tree : this.tree(text)
       this.results.set(id, this.artifacts().put({
         kind: 'report', bodySchema: 'agent-result@1.1', classification: 'public', producer: { type: 'worker', ref: 'w:standard' },
-        body: { schema: 'agent-result@1.1', worker: 'w:standard', runtime: 'scripted', runId: 'agent-run', promptHash: sha256(text), sandbox: 'workspace-write', text, workspace: this.tree, subject: captureGitSubject(this.tree)!.subject },
+        body: { schema: 'agent-result@1.1', worker: 'w:standard', runtime: 'scripted', runId: 'agent-run', promptHash: sha256(text), sandbox: 'workspace-write', text, workspace: tree, subject: captureGitSubject(tree)!.subject },
       }).id as ArtifactRef)
     }
     return { ...execution, result: this.results.get(id)! }
@@ -53,15 +57,38 @@ class TreeWorkers extends ScriptedWorkers {
 
 const BASE = { branch: 'main', sha: 'b'.repeat(40) }
 const HEAD = 'c'.repeat(40)
+/** Where a result forked from `main` when its target moved since (ADR-0068). */
+const FORK = 'a'.repeat(40)
+/** The run branch's head once the result is rebased onto `main`. */
+const REBASED = 'e'.repeat(40)
 
-/** A source that holds no Worker and lands what its script says; every step it is asked is kept. */
+type RebaseStep = Extract<LandStep, { step: 'rebase' }>
+
+/** A source that holds no Worker and lands what its script says; every step it is asked, and every check, is kept. */
 class Lander {
   readonly steps: LandStep[] = []
+  readonly checked: CheckStep[] = []
+  /** Where its commit says the result forked from the base; unset, it says nothing, as before ADR-0068. */
+  fork: string | undefined
+  rebaseAnswer: (step: RebaseStep) => Landed = (step) => step.phase === 'abandon'
+    ? { outcome: 'abandoned', repository: '/repo', branch: `system/run/${step.runId}`, head: step.head, left: [] }
+    : { outcome: 'rebased', repository: '/repo', branch: `system/run/${step.runId}`, head: REBASED, from: step.head, base: step.base, subject: { ref: REBASED, version: 'v-rebased' }, stat: ' a.c | 3 ++-', already: false }
+
   answer: (step: LandStep) => Landed | undefined = (step) => step.step === 'commit'
-    ? { outcome: 'committed', repository: '/repo', branch: `system/run/${step.runId}`, head: HEAD, committed: true, base: BASE, contained: false, stat: ' a.c | 2 +-' }
-    : { outcome: 'merged', repository: '/repo', branch: `system/run/${step.runId}`, head: step.head, base: step.base, commit: 'd'.repeat(40), already: false }
+    ? { outcome: 'committed', repository: '/repo', branch: `system/run/${step.runId}`, head: HEAD, committed: true, base: BASE, contained: false, stat: ' a.c | 2 +-', subject: { ref: HEAD, version: 'v-committed' }, ...(this.fork ? { fork: this.fork } : {}) }
+    : step.step === 'rebase' ? this.rebaseAnswer(step)
+      : step.step === 'record' ? undefined
+      : step.step === 'release' ? { outcome: 'released', repository: '/repo', branch: `system/run/${step.runId}`, path: step.workspace, decision: `sha256:${'1'.repeat(64)}` }
+      : { outcome: 'merged', repository: '/repo', branch: `system/run/${step.runId}`, head: step.head, base: step.base, commit: 'd'.repeat(40), already: false }
+
+  /** Each check passes, unless the script says otherwise. */
+  checkAnswer: (step: CheckStep) => Checked = (step) => ({ outcome: 'checked', results: step.checks.map((check) => ({ check, outcome: 'passed', exitCode: 0, reason: 'exited 0' })) })
+  /** Set: each check run is recorded as a `check-run@1.0`, each check's command configured, as the agents source does. */
+  recorded = false
+  private artifacts!: Context['artifacts']
 
   register(ctx: Context): void {
+    this.artifacts = ctx.artifacts
     ctx.workers.register({
       name: 'lander', describe: async () => [],
       start: () => {
@@ -72,15 +99,35 @@ class Lander {
         this.steps.push(step)
         return this.answer(step)
       },
+      check: async (step) => {
+        this.checked.push(step)
+        const checked = this.checkAnswer(step)
+        if (!this.recorded || checked.outcome !== 'checked') return checked
+        const evidence = this.artifacts.put({
+          kind: 'evidence', bodySchema: 'check-run@1.0', classification: step.classification, producer: { type: 'system', ref: 'lander' }, runId: step.runId,
+          body: { schema: 'check-run@1.0', runId: step.runId, repository: step.workspace, workspace: step.workspace, subject: { type: 'git-head', ...step.subject }, setup: sha256('setup'), checks: checked.results.map((r) => ({ ...r, argv: ['npm', 'run', r.check] })) },
+        }).id
+        return { ...checked, evidence }
+      },
     })
   }
 }
 
-function tree(): string {
+/** A step as a list of them reads: its kind, and a rebase's phase. */
+const stepOf = (step: LandStep): string => (step.step === 'rebase' ? `rebase:${step.phase}` : step.step)
+
+/** A rebase the source could not replay past: `a.c` conflicts, `main` having gained one commit since the fork. */
+const conflicted = (step: RebaseStep): Landed => ({
+  outcome: 'conflicted', repository: '/repo', branch: `system/run/${step.runId}`, from: step.head, base: step.base, fork: FORK, files: ['a.c'], more: 0,
+  moved: ['1234567 dev: a change the result must keep'],
+})
+
+/** A git working tree with one uncommitted change; `salt` makes its commits its own (a repository of its own, as a run's worktree is). */
+function tree(salt = ''): string {
   const dir = mkdtempSync(join(tmpdir(), 'system-workflow-landing-'))
   const git = (...args: string[]): void => void execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@example.test', ...args], { stdio: 'ignore' })
   git('init', '-q')
-  writeFileSync(join(dir, 'a.c'), 'int a;\n')
+  writeFileSync(join(dir, 'a.c'), `int a;${salt ? ` /* ${salt} */` : ''}\n`)
   git('add', '.')
   git('commit', '-q', '-m', 'init')
   writeFileSync(join(dir, 'a.c'), 'int a = 1;\n')
@@ -88,12 +135,54 @@ function tree(): string {
   return dir
 }
 
-async function boot(merge: Mode, lander: Lander | undefined) {
+/** The step that writes the result needs `develop`, as a template's writing step does (ADR-0068: its Worker is the result's author). */
+const solo = (): NodeTemplate => ({ ...TEMPLATES['solo']![0]!, capabilities: ['reason', 'develop'] })
+/**
+ * The templates the landings run: `solo`, one writing step; and `made`, a writing step on the standard
+ * tier, then a step on the economy tier that only runs in its worktree (a validation): its result names
+ * the same tree, on a writing sandbox, but it wrote nothing of it.
+ */
+const LANDING_TEMPLATES: Record<string, NodeTemplate[]> = {
+  ...TEMPLATES,
+  solo: [solo()],
+  made: [
+    { ...solo(), nodeId: 'develop' },
+    { ...solo(), nodeId: 'validate', prompt: 'Validate the change in the worktree', capabilities: ['reason'], tier: 'economy', dependsOn: ['develop'] },
+  ],
+}
+
+/**
+ * A landing provider other than the local one (PROP-0017 L0): its own subject for the merge request,
+ * and a `land` that fails, as one that went away before it landed would, so the landing stays
+ * `merging` on its approval.
+ */
+class FirstLanding extends Landing {
+  static lands = 0
+  readonly id = 'first'
+
+  async prepare(t: LandingTarget): Promise<Prepared> {
+    return { outcome: 'prepared', provider: this.id, subject: { type: 'git-head', ref: t.branch, version: `landing:first:${t.base.sha}:${t.head}` }, consequences: ['Approved: the first provider lands it.', 'Denied: nothing lands.'] }
+  }
+
+  async land(): Promise<never> {
+    FirstLanding.lands++
+    throw new Error('the first provider went away before it landed')
+  }
+
+  async status(): Promise<LandingStatus> {
+    return { state: 'unknown', provider: this.id, reason: 'not read' }
+  }
+}
+
+/** The landing provider the composition mounts, as the bundle's `landing-local` row does; `swap` puts another in its place. */
+async function boot(merge: Mode, lander: Lander | undefined, requires: Check[] = [], template = 'solo', landingProvider: Plugin = LocalLanding, many: { runs: number; batch?: number } = { runs: 1 }) {
   const dir = mkdtempSync(join(tmpdir(), 'system-workflow-landing-db-'))
-  const workspace = tree()
+  // With several runs, each has a working tree of its own, picked by the marker its input carries.
+  const workspaces = Array.from({ length: many.runs }, (_, k) => tree(many.runs > 1 ? `#${k}` : ''))
+  const workspace = workspaces[0]!
   const ctx = new Context()
-  const workers = new TreeWorkers(workspace, () => ctx.artifacts)
-  const config = { ...CONFIG, approvalPollSeconds: 1, templates: TEMPLATES }
+  const workers = new TreeWorkers(many.runs > 1 ? (text) => workspaces.find((_, k) => text.includes(`change it #${k}`)) ?? workspace : workspace, () => ctx.artifacts)
+  const config = { ...CONFIG, approvalPollSeconds: 1, templates: LANDING_TEMPLATES, ...(many.batch ? { landingBatch: many.batch } : {}) }
   const fibers: Fiber[] = [
     ctx.plugin(Store, { path: join(dir, 'system.db') }), ctx.plugin(Artifacts, {}), ctx.plugin(EventLog, {}), ctx.plugin(Leases, {}), ctx.plugin(Egress, {}),
     ctx.plugin(WorkerRouter, {}), ctx.plugin(WorkerSessions, {}),
@@ -101,13 +190,16 @@ async function boot(merge: Mode, lander: Lander | undefined) {
       c.workers.register(workers.source(c))
       lander?.register(c)
     } }),
-    ctx.plugin(StoreApprovals, { policies: [policy(merge)], sweepSeconds: 3600 }), ctx.plugin(StoreBoard, { sweepSeconds: 0 }),
+    ctx.plugin(StoreApprovals, { policies: [policy(merge, requires)], sweepSeconds: 3600 }), ctx.plugin(StoreBoard, { sweepSeconds: 0 }),
   ]
   await Promise.all(fibers)
+  let landing = ctx.plugin(landingProvider)
+  await landing
   let engine = ctx.plugin(Workflow, config)
   await engine
   onTestFinished(async () => {
     await engine.dispose()
+    await landing.dispose()
     for (const fiber of [...fibers].reverse()) await fiber.dispose()
     rmSync(dir, { recursive: true, force: true })
   })
@@ -115,13 +207,24 @@ async function boot(merge: Mode, lander: Lander | undefined) {
   const { subject } = captureGitSubject(workspace)!
   // A read task the engine itself accepts: done once its run reports (no operator review).
   const task = await readyTask(ctx, 'tree', { writes: { type: 'git-head', ref: subject.ref } })
-  const run = await ctx.workflow.start({ template: 'solo', input: 'change it', classification: 'public', task: { taskId: task.taskId } })
+  const run = await ctx.workflow.start({ template, input: many.runs > 1 ? 'change it #0' : 'change it', classification: 'public', task: { taskId: task.taskId } })
+  const runs = [{ taskId: task.taskId, runId: run.runId }]
+  for (let k = 1; k < many.runs; k++) {
+    const more = await readyTask(ctx, `tree ${k}`, { writes: { type: 'git-head', ref: captureGitSubject(workspaces[k]!)!.subject.ref } })
+    runs.push({ taskId: more.taskId, runId: (await ctx.workflow.start({ template, input: `change it #${k}`, classification: 'public', task: { taskId: more.taskId } })).runId })
+  }
   return {
-    ctx, workspace, subject, taskId: task.taskId, runId: run.runId,
+    ctx, workers, workspace, subject, taskId: task.taskId, runId: run.runId, runs,
     restart: async () => {
       await engine.dispose()
       engine = ctx.plugin(Workflow, config)
       await engine
+    },
+    /** Put another landing provider in place of the one mounted. */
+    swap: async (next: Plugin) => {
+      await landing.dispose()
+      landing = ctx.plugin(next)
+      await landing
     },
   }
 }
@@ -129,17 +232,20 @@ async function boot(merge: Mode, lander: Lander | undefined) {
 const landingOf = (ctx: Context, runId: string): TaskLanding | undefined => ctx.workflow.get(runId)?.task?.landing
 const until = (ctx: Context, runId: string, ...states: Array<TaskLanding['state']>): Promise<TaskLanding> => vi.waitFor(() => {
   const landing = landingOf(ctx, runId)
-  if (!landing || !states.includes(landing.state)) throw new Error(`the landing of ${runId} is ${landing?.state ?? 'not there'}, not ${states.join(' or ')}`)
+  if (!landing || !states.includes(landing.state)) throw new Error(`the landing of ${runId} is ${landing?.state ?? 'not there'}${landing?.reason ? ` (${landing.reason})` : ''}, not ${states.join(' or ')}`)
   return landing
 }, { timeout: 30_000, interval: 25 })
 const optionsOf = (ctx: Context, landing: TaskLanding): string[] => (landing.decisions ?? []).map((d) => (ctx.artifacts.get(d)!.body as { outcome: { option: string } }).outcome.option)
 const merges = async (ctx: Context) => (await ctx.approvals.list({ states: ['open', 'batched', 'approved', 'rejected'] })).filter((r) => r.action.class === 'merge')
 
 describe('ctx.workflow lands an accepted result through the source that holds its tree (ADR-0060)', () => {
-  it('asks to merge once the task is done, adopts the request it asked before a restart instead of asking twice, and merges on the approval (REQ-WF-13, INV-4, INV-5)', async () => {
+  it('asks to merge once the task is accepted, adopts the request it asked before a restart instead of asking twice, and merges on the approval: the task is done only then (REQ-WF-13, INV-4, INV-5, T293)', async () => {
     const lander = new Lander()
     const { ctx, workspace, subject, taskId, runId, restart } = await boot('ask', lander)
     const asked = await until(ctx, runId, 'asked')
+    // Accepted, not done: it waits for its landing while the merge is asked (T293).
+    const waiting = (await ctx.board.task(taskId))!
+    expect(waiting).toMatchObject({ state: 'review', waiting: { reason: 'landing' } })
     expect(lander.steps[0]).toMatchObject({ step: 'commit', runId, workspace, subject: { ref: subject.ref, version: subject.version } })
     expect((lander.steps[0] as { message: string }).message).toMatch(new RegExp(`^system: land task ${taskId}: tree\\n\\nThe result of run ${runId} on git:${subject.ref}:${subject.version}, accepted by rule workflow\\.task-acceptance`))
     const [request] = await merges(ctx)
@@ -150,55 +256,64 @@ describe('ctx.workflow lands an accepted result through the source that holds it
     const again = await until(ctx, runId, 'asked')
     expect(again.requestId).toBe(asked.requestId)
     expect(await merges(ctx)).toHaveLength(1)
+    expect((await ctx.board.task(taskId))?.state).toBe('review')
     await ctx.approvals.decide([{ requestId: asked.requestId!, subject: request!.subject, verdict: 'approved' }])
     const merged = await until(ctx, runId, 'merged')
     expect(merged.commit).toBe('d'.repeat(40))
-    expect(lander.steps.at(-1)).toMatchObject({ step: 'merge', runId, head: HEAD, base: BASE, message: expect.stringContaining(`on the operator's approval of request ${asked.requestId}`) })
+    // The merge is the last landing step; once it ends, the worktree is released (T345).
+    expect(lander.steps.filter((s) => s.step !== 'release').at(-1)).toMatchObject({ step: 'merge', runId, head: HEAD, base: BASE, message: expect.stringContaining(`on the operator's approval of request ${asked.requestId}`) })
     expect(optionsOf(ctx, merged)).toEqual(['commit', 'merge'])
+    // Merged, the board's landing wait ends: done on a board.landed decision naming the merge.
+    const done = await vi.waitFor(async () => {
+      const t = (await ctx.board.task(taskId))!
+      if (t.state !== 'done') throw new Error(`task ${taskId} is ${t.state}`)
+      return t
+    }, { timeout: 30_000, interval: 25 })
+    expect(ctx.artifacts.get(done.lastDecision!)?.body).toMatchObject({ decider: { id: 'board.landed' }, outcome: { option: 'done', detail: { outcome: 'merged', landing: merged.decisions!.at(-1), acceptance: waiting.result!.acceptance } } })
+    expect(landingOf(ctx, runId)).toMatchObject({ tell: 'merged', told: true })
   })
 
-  it('names the files a merge regenerated, and the commands that made them, in its merge decision (T166, INV-13)', async () => {
-    const lander = new Lander()
-    const { ctx, runId } = await boot('ask', lander)
-    const asked = await until(ctx, runId, 'asked')
-    // The commands' autonomy decision: any recorded artifact stands for it here.
-    const autonomy = asked.decisions![0]!
-    lander.answer = (step) => step.step === 'merge'
-      ? { outcome: 'merged', repository: '/repo', branch: `system/run/${step.runId}`, head: step.head, base: step.base, commit: 'e'.repeat(40), already: false,
-        regenerated: { files: ['docs/validation/traceability.md'], commands: ['corepack pnpm gen:traceability'], autonomy: [autonomy] } }
-      : undefined
-    const [request] = await merges(ctx)
-    await ctx.approvals.decide([{ requestId: asked.requestId!, subject: request!.subject, verdict: 'approved' }])
-    const merged = await until(ctx, runId, 'merged')
-    expect(merged.commit).toBe('e'.repeat(40))
-    const decision = ctx.artifacts.get(merged.decisions!.at(-1)!)!
-    const body = decision.body as { outcome: { option: string; detail: Record<string, unknown> }; candidates: Array<{ option: string; reasons: string[] }> }
-    expect(body.outcome).toMatchObject({ option: 'merge', detail: { regenerated: { files: ['docs/validation/traceability.md'], commands: ['corepack pnpm gen:traceability'] } } })
-    expect(body.candidates[0]!.reasons.join('\n')).toContain('regenerated: docs/validation/traceability.md')
-    expect(body.candidates[0]!.reasons.join('\n')).toContain('corepack pnpm gen:traceability')
-    expect(decision.inputs).toContain(autonomy)
-  })
+  it('asks the source that holds the worktree to remove it once the landing is merged and the task done, and when there was nothing to land; a worktree of a task that may be retried is never asked for (T345)', async () => {
+    const releases = (lander: Lander) => lander.steps.filter((s) => s.step === 'release')
+    // Merged: the task is done, then the source is asked to remove the run's worktree, once.
+    const merged = new Lander()
+    const m = await boot('ask', merged)
+    const asked = await until(m.ctx, m.runId, 'asked')
+    expect(releases(merged)).toEqual([])
+    const [request] = await merges(m.ctx)
+    await m.ctx.approvals.decide([{ requestId: asked.requestId!, subject: request!.subject, verdict: 'approved' }])
+    await until(m.ctx, m.runId, 'merged')
+    await vi.waitFor(() => expect(releases(merged)).toEqual([{ step: 'release', runId: m.runId, workspace: m.workspace }]), { timeout: 30_000, interval: 25 })
+    expect((await m.ctx.board.task(m.taskId))?.state).toBe('done')
+    expect(merged.steps.map(stepOf)).toEqual(['commit', 'merge', 'release'])
 
-  it('refuses the merge a forbid policy forbids, recorded, asking no one; a merge always asks, whatever the policy says, and a denied one merges nothing (D56, REQ-WF-13, INV-2)', async () => {
-    const forbidden = await boot('forbid', new Lander())
-    const refused = await until(forbidden.ctx, forbidden.runId, 'refused')
-    expect(refused).toMatchObject({ cause: 'forbidden', reason: expect.stringMatching(/forbids merge/) })
-    expect(optionsOf(forbidden.ctx, refused)).toEqual(['commit', 'refuse'])
-    expect(await merges(forbidden.ctx)).toEqual([])
+    // Nothing to land (the base already holds the accepted tree): done as not needed, and the worktree released.
+    const nothing = new Lander()
+    nothing.answer = (step) => step.step === 'commit'
+      ? { outcome: 'committed', repository: '/repo', branch: `system/run/${step.runId}`, head: step.subject.ref, committed: false, base: BASE, contained: true, stat: '' }
+      : step.step === 'release' ? { outcome: 'released', repository: '/repo', branch: `system/run/${step.runId}`, path: step.workspace, decision: `sha256:${'1'.repeat(64)}` } : undefined
+    const n = await boot('ask', nothing)
+    await until(n.ctx, n.runId, 'none')
+    await vi.waitFor(() => expect(releases(nothing)).toEqual([{ step: 'release', runId: n.runId, workspace: n.workspace }]), { timeout: 30_000, interval: 25 })
+    expect(landingOf(n.ctx, n.runId)).toMatchObject({ tell: 'not-needed', told: true })
 
-    // No policy merges on its own word: one that gives merge auto or notify is refused when the queue loads it (ALWAYS_ASK).
-    for (const mode of ['auto', 'notify'] as const) expect(checkConfig({ policies: [policy(mode)] })).toContain(`policy studio: merge always asks; its rule may not say ${mode}`)
-
-    // The merge waits on the operator's approval: the request says so, and denied, nothing is merged.
-    const lander = new Lander()
-    const denied = await boot('ask', lander)
-    const asked = await until(denied.ctx, denied.runId, 'asked')
-    const [request] = await merges(denied.ctx)
-    expect(request!.action.consequences).toContain('A merge always asks the operator (D56), whatever the policy\'s mode for merge.')
-    await denied.ctx.approvals.decide([{ requestId: asked.requestId!, subject: request!.subject, verdict: 'rejected' }])
-    const rejected = await until(denied.ctx, denied.runId, 'rejected')
-    expect(rejected.reason).toMatch(/was not approved \(the operator denied it\): nothing is merged/)
-    expect(lander.steps.map((s) => s.step)).toEqual(['commit'])
+    // A result sent back as another attempt is retried: its worktree is kept, never asked for.
+    const retried = new Lander()
+    retried.checkAnswer = (step) => ({ outcome: 'checked', results: step.checks.map((check) => (step.scope === 'landing' ? { check, outcome: 'failed' as const, exitCode: 1, reason: 'exited 1' } : { check, outcome: 'passed' as const, exitCode: 0, reason: 'exited 0' })) })
+    const r = await boot('ask', retried, ['tests'])
+    await until(r.ctx, r.runId, 'returned')
+    expect((await r.ctx.board.task(r.taskId))!).toMatchObject({ state: 'ready', attempts: { count: 1 } })
+    expect(releases(retried)).toEqual([])
+    // One the source keeps (it holds something uncommitted) leaves the landing as it ended.
+    const kept = new Lander()
+    const answer = kept.answer
+    kept.answer = (step) => (step.step === 'release' ? { outcome: 'refused', cause: 'dirty', reason: 'it holds changes not committed' } : answer(step))
+    const k = await boot('ask', kept)
+    const askedK = await until(k.ctx, k.runId, 'asked')
+    const [requestK] = await merges(k.ctx)
+    await k.ctx.approvals.decide([{ requestId: askedK.requestId!, subject: requestK!.subject, verdict: 'approved' }])
+    await vi.waitFor(() => expect(releases(kept)).toHaveLength(1), { timeout: 30_000, interval: 25 })
+    expect(landingOf(k.ctx, k.runId)).toMatchObject({ state: 'merged', told: true })
   })
 
   it('lands nothing when no Worker source holds the tree, and waits while the source says a run may still write it (INV-15)', async () => {
@@ -217,4 +332,140 @@ describe('ctx.workflow lands an accepted result through the source that holds it
     lander.answer = answer
     await until(busy.ctx, busy.runId, 'asked')
   })
+
+  it('lands only on the subject the approved request names: a provider that changed after the approval, before the merge, lands nothing on it, and the merge is asked again on its own subject (PROP-0017 L0, INV-4, INV-5)', async () => {
+    FirstLanding.lands = 0
+    const lander = new Lander()
+    const { ctx, runId, swap } = await boot('ask', lander, [], 'solo', FirstLanding)
+    const asked = await until(ctx, runId, 'asked')
+    const [request] = await merges(ctx)
+    expect(request!.subject).toEqual({ type: 'git-head', ref: `system/run/${runId}`, version: `landing:first:${BASE.sha}:${HEAD}` })
+    await ctx.approvals.decide([{ requestId: asked.requestId!, subject: request!.subject, verdict: 'approved' }])
+    // Approved, and the first provider went away before it landed: the landing stays `merging` on that approval.
+    await vi.waitFor(() => expect(FirstLanding.lands).toBeGreaterThan(0), { timeout: 30_000 })
+    expect(landingOf(ctx, runId)?.state).toBe('merging')
+    // Another provider in its place: its subject is not the approved one, so nothing lands on that approval.
+    await swap(LocalLanding)
+    const again = await vi.waitFor(() => {
+      const l = landingOf(ctx, runId)
+      if (l?.state !== 'asked' || l.requestId === asked.requestId) throw new Error(`the landing is ${l?.state}, not asked again`)
+      return l
+    }, { timeout: 30_000, interval: 25 })
+    expect(lander.steps.map((s) => s.step)).not.toContain('merge')
+    const refusal = (again.decisions ?? []).map((d) => bodyOf(ctx, d)).find((b) => b.outcome.option === 'refuse')
+    expect(refusal?.outcome.detail).toMatchObject({ step: 'merge', cause: 'unbound' })
+    expect(refusal?.candidates[0]!.reasons[0]).toMatch(/approved system\/run\/\S+ at landing:first:.*but the landing provider in force \(local\) lands .* at landing:merge:/)
+    expect((await merges(ctx)).map((r) => [r.state, r.subject.version])).toEqual(expect.arrayContaining([
+      ['approved', `landing:first:${BASE.sha}:${HEAD}`], ['open', `landing:merge:${BASE.sha}:${HEAD}`],
+    ]))
+  })
 })
+
+type Body = { outcome: { option: string; detail: Record<string, unknown> }; candidates: Array<{ option: string; reasons: string[] }>; inputs: string[] }
+const bodyOf = (ctx: Context, ref: ArtifactRef): Body => ctx.artifacts.get(ref)!.body as Body
+
+describe('ctx.workflow rebases an accepted result onto its landing target when that moved, and checks it again before the merge is asked (ADR-0068, D82)', () => {
+
+  it('gives a conflicting rebase to a writing step on the result\'s own author\'s Worker, told what moved and that the target\'s behaviour is kept, then lands its resolution; one it cannot resolve goes back as another attempt, the branch put back (INV-2, INV-13)', async () => {
+    const lander = new Lander()
+    lander.fork = FORK
+    lander.rebaseAnswer = (step) => step.phase === 'start' ? conflicted(step) : new Lander().rebaseAnswer(step)
+    const { ctx, workers, runId, taskId } = await boot('ask', lander)
+    const asked = await until(ctx, runId, 'asked')
+    expect(lander.steps.map(stepOf)).toEqual(['commit', 'rebase:start', 'rebase:resolved'])
+    // The resolving step: on the Worker that wrote the result, in the run (so in its worktree), started once.
+    const author = ctx.workflow.get(runId)!.nodes.find((n) => n.nodeId === 'solo')!.worker
+    const resolving = workers.started.filter((s) => s.key.startsWith('landing-rebase:'))
+    expect(resolving).toHaveLength(1)
+    expect(resolving[0]).toMatchObject({ key: `landing-rebase:${runId}:${HEAD}:${BASE.sha}`, worker: author, runId })
+    const prompt = resolving[0]!.prompt
+    expect(prompt).toContain(`What moved: main went from ${FORK} to ${BASE.sha}, with these commits (newest first):\n- 1234567 dev: a change the result must keep`)
+    expect(prompt).toContain('These files have conflicts, marked with <<<<<<< and >>>>>>> lines: a.c.')
+    expect(prompt).toContain('main\'s behaviour must be kept: never drop or undo a change that came from it')
+    expect(prompt).toContain('Do not commit and do not run git')
+    expect(optionsOf(ctx, asked)).toEqual(['commit', 'resolve', 'rebase'])
+    const resolve = bodyOf(ctx, asked.decisions![1]!)
+    expect(resolve.outcome.detail).toMatchObject({ step: 'resolve', files: ['a.c'], worker: author, nodeId: 'solo' })
+    expect(bodyOf(ctx, asked.decisions![2]!).outcome.detail).toMatchObject({ step: 'rebase', from: HEAD, head: REBASED, resolvedBy: { nodeId: 'solo', worker: author } })
+    const [request] = await merges(ctx)
+    // No command check ran on the result at its acceptance (none is required), so none runs again, and the request says so.
+    expect(request!.action.consequences).toContain(`the result was rebased onto it from ${HEAD}, its conflicts resolved by ${author}; no check ran on the rebased tree, as no command check ran on the result at its acceptance.`)
+    expect(await ctx.board.task(taskId)).toMatchObject({ state: 'review', waiting: { reason: 'landing' }, attempts: { count: 1 } })
+
+    // Markers left: not resolved, the branch put back, and the result goes back to the board with why.
+    const stuck = new Lander()
+    stuck.fork = FORK
+    stuck.rebaseAnswer = (step) => step.phase === 'start' ? conflicted(step)
+      : step.phase === 'resolved' ? { outcome: 'refused', cause: 'conflict', reason: 'conflict markers are left in a.c: the rebase is not resolved' }
+        : { outcome: 'abandoned', repository: '/repo', branch: `system/run/${step.runId}`, head: step.head, left: [] }
+    const back = await boot('ask', stuck)
+    back.workers.reply = () => ({ text: 'The conflict in a.c changes what main does either way; I left its markers.' })
+    const returned = await until(back.ctx, back.runId, 'returned')
+    expect(stuck.steps.map(stepOf)).toEqual(['commit', 'rebase:start', 'rebase:resolved', 'rebase:abandon'])
+    expect(returned.reason).toMatch(/did not resolve the rebase onto main at b+: conflict markers are left in a\.c/)
+    expect(returned.reason).toContain('It said: The conflict in a.c changes what main does either way; I left its markers.')
+    expect(optionsOf(back.ctx, returned)).toEqual(['commit', 'resolve', 'return'])
+    const giveUp = returned.decisions!.at(-1)!
+    expect(bodyOf(back.ctx, giveUp).candidates[0]!.reasons).toContain(`system/run/${back.runId} is back at ${HEAD}`)
+    // Another attempt, through the gate again, the board's decision naming why; nothing merges.
+    const task = (await back.ctx.board.task(back.taskId))!
+    expect(task).toMatchObject({ state: 'ready', attempts: { count: 1 } })
+    expect(bodyOf(back.ctx, task.lastDecision!).inputs).toContain(giveUp)
+    expect(await merges(back.ctx)).toEqual([])
+  })
+
+  it('does not land a result whose required check fails after the rebase: it goes back as another attempt, with the check that failed (INV-2, INV-5)', async () => {
+    const lander = new Lander()
+    lander.fork = FORK
+    lander.checkAnswer = (step) => ({
+      outcome: 'checked', results: step.checks.map((check) => step.subject.ref === REBASED
+        ? { check, outcome: 'failed' as const, exitCode: 1, reason: 'exited 1', failures: ['FAIL scripts/other.spec.ts > a test the base gained', 'AssertionError: expected 1 to be 2'] }
+        : { check, outcome: 'passed' as const, exitCode: 0, reason: 'exited 0' }),
+    })
+    const { ctx, runId, taskId } = await boot('ask', lander, ['tests'])
+    const returned = await until(ctx, runId, 'returned')
+    expect(returned.reason).toMatch(new RegExp(`its required tests check\\(s\\) failed on the result rebased onto main at ${BASE.sha} \\(tests failed \\(exit 1\\)\\)`))
+    // The failing tests are named in what goes back (T270).
+    expect(returned.reason).toContain('failing: tests: FAIL scripts/other.spec.ts > a test the base gained | tests: AssertionError: expected 1 to be 2')
+    expect(lander.checked.at(-1)).toMatchObject({ scope: 'landing' })
+    expect(lander.steps.map(stepOf)).toEqual(['commit', 'rebase:start'])
+    expect(optionsOf(ctx, returned)).toEqual(['commit', 'rebase', 'return'])
+    expect(bodyOf(ctx, returned.decisions!.at(-1)!).outcome.detail).toMatchObject({ step: 'recheck', subject: { ref: REBASED, version: 'v-rebased' }, results: [{ check: 'tests', outcome: 'failed', exitCode: 1 }] })
+    expect(await merges(ctx)).toEqual([])
+    const task = (await ctx.board.task(taskId))!
+    expect(task).toMatchObject({ state: 'ready', attempts: { count: 1 } })
+    expect(bodyOf(ctx, task.lastDecision!).inputs).toContain(returned.decisions!.at(-1)!)
+  })
+
+  it('runs the full suite once on the committed tree when the base did not move, before the merge is asked; a failure there goes back with its failing tests named (T299)', async () => {
+    for (const fork of [BASE.sha, undefined]) {
+      const lander = new Lander()
+      lander.fork = fork
+      const { ctx, subject, runId } = await boot('ask', lander, ['tests'])
+      const asked = await until(ctx, runId, 'asked')
+      expect(lander.steps.map(stepOf)).toEqual(['commit'])
+      // The acceptance's related tests on the result's tree, then the landing's full suite on the committed tree, once.
+      expect(lander.checked.map((c) => [c.subject, c.scope])).toEqual([[{ ref: subject.ref, version: subject.version }, undefined], [{ ref: HEAD, version: 'v-committed' }, 'landing']])
+      expect(optionsOf(ctx, asked)).toEqual(['commit', 'recheck'])
+      expect(bodyOf(ctx, asked.decisions![1]!).outcome.detail).toMatchObject({ step: 'recheck', scope: 'landing', subject: { ref: HEAD, version: 'v-committed' }, results: [{ check: 'tests', outcome: 'passed' }] })
+      expect(asked).toMatchObject({ head: HEAD, base: BASE })
+      expect(await merges(ctx)).toHaveLength(1)
+    }
+    const lander = new Lander()
+    lander.checkAnswer = (step) => ({
+      outcome: 'checked', results: step.checks.map((check) => step.scope === 'landing'
+        ? { check, outcome: 'failed' as const, exitCode: 1, reason: 'exited 1', failures: ['FAIL packages/other/tests/x.spec.ts > a test the related set left out'] }
+        : { check, outcome: 'passed' as const, exitCode: 0, reason: 'exited 0' }),
+    })
+    const { ctx, runId, taskId } = await boot('ask', lander, ['tests'])
+    const returned = await until(ctx, runId, 'returned')
+    expect(returned.reason).toContain(`failed on the result committed on system/run/${runId} at ${HEAD}`)
+    expect(returned.reason).toContain('failing: tests: FAIL packages/other/tests/x.spec.ts > a test the related set left out')
+    expect(optionsOf(ctx, returned)).toEqual(['commit', 'return'])
+    expect(await merges(ctx)).toEqual([])
+    expect((await ctx.board.task(taskId))!).toMatchObject({ state: 'ready', attempts: { count: 1 } })
+  })
+})
+
+
+

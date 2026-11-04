@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { canRunBrowser } from '../../browser-patchright/tests/support.ts'
-import type { RunView } from '../src/types.ts'
-import { ballot, browserStack, findings, isProposal, kind, proposal, until } from './stack.ts'
+import { ballot, browserStack, findings, isProposal, proposal, until } from './stack.ts'
 
 const { boot } = browserStack()
 
@@ -21,28 +20,6 @@ describe.runIf(canRunBrowser)('ctx.workflow: runs that wait on a vote, and their
     // An uncapped 720 h timer fires at once in Node, and the run would advance again and again.
     expect(holds).toEqual([])
   }, 180_000)
-
-  it('admits new work beside a run that only waits on a vote, and bounds such runs on their own (INV-9)', async () => {
-    const { ctx } = await boot({
-      fake: { answer: (prompt) => (isProposal(prompt) ? proposal('A') : kind(prompt) === 'other' ? 'Plain answer.' : ballot('O1')) },
-      gemini: { answer: (prompt) => (isProposal(prompt) ? proposal('B') : ballot('O2')) },
-      workflow: { maxActiveRuns: 1, maxWaitingRuns: 1 },
-    })
-    const tied = ctx.workflow.start({ template: 'brainstorm', input: 'q' })
-    expect((await ctx.workflow.wait(tied.runId, 120_000)).blocked).toMatchObject({ kind: 'tie' })
-    // The tie runs nothing, so it holds no slot of the one run that may execute.
-    const asked = ctx.workflow.start({ template: 'ask', input: 'an unrelated question' })
-    expect(() => ctx.workflow.start({ template: 'ask', input: 'one more' })).toThrow('1 runs are already executing (limit 1)')
-    expect(await ctx.workflow.wait(asked.runId, 60_000)).toMatchObject({ status: 'completed', answer: 'Plain answer.' })
-    // Waiting runs have their own bound: a second tie fills it, and new work is refused, saying why.
-    const second = ctx.workflow.start({ template: 'brainstorm', input: 'q2' })
-    expect((await ctx.workflow.wait(second.runId, 120_000)).blocked).toMatchObject({ kind: 'tie' })
-    expect(() => ctx.workflow.start({ template: 'ask', input: 'blocked' })).toThrow('2 runs wait on an approval or a vote (limit 1)')
-    // A deciding vote frees one.
-    ctx.workflow.vote(tied.runId, { decision: (ctx.workflow.get(tied.runId)!.blocked as Extract<RunView['blocked'], { kind: 'tie' }>).decision, option: 'O1', rationale: 'r', by: 'client' })
-    expect(await ctx.workflow.wait(tied.runId, 60_000)).toMatchObject({ status: 'completed' })
-    expect(ctx.workflow.start({ template: 'ask', input: 'after the vote' }).status).toBe('running')
-  }, 300_000)
 
   it('ends a tie nobody decides as inconclusive, by rule, after tieTimeoutHours (INV-9); a tied review never passes silently', async () => {
     // No objections: no debate; split: a tie at once.

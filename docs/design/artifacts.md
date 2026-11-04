@@ -8,7 +8,6 @@
 > Implemented in [`artifacts`](../../packages/plugins/artifacts/README.md); differs from target:
 > bodies are inline only (no large-body store); no `spec-admission` decision is recorded; the
 > store does not itself reject a transition without a decision id.
-
 An **artifact** is an immutable, typed, content-addressed record. The work that
 `system` produces is artifacts, and so is the record of how `system` decided.
 Workflow state (node status, leases) is mutable and points at artifacts.
@@ -25,7 +24,7 @@ Every artifact shares one envelope
 | `id` | computed by the store from the content ([formula](../reference/schemas.md#artifact-envelope)); equal content means an equal id |
 | `kind` | one of the kinds below |
 | `bodySchema` | schema of the body, e.g. `decision@1.0` |
-| `body` or `blob` | inline body, or a SHA-256 ref to a large body (planned) |
+| `body` or `blob` | inline body; a SHA-256 ref to a large body is reserved ([storage](#storage)) |
 | `classification` | `public`, `operator-shared`, or `local-private`; drives egress ([INV-12](../architecture/invariants.md#inv-12-data-egress-is-explicit)) |
 | `producer` | who made it: `{ type: node, worker, policy, operator, system; ref }` |
 | `subject` | what it is about, when exact-subject binding applies (e.g. a git head SHA) |
@@ -181,9 +180,8 @@ attempt's answer is read: `system explain <runId>` names, on each acceptance dec
 
 Envelopes and their bodies are stored in `ctx.store`, indexed by id, kind,
 `runId`, `nodeId`, subject, and decision type. A large-body store is a target only:
-per the [ADR-0003 amendment](../decisions/adr/0003-sqlite-durable-store.md#amendment-2026-10-12-no-blob-store-until-a-consumer-exists),
-the blob store was removed and the envelope's `blob` ref is reserved until a
-consumer exists (none is read today). Retention follows the workflow retention
+the blob store was removed ([ADR-0003 amendment](../decisions/adr/0003-sqlite-durable-store.md#amendment-2026-10-12-no-blob-store-until-a-consumer-exists)),
+and the envelope's `blob` ref is reserved until a consumer exists. Retention follows the workflow retention
 rules. A decision artifact is kept for as long as any artifact or state that
 references it.
 
@@ -203,7 +201,4 @@ re-checking what was written since the scan began: a new artifact's inputs and
 lineage, and a new run link. That covers every way a writer reaches an old id
 today (from a row the scan marked, or through a `put`, which refuses a missing
 input); a writer that copied a raw id from a row the scan had not yet read while
-that row was deleted is the case left, and no writer does that. On a synthetic
-267 MB store with 200,000 artifacts, a pass that removed 100,000 took 12 s; the
-longest write transaction was 112 ms and the longest stall of the event loop
-317 ms (marking).
+that row was deleted is the case left, and no writer does that.

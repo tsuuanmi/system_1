@@ -19,60 +19,64 @@ A plugin may also consume a service of the dsh launcher itself, which no row pro
 | Package | Layer | Defines / provides | Bundle row | Consumes | Imports |
 |---|---|---|---|---|---|
 | [cli](../../packages/cli/README.md) | gateways | — | — | — | `browser-patchright`, `libs`, `system-bundle` |
+| [decisions](../../packages/plugins/decisions/README.md) | gateways | — | `decisions` | `store`, `mcp` (optional) | `gateway-core`, `ledger-core`, `libs` |
 | [gateway-anthropic](../../packages/plugins/gateway-anthropic/README.md) | gateways | — | `gateway-anthropic` | `webServer`, `workflow`, `store` | `gateway-core`, `gateway-turns`, `libs` |
 | [gateway-core](../../packages/gateway-core/README.md) | gateways | defines `mcp` | — | — | `libs` |
 | [gateway-responses](../../packages/plugins/gateway-responses/README.md) | gateways | — | `gateway-responses` | `webServer`, `workflow`, `store` | `gateway-core`, `gateway-turns`, `libs` |
-| [gateway-turns](../../packages/gateway-turns/README.md) | gateways | — | — | — | `gateway-core`, `libs` |
+| [gateway-turns](../../packages/gateway-turns/README.md) | gateways | — | — | — | `gateway-core`, `ledger-core`, `libs` |
+| [lead-inbox](../../packages/plugins/lead-inbox/README.md) | gateways | `leadInbox` | `lead-inbox` | `store`, `eventLog`, `accounts` (optional), `agentWorkers` (optional), `approvals` (optional), `board` (optional), `mcp` (optional), `resources` (optional), `workers` (optional), `workflow` (optional) | `gateway-core`, `ledger-core`, `libs` |
 | [mcp-server](../../packages/plugins/mcp-server/README.md) | gateways | `mcp` | `mcp-server` | `webServer`, `accounts` (optional), `agentWorkers` (optional), `artifacts` (optional), `board` (optional), `browser` (optional), `credentials` (optional), `eventLog` (optional), `pluginHost` (optional), `providers` (optional), `resources` (optional), `store` (optional), `turns` (optional), `workers` (optional), `workflow` (optional) | `gateway-core`, `libs`, `plugin-host-core`, `resources-core` |
-| [notify](../../packages/plugins/notify/README.md) | gateways | — | `notify` | `store`, `eventLog`, `credentials` (optional), `egress` (optional), `mcp` (optional) | `gateway-core`, `libs` |
-| [report](../../packages/plugins/report/README.md) | gateways | — | `report` | `artifacts`, `eventLog`, `approvals` (optional), `board` (optional), `digests` (optional), `mcp` (optional), `resources` (optional) | `approvals-core`, `board-core`, `digest-core`, `gateway-core`, `libs`, `resources-core` |
-| [web-ui](../../packages/plugins/web-ui/README.md) | gateways | — | `web-ui` | `webServer`, `workflow`, `accounts` (optional), `agentWorkers` (optional), `approvals` (optional), `artifacts` (optional), `board` (optional), `eventLog` (optional), `resources` (optional), `workers` (optional) | `approvals-core`, `board-core`, `gateway-core`, `libs`, `workers-core` |
-| [board](../../packages/plugins/board/README.md) | orchestration | `board` | `board` | `store`, `artifacts`, `leases`, `approvals`, `eventLog` (optional), `mcp` (optional) | `approvals-core`, `board-core`, `gateway-core`, `leases`, `libs` |
-| [board-core](../../packages/board-core/README.md) | orchestration | defines `board` | — | — | `approvals-core` |
-| [digest](../../packages/plugins/digest/README.md) | orchestration | `digests` | `digest` | `store`, `artifacts`, `leases`, `workers`, `eventLog` (optional), `mcp` (optional) | `digest-core`, `gateway-core`, `leases`, `libs`, `workers-core` |
-| [digest-core](../../packages/digest-core/README.md) | orchestration | defines `digests` | — | — | `gateway-core`, `libs` |
-| [digest-extractive](../../packages/plugins/digest-extractive/README.md) | orchestration | `digests` | `digest-extractive` | `store`, `artifacts`, `leases`, `workers`, `eventLog` (optional), `mcp` (optional) | `digest-core`, `gateway-core`, `leases`, `libs`, `workers-core` |
-| [evaluations-core](../../packages/evaluations-core/README.md) | orchestration | defines `evaluations` | — | — | `experiments-core`, `libs` |
-| [experiments-core](../../packages/experiments-core/README.md) | orchestration | defines `experiments` | — | — | `libs` |
-| [profile-scientific-research](../../packages/plugins/profile-scientific-research/README.md) | orchestration | — | `profile-scientific-research` | `workflow`, `workers`, `artifacts`, `eventLog` | `libs` |
-| [profile-software-development](../../packages/plugins/profile-software-development/README.md) | orchestration | — | `profile-software-development` | `workflow` | `workers-core` |
-| [statistics](../../packages/statistics/README.md) | orchestration | — | — | — | — |
-| [worker-sessions](../../packages/plugins/worker-sessions/README.md) | orchestration | `workerSessions` | `worker-sessions` | `store`, `artifacts`, `mcp` (optional) | `gateway-core`, `libs` |
-| [workflow](../../packages/plugins/workflow/README.md) | orchestration | `workflow` | `workflow` | `store`, `artifacts`, `eventLog`, `leases`, `egress`, `workers`, `workerSessions`, `agentWorkers` (optional), `approvals` (optional), `board` (optional), `digests` (optional), `mcp` (optional), `resources` (optional) | `approvals-core`, `board-core`, `digest-core`, `gateway-core`, `leases`, `libs`, `provider-core`, `resources-core`, `worker-sessions`, `workers-core` |
-| [approvals](../../packages/plugins/approvals/README.md) | routing | `approvals` | `approvals` | `store`, `artifacts`, `eventLog` (optional), `mcp` (optional) | `approvals-core`, `gateway-core`, `libs` |
-| [approvals-core](../../packages/approvals-core/README.md) | routing | defines `approvals` | — | — | — |
-| [egress](../../packages/plugins/egress/README.md) | routing | `egress` | `egress` | `artifacts` | `libs`, `provider-core` |
-| [resources](../../packages/plugins/resources/README.md) | routing | `resources` | `resources` | `store`, `artifacts`, `eventLog` (optional), `mcp` (optional) | `gateway-core`, `libs`, `resources-core` |
+| [notify](../../packages/plugins/notify/README.md) | gateways | — | `notify` | `store`, `eventLog`, `board` (optional), `credentials` (optional), `egress` (optional), `mcp` (optional) | `gateway-core`, `ledger-core`, `libs`, `workers-core` |
+| [report](../../packages/plugins/report/README.md) | gateways | — | `report` | `artifacts`, `eventLog`, `store`, `agentWorkers` (optional), `approvals` (optional), `board` (optional), `digests` (optional), `leadInbox` (optional), `mcp` (optional), `pluginHost` (optional), `resources` (optional), `workers` (optional), `workflow` (optional) | `approvals-core`, `board-core`, `digest-core`, `gateway-core`, `ledger-core`, `libs`, `resources-core` |
+| [web-ui](../../packages/plugins/web-ui/README.md) | gateways | — | `web-ui` | `webServer`, `workflow`, `accounts` (optional), `agentWorkers` (optional), `approvals` (optional), `artifacts` (optional), `board` (optional), `eventLog` (optional), `leadInbox` (optional), `resources` (optional), `workers` (optional) | `approvals-core`, `board-core`, `gateway-core`, `ledger-core`, `libs`, `workers-core` |
+| [board](../../packages/plugins/board/README.md) | orchestration | `board` | `board` | `store`, `artifacts`, `leases`, `approvals`, `eventLog` (optional), `mcp` (optional) | `approvals-core`, `board-core`, `gateway-core`, `ledger-core`, `libs` |
+| [board-core](../../packages/board-core/README.md) | orchestration | defines `board`, defines `leases` | — | — | `approvals-core` |
+| [decision-core](../../packages/decision-core/README.md) | orchestration | defines `dispatchAdvisor` | — | — | `libs` |
+| [digest](../../packages/plugins/digest/README.md) | orchestration | `digests` | `digest` | `store`, `artifacts`, `leases`, `workers`, `mcp` (optional) | `board-core`, `digest-core`, `gateway-core`, `ledger-core`, `libs`, `workers-core` |
+| [digest-core](../../packages/digest-core/README.md) | orchestration | defines `digests` | — | `eventLog` (optional) | `board-core`, `gateway-core`, `ledger-core`, `libs`, `workers-core` |
+| [digest-extractive](../../packages/plugins/digest-extractive/README.md) | orchestration | `digests` | `digest-extractive` | `store`, `artifacts`, `leases`, `workers`, `mcp` (optional) | `board-core`, `digest-core`, `gateway-core`, `ledger-core`, `libs`, `workers-core` |
+| [landing-core](../../packages/landing-core/README.md) | orchestration | defines `landing` | — | — | — |
+| [landing-local](../../packages/plugins/landing-local/README.md) | orchestration | `landing` | `landing-local` | `workers` | `landing-core`, `workers-core` |
+| [profile-scientific-research](../../packages/plugins/profile-scientific-research/README.md) | orchestration | — | `profile-scientific-research` | `workflow`, `workers`, `artifacts`, `eventLog` | `ledger-core`, `libs` |
+| [profile-software-development](../../packages/plugins/profile-software-development/README.md) | orchestration | — | `profile-software-development` | `workflow` | `workers-core`, `workflow` |
+| [worker-sessions](../../packages/plugins/worker-sessions/README.md) | orchestration | `workerSessions` | `worker-sessions` | `store`, `artifacts`, `mcp` (optional), `workflow` (optional) | `gateway-core`, `ledger-core`, `libs` |
+| [workflow](../../packages/plugins/workflow/README.md) | orchestration | `workflow` | `workflow` | `store`, `artifacts`, `eventLog`, `leases`, `egress`, `workers`, `workerSessions`, `agentWorkers` (optional), `approvals` (optional), `board` (optional), `digests` (optional), `dispatchAdvisor` (optional), `landing` (optional), `mcp` (optional), `pluginHost` (optional), `resources` (optional) | `approvals-core`, `board-core`, `decision-core`, `digest-core`, `gateway-core`, `landing-core`, `ledger-core`, `libs`, `provider-core`, `resources-core`, `worker-sessions`, `workers-core` |
+| [approvals](../../packages/plugins/approvals/README.md) | routing | `approvals` | `approvals` | `store`, `artifacts`, `board` (optional), `eventLog` (optional), `mcp` (optional), `workflow` (optional) | `approvals-core`, `gateway-core`, `ledger-core`, `libs` |
+| [approvals-core](../../packages/approvals-core/README.md) | routing | defines `approvals` | — | — | `libs` |
+| [egress](../../packages/plugins/egress/README.md) | routing | `egress` | `egress` | `artifacts` | `ledger-core`, `libs`, `workers-core` |
+| [resources](../../packages/plugins/resources/README.md) | routing | `resources` | `resources` | `store`, `artifacts`, `board` (optional), `eventLog` (optional), `mcp` (optional), `workflow` (optional) | `gateway-core`, `ledger-core`, `libs`, `resources-core` |
 | [resources-core](../../packages/resources-core/README.md) | routing | defines `resources` | — | — | — |
-| [workers](../../packages/plugins/workers/README.md) | routing | `workers` | `workers` | `artifacts`, `resources` (optional) | `libs`, `workers-core` |
-| [workers-core](../../packages/workers-core/README.md) | routing | defines `workers` | — | — | — |
+| [workers](../../packages/plugins/workers/README.md) | routing | `workers` | `workers` | `artifacts`, `resources` (optional) | `ledger-core`, `libs`, `workers-core` |
+| [workers-core](../../packages/workers-core/README.md) | routing | defines `egress`, defines `workers` | — | — | `libs` |
 | [agent-runtime-core](../../packages/agent-runtime-core/README.md) | capabilities | defines `agentRuntimes` | — | — | — |
 | [agent-runtimes](../../packages/plugins/agent-runtimes/README.md) | capabilities | `agentRuntimes` | `agent-runtimes` | — | `agent-runtime-core`, `libs` |
-| [agent-workers](../../packages/plugins/agent-workers/README.md) | capabilities | `agentWorkers` | `agent-workers` | `store`, `artifacts`, `leases`, `workers`, `agentRuntimes`, `egress`, `approvals` (optional), `credentials` (optional), `eventLog` (optional), `mcp` (optional), `resources` (optional) | `agent-runtime-core`, `approvals-core`, `gateway-core`, `leases`, `libs`, `provider-core`, `resources-core`, `workers-core` |
-| [models](../../packages/plugins/models/README.md) | capabilities | `models` | `models` | `llm`, `store`, `artifacts`, `leases`, `workers`, `egress`, `models`, `credentials` (optional), `eventLog` (optional), `mcp` (optional) | `gateway-core`, `leases`, `libs`, `models-core`, `provider-core`, `workers-core` |
+| [agent-workers](../../packages/plugins/agent-workers/README.md) | capabilities | `agentWorkers` | `agent-workers` | `store`, `artifacts`, `leases`, `workers`, `agentRuntimes`, `egress`, `approvals` (optional), `credentials` (optional), `eventLog` (optional), `mcp` (optional), `pluginHost` (optional), `resources` (optional), `workflow` (optional) | `agent-runtime-core`, `approvals-core`, `board-core`, `gateway-core`, `ledger-core`, `libs`, `provider-core`, `resources-core`, `workers-core` |
+| [models](../../packages/plugins/models/README.md) | capabilities | `models` | `models` | `llm`, `store`, `artifacts`, `leases`, `workers`, `egress`, `models`, `credentials` (optional), `eventLog` (optional), `mcp` (optional) | `board-core`, `gateway-core`, `ledger-core`, `libs`, `models-core`, `provider-core`, `workers-core` |
 | [models-core](../../packages/models-core/README.md) | capabilities | defines `models` | — | — | `workers-core` |
 | [runtime-acp](../../packages/plugins/runtime-acp/README.md) | capabilities | — | `runtime-acp` | `agentRuntimes` | `agent-runtime-core`, `provider-core` |
 | [runtime-antigravity-cli](../../packages/plugins/runtime-antigravity-cli/README.md) | capabilities | — | `runtime-antigravity-cli` | `agentRuntimes` | `agent-runtime-core`, `libs`, `provider-core` |
 | [runtime-claude-agent-sdk](../../packages/plugins/runtime-claude-agent-sdk/README.md) | capabilities | — | `runtime-claude-agent-sdk` | `agentRuntimes` | `agent-runtime-core`, `libs`, `provider-core` |
 | [runtime-codex-sdk](../../packages/plugins/runtime-codex-sdk/README.md) | capabilities | — | `runtime-codex-sdk` | `agentRuntimes` | `agent-runtime-core`, `libs`, `provider-core` |
-| [turns](../../packages/plugins/turns/README.md) | capabilities | `turns` | `turns` | `store`, `artifacts`, `leases`, `egress`, `turnReceipts`, `accounts`, `browser`, `providers`, `workers`, `eventLog` (optional), `login` (optional), `mcp` (optional) | `gateway-core`, `leases`, `libs`, `provider-core`, `workers-core` |
+| [turns](../../packages/plugins/turns/README.md) | capabilities | `turns` | `turns` | `store`, `artifacts`, `leases`, `egress`, `turnReceipts`, `accounts`, `browser`, `providers`, `workers`, `eventLog` (optional), `login` (optional), `mcp` (optional) | `board-core`, `gateway-core`, `ledger-core`, `libs`, `provider-core`, `workers-core` |
+| [workers-fake](../../packages/plugins/workers-fake/README.md) | capabilities | — | `workers-fake` | `artifacts`, `workers`, `workflow` (optional) | `ledger-core`, `libs`, `workers-core` |
 | [accounts](../../packages/plugins/accounts/README.md) | provider runtime | `accounts` | `accounts` | `credentials` | `libs`, `provider-core` |
 | [browser-patchright](../../packages/plugins/browser-patchright/README.md) | provider runtime | `browser` | `browser` | `display`, `eventLog` (optional) | `libs`, `provider-core` |
 | [display-virtual](../../packages/plugins/display-virtual/README.md) | provider runtime | `display` | `display` | — | `libs`, `provider-core` |
 | [login](../../packages/plugins/login/README.md) | provider runtime | `login` | `login` | `accounts`, `browser`, `providers`, `mcp` (optional) | `display-virtual`, `gateway-core`, `libs`, `provider-core` |
-| [provider-chatgpt-web](../../packages/plugins/provider-chatgpt-web/README.md) | provider runtime | — | `provider-chatgpt-web` | `providers`, `artifacts` (optional), `eventLog` (optional) | `libs`, `provider-core`, `ui-ops` |
+| [provider-chatgpt-web](../../packages/plugins/provider-chatgpt-web/README.md) | provider runtime | — | `provider-chatgpt-web` | `providers`, `artifacts` (optional), `eventLog` (optional) | `ledger-core`, `libs`, `provider-core`, `ui-ops` |
 | [provider-core](../../packages/provider-core/README.md) | provider runtime | defines `browser`, defines `display`, defines `providers` | — | — | `libs` |
-| [provider-gemini-web](../../packages/plugins/provider-gemini-web/README.md) | provider runtime | — | `provider-gemini-web` | `providers`, `artifacts` (optional), `eventLog` (optional) | `provider-core`, `ui-ops` |
+| [provider-gemini-web](../../packages/plugins/provider-gemini-web/README.md) | provider runtime | — | `provider-gemini-web` | `providers`, `artifacts` (optional), `eventLog` (optional) | `ledger-core`, `provider-core`, `ui-ops` |
 | [providers](../../packages/plugins/providers/README.md) | provider runtime | `providers` | `providers` | — | `provider-core` |
-| [turn-receipts](../../packages/plugins/turn-receipts/README.md) | provider runtime | `turnReceipts` | `turn-receipts` | `store`, `artifacts` | `libs`, `provider-core` |
+| [turn-receipts](../../packages/plugins/turn-receipts/README.md) | provider runtime | `turnReceipts` | `turn-receipts` | `store`, `artifacts` | `ledger-core`, `libs`, `provider-core` |
 | [ui-ops](../../packages/ui-ops/README.md) | provider runtime | — | — | — | `libs`, `provider-core` |
-| [artifacts](../../packages/plugins/artifacts/README.md) | kernel | `artifacts` | `artifacts` | `store` | `libs` |
+| [artifacts](../../packages/plugins/artifacts/README.md) | kernel | `artifacts` | `artifacts` | `store` | `ledger-core`, `libs` |
 | [credentials-vault](../../packages/plugins/credentials-vault/README.md) | kernel | `credentials` | `credentials` | — | `libs` |
-| [event-log](../../packages/plugins/event-log/README.md) | kernel | `eventLog` | `event-log` | `store` | `libs` |
-| [leases](../../packages/plugins/leases/README.md) | kernel | `leases` | `leases` | `store` | `libs` |
-| [plugin-host](../../packages/plugins/plugin-host/README.md) | kernel | `pluginHost` | `plugin-host` | `store`, `artifacts`, `loader`, `profileContext` (optional) | `plugin-host-core` |
+| [event-log](../../packages/plugins/event-log/README.md) | kernel | `eventLog` | `event-log` | `store` | `ledger-core`, `libs` |
+| [leases](../../packages/plugins/leases/README.md) | kernel | `leases` | `leases` | `store` | `board-core`, `ledger-core`, `libs` |
+| [ledger-core](../../packages/ledger-core/README.md) | kernel | defines `artifacts`, defines `eventLog`, defines `store` | — | — | `libs` |
+| [plugin-host](../../packages/plugins/plugin-host/README.md) | kernel | `pluginHost` | `plugin-host` | `store`, `artifacts`, `loader`, `profileContext` (optional) | `ledger-core`, `libs`, `plugin-host-core` |
 | [plugin-host-core](../../packages/plugin-host-core/README.md) | kernel | defines `pluginHost` | — | — | `libs` |
-| [store](../../packages/plugins/store/README.md) | kernel | `store` | `store` | — | `libs` |
+| [store](../../packages/plugins/store/README.md) | kernel | `store` | `store` | — | `ledger-core`, `libs` |
 | [libs](../../packages/libs/README.md) | host and libraries | — | — | — | — |
 | [system-bundle](../../packages/system-bundle/README.md) | host and libraries | — | — | — | — |
 | `@deepseek-ai/cordis-plugin-timer` (DSH row) | host and libraries | `timer` | `timer` | — | — |
@@ -91,8 +95,10 @@ of DSH core appear under host and libraries.
 ```mermaid
 flowchart TB
   subgraph gateways ["gateways"]
+    decisions["decisions"]
     gateway_anthropic["gateway-anthropic"]
     gateway_responses["gateway-responses"]
+    lead_inbox["lead-inbox<br/>ctx.leadInbox"]
     mcp_server["mcp-server<br/>ctx.mcp"]
     notify["notify"]
     report["report"]
@@ -100,8 +106,11 @@ flowchart TB
   end
   subgraph orchestration ["orchestration"]
     board["board<br/>ctx.board"]
+    decision_core["decision-core<br/>defines dispatchAdvisor"]
     digest["digest<br/>ctx.digests"]
+    digest_core["digest-core<br/>defines digests"]
     digest_extractive["digest-extractive<br/>ctx.digests"]
+    landing_local["landing-local<br/>ctx.landing"]
     profile_scientific_research["profile-scientific-research"]
     profile_software_development["profile-software-development"]
     worker_sessions["worker-sessions<br/>ctx.workerSessions"]
@@ -122,6 +131,7 @@ flowchart TB
     runtime_claude_agent_sdk["runtime-claude-agent-sdk"]
     runtime_codex_sdk["runtime-codex-sdk"]
     turns["turns<br/>ctx.turns"]
+    workers_fake["workers-fake"]
   end
   subgraph provider_runtime ["provider runtime"]
     accounts["accounts<br/>ctx.accounts"]
@@ -156,11 +166,15 @@ flowchart TB
   agent_workers -.-> credentials_vault
   agent_workers -.-> event_log
   agent_workers -.-> mcp_server
+  agent_workers -.-> plugin_host
   agent_workers -.-> resources
+  agent_workers -.-> workflow
   approvals --> store
   approvals --> artifacts
+  approvals -.-> board
   approvals -.-> event_log
   approvals -.-> mcp_server
+  approvals -.-> workflow
   artifacts --> store
   board --> store
   board --> artifacts
@@ -170,17 +184,18 @@ flowchart TB
   board -.-> mcp_server
   browser_patchright --> display_virtual
   browser_patchright -.-> event_log
+  decisions --> store
+  decisions -.-> mcp_server
   digest --> store
   digest --> artifacts
   digest --> leases
   digest --> workers
-  digest -.-> event_log
   digest -.-> mcp_server
+  digest_core -.-> event_log
   digest_extractive --> store
   digest_extractive --> artifacts
   digest_extractive --> leases
   digest_extractive --> workers
-  digest_extractive -.-> event_log
   digest_extractive -.-> mcp_server
   egress --> artifacts
   event_log --> store
@@ -190,6 +205,17 @@ flowchart TB
   gateway_responses --> webserver
   gateway_responses --> workflow
   gateway_responses --> store
+  landing_local --> workers
+  lead_inbox --> store
+  lead_inbox --> event_log
+  lead_inbox -.-> accounts
+  lead_inbox -.-> agent_workers
+  lead_inbox -.-> approvals
+  lead_inbox -.-> board
+  lead_inbox -.-> mcp_server
+  lead_inbox -.-> resources
+  lead_inbox -.-> workers
+  lead_inbox -.-> workflow
   leases --> store
   login --> accounts
   login --> browser_patchright
@@ -222,6 +248,7 @@ flowchart TB
   models -.-> mcp_server
   notify --> store
   notify --> event_log
+  notify -.-> board
   notify -.-> credentials_vault
   notify -.-> egress
   notify -.-> mcp_server
@@ -240,15 +267,23 @@ flowchart TB
   provider_gemini_web -.-> event_log
   report --> artifacts
   report --> event_log
+  report --> store
+  report -.-> agent_workers
   report -.-> approvals
   report -.-> board
   report -.-> digest
+  report -.-> lead_inbox
   report -.-> mcp_server
+  report -.-> plugin_host
   report -.-> resources
+  report -.-> workers
+  report -.-> workflow
   resources --> store
   resources --> artifacts
+  resources -.-> board
   resources -.-> event_log
   resources -.-> mcp_server
+  resources -.-> workflow
   runtime_acp --> agent_runtimes
   runtime_antigravity_cli --> agent_runtimes
   runtime_claude_agent_sdk --> agent_runtimes
@@ -275,13 +310,18 @@ flowchart TB
   web_ui -.-> artifacts
   web_ui -.-> board
   web_ui -.-> event_log
+  web_ui -.-> lead_inbox
   web_ui -.-> resources
   web_ui -.-> workers
   worker_sessions --> store
   worker_sessions --> artifacts
   worker_sessions -.-> mcp_server
+  worker_sessions -.-> workflow
   workers --> artifacts
   workers -.-> resources
+  workers_fake --> artifacts
+  workers_fake --> workers
+  workers_fake -.-> workflow
   workflow --> store
   workflow --> artifacts
   workflow --> event_log
@@ -293,7 +333,10 @@ flowchart TB
   workflow -.-> approvals
   workflow -.-> board
   workflow -.-> digest
+  workflow -.-> decision_core
+  workflow -.-> landing_local
   workflow -.-> mcp_server
+  workflow -.-> plugin_host
   workflow -.-> resources
 ```
 
@@ -309,7 +352,10 @@ policy above it. Each such edge is listed here so a new one is a visible change.
 | `agent-workers` (capabilities) | `mcp` | `mcp-server` (gateways) | optional |
 | `agent-workers` (capabilities) | `resources` | `resources` (routing) | optional |
 | `agent-workers` (capabilities) | `workers` | `workers` (routing) | required |
+| `agent-workers` (capabilities) | `workflow` | `workflow` (orchestration) | optional |
+| `approvals` (routing) | `board` | `board` (orchestration) | optional |
 | `approvals` (routing) | `mcp` | `mcp-server` (gateways) | optional |
+| `approvals` (routing) | `workflow` | `workflow` (orchestration) | optional |
 | `board` (orchestration) | `mcp` | `mcp-server` (gateways) | optional |
 | `digest-extractive` (orchestration) | `mcp` | `mcp-server` (gateways) | optional |
 | `digest` (orchestration) | `mcp` | `mcp-server` (gateways) | optional |
@@ -317,11 +363,15 @@ policy above it. Each such edge is listed here so a new one is a visible change.
 | `models` (capabilities) | `egress` | `egress` (routing) | required |
 | `models` (capabilities) | `mcp` | `mcp-server` (gateways) | optional |
 | `models` (capabilities) | `workers` | `workers` (routing) | required |
+| `resources` (routing) | `board` | `board` (orchestration) | optional |
 | `resources` (routing) | `mcp` | `mcp-server` (gateways) | optional |
+| `resources` (routing) | `workflow` | `workflow` (orchestration) | optional |
 | `turns` (capabilities) | `egress` | `egress` (routing) | required |
 | `turns` (capabilities) | `mcp` | `mcp-server` (gateways) | optional |
 | `turns` (capabilities) | `workers` | `workers` (routing) | required |
 | `worker-sessions` (orchestration) | `mcp` | `mcp-server` (gateways) | optional |
+| `workers-fake` (capabilities) | `workers` | `workers` (routing) | required |
+| `workers-fake` (capabilities) | `workflow` | `workflow` (orchestration) | optional |
 | `workflow` (orchestration) | `mcp` | `mcp-server` (gateways) | optional |
 
 ## Library imports
@@ -333,10 +383,12 @@ almost every package, is not drawn.
 flowchart TB
   subgraph gateways ["gateways"]
     cli["cli"]
+    decisions["decisions"]
     gateway_anthropic["gateway-anthropic"]
     gateway_core["gateway-core<br/>defines mcp"]
     gateway_responses["gateway-responses"]
     gateway_turns["gateway-turns"]
+    lead_inbox["lead-inbox<br/>ctx.leadInbox"]
     mcp_server["mcp-server<br/>ctx.mcp"]
     notify["notify"]
     report["report"]
@@ -344,12 +396,14 @@ flowchart TB
   end
   subgraph orchestration ["orchestration"]
     board["board<br/>ctx.board"]
-    board_core["board-core<br/>defines board"]
+    board_core["board-core<br/>defines board, leases"]
+    decision_core["decision-core<br/>defines dispatchAdvisor"]
     digest["digest<br/>ctx.digests"]
     digest_core["digest-core<br/>defines digests"]
     digest_extractive["digest-extractive<br/>ctx.digests"]
-    evaluations_core["evaluations-core<br/>defines evaluations"]
-    experiments_core["experiments-core<br/>defines experiments"]
+    landing_core["landing-core<br/>defines landing"]
+    landing_local["landing-local<br/>ctx.landing"]
+    profile_scientific_research["profile-scientific-research"]
     profile_software_development["profile-software-development"]
     worker_sessions["worker-sessions<br/>ctx.workerSessions"]
     workflow["workflow<br/>ctx.workflow"]
@@ -361,7 +415,7 @@ flowchart TB
     resources["resources<br/>ctx.resources"]
     resources_core["resources-core<br/>defines resources"]
     workers["workers<br/>ctx.workers"]
-    workers_core["workers-core<br/>defines workers"]
+    workers_core["workers-core<br/>defines egress, workers"]
   end
   subgraph capabilities ["capabilities"]
     agent_runtime_core["agent-runtime-core<br/>defines agentRuntimes"]
@@ -374,6 +428,7 @@ flowchart TB
     runtime_claude_agent_sdk["runtime-claude-agent-sdk"]
     runtime_codex_sdk["runtime-codex-sdk"]
     turns["turns<br/>ctx.turns"]
+    workers_fake["workers-fake"]
   end
   subgraph provider_runtime ["provider runtime"]
     accounts["accounts<br/>ctx.accounts"]
@@ -388,9 +443,13 @@ flowchart TB
     ui_ops["ui-ops"]
   end
   subgraph kernel ["kernel"]
+    artifacts["artifacts<br/>ctx.artifacts"]
+    event_log["event-log<br/>ctx.eventLog"]
     leases["leases<br/>ctx.leases"]
+    ledger_core["ledger-core<br/>defines artifacts, eventLog, store"]
     plugin_host["plugin-host<br/>ctx.pluginHost"]
     plugin_host_core["plugin-host-core<br/>defines pluginHost"]
+    store["store<br/>ctx.store"]
   end
   subgraph host_and_libraries ["host and libraries"]
     system_bundle["system-bundle"]
@@ -399,55 +458,81 @@ flowchart TB
   agent_runtimes --> agent_runtime_core
   agent_workers --> agent_runtime_core
   agent_workers --> approvals_core
+  agent_workers --> board_core
   agent_workers --> gateway_core
-  agent_workers --> leases
+  agent_workers --> ledger_core
   agent_workers --> provider_core
   agent_workers --> resources_core
   agent_workers --> workers_core
   approvals --> approvals_core
   approvals --> gateway_core
+  approvals --> ledger_core
+  artifacts --> ledger_core
   board --> approvals_core
   board --> board_core
   board --> gateway_core
-  board --> leases
+  board --> ledger_core
   board_core --> approvals_core
   browser_patchright --> provider_core
   cli --> browser_patchright
   cli --> system_bundle
+  decisions --> gateway_core
+  decisions --> ledger_core
+  digest --> board_core
   digest --> digest_core
   digest --> gateway_core
-  digest --> leases
+  digest --> ledger_core
   digest --> workers_core
+  digest_core --> board_core
   digest_core --> gateway_core
+  digest_core --> ledger_core
+  digest_core --> workers_core
+  digest_extractive --> board_core
   digest_extractive --> digest_core
   digest_extractive --> gateway_core
-  digest_extractive --> leases
+  digest_extractive --> ledger_core
   digest_extractive --> workers_core
   display_virtual --> provider_core
-  egress --> provider_core
-  evaluations_core --> experiments_core
+  egress --> ledger_core
+  egress --> workers_core
+  event_log --> ledger_core
   gateway_anthropic --> gateway_core
   gateway_anthropic --> gateway_turns
   gateway_responses --> gateway_core
   gateway_responses --> gateway_turns
   gateway_turns --> gateway_core
+  gateway_turns --> ledger_core
+  landing_local --> landing_core
+  landing_local --> workers_core
+  lead_inbox --> gateway_core
+  lead_inbox --> ledger_core
+  leases --> board_core
+  leases --> ledger_core
   login --> display_virtual
   login --> gateway_core
   login --> provider_core
   mcp_server --> gateway_core
   mcp_server --> plugin_host_core
   mcp_server --> resources_core
+  models --> board_core
   models --> gateway_core
-  models --> leases
+  models --> ledger_core
   models --> models_core
   models --> provider_core
   models --> workers_core
   models_core --> workers_core
   notify --> gateway_core
+  notify --> ledger_core
+  notify --> workers_core
+  plugin_host --> ledger_core
   plugin_host --> plugin_host_core
+  profile_scientific_research --> ledger_core
   profile_software_development --> workers_core
+  profile_software_development --> workflow
+  provider_chatgpt_web --> ledger_core
   provider_chatgpt_web --> provider_core
   provider_chatgpt_web --> ui_ops
+  provider_gemini_web --> ledger_core
   provider_gemini_web --> provider_core
   provider_gemini_web --> ui_ops
   providers --> provider_core
@@ -455,8 +540,10 @@ flowchart TB
   report --> board_core
   report --> digest_core
   report --> gateway_core
+  report --> ledger_core
   report --> resources_core
   resources --> gateway_core
+  resources --> ledger_core
   resources --> resources_core
   runtime_acp --> agent_runtime_core
   runtime_acp --> provider_core
@@ -466,23 +553,33 @@ flowchart TB
   runtime_claude_agent_sdk --> provider_core
   runtime_codex_sdk --> agent_runtime_core
   runtime_codex_sdk --> provider_core
+  store --> ledger_core
+  turn_receipts --> ledger_core
   turn_receipts --> provider_core
+  turns --> board_core
   turns --> gateway_core
-  turns --> leases
+  turns --> ledger_core
   turns --> provider_core
   turns --> workers_core
   ui_ops --> provider_core
   web_ui --> approvals_core
   web_ui --> board_core
   web_ui --> gateway_core
+  web_ui --> ledger_core
   web_ui --> workers_core
   worker_sessions --> gateway_core
+  worker_sessions --> ledger_core
+  workers --> ledger_core
   workers --> workers_core
+  workers_fake --> ledger_core
+  workers_fake --> workers_core
   workflow --> approvals_core
   workflow --> board_core
+  workflow --> decision_core
   workflow --> digest_core
   workflow --> gateway_core
-  workflow --> leases
+  workflow --> landing_core
+  workflow --> ledger_core
   workflow --> provider_core
   workflow --> resources_core
   workflow --> worker_sessions

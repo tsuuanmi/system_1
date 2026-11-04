@@ -10,8 +10,8 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { DatabaseSync } from 'node:sqlite'
-import type { Lease } from '@tsuuanmi/system-leases'
-import type { ContentId } from '@tsuuanmi/system-libs'
+import type { Lease } from '@tsuuanmi/system-board-core'
+import { type ContentId, unique } from '@tsuuanmi/system-libs'
 import { type BrowserTurn, type ConversationMode, type ProviderDriver, ProviderError, type ProviderFeature, type ProviderScheduler, toProviderError } from '@tsuuanmi/system-provider-core'
 
 export type LedgerState = 'live' | 'due' | 'deleted' | 'kept' | 'failed'
@@ -57,7 +57,7 @@ interface LedgerRow {
 }
 
 /** Attempts before a deletion is reported as failed (in health). */
-export const MAX_DELETE_ATTEMPTS = 3
+const MAX_DELETE_ATTEMPTS = 3
 const LEASE_TTL_MS = 60_000
 
 /**
@@ -136,7 +136,7 @@ export function listConversations(db: DatabaseSync, filter: { state?: LedgerStat
  * Called by the session's owner, inside its own transaction when it has one.
  */
 export function releaseSessions(host: LedgerHost, sessionIds: readonly string[], reason: string): { due: number; decision?: ContentId } {
-  const sessions = [...new Set(sessionIds)].sort()
+  const sessions = unique(sessionIds)
   if (!sessions.length) return { due: 0 }
   return host.ctx.store.transaction((db) => {
     const marks = sessions.map(() => '?').join(', ')

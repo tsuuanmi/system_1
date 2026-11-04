@@ -3,7 +3,8 @@
  * preflight validates a DAG before anything runs, and a resolved spec is hashed so a run
  * binds to exactly what was admitted.
  */
-import { BRIEF_LIMITS, type BriefPointer, type BriefSegment, contentId, type ContentId, extractJson } from '@tsuuanmi/system-libs'
+import { BRIEF_LIMITS, type BriefPointer, type BriefSegment, clampText, contentId, type ContentId, extractJson } from '@tsuuanmi/system-libs'
+import type { RiskTier } from '@tsuuanmi/system-approvals-core'
 import { type ArtifactRef, TIERS, type Tier, WORK_KIND } from '@tsuuanmi/system-workers-core'
 
 export interface NodeTemplate {
@@ -17,6 +18,12 @@ export interface NodeTemplate {
   prompt: string
   /** Capabilities the node needs (docs/design/routing.md#capability-vocabulary); routing admits Workers by them. */
   capabilities: string[]
+  /**
+   * Capabilities the node prefers but does not need (T262, `work-requirement@1.3` `prefers`): an
+   * admitted Worker that proves them ranks before one that does not, never a refusal. `research`'s
+   * second review prefers `web-search`, so a Worker that searches takes it before one that only cites.
+   */
+  prefers?: string[]
   /** Minimum tier (REQ-WRK-9). */
   tier: Tier
   /**
@@ -63,11 +70,47 @@ export interface NodeTemplate {
    */
   differentFrom?: string[]
   /**
+   * How firmly `differentFrom` holds. `required` (the default): with no Worker of another family the
+   * step fails closed (ADR-0027), unless the operator's `allowSameFamily` lets it run on one
+   * (ADR-0029). `preferred`: it then runs once on the family of the steps it differs from, in a
+   * conversation of its own, recorded as a `single-family` decision that its later steps and the
+   * run's answer state; the run never fails or waits for the other family (./single-family.ts, D89).
+   */
+  diversity?: 'required' | 'preferred'
+  /**
    * A source step (PROP-0004 Phase 4), run by the engine and no Worker: the caller's repository at
    * one pinned commit, or else the caller's text, as line-numbered files a review quotes. Its
    * result renders as `{{node:<id>}}`.
    */
   snapshot?: true
+  /**
+   * The risk tiers (PROP-0016 §4, ADR-0071) at which a board task's run skips this step: once its
+   * review approved a change of such a tier and every check the policy requires of it passed on its
+   * exact tree, the step is retired before it starts, recorded (`workflow.risk-skip`). Only on the
+   * final step, never at `heavy`; with no path map in the policy, it always runs.
+   */
+  riskSkip?: RiskTier[]
+  /**
+   * On a writing step of a board task's run (T267): it ends with the output of the checks the author
+   * ran, pasted into the task's dossier as an `evidence` entry of its own. A step that completes
+   * without one is refused at its end (`evidence_missing`), nothing after it starts.
+   */
+  showsEvidence?: true
+  /**
+   * On a review step (T267): the author's own review of the change, by the node named (a writing step
+   * it depends on). It runs on that step's account in a conversation of its own, so the author never
+   * reviews in its own transcript, and it is never an independent review: it counts for no tier, no
+   * provider family, and no acceptance (`approvals`, `lastReview`). Its confirmed important findings grow a fix
+   * that continues the author's session, answered before the next review starts.
+   */
+  selfReview?: string
+  /**
+   * On a step that reads the work it is given as text, not a change in a working tree (the scheduled
+   * review's two reviewers, T349b): the engine binds it to no git subject, so it gets no assessment
+   * block and no exact-subject gate. Its caller reads the JSON it answers (`assessment`: a review's, `votes`:
+   * a verifier's): an answer without it is asked once for it, and a second miss fails the step as `assessment_missing`.
+   */
+  unbound?: 'assessment' | 'votes'
 }
 
 /** What a variant may change of a node: what it needs, what kind of work it is, where it runs, and how it is judged. */
@@ -215,6 +258,31 @@ export interface ResolvedNode extends Omit<NodeTemplate, 'callerTier' | 'convers
   /** A re-review's cycle (the first review is cycle 1), and the review node the cycles started from. */
   cycle?: number
   reviewOf?: string
+  /**
+   * On a remediation fix: the review whose blocking findings it fixes. The engine keeps the tree
+   * that review read before the fix runs, and the fix's result after it, each as its own commit of
+   * the run's review history, never moving the worktree's HEAD (docs/design/workflow-engine.md#review-cycles).
+   */
+  fixOf?: string
+  /**
+   * On a remediation fix that continues its author's session (one task, one author session): the
+   * writing step whose session `session.sessionId` is. The fix is that session's next message, on its
+   * Worker; when that Worker cannot take it, it waits within `fixSessionWaitMinutes` or is handed off,
+   * and which path it took is a `workflow.fix-session` decision (docs/design/sessions-and-messaging.md).
+   */
+  author?: { node: string; sessionId: string }
+  /**
+   * On a heavy change's second review (ADR-0071): the approving review it differs from in provider
+   * family (`differentFrom` names it), and the `workflow.risk-tier` decision that grew it. It never
+   * runs on the same family for want of another (`allowSameFamily` does not apply).
+   */
+  secondReview?: { of: string; decision: string }
+  /**
+   * On a verification step (ADR-0075): the review whose important findings it votes on, and the
+   * assessment it read them from. It is bound to that review's exact subject, prefers another provider
+   * family than the review's (`differentFrom`, `diversity: preferred`), and runs in a session of its own.
+   */
+  verifies?: { review: string; assessment: string }
   /** `member` names a team member's identity; the engine issues its session at admission. */
   session: { sessionId?: string; persist?: boolean; member?: string }
   team?: TeamRole
@@ -343,10 +411,29 @@ export function preflight(nodes: readonly NodeTemplate[]): string[] {
       if (typeof node.kind !== 'string' || !WORK_KIND.test(node.kind)) throw new TypeError(`node ${node.nodeId}: kind ${JSON.stringify(node.kind)} is not a kind of work (${WORK_KIND})`)
       if (node.team || node.snapshot) throw new TypeError(`node ${node.nodeId}: a ${node.team ? 'team' : 'source step'} has no kind`)
     }
+    // What a step prefers is capabilities it does not need (T262): 1 to 8 distinct names, none it needs already.
+    if (node.prefers !== undefined) {
+      const prefers: unknown = node.prefers
+      if (!Array.isArray(prefers) || !prefers.length || prefers.length > 8 || !prefers.every(TEXT) || new Set(prefers).size !== prefers.length) throw new TypeError(`node ${node.nodeId}: prefers is a list of 1 to 8 distinct capabilities`)
+      if (prefers.some((c) => node.capabilities.includes(c as string))) throw new TypeError(`node ${node.nodeId}: prefers names a capability it needs already (capabilities)`)
+      if (node.team || node.snapshot) throw new TypeError(`node ${node.nodeId}: a ${node.team ? 'team' : 'source step'} prefers nothing`)
+    }
     if (node.resultSchema !== undefined && !(typeof node.resultSchema === 'string' && /^[a-z][a-z0-9-]*@\d+\.\d+$/.test(node.resultSchema))) {
       throw new TypeError(`node ${node.nodeId}: resultSchema must be a schema tag such as plan@1.0`)
     }
+    if (node.diversity !== undefined && (!['required', 'preferred'].includes(node.diversity) || !node.differentFrom?.length)) {
+      throw new TypeError(`node ${node.nodeId}: diversity is required or preferred, on a node with differentFrom`)
+    }
     for (const dep of node.dependsOn ?? []) if (!byId.has(dep)) throw new TypeError(`node ${node.nodeId} depends on unknown node ${dep}`)
+    if (node.showsEvidence !== undefined && (node.showsEvidence !== true || !node.capabilities.includes('develop') || node.team || node.snapshot)) {
+      throw new TypeError(`node ${node.nodeId}: showsEvidence is true, on a writing step (it needs develop)`)
+    }
+    if (node.selfReview !== undefined) {
+      const author = byId.get(node.selfReview)
+      if (!author || !author.capabilities.includes('develop') || !(node.dependsOn ?? []).includes(node.selfReview) || !node.capabilities.includes('review') || node.capabilities.includes('develop') || node.team || node.differentFrom?.length) {
+        throw new TypeError(`node ${node.nodeId}: selfReview names a writing step it depends on, and a review has no differentFrom (a self-review is the author's own)`)
+      }
+    }
     for (const other of node.differentFrom ?? []) {
       if (other === node.nodeId || !byId.has(other)) throw new TypeError(`node ${node.nodeId} differs from ${other === node.nodeId ? 'itself' : `unknown node ${other}`}`)
       if (byId.get(other)!.team) throw new TypeError(`node ${node.nodeId} differs from team ${other}, which has several Workers`)
@@ -379,7 +466,22 @@ export function preflight(nodes: readonly NodeTemplate[]): string[] {
   const used = new Set(nodes.flatMap((n) => n.dependsOn ?? []))
   const finals = nodes.filter((n) => !used.has(n.nodeId))
   if (finals.length !== 1) throw new TypeError(`a workflow needs exactly one final node, whose result is the run's; found ${finals.map((n) => n.nodeId).join(', ')}`)
+  for (const node of nodes) if (node.riskSkip !== undefined) checkRiskSkip(node, finals[0]!.nodeId)
   return order
+}
+
+/**
+ * A step skipped at a risk tier (ADR-0071) is the final one, so no step ever waits for one that
+ * never runs, and a Worker step that depends on another; it names light or normal, never heavy.
+ */
+function checkRiskSkip(node: NodeTemplate, final: string): void {
+  const tiers: unknown = node.riskSkip
+  if (!Array.isArray(tiers) || !tiers.length || new Set(tiers).size !== tiers.length || !tiers.every((t) => t === 'light' || t === 'normal')) {
+    throw new TypeError(`node ${node.nodeId}: riskSkip is a list of distinct risk tiers, light or normal (a heavy change never skips a step)`)
+  }
+  if (node.nodeId !== final || !(node.dependsOn ?? []).length || node.team || node.grows || node.snapshot) {
+    throw new TypeError(`node ${node.nodeId}: only the final step, a Worker step that depends on another, may be skipped at a risk tier`)
+  }
 }
 
 /** Every node a node waits for, directly or through others. */
@@ -657,12 +759,6 @@ function instructions(from: Instructions = { segments: [], pointers: [] }) {
   }
 }
 
-/** At most `max` characters (code points), cut on a whole character and marked with '…'. */
-export function clampText(text: string, max: number): string {
-  const chars = [...text]
-  return chars.length <= max ? text : `${chars.slice(0, max - 1).join('')}…`
-}
-
 const STEP_ID = /^[a-z0-9][a-z0-9-]{0,40}$/
 
 /**
@@ -710,70 +806,328 @@ export function parsePlan(text: string, planner: string, policy: { maxNodes: num
   return { ok: true, confidence: value.confidence as 'low' | 'medium' | 'high', nodes }
 }
 
+/**
+ * A review finding's severity (ADR-0075): `important` is a real defect of this change (wrong behaviour,
+ * a broken invariant, a security or data risk, a missing required test or doc); `nit` is style,
+ * naming, wording, a small improvement; `pre-existing` is a defect the change did not introduce.
+ */
+export type Severity = 'important' | 'nit' | 'pre-existing'
+export const SEVERITIES: readonly Severity[] = ['important', 'nit', 'pre-existing']
+
+/** The severities of `assessment@1.0`, still read: `blocking` as `important`, `warning` and `info` as `nit`. */
+const LEGACY_SEVERITY: Readonly<Record<string, Severity>> = { blocking: 'important', warning: 'nit', info: 'nit' }
+
+/** A verifier's vote on an important finding: `none` when its answer named no vote for it. */
+export interface Verification { vote: 'confirm' | 'reject' | 'none'; reason: string; node: string; worker?: string }
+
+export interface Finding {
+  /** The finding's id within its review (`f1`, `f2`, …), what a verifier's vote and an author's response name. */
+  id?: string
+  /** `assessment@1.1` writes `important`, `nit`, `pre-existing`; an `assessment@1.0` read back holds `blocking`, `warning`, `info`. */
+  severity: Severity | 'blocking' | 'warning' | 'info'
+  title: string
+  detail?: string
+  file?: string
+  line?: number
+  /** What fails, and how the file and line show it: an `important` or `pre-existing` finding without file, line, and it is a nit. */
+  evidence?: string
+  /** The class of defect (a short name), so the author fixes every instance of it. */
+  class?: string
+  /** Set when the reviewer said `important` or `pre-existing` with no file, line, or evidence: the finding is read as a nit. */
+  demoted?: 'no-evidence'
+  /** The earlier finding (`<review step>#<id>`) already answered that this one repeats: shown, never counted or sent. */
+  repeated?: string
+  /** The verifier's vote on an important finding; only a `confirm` makes it block. */
+  verification?: Verification
+}
+
 export interface Assessment {
   subject: string
+  /** `changes-requested` only while a confirmed important finding stands; one waiting for its verification does not request changes. */
   verdict: 'approve' | 'changes-requested'
-  findings: Array<{ severity: 'blocking' | 'warning' | 'info'; title: string; detail?: string; file?: string }>
+  findings: Finding[]
+  /** The verdict the reviewer wrote, when the engine's reading of the severities changed it. */
+  said?: 'approve' | 'changes-requested'
+  /** From review cycle 3 on: whether the reviewer thinks the approach should change, and why. */
+  approach?: { change: boolean; why: string }
 }
+
+/** Whether a finding blocks: an `important` one a verifier confirmed, or an `assessment@1.0`'s `blocking` one (never verified). */
+export const blocks = (f: Pick<Finding, 'severity' | 'verification' | 'repeated'>): boolean =>
+  !f.repeated && (f.severity === 'blocking' || (f.severity === 'important' && f.verification?.vote === 'confirm'))
+
+/** Whether an important finding still waits for its verification: counted, not yet blocking. */
+export const pendingImportant = (f: Finding): boolean => f.severity === 'important' && !f.repeated && !f.verification
+
+/**
+ * The count a review's summary opens with: `2 important, 3 nits, 1 pre-existing`, or `no issues`. An
+ * important finding a verifier voted on says how many were confirmed; a repeated finding is not counted.
+ */
+export function countOf(findings: readonly Finding[]): string {
+  const live = findings.filter((f) => !f.repeated)
+  const important = live.filter((f) => f.severity === 'important' || f.severity === 'blocking')
+  const nits = live.filter((f) => f.severity === 'nit' || f.severity === 'warning' || f.severity === 'info').length
+  const pre = live.filter((f) => f.severity === 'pre-existing').length
+  const voted = important.filter((f) => f.verification)
+  const confirmed = important.filter((f) => blocks(f)).length
+  const parts = [
+    ...(important.length ? [`${important.length} important${voted.length ? ` (${confirmed} confirmed, ${important.length - confirmed} not)` : ''}`] : []),
+    ...(nits ? [`${nits} nit${nits === 1 ? '' : 's'}`] : []),
+    ...(pre ? [`${pre} pre-existing`] : []),
+  ]
+  return parts.length ? parts.join(', ') : 'no issues'
+}
+
+/** A review's summary: its count first, then what it means for the work. */
+export function summaryOf(assessment: Pick<Assessment, 'findings' | 'verdict' | 'approach'>): string {
+  const repeated = assessment.findings.filter((f) => f.repeated).length
+  const pending = assessment.findings.filter(pendingImportant).length
+  const blocking = assessment.findings.filter(blocks).length
+  const then = blocking ? `${blocking} confirmed important finding${blocking === 1 ? '' : 's'} block${blocking === 1 ? 's' : ''}: the author fixes ${blocking === 1 ? 'it' : 'them'}`
+    : pending ? `${pending} important finding${pending === 1 ? '' : 's'} wait${pending === 1 ? 's' : ''} for verification by a second reviewer`
+      : 'nothing blocks'
+  return clampText([
+    `${countOf(assessment.findings)}; ${then}.`,
+    ...(repeated ? [`${repeated} finding${repeated === 1 ? '' : 's'} repeated one already answered, not counted.`] : []),
+    ...(assessment.approach ? [`Approach: ${assessment.approach.change ? 'should change' : 'should stay'}${assessment.approach.why ? ` (${assessment.approach.why})` : ''}.`] : []),
+  ].join(' '), 2000)
+}
+
+const RANK: Readonly<Record<string, number>> = { important: 0, blocking: 0, 'pre-existing': 1, nit: 2, warning: 2, info: 2 }
+
+/** Findings by severity, as a reader is shown them: important first (confirmed before the rest), then pre-existing, then nits; repeats last. */
+export const bySeverity = <F extends Finding>(findings: readonly F[]): F[] => findings
+  .map((f, i) => ({ f, i }))
+  .sort((a, b) => Number(!!a.f.repeated) - Number(!!b.f.repeated) || (RANK[a.f.severity] ?? 3) - (RANK[b.f.severity] ?? 3) || Number(!blocks(a.f)) - Number(!blocks(b.f)) || a.i - b.i)
+  .map(({ f }) => f)
+
+/** The key two findings share when one repeats the other: its file and its title, lowercased and squeezed. */
+export const findingKey = (f: Pick<Finding, 'title' | 'file'>): string => `${(f.file ?? '').trim()}\0${f.title.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()}`
+
+/** An earlier finding a re-review is shown: open (sent to the fix) or answered (it must not raise again). */
+export interface PriorFinding { review: string; finding: Finding; state: 'open' | 'answered' }
 
 /**
  * What every review bound to an exact subject is told about commands: it reads and judges the change,
- * and never runs the project's tests or builds, which the validation and the run's required checks at
- * acceptance run (ADR-0063). A reviewer often runs read-only, so a command it could not run says
- * nothing about the change: such an environment limit is at most an `info` finding, never a blocking
- * one that would grow a remediation cycle no fix can satisfy.
+ * and never runs the project's tests or builds, which the run's required checks at acceptance run
+ * (ADR-0063), and a writer's own, shown in the task's dossier, before it (T267). A reviewer often runs
+ * read-only, so a command it could not run says nothing about the change: such an environment limit is
+ * at most a `nit`, never an important finding that would grow a remediation cycle no fix can satisfy.
  */
-export const REVIEW_RUNS_NOTHING = 'Read and judge the change: never run the project\'s tests or builds, which the validation and the run\'s required checks run. A command you could not run is no finding about the change; an environment limit (a read-only sandbox, a denied or failing command) is at most an "info" finding, never a "blocking" one.'
+export const REVIEW_RUNS_NOTHING = 'Read and judge the change: never run the project\'s tests or builds, which the run\'s required checks run. A command you could not run is no finding about the change; an environment limit (a read-only sandbox, a denied or failing command) is at most a "nit", never an "important" finding.'
 
-/** The subject block appended to a review bound to an exact subject (REQ-TEAM-5, REQ-WF-5). */
-export function subjectBlock(id: string, workspace: string, head: string, diff: string, request: string): string {
+/**
+ * How a reviewer grades a finding (ADR-0075): the three severities, the evidence an important or
+ * pre-existing finding needs, that only a confirmed important finding asks for a fix, and the class.
+ */
+export const SEVERITY_RULES = [
+  'Grade each finding. "important": a real defect this change introduces (wrong behaviour, a broken invariant, a security or data risk, a missing required test or doc). "nit": style, naming, wording, a small improvement. "pre-existing": a defect the change did not introduce (it becomes a follow-up task, never a fix of this change).',
+  'An important or pre-existing finding names its file and line and its evidence: what fails, and how that line shows it. One without is read as a nit.',
+  'A second reviewer verifies each important finding against the code; only a confirmed one asks the author for a fix. Request changes only for an important finding; nits never hold the change.',
+  'Name a finding\'s class (a short name for the kind of defect) when the same defect may occur elsewhere, so the author fixes every instance of it.',
+].join('\n')
+
+/**
+ * What a re-review is shown of its cycle (docs/design/workflow-engine.md#review-cycles): the subject
+ * the last review read, the change since then (relative to the commit that holds that subject, when
+ * one does), the findings still open and those already answered; the whole change relative to the
+ * commit the first review's change started from only when the change since cannot be shown apart.
+ */
+export interface ReviewCycle {
+  cycle: number
+  previous: { review: string; subject: string }
+  since?: { commit: string; diff: string }
+  whole: { commit: string; diff: string }
+  /** The findings of the earlier reviews of this change: open (sent to the last fix) or answered. */
+  prior?: PriorFinding[]
+}
+
+const diffBlock = (diff: string): string[] => ['```diff', diff || '(no change)', '```']
+
+/** One finding as a line a reviewer, verifier, or author reads: its id, severity, title, place, class, and evidence. */
+export function findingLine(f: Finding, review?: string): string {
+  const place = f.file ? ` (${f.file}${f.line ? `:${f.line}` : ''})` : ''
+  return `- ${review ? `${review}#` : ''}${f.id ? `${f.id} ` : ''}${f.severity}: ${f.title}${place}${f.class ? ` [class: ${f.class}]` : ''}${f.evidence ? `; evidence: ${f.evidence}` : ''}`
+}
+
+/** The cycle at which a re-review is asked whether the approach should change (after the third round). */
+export const APPROACH_CYCLE = 3
+
+/** The subject block appended to a review bound to an exact subject (REQ-TEAM-5, REQ-WF-5); a re-review's shows its cycle. */
+export function subjectBlock(id: string, workspace: string, head: string, diff: string, request: string, cycle?: ReviewCycle): string {
+  const open = cycle?.prior?.filter((p) => p.state === 'open') ?? []
+  const answered = cycle?.prior?.filter((p) => p.state === 'answered') ?? []
+  const change = !cycle
+    ? [`The change relative to commit ${head}, verbatim:`, ...diffBlock(diff)]
+    : [
+      `This is review cycle ${cycle.cycle}. The last review (${cycle.previous.review}) read subject ${cycle.previous.subject}, and its blocking findings were fixed since. Review only what changed since then, and whether each open finding below is fixed: the rest of the change was reviewed already.`,
+      ...(open.length ? ['Open findings (sent to the fix; say whether each is fixed, and raise it again only if it is not):', ...open.map((p) => findingLine(p.finding, p.review))] : []),
+      ...(answered.length ? ['Findings already answered (verified and rejected, nits, pre-existing, or fixed and re-reviewed): never raise them again; one you raise again is not counted:', ...answered.slice(0, 50).map((p) => findingLine(p.finding, p.review))] : []),
+      ...(cycle.since
+        ? [`The change since the subject the last review read (relative to commit ${cycle.since.commit}, which holds it), verbatim:`, ...diffBlock(cycle.since.diff)]
+        : [
+          'The change since the subject the last review read cannot be shown apart: no commit holds that subject.',
+          `The whole change relative to commit ${cycle.whole.commit}, where it started, verbatim:`,
+          ...diffBlock(cycle.whole.diff),
+        ]),
+      ...(cycle.cycle >= APPROACH_CYCLE ? [`This change has been through ${cycle.cycle - 1} rounds of fixes. Say in "approach" whether the approach should change rather than be fixed again, and why.`] : []),
+    ]
+  const approach = cycle && cycle.cycle >= APPROACH_CYCLE ? ', "approach": {"change": true or false, "why": "..."}' : ''
   return [
     '## The exact subject of this review',
     'Review exactly this change against the request. You see none of the producer\'s conversation.',
     REVIEW_RUNS_NOTHING,
+    SEVERITY_RULES,
     `Subject: ${id}`,
     `Workspace: ${workspace}`,
     `Requested change: ${request}`,
-    `The change relative to commit ${head}, verbatim:`,
-    '```diff',
-    diff || '(no change)',
-    '```',
+    ...change,
     'Reply with only a JSON object in a ```json block, naming the subject exactly:',
-    `{"subject": "${id}", "verdict": "approve" or "changes-requested", "findings": [{"severity": "blocking" | "warning" | "info", "title": "...", "detail": "...", "file": "path"}]}`,
+    assessmentShape(id, approach),
   ].join('\n')
 }
 
-/** A reviewer's assessment from its answer, or why it is not one. */
-export function parseAssessment(text: string): { ok: true; assessment: Assessment } | { ok: false; reason: string } {
-  const v = extractJson(text) as Partial<Assessment> | undefined
+/** The JSON an assessment is, as a review is told it. */
+const assessmentShape = (id: string, approach = ''): string =>
+  `{"subject": "${id}", "verdict": "approve" or "changes-requested", "findings": [{"severity": "important" | "nit" | "pre-existing", "title": "...", "file": "path", "line": 12, "evidence": "what fails, and how that line shows it", "class": "the kind of defect", "detail": "..."}]${approach}}`
+
+/**
+ * What a step whose answer missed its JSON is asked once (T349b): what was missing, and exactly the
+ * block it lacks, fenced and last. A verification step passes the first finding's id (its votes);
+ * a review gets the assessment.
+ */
+export function jsonRequest(problem: string, id: string, votesOn?: string): string {
+  return [
+    `Your answer cannot be read: ${problem}.`,
+    'Reply again with only the JSON object it lacks, in a ```json block, the last thing in your answer, naming the subject exactly:',
+    votesOn ? `{"subject": "${id}", "votes": [{"finding": "${votesOn}", "vote": "confirm" | "reject", "reason": "why"}]}` : assessmentShape(id),
+  ].join('\n')
+}
+
+const text = (v: unknown, max: number): string | undefined => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : undefined)
+
+/**
+ * A reviewer's assessment from its answer, or why it is not one. Each finding gets its id and the
+ * engine's reading of its severity (ADR-0075): an `assessment@1.0` severity is read as its new one; an
+ * important or pre-existing finding without a file, a line, and evidence is a nit (`demoted`); one that
+ * repeats a finding already `answered` is marked `repeated`. The verdict is `changes-requested` only
+ * for a finding that already blocks (none, until a verifier confirms one), whatever the reviewer
+ * wrote (`said` keeps that when it differs).
+ */
+export function parseAssessment(answer: string, answered: readonly PriorFinding[] = []): { ok: true; assessment: Assessment } | { ok: false; reason: string } {
+  const v = extractJson(answer) as (Partial<Assessment> & { approach?: unknown }) | undefined
   if (!v) return { ok: false, reason: 'the review has no JSON assessment' }
   if (typeof v.subject !== 'string') return { ok: false, reason: 'the assessment names no subject' }
   if (v.verdict !== 'approve' && v.verdict !== 'changes-requested') return { ok: false, reason: 'the assessment has no verdict (approve or changes-requested)' }
   if (!Array.isArray(v.findings)) return { ok: false, reason: 'the assessment has no findings list' }
-  const findings: Assessment['findings'] = []
-  for (const f of v.findings as Array<Record<string, unknown>>) {
-    if (!f || !['blocking', 'warning', 'info'].includes(f.severity as string) || typeof f.title !== 'string' || !f.title.trim()) {
-      return { ok: false, reason: 'a finding needs a severity (blocking, warning, info) and a title' }
+  const earlier = new Map(answered.map((p) => [findingKey(p.finding), `${p.review}#${p.finding.id ?? '?'}`]))
+  const findings: Finding[] = []
+  for (const f of (v.findings as unknown as Array<Record<string, unknown>>).slice(0, 200)) {
+    const said = f?.severity as string
+    const severity = SEVERITIES.includes(said as Severity) ? said as Severity : LEGACY_SEVERITY[said]
+    if (!f || !severity || typeof f.title !== 'string' || !f.title.trim()) {
+      return { ok: false, reason: 'a finding needs a severity (important, nit, pre-existing) and a title' }
     }
-    findings.push({
-      severity: f.severity as Assessment['findings'][number]['severity'], title: f.title.slice(0, 500),
-      ...(typeof f.detail === 'string' ? { detail: f.detail.slice(0, 8000) } : {}), ...(typeof f.file === 'string' ? { file: f.file.slice(0, 1024) } : {}),
-    })
+    const file = text(f.file, 1024)
+    const evidence = text(f.evidence, 2000)
+    const line = Number.isInteger(f.line) && (f.line as number) >= 1 ? f.line as number : undefined
+    const cls = text(f.class, 100)
+    // A finding without evidence is a nit (ADR-0075): it names no file and line, or says nothing of what fails.
+    const demoted = severity !== 'nit' && (!file || !line || !evidence)
+    const finding: Finding = {
+      id: `f${findings.length + 1}`, severity: demoted ? 'nit' : severity, title: f.title.trim().slice(0, 500),
+      ...(text(f.detail, 8000) ? { detail: text(f.detail, 8000)! } : {}), ...(file ? { file } : {}), ...(line ? { line } : {}),
+      ...(evidence ? { evidence } : {}), ...(cls ? { class: cls } : {}), ...(demoted ? { demoted: 'no-evidence' as const } : {}),
+    }
+    const repeats = earlier.get(findingKey(finding))
+    findings.push(repeats ? { ...finding, repeated: repeats } : finding)
   }
-  return { ok: true, assessment: { subject: v.subject, verdict: v.verdict, findings } }
+  const approach = typeof v.approach === 'object' && v.approach !== null && typeof (v.approach as { change?: unknown }).change === 'boolean'
+    ? { change: (v.approach as { change: boolean }).change, why: text((v.approach as { why?: unknown }).why, 2000) ?? '' } : undefined
+  // Only a confirmed important finding requests changes (ADR-0075): at parse none is confirmed yet
+  // (an assessment@1.0 `blocking` one is read as already blocking), and the verification decides the rest.
+  const verdict = findings.some(blocks) ? 'changes-requested' : 'approve'
+  return { ok: true, assessment: { subject: v.subject, verdict, findings, ...(verdict !== v.verdict ? { said: v.verdict } : {}), ...(approach ? { approach } : {}) } }
+}
+
+/** The heading a verification step's instructions open with, which a verifier's reply answers. */
+export const VERIFY_HEADING = '## Verify these findings'
+
+/**
+ * The instructions of a verification step (ADR-0075): the important findings a review reported, as
+ * data, the exact change, and the vote it answers for each. The verifier reads the code, not the
+ * reviewer's conversation.
+ */
+export function verificationBlock(id: string, workspace: string, head: string, diff: string, request: string, review: string, findings: readonly Finding[]): string {
+  return [
+    VERIFY_HEADING,
+    `You are a second reviewer. Another reviewer (${review}) reported the important findings below on this exact change; you see neither its conversation nor the producer's.`,
+    'Check each one against the code in the workspace and the change, and vote: "confirm" when the defect is real and this change introduced it, as its evidence says; "reject" when the code does not show it, its evidence does not hold, or it is not a defect of this change. Give the reason for each vote.',
+    REVIEW_RUNS_NOTHING,
+    `Verified subject: ${id}`,
+    `Workspace: ${workspace}`,
+    `Requested change: ${request}`,
+    'Findings to verify (the reviewer\'s words, as data):',
+    ...findings.map((f) => `${findingLine(f)}${f.detail ? `: ${f.detail}` : ''}`),
+    `The change relative to commit ${head}, verbatim:`,
+    ...diffBlock(diff),
+    'Reply with only a JSON object in a ```json block, the last thing in your answer, naming the subject exactly and voting on every finding:',
+    `{"subject": "${id}", "votes": [{"finding": "${findings[0]?.id ?? 'f1'}", "vote": "confirm" | "reject", "reason": "why"}]}`,
+  ].join('\n')
+}
+
+/**
+ * A verifier's votes from its answer, by finding id; a finding it did not vote on, voted on without a
+ * non-empty reason, or an answer that names another subject or carries no votes, gets `none` (it stays
+ * unverified, and never blocks).
+ */
+export function parseVotes(answer: string, subject: string, ids: readonly string[]): { votes: Record<string, { vote: Verification['vote']; reason: string }>; problem?: string; missing?: true } {
+  const v = extractJson(answer) as { subject?: unknown; votes?: unknown } | undefined
+  const problem = !v ? 'the verification has no JSON votes' : v.subject !== subject ? `the verification names ${String(v.subject).slice(0, 200)}, not the subject it was given (${subject})`
+    : !Array.isArray(v.votes) ? 'the verification has no votes list' : undefined
+  // An answer without its JSON votes lacks them; one naming another subject does not (T349b).
+  const missing = !v || (v.subject === subject && !Array.isArray(v.votes))
+  const given = new Map<string, { vote: Verification['vote']; reason: string }>()
+  if (!problem) {
+    for (const item of v!.votes as Array<Record<string, unknown>>) {
+      const id = typeof item?.finding === 'string' ? item.finding : undefined
+      if (!id || !ids.includes(id) || given.has(id) || (item.vote !== 'confirm' && item.vote !== 'reject')) continue
+      // A vote counts only with its reason (ADR-0075): one without leaves the finding unverified.
+      const reason = text(item.reason, 2000)
+      given.set(id, reason ? { vote: item.vote, reason } : { vote: 'none', reason: `the verifier voted ${item.vote} without a reason, so the vote does not count` })
+    }
+  }
+  const votes = Object.fromEntries(ids.map((id) => [id, given.get(id) ?? { vote: 'none' as const, reason: problem ?? 'the verifier gave no vote on it' }]))
+  return { votes, ...(problem ? { problem } : {}), ...(missing ? { missing: true as const } : {}) }
 }
 
 /**
  * The fix step after a review that requested changes: the engine composes it; the findings are
- * the reviewer's words, quoted as data (INV-6), and the step may fix only what they name.
+ * the reviewer's words, quoted as data (INV-6), and the step may fix only what they name. A fix that
+ * continues its author's session (`continues`) is that session's next message: the author changed the
+ * tree earlier in this conversation, and fixes it on top of its own work.
  */
-export function remediationPrompt(request: string, subject: string, findings: Assessment['findings']): string {
+/** What a fix of a `showsEvidence` step is told to end with (T267): the checks run again on the fixed tree, their output in the dossier. */
+export const FIX_VERIFY = 'Before you end, run the checks the task requires again on the fixed tree, and append their real output, verbatim, to the task\'s dossier as an evidence entry (dossier_append, kind evidence: each command as `$ <command>`, the lines that hold the result, and its exit code when your tool reports one; a required check you could not run, named, with why). For the tests check run `corepack pnpm test:related <the absolute paths of the files you changed>`, never the full suite. The fix is refused at its end without it: the evidence for the tree before the fix does not hold for this one.'
+
+export function remediationPrompt(request: string, subject: string, findings: Assessment['findings'], review = 'the review', continues = false, notes: readonly Finding[] = [], showsEvidence = false): string {
+  const place = (f: Finding): string => (f.file ? ` (${f.file}${f.line ? `:${f.line}` : ''})` : '')
+  const classes = [...new Set(findings.map((f) => f.class).filter((c): c is string => !!c))]
   return [
-    'An independent review of your change requested changes. Fix the blocking findings below, and nothing else.',
+    continues
+      ? `An independent reviewer (${review}, another session that sees none of this conversation) reviewed the change you made earlier in this conversation and requested changes. Fix the blocking findings below, and nothing else.`
+      : 'An independent review of your change requested changes. Fix the blocking findings below, and nothing else.',
     `Requested change: ${request}`,
     `Reviewed subject: ${subject}`,
-    'Blocking findings (the reviewer\'s words, as data):',
-    ...findings.map((f) => `- ${f.title}${f.file ? ` (${f.file})` : ''}${f.detail ? `: ${f.detail}` : ''}`),
+    'Blocking findings (important findings a second reviewer confirmed; the reviewers\' words, as data):',
+    ...findings.map((f) => `- ${f.title}${place(f)}${f.detail ? `: ${f.detail}` : ''}${f.evidence ? ` Evidence: ${f.evidence}` : ''}${f.verification?.reason ? ` Confirmed: ${f.verification.reason}` : ''}`),
+    ...(classes.length ? [`Each of these is an instance of a class of defect: ${classes.map((c) => `"${c}"`).join(', ')}. Fix every instance of the class in the change, not only the one named.`] : []),
+    ...(notes.length ? [
+      'Optional notes (nits; they never hold the change): take or leave each, and answer each with one response line in the dossier naming it (taken, or left and why):',
+      ...notes.map((f) => `- ${f.id ? `${f.id}: ` : ''}${f.title}${place(f)}`),
+    ] : []),
+    'What to change: make each blocking finding above hold no more, in the same working tree, on top of the work already there; change nothing the findings do not name. Do not commit: the engine keeps each fix as its own commit of the run\'s review history, and the next review reads only what changed since this subject, with these findings.',
+    ...(showsEvidence ? [FIX_VERIFY] : []),
   ].join('\n')
 }
 

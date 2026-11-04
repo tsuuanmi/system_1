@@ -26,7 +26,36 @@ decides nothing, and no model takes part.
   scope's tasks in review waiting `operator-review` as the report is made, the soonest to expire
   first, each with its title, its pending checks, and `expiresAt` (at most 64, the rest counted in
   `reviewsHeldOmitted`), only when there is any; the rendering says how long each has left as of
-  `asOf`, since an unanswered review expires and its task waits for input that nothing revives.
+  `asOf`, since an unanswered review expires and its task waits for input that only a re-opening revives (`board_reopen_review`).
+- **The dispatch advisor in shadow** (PROP-0015 J1, `mcp-report` 1.5, `advice`): choices advised
+  and not (`workflow.dispatch.advised`), dispatched attempts whose outcome was recorded
+  (`workflow.dispatch.outcome`) and how many were advised, D74's 100 attempts, and per question
+  (`accepted`, `limit`, `needs-operator`) the Brier score of the chosen candidate's probability (read
+  from its advice decision's `modelAnswers`) against the recorded label, beside the observed rate and
+  the score of always answering it (`brierScores`, libs); only when there is any.
+- **The maturity metrics** (PROP-0016 §1, I4 part 1, `mcp-report` 1.6,
+  [design](../../../docs/design/maturity-metrics.md)): MCP `metrics` (client scope; `projectId`,
+  `days` default 30, `until`) and `system metrics` read every metric of §1 over a rolling window.
+  Each is measured, with its value, sample, and sources, and marked when only a bound, or not
+  measurable, with why and no value. Then the L3 reading. Beside the report's reads, it reads
+  `workflow.run.started` (with `startedBy`), `workflow.task.landing`, the decisions people made on
+  the runs (`ctx.artifacts.list` by run), and the board's moves to ready. The report's last section,
+  `maturity`, is the same over the 30 days to its end. [`src/metrics.ts`](src/metrics.ts) is pure.
+- **The lead's digest and health table** (PROP-0019 section 2.10, `mcp-report` 1.7): MCP
+  `lead_digest` (client scope; a lead token reaches its own project only; `day`, UTC, default
+  today) and `lead_health`; `system lead digest [--project] [--day]` and `system lead health`.
+  The digest names what landed, what the lead decided on its own token, what waits on the
+  operator (brief and expiry), what failed, and D108's day measures: landed by System and by hand (a
+  first-parent commit on a branch the project landed on that no merged landing names, read with
+  `git log`), lead touches, reruns, red dev (a failed daily check), incidents. A finished day is
+  stored as `lead-digest@1.0` and read back unchanged; today's is read now. The health table has
+  one row per source (dispatch, Workers, quota, notification and lead sinks, live update, landing
+  queue, worktrees, each enforce switch, and each policy file the repository ships for the project
+  against the live policy, [`src/policy-drift.ts`](src/policy-drift.ts), T352:
+  [policy drift](../../../docs/operations/runbooks.md#policy-drift)), each `ok`, `degraded`, or `unknown`; a source not
+  mounted or failing is `unknown`, never `ok` (INV-2). [`src/digest.ts`](src/digest.ts) and
+  [`src/health.ts`](src/health.ts) are pure; [`src/lead.ts`](src/lead.ts) reads. Read-only; the
+  digest's push to a sink at an hour is not built here: it will be its own switch, off.
 - **What a cap counts as 0** (D25, `mcp-report` 1.1,
   [resources](../../../docs/design/resources.md#usage-the-ledger-cannot-count)): per pool and in all,
   the records without token counts, a cost, or turns, and the runs recorded in the period whose
@@ -60,6 +89,8 @@ decides nothing, and no model takes part.
   records (period bounds, scope, waits, attention against the charter, usage per pool, the
   baseline, determinism, the bounds, the rendering, what a cap counts as 0, the agent runs whose
   liveness asked for the operator, the reviews held for the operator);
+  [`tests/metrics.spec.ts`](tests/metrics.spec.ts) checks each maturity metric on a fixture log of
+  30 days, an empty log, and the window's bounds;
   [`tests/pilot.spec.ts`](tests/pilot.spec.ts) runs the `algorithm-development` template on the
   software-development profile's [pilot in miniature](../profile-software-development/tests/pilot.ts)
   and reads what it recorded through the tool: a project's report, the studio's, the same period

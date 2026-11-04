@@ -1,0 +1,355 @@
+{
+  "schema": "autonomy-policy@1.6",
+  "id": "system.policy",
+  "version": 4,
+  "scope": "project",
+  "projectId": "system",
+  "narrows": "studio-default",
+  "rules": [
+    {
+      "actionClass": "merge",
+      "mode": "ask",
+      "note": "an accepted result lands on the operator's merge approval (D56, ADR-0060); this policy is here for its path map"
+    }
+  ],
+  "default": "ask",
+  "expiry": {
+    "defaultSeconds": 86400,
+    "maxSeconds": 1209600
+  },
+  "commandRules": [
+    { "id": "read-cat", "program": "cat", "positionals": [{ "kind": "path", "scope": "repository-read", "min": 1, "max": 20 }], "note": "reads files inside the run's worktree or its repository" },
+    { "id": "read-head", "program": "head", "countFlag": true, "options": [{ "name": "-n", "kind": "number", "atMost": 100000 }], "positionals": [{ "kind": "path", "scope": "repository-read", "min": 1, "max": 20 }], "note": "the first lines of files inside the run's worktree or its repository" },
+    { "id": "read-tail", "program": "tail", "countFlag": true, "options": [{ "name": "-n", "kind": "number", "atMost": 100000 }], "positionals": [{ "kind": "path", "scope": "repository-read", "min": 1, "max": 20 }], "note": "the last lines of files inside the run's worktree or its repository" },
+    { "id": "read-wc", "program": "wc", "flags": ["-l"], "required": ["-l"], "positionals": [{ "kind": "path", "scope": "repository-read", "min": 1, "max": 20 }], "note": "counts the lines of files inside the run's worktree or its repository" },
+    { "id": "read-ls", "program": "ls", "flagLetters": "1alAhRF", "positionals": [{ "kind": "path", "scope": "repository-read", "max": 20 }], "note": "lists directories inside the run's worktree or its repository" },
+    {
+      "id": "read-grep", "program": "grep", "flagLetters": "rniwlcEFHo",
+      "options": [{ "name": "-m", "kind": "number", "atMost": 100000 }, { "name": "-A", "kind": "number", "atMost": 1000 }, { "name": "-B", "kind": "number", "atMost": 1000 }, { "name": "-C", "kind": "number", "atMost": 1000 }],
+      "positionals": [{ "kind": "word", "min": 1, "max": 1 }, { "kind": "path", "scope": "repository-read", "min": 1, "max": 20 }],
+      "note": "searches files for a pattern word, inside the run's worktree or its repository"
+    },
+    {
+      "id": "read-grep-e", "program": "grep", "flagLetters": "rniwlcEFHo", "required": ["-e"],
+      "options": [{ "name": "-e", "kind": "word" }, { "name": "-m", "kind": "number", "atMost": 100000 }, { "name": "-A", "kind": "number", "atMost": 1000 }, { "name": "-B", "kind": "number", "atMost": 1000 }, { "name": "-C", "kind": "number", "atMost": 1000 }],
+      "positionals": [{ "kind": "path", "scope": "repository-read", "min": 1, "max": 20 }],
+      "note": "searches files for each -e pattern word, inside the run's worktree or its repository"
+    },
+    {
+      "id": "read-rg", "program": "rg", "flagLetters": "niwlcFHo",
+      "options": [{ "name": "-m", "kind": "number", "atMost": 100000 }, { "name": "-A", "kind": "number", "atMost": 1000 }, { "name": "-B", "kind": "number", "atMost": 1000 }, { "name": "-C", "kind": "number", "atMost": 1000 }, { "name": "-g", "kind": "word" }, { "name": "-t", "kind": "word", "pattern": "^[A-Za-z0-9_]+$" }],
+      "positionals": [{ "kind": "word", "min": 1, "max": 1 }, { "kind": "path", "scope": "repository-read", "min": 1, "max": 20 }],
+      "note": "searches files for a pattern word, inside the run's worktree or its repository"
+    },
+    {
+      "id": "read-rg-e", "program": "rg", "flagLetters": "niwlcFHo", "required": ["-e"],
+      "options": [{ "name": "-e", "kind": "word" }, { "name": "-m", "kind": "number", "atMost": 100000 }, { "name": "-A", "kind": "number", "atMost": 1000 }, { "name": "-B", "kind": "number", "atMost": 1000 }, { "name": "-C", "kind": "number", "atMost": 1000 }, { "name": "-g", "kind": "word" }, { "name": "-t", "kind": "word", "pattern": "^[A-Za-z0-9_]+$" }],
+      "positionals": [{ "kind": "path", "scope": "repository-read", "min": 1, "max": 20 }],
+      "note": "searches files for each -e pattern word, inside the run's worktree or its repository"
+    },
+    { "id": "read-echo", "program": "echo", "positionals": [{ "kind": "any", "max": 40 }], "note": "prints its words" },
+    { "id": "read-pwd", "program": "pwd", "note": "prints the working directory" },
+    { "id": "read-true", "program": "true", "note": "does nothing, succeeds" },
+    { "id": "read-false", "program": "false", "note": "does nothing, fails" },
+    { "id": "read-sleep", "program": "sleep", "positionals": [{ "kind": "number", "atMost": 99, "min": 1, "max": 1 }], "note": "waits at most 99 seconds" },
+    { "id": "read-node-version", "program": "node", "words": ["--version"], "note": "prints node's version" },
+    { "id": "read-pnpm-version", "program": "pnpm", "words": ["--version"], "note": "prints pnpm's version" },
+    {
+      "id": "git-status", "program": "git", "words": ["status"], "flags": ["--short", "-s", "--porcelain", "-uall", "-uno", "--ignored"],
+      "options": [{ "name": "--untracked-files=", "kind": "word", "oneOf": ["all", "no"] }],
+      "note": "the run's worktree status"
+    },
+    {
+      "id": "git-diff", "program": "git", "words": ["diff"], "flags": ["--stat", "--name-only", "--cached", "--name-status", "--"],
+      "positionals": [{ "kind": "revision", "max": 2 }, { "kind": "path", "scope": "repository-read", "max": 20 }],
+      "note": "differences between revisions, the index, and the worktree"
+    },
+    {
+      "id": "git-log", "program": "git", "words": ["log"], "flags": ["--oneline", "--stat", "--name-only", "--all", "--"], "countFlag": true,
+      "options": [
+        { "name": "-n", "kind": "number", "atMost": 100000 }, { "name": "--format=", "kind": "any", "pattern": "^[A-Za-z0-9%:,._-]+$" },
+        { "name": "--grep=", "kind": "word" }, { "name": "--author=", "kind": "word" }, { "name": "--since=", "kind": "word" }, { "name": "--until=", "kind": "word" }
+      ],
+      "positionals": [{ "kind": "revision", "max": 2 }, { "kind": "path", "scope": "repository-read", "max": 20 }],
+      "note": "the history of revisions and paths"
+    },
+    {
+      "id": "git-show", "program": "git", "words": ["show"], "flags": ["--stat", "--name-only"],
+      "options": [{ "name": "--format=", "kind": "any", "pattern": "^[A-Za-z0-9%:,._-]+$" }],
+      "positionals": [{ "kind": "revision", "max": 2 }, { "kind": "revision-path", "max": 2 }],
+      "note": "a revision, or a file of a revision"
+    },
+    { "id": "git-branch", "program": "git", "words": ["branch"], "flags": ["-a", "-r", "--show-current", "-v", "-vv"], "note": "lists branches" },
+    {
+      "id": "git-grep", "program": "git", "words": ["grep"], "flagLetters": "niwlcEF",
+      "positionals": [{ "kind": "word", "min": 1, "max": 1 }, { "kind": "path", "scope": "repository-read", "max": 20 }],
+      "note": "searches tracked files for a pattern word"
+    },
+    {
+      "id": "git-grep-e", "program": "git", "words": ["grep"], "flagLetters": "niwlcEF", "required": ["-e"],
+      "options": [{ "name": "-e", "kind": "word" }],
+      "positionals": [{ "kind": "path", "scope": "repository-read", "max": 20 }],
+      "note": "searches tracked files for each -e pattern word"
+    },
+    { "id": "git-ls-files", "program": "git", "words": ["ls-files"], "positionals": [{ "kind": "path", "scope": "repository-read", "max": 20 }], "note": "lists tracked files" },
+    { "id": "git-rev-parse", "program": "git", "words": ["rev-parse"], "flags": ["--show-toplevel", "--abbrev-ref", "--short", "--verify"], "positionals": [{ "kind": "revision", "max": 4 }], "note": "names revisions" },
+    { "id": "git-merge-base", "program": "git", "words": ["merge-base"], "flags": ["--is-ancestor", "-a", "--all"], "positionals": [{ "kind": "revision", "min": 2, "max": 4 }], "note": "the common ancestor of revisions" },
+    {
+      "id": "test-vitest-run", "program": "corepack", "words": ["pnpm", "vitest", "run"],
+      "options": [{ "name": "--reporter=", "kind": "word", "oneOf": ["dot", "default", "verbose", "basic"] }],
+      "positionals": [{ "kind": "path", "scope": "test-target", "min": 1, "max": 20 }],
+      "note": "the run's own test files or tests directories, never the whole suite (the checks run it)"
+    },
+    {
+      "id": "test-vitest-exec-run", "program": "corepack", "words": ["pnpm", "exec", "vitest", "run"],
+      "options": [{ "name": "--reporter=", "kind": "word", "oneOf": ["dot", "default", "verbose", "basic"] }],
+      "positionals": [{ "kind": "path", "scope": "test-target", "min": 1, "max": 20 }],
+      "note": "the run's own test files or tests directories, never the whole suite (the checks run it)"
+    },
+    {
+      "id": "check-script", "program": "corepack", "words": ["pnpm"], "flags": ["-s"],
+      "positionals": [{ "kind": "word", "min": 1, "max": 1, "pattern": "^(lint|typecheck|check(:[a-z0-9-]+)?)$" }],
+      "note": "the repository's read-only checks"
+    },
+    { "id": "test-related", "program": "corepack", "words": ["pnpm", "test:related"], "positionals": [{ "kind": "path", "scope": "run-worktree", "min": 1, "max": 64 }], "note": "the tests that relate to files of the run's worktree (T299)" },
+    { "id": "edit-git-mv", "program": "git", "words": ["mv"], "positionals": [{ "kind": "path", "scope": "run-worktree", "min": 2, "max": 2 }], "note": "moves a path of the run's own tree" },
+    { "id": "edit-git-rm", "program": "git", "words": ["rm"], "flagLetters": "rq", "positionals": [{ "kind": "path", "scope": "run-worktree", "min": 1, "max": 20 }], "note": "removes paths of the run's own tree" },
+    { "id": "edit-pnpm-install", "program": "corepack", "words": ["pnpm", "install"], "flags": ["--offline", "--frozen-lockfile"], "required": ["--offline"], "note": "installs dependencies in the worktree from the offline store" },
+    { "id": "scratch-rm", "program": "rm", "positionals": [{ "kind": "path", "scope": "scratch-file", "min": 1, "max": 20 }], "note": "removes the run's own untracked scratch files" },
+    {
+      "id": "test-vitest-run-options", "program": "corepack", "words": ["pnpm", "vitest", "run"], "enforce": "warn",
+      "flags": ["--silent"],
+      "options": [
+        { "name": "--reporter=", "kind": "word", "oneOf": ["dot", "default", "verbose", "basic", "json"] },
+        { "name": "--silent=", "kind": "word", "oneOf": ["true", "false"] },
+        { "name": "--exclude=", "kind": "path", "scope": "run-worktree", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./-]*$" },
+        { "name": "--outputFile=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.dot=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.default=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.verbose=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.basic=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.json=", "kind": "path", "scope": "run-worktree" }
+      ],
+      "positionals": [{ "kind": "path", "scope": "test-target", "min": 1, "max": 60 }],
+      "note": "the run's own test files or tests directories, never the whole suite, with a reporter, --silent, --exclude, and --outputFile inside the worktree (T326)"
+    },
+    {
+      "id": "test-vitest-exec-run-options", "program": "corepack", "words": ["pnpm", "exec", "vitest", "run"], "enforce": "warn",
+      "flags": ["--silent"],
+      "options": [
+        { "name": "--reporter=", "kind": "word", "oneOf": ["dot", "default", "verbose", "basic", "json"] },
+        { "name": "--silent=", "kind": "word", "oneOf": ["true", "false"] },
+        { "name": "--exclude=", "kind": "path", "scope": "run-worktree", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./-]*$" },
+        { "name": "--outputFile=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.dot=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.default=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.verbose=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.basic=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.json=", "kind": "path", "scope": "run-worktree" }
+      ],
+      "positionals": [{ "kind": "path", "scope": "test-target", "min": 1, "max": 60 }],
+      "note": "the same, run through pnpm exec (T326)"
+    },
+    {
+      "id": "test-related-options", "program": "corepack", "words": ["pnpm", "test:related"], "enforce": "warn",
+      "flags": ["--", "--silent"],
+      "options": [
+        { "name": "--reporter=", "kind": "word", "oneOf": ["dot", "default", "verbose", "basic", "json"] },
+        { "name": "--silent=", "kind": "word", "oneOf": ["true", "false"] },
+        { "name": "--exclude=", "kind": "path", "scope": "run-worktree", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./-]*$" },
+        { "name": "--outputFile=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.dot=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.default=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.verbose=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.basic=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.json=", "kind": "path", "scope": "run-worktree" }
+      ],
+      "positionals": [{ "kind": "path", "scope": "run-worktree", "min": 1, "max": 60 }],
+      "note": "the tests that relate to files of the run's worktree, with vitest's reporter, --silent, --exclude, and --outputFile after -- (T326)"
+    },
+    {
+      "id": "test-related-silent-options", "program": "corepack", "words": ["pnpm", "-s", "test:related"], "enforce": "warn",
+      "flags": ["--", "--silent"],
+      "options": [
+        { "name": "--reporter=", "kind": "word", "oneOf": ["dot", "default", "verbose", "basic", "json"] },
+        { "name": "--silent=", "kind": "word", "oneOf": ["true", "false"] },
+        { "name": "--exclude=", "kind": "path", "scope": "run-worktree", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./-]*$" },
+        { "name": "--outputFile=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.dot=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.default=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.verbose=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.basic=", "kind": "path", "scope": "run-worktree" },
+        { "name": "--outputFile.json=", "kind": "path", "scope": "run-worktree" }
+      ],
+      "positionals": [{ "kind": "path", "scope": "run-worktree", "min": 1, "max": 60 }],
+      "note": "the same, with pnpm's -s (T326)"
+    }
+  ],
+  "webAccess": {
+    "version": 1,
+    "rules": [
+      {
+        "profile": "research",
+        "tools": ["WebSearch", "WebFetch"],
+        "maxWebCallsPerRun": 40,
+        "maxClassification": "operator-shared",
+        "note": "research's literature reviews search and fetch the web (D91, T262, ADR-0074): a research role's web call runs unasked when the egress check passes on its query or URL, at most 40 per run; past that, or refused, it asks. Effective only once the studio policy grants it too, each through a policy-change approval"
+      }
+    ]
+  },
+  "riskTiers": {
+    "version": 1,
+    "rules": [
+      {
+        "tier": "light",
+        "note": "documentation, proposals, and research: read by people and Workers, run by nothing",
+        "paths": ["docs/", "README.md", "**/README.md", "CONTRIBUTING.md", "SECURITY.md"]
+      },
+      {
+        "tier": "light",
+        "note": "changesets: release notes",
+        "paths": [".changeset/"]
+      },
+      {
+        "tier": "heavy",
+        "note": "ADRs and invariants: the constitution (handbook layer 1)",
+        "paths": ["docs/decisions/adr/", "docs/architecture/invariants.md"]
+      },
+      {
+        "tier": "heavy",
+        "note": "this policy and its path map: changed only through a policy-change approval (ADR-0041)",
+        "paths": ["policies/"]
+      },
+      {
+        "tier": "heavy",
+        "note": "the gate and approvals: the autonomy policy, the approval queue, the tool gates, the board's acceptance gate and auto-accept, and the landing seam that merges an accepted result",
+        "paths": [
+          "packages/approvals-core/",
+          "packages/plugins/approvals/",
+          "packages/board-core/",
+          "packages/plugins/board/",
+          "packages/landing-core/",
+          "packages/plugins/landing-local/",
+          "packages/plugins/workflow/src/acceptance.ts",
+          "packages/plugins/workflow/src/checks.ts",
+          "packages/plugins/workflow/src/queue.ts",
+          "packages/plugins/workflow/src/continuations.ts",
+          "packages/plugins/workflow/src/landings.ts",
+          "packages/plugins/workflow/src/review.ts",
+          "packages/plugins/workflow/src/risk.ts",
+          "packages/plugins/workflow/src/tasks.ts"
+        ]
+      },
+      {
+        "tier": "heavy",
+        "note": "dispatch and routing: which Worker takes which work, and what starts on its own",
+        "paths": [
+          "packages/workers-core/",
+          "packages/plugins/workers/",
+          "packages/plugins/workers-fake/",
+          "packages/decision-core/",
+          "packages/plugins/workflow/src/dispatch.ts",
+          "packages/plugins/workflow/src/advisor.ts"
+        ]
+      },
+      {
+        "tier": "heavy",
+        "note": "confinement and credentials: sandboxes, the workspace reads server, egress, the credential vault, and sign-ins",
+        "paths": [
+          "packages/agent-runtime-core/",
+          "packages/plugins/agent-runtimes/",
+          "packages/plugins/agent-workers/",
+          "packages/plugins/runtime-acp/",
+          "packages/plugins/runtime-antigravity-cli/",
+          "packages/plugins/runtime-claude-agent-sdk/",
+          "packages/plugins/runtime-codex-sdk/",
+          "packages/plugins/credentials-vault/",
+          "packages/plugins/egress/",
+          "packages/plugins/login/",
+          "packages/plugins/accounts/",
+          "packages/libs/src/secrets.ts",
+          "scripts/check-secrets.ts"
+        ]
+      },
+      {
+        "tier": "heavy",
+        "note": "the ledger's guarantees: the store, the artifacts and decisions of record, the event log, and the resource ledger",
+        "paths": [
+          "packages/ledger-core/",
+          "packages/plugins/store/",
+          "packages/plugins/artifacts/",
+          "packages/plugins/event-log/",
+          "packages/resources-core/",
+          "packages/plugins/resources/"
+        ]
+      },
+      {
+        "tier": "heavy",
+        "note": "store migrations and schema majors: a record's shape changes for every reader",
+        "paths": [
+          "**/migrations.ts",
+          "**/migrations/",
+          "scripts/check-migrations.ts",
+          "schemas/*.v2.json",
+          "schemas/*.v3.json",
+          "schemas/*.v4.json",
+          "schemas/*.v5.json",
+          "schemas/*.v6.json",
+          "schemas/*.v7.json",
+          "schemas/*.v8.json",
+          "schemas/*.v9.json"
+        ]
+      },
+      {
+        "tier": "heavy",
+        "note": "the invariants' own checks: the architecture test and the conformance and crash suites every provider of a guarantee seam must pass",
+        "paths": ["scripts/architecture.spec.ts", "**/conformance/", "**/tests/crash/"]
+      },
+      {
+        "tier": "normal",
+        "note": "a capability package: source, tests, and configuration",
+        "paths": [
+          "packages/cli/",
+          "packages/digest-core/",
+          "packages/gateway-core/",
+          "packages/gateway-turns/",
+          "packages/libs/",
+          "packages/models-core/",
+          "packages/plugin-host-core/",
+          "packages/provider-core/",
+          "packages/system-bundle/",
+          "packages/ui-ops/",
+          "packages/plugins/browser-patchright/",
+          "packages/plugins/digest/",
+          "packages/plugins/digest-extractive/",
+          "packages/plugins/display-virtual/",
+          "packages/plugins/gateway-anthropic/",
+          "packages/plugins/gateway-responses/",
+          "packages/plugins/leases/",
+          "packages/plugins/mcp-server/",
+          "packages/plugins/models/",
+          "packages/plugins/notify/",
+          "packages/plugins/lead-inbox/",
+          "packages/plugins/decisions/",
+          "packages/plugins/plugin-host/",
+          "packages/plugins/profile-scientific-research/",
+          "packages/plugins/profile-software-development/",
+          "packages/plugins/provider-chatgpt-web/",
+          "packages/plugins/provider-gemini-web/",
+          "packages/plugins/providers/",
+          "packages/plugins/report/",
+          "packages/plugins/turn-receipts/",
+          "packages/plugins/turns/",
+          "packages/plugins/web-ui/",
+          "packages/plugins/worker-sessions/",
+          "packages/plugins/workflow/"
+        ]
+      },
+      {
+        "tier": "normal",
+        "note": "the repository's tooling, dependency patches, schemas' minor versions, and root configuration",
+        "paths": ["scripts/", "schemas/", "patches/", ".github/", "*.json", "*.yaml", "*.ts", ".*", "AGENTS.md"]
+      }
+    ]
+  }
+}

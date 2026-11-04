@@ -158,7 +158,7 @@
   check never sees another's); the tree is captured again after it as proof. A check passes only on
   a command its launcher positively executed (the exec itself acknowledged, not a lookup on
   `PATH`); one never executed (an interpreter its `#!` names that is missing among them), or a
-  nonzero exit whose command reports (on `SYSTEM_CHECK_REPORT_FD`) a nested bubblewrap refused, is an infrastructure `error`, held for the operator, never a failure that sends the work
+  nonzero exit whose command reports (in the report file `SYSTEM_CHECK_REPORT_PATH` names) a nested bubblewrap refused, is an infrastructure `error`, held for the operator, never a failure that sends the work
   back; no probe of the host turns another check's nonzero exit into an `error`. Each check's
   outcome is stored on its subject, argv, and setup before the acceptance is decided and reused
   after a restart; one a crash interrupted, or a stop (a lost lease) killed, is an `error`, and one
@@ -316,7 +316,7 @@
       alias named `echo` or `cat` in `~/.bashrc`, `~/.bash_profile`,
       `~/.profile`, a `BASH_ENV` or `ENV` file, or an exported function
       (`BASH_FUNC_echo%%`) would run instead, on a later call the gate passed as
-      a read (T197, T198). The gate therefore takes a `Bash` call for a read
+      a read. The gate therefore takes a `Bash` call for a read
       only for a runtime that enforces, in the shell that actually runs each
       call, a non-login, non-interactive shell with no startup file and no
       startup variable (`bash --norc --noprofile`, no `BASH_ENV` or `ENV`), a
@@ -343,34 +343,96 @@
       startup file a call can reach, and the next call's `echo` and `cat`,
       plain, login, and interactive, are the real ones. That still does not
       earn `cleanShells`: the shell program itself is the call's to pick;
-    - so a Codex Worker reads without a shell (T200b): every run registers
+    - so a Codex Worker reads without a shell: every run registers
       System's own workspace reads server (`agent-runtime-core`,
       [the workspace reads server](../design/agent-runtimes.md#the-workspace-reads-server)),
-      whose three tools (`read_file`, `list_dir`, `search`) the gate classifies
+      whose tools (`read_file`, `list_dir`, `search`, and the git views of
+      below) the gate classifies
       as `read` by their MCP names (`mcp__workspace__…`), only for a run whose
       runtime reports that it gives its agent that server (`workspaceReads`
       evidence; elsewhere every `mcp__workspace__…` tool is denied, so a
       server of that name System did not start is never taken for reads); any
-      other tool name of that server is denied. They are reads because they run no program: the
+      other tool name of that server is denied. They are reads because they run no program but
+      git, run read-only as below: the
       server is Node built-ins only, searches in a thread of its own (killed at
-      its deadline), and runs no shell, git, or subprocess. Codex starts it
+      its deadline), and runs no shell, and no subprocess but git. Codex starts it
       outside its own sandbox, so the server confines itself: a bubblewrap of
       its own nested in the run's read confinement, the host and the workspace
       read-only, no network, its root fixed by its arguments (MCP Roots are
       ignored, and it sends the client no request). Its path checks are a
       second layer: every path is resolved with `realpath` and must stay in the
       workspace (`..`, an absolute path outside, and a symlink out are
-      refused), git's data and secret-named files (`.env`, keys, credentials)
-      are never read, and each file is opened without following a final link
-      and checked again by what its descriptor names (`/proc/self/fd`). Every
-      bound (bytes, entries, matches, files, line and pattern length, the
-      search deadline) is configuration with a validated range. A call Codex
+      refused), git's data (a bare `*.git` repository too) and secret-named
+      files (`.env`, `.envrc`, keys, credentials, `.pgpass`, Terraform
+      variables and state, `kubeconfig`, `.aws`, `.docker`, and `.kube`
+      credentials) are never read, nor a file the workspace's own
+      `.gitignore` files ignore whose name holds a secret's word (token,
+      secret, password, private, API key; patterns matched in bounded time
+      without backtracking, and an ignore file too long to read whole, or a
+      call past its matching budget, counting as ignoring such a name), and
+      each file is opened without
+      following a final link and checked again by what its descriptor names
+      (`/proc/self/fd`). A file with more than one hard link is not read
+      (a hard link is another file under another name: a `.env`, or a file
+      outside the workspace on its filesystem), except under `node_modules`,
+      where pnpm links its store; a file linked there is bounded only by the
+      read confinement. These are names, not contents: a secret in a file
+      named like no secret, or ignored only by git's global excludes, is
+      read (the residual gap; the read confinement keeps the host's secrets
+      out). Every bound (bytes, entries, matches, files, line and pattern
+      length, the search deadline) is configuration with a validated range;
+      a directory is read one entry at a time and no further than
+      10 x `maxEntries`, and a search's thread has a heap bounded by
+      `maxScanBytes` (`resourceLimits`), so neither a huge directory nor a
+      large tree exhausts the server's memory. A call Codex
       reports for it passes the hook like any other, and an MCP item no allowed
       call accounts for stops the run. Not covered: that Codex 0.164 runs the
       PreToolUse hook on an MCP tool and names it `mcp__workspace__<tool>`
       rests on the runtime's item accounting, not on the probe's turn, which
       calls no MCP tool (a hook that did not run stops the run, after one
       read); and what a read returns reaches the model, as any read does;
+    - so a Worker reads git history without a shell: the same server's
+      `git_log`, `git_show`, `git_diff`, and `git_status`, which the gate
+      classifies as `read` only as it does the server's other tools, and only
+      when every commit they name is a hex id and every path is inside the
+      workspace and not git's data. The threat is a git read command running
+      a program its repository's configuration names (`.git/config` is not
+      the agent's to write, but a repository can arrive so configured). Per
+      git-config(1), gitattributes(5), and githooks(5), on `log`, `show`,
+      `diff`, and `status` that can be: `core.fsmonitor` (a hook run to ask
+      what changed), the pager, `diff.external` and a diff driver's
+      `command`, a driver's `textconv`, `gpg.program` (`log.showSignature`), a
+      transport's programs on a partial clone's lazy fetch (`core.sshCommand`,
+      credential helpers), a submodule's own git, and filter drivers:
+      contrary to "filters only on checkout", a `clean` (or `process`) filter
+      runs whenever git reads a worktree file to compare or diff it, so on
+      `status` and a worktree `diff`. Hooks are not run by these commands
+      (`post-index-change` only when the index is written). The server runs
+      git with an argv it builds (no shell; commits only as hex ids; paths
+      checked as for `read_file`, then given after `--` as literal pathspecs)
+      and turns each of these off: `-c core.fsmonitor= -c core.pager=cat
+      -c core.hooksPath=/dev/null -c diff.external= -c core.attributesFile=/dev/null`,
+      `log.showSignature=false`, `protocol.allow=never`, the submodule
+      settings, `--no-pager`, `--no-optional-locks`, `--no-ext-diff`,
+      `--no-textconv`, `--no-show-signature`, `--ignore-submodules=all`, and
+      every filter driver the repository's configuration names (read with
+      `git config`, which runs nothing) with an empty `clean`, `smudge`, and
+      `process` and `required` false. Its environment is its own:
+      `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
+      `GIT_TERMINAL_PROMPT=0`, `GIT_NO_LAZY_FETCH=1`, the repository found
+      only at the workspace's root, its worktree the workspace (over any
+      `core.worktree`). Each view is bounded in bytes (`maxGitBytes`), commits
+      (`maxLogCount`), and time (`gitTimeoutMs`, the whole process group
+      killed past it), and files named as secrets are left out of every stat,
+      patch, and status. A test repository whose `.git/config` names an
+      fsmonitor, a clean and a process filter, a textconv, a diff command, and
+      an external diff, each a script leaving a marker, is shown to run them
+      under plain git and none of them through the views. Not covered: a
+      program-running setting a later git adds; a commit message or file
+      content, which reaches the model as any read does; and a linked
+      worktree whose git directory lies under a path the run's read
+      confinement hides: the server sees none of it, so there the views
+      answer that git failed (no runtime binds that directory back yet);
     - a process inside Codex's sandbox that could read the socket's path cannot
       present the key, and the gate only answers: no call runs because of it;
   - ACP agents (`runtime-acp`): the client side enforces the policy. Every
@@ -402,7 +464,7 @@
     [ADR-0043](../decisions/adr/0043-antigravity-cli-workers-gated-on-a-version-verified-live.md)).
     An agy upgrade is unverified until checked the same way. Not covered: the
     version check trusts that one agy version runs its hooks the same on every
-    host; the check covered `gemini-3.8-flash`'s file tools, and another
+    host; the check covered its economy model's file tools, and another
     model's tools are denied, not proven; and the token is no secret from the agent's own processes, which
     share the run's user and namespaces (they can reach only the gate's
     questions, never run a call).
@@ -436,7 +498,7 @@
   Worker may write or `validate`; the release checklist verifies the sandbox
   Claude Code itself starts, live. Each command still passes the tool gate by its
   exact argv, so a shell metacharacter is forbidden and an unlisted command asks
-  the operator. No `Bash` call is a read (T198): Claude Code starts its Bash
+  the operator. No `Bash` call is a read: Claude Code starts its Bash
   tool's shells its own way and runs each command after sourcing a shell
   snapshot kept in its home, so it does not report `cleanShells`, and even the
   fixed inspection commands and the probes that can do nothing are each the
@@ -589,7 +651,7 @@
   home-directory encryption is a **deployment precondition** for hosts holding
   private data: application-level encryption of the store would not help against
   the same user, who holds the key, and SQLCipher does not work with
-  `node:sqlite` ([PROP-0003](../proposals/0003-production-readiness.md#m6a-security-hardening)).
+  `node:sqlite` (PROP-0003).
 - **The vault key read together with the vault.** By default the key sits beside
   the vault, so anyone who can read the account reads both. The key can live
   elsewhere (`keyFile`: another volume or a systemd credential); a key outside the

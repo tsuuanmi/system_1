@@ -8,13 +8,17 @@
  * at start, resolving the pointers there (INV-12). No execution starts on instructions that leave a
  * template's placeholder unfilled (`instructionsProblem`, INV-2).
  */
-import type { Lease } from '@tsuuanmi/system-leases'
-import { type Brief, type BriefBudgetLine, type BriefCheck, type BriefFile, BRIEF_LIMITS, type BriefPointer, NO_LOCAL_SANDBOX, QUESTION_LIMITS, renderBrief } from '@tsuuanmi/system-libs'
+import type { Lease } from '@tsuuanmi/system-board-core'
+import { type Brief, type BriefBudgetLine, type BriefCheck, type BriefFile, BRIEF_LIMITS, type BriefPointer, clampText, NO_LOCAL_SANDBOX, QUESTION_LIMITS, renderBrief } from '@tsuuanmi/system-libs'
 import { dispositionOf } from '@tsuuanmi/system-provider-core'
-import type { ArtifactRef, WorkerSandbox, WorkRequirement } from '@tsuuanmi/system-workers-core'
+import type { ArtifactRef, Tier, WorkerSandbox, WorkRequirement } from '@tsuuanmi/system-workers-core'
+import { landingTargets } from './checks.ts'
+import { roleOf } from './dossiers.ts'
 import type { Engine } from './engine.ts'
 import { type Wording, wordingOf } from './review.ts'
-import { clampText, type Instructions, literal, type PlaceholderScope, type ResolvedNode, unfilledPlaceholders } from './spec.ts'
+import { changePaths } from './risk.ts'
+import { guidesTouching, loadGuides, renderGuides } from './review-guides.ts'
+import { type Instructions, literal, type PlaceholderScope, type ResolvedNode, unfilledPlaceholders } from './spec.ts'
 import { type NodeRecord, type NodeRow, type RunRow, type WorkflowError, WorkflowFailure } from './types.ts'
 
 /**
@@ -61,13 +65,20 @@ export function instructionsOf(node: NodeRow): Instructions {
  * acceptance contract and result schema. A node on a session the Worker keeps natively names that
  * session (`resume`): its brief is the session's next message.
  */
-export function draftOf(e: Engine, run: RunRow, node: NodeRow, spec: ResolvedNode, requirement: WorkRequirement): Draft {
+export function draftOf(e: Engine, run: RunRow, node: NodeRow, spec: ResolvedNode, requirement: WorkRequirement, guides?: BriefPointer): Draft {
   const parts = instructionsOf(node)
   const task = e.tasks.frame(run.run_id)
   const own = new Set(parts.pointers.map((p) => p.ref))
+  // An author's self-review (T267) is given the goal, the diff (its instructions' subject block), and
+  // the review guides only: none of the task's pointers (earlier results, decisions, the carried work),
+  // no dossier, and no files, so nothing its author planned, did, or was told reaches it.
+  const fresh = spec.selfReview !== undefined
   // A run whose worktree starts from the previous attempt's work says so first (ADR-0061).
-  const carried = task ? e.tasks.carries.pointer(run.run_id) : undefined
-  const extra = [...(carried ? [carried] : []), ...(task?.pointers ?? [])].filter((p) => !own.has(p.ref)).slice(0, BRIEF_LIMITS.pointers - parts.pointers.length)
+  const carried = task && !fresh ? e.tasks.carries.pointer(run.run_id) : undefined
+  // The task's dossier as it stands now (ADR-0070): its slice for every step, the whole of it as a file.
+  const dossier = task && !fresh ? e.tasks.dossiers.forBrief(run, node) : {}
+  const extra = [...(carried ? [carried] : []), ...(fresh ? [] : task?.pointers ?? []), ...(dossier.pointer ? [dossier.pointer] : []), ...(guides ? [guides] : [])].filter((p) => !own.has(p.ref)).slice(0, BRIEF_LIMITS.pointers - parts.pointers.length)
+  const files = [...(fresh ? [] : task?.files ?? []), ...(dossier.file ? [dossier.file] : [])].slice(0, BRIEF_LIMITS.files)
   const bound = node.subject ? (JSON.parse(node.subject) as { subject?: { type: 'git-head'; ref: string; version: string } }).subject : undefined
   const handle = spec.session.sessionId ? e.ctx.workers.handle(spec.session.sessionId) : undefined
   return {
@@ -75,7 +86,7 @@ export function draftOf(e: Engine, run: RunRow, node: NodeRow, spec: ResolvedNod
     // A criterion that names what checks it carries that (@1.3 `check`), so a step that measures the change knows its own.
     schema: !task ? 'brief@1.1' : task.acceptance.some((a) => a.check !== undefined) ? 'brief@1.3' : 'brief@1.2',
     ...(task ? { projectId: task.projectId, taskId: task.taskId, attempt: task.attempt, ask: { maxQuestions: QUESTION_LIMITS.count } } : {}),
-    ...(task?.files?.length ? { files: task.files } : {}),
+    ...(files.length ? { files } : {}),
     goal: clampText(task?.goal ?? spec.objective, BRIEF_LIMITS.goal),
     acceptance: task?.acceptance ?? [
       { id: 'contract', statement: clampText(`The result passes the acceptance contract ${spec.acceptance}`, BRIEF_LIMITS.statement) },
@@ -91,6 +102,32 @@ export function draftOf(e: Engine, run: RunRow, node: NodeRow, spec: ResolvedNod
   }
 }
 
+/**
+ * The review guides a review step's brief points at (T267): the REVIEW.md of the areas the run's
+ * change touches, read from the repository the run's worktree was cut from, and only those; every
+ * guide when the change's paths could not all be read (INV-2). Undefined for a step that does not
+ * review, a run no Worker source holds a worktree of, or a repository with no guides. A guide that
+ * cannot be used is named in the text, never left out in silence.
+ */
+export async function guidesFor(e: Engine, run: RunRow, node: NodeRow, spec: ResolvedNode): Promise<BriefPointer | undefined> {
+  if (roleOf(spec, node) !== 'review') return undefined
+  // Its switch (`review-guides`, ADR-0078), read at each review: off gives none.
+  if (e.enforce('review-guides') === 'off') return undefined
+  const targets = await landingTargets(e, run.run_id)
+  const root = targets[0]?.repository
+  if (!root) return undefined
+  const { guides, problems } = loadGuides(root)
+  if (!guides.length && !problems.length) return undefined
+  const picked = guidesTouching(guides, await changePaths(e, run.run_id))
+  const rendered = renderGuides(picked.selected, picked.left, picked.all, problems)
+  if (!rendered) return undefined
+  const ref = e.ctx.artifacts.put({
+    kind: 'report', bodySchema: 'review-guides@1.0', body: rendered.body, classification: run.classification ?? e.ctx.egress.defaultClassification,
+    producer: { type: 'system', ref: 'workflow' }, runId: run.run_id, nodeId: node.node_id,
+  }).id as ArtifactRef
+  return { ref, role: 'context', note: `the review guides of the areas this change touches (${picked.selected.length}): what failure looks like there, and how to report it` }
+}
+
 /** The length of what a Worker source renders from the draft, in characters (code points), for admission (ADR-0032). */
 export function renderedChars(e: Engine, draft: Draft): number {
   // Rendered as a source that writes the brief's files renders it, the longest any source sends.
@@ -103,7 +140,7 @@ export function renderedChars(e: Engine, draft: Draft): number {
  * applies, INV-12), with the sandbox the routed Worker's source declares (none: a Worker that runs
  * nothing on this machine).
  */
-export function recordBrief(e: Engine, run: RunRow, node: NodeRow, draft: Draft, sandbox: WorkerSandbox | undefined): ArtifactRef {
+export function recordBrief(e: Engine, run: RunRow, node: NodeRow, draft: Draft, sandbox: WorkerSandbox | undefined, tier?: Tier, model?: string): ArtifactRef {
   // At least as strict as what it points at, in its body as in its envelope (INV-12).
   let classification = draft.classification
   const refs = [...new Set([...draft.artifacts.map((p) => p.ref), ...(draft.files ?? []).map((f) => f.ref)])]
@@ -111,7 +148,13 @@ export function recordBrief(e: Engine, run: RunRow, node: NodeRow, draft: Draft,
     const stricter = e.ctx.artifacts.get(ref)?.classification
     if (stricter && RANK[stricter] > RANK[classification]) classification = stricter
   }
-  const body: Brief = { ...draft, sandbox: sandbox ?? NO_LOCAL_SANDBOX, classification }
+  // The tier the run was routed at, when its Worker offers several, and the model its source's
+  // configuration runs there (ADR-0073): `brief@1.4` with the tier, `@1.5` with its model too.
+  const named = model !== undefined && model.length && model.length <= 200 ? model : undefined
+  // A brief that records its handbook slice is `brief@1.6`, which holds the tier and the model too.
+  const versioned = draft.handbook ? { schema: 'brief@1.6' as const } : undefined
+  const tiered = tier ? (named ? { ...(versioned ?? { schema: 'brief@1.5' as const }), tier, model: named } : { ...(versioned ?? { schema: 'brief@1.4' as const }), tier }) : (versioned ?? {})
+  const body: Brief = { ...draft, ...tiered, sandbox: sandbox ?? NO_LOCAL_SANDBOX, classification }
   return e.ctx.artifacts.put({
     kind: 'objective', bodySchema: body.schema, body, inputs: refs,
     classification: body.classification, producer: { type: 'system', ref: 'workflow' }, runId: run.run_id, nodeId: node.node_id,

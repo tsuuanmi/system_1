@@ -3,7 +3,10 @@
 - **Status:** Accepted (2026-10-25, by the operator, D67; proposed 2026-10-25, T151, and built on the
   operator's go-ahead for T151). It changes what
   the core accepts only for a repository whose checks the operator configures: with none
-  configured, every result is accepted as before.
+  configured, every result is accepted as before. Amended by
+  [ADR-0067](0067-system-accepts-a-listed-branchs-result-on-its-review-and-checks.md) (D80): for the
+  projects and branches `board.autoAccept` lists, the board also reads the run's last review, the
+  `check-run` record, and the landing target before it accepts, and the task acceptance is version 3.
 - **Date:** 2026-10-25
 - **Related:** T151, [PROP-0013](../../proposals/0013-feedback-from-work.md) (C3, open question 9),
   [PROP-0010](../../proposals/0010-base-version.md) (B5, B8),
@@ -108,7 +111,9 @@ What constrains a fix:
   `review`, gives each `error` as a reason, and keeps what was asked in `outcome.detail.checkRun`.
 - **What the board does with it** is unchanged: no check failed and none pending, the result is
   accepted without the operator; a failed one is another attempt; a pending one holds the review for
-  the operator. A plain run records them and is never blocked.
+  the operator. A plain run records them and is never blocked. (Amended by ADR-0067: on a project
+  and branch `board.autoAccept` lists, the result is accepted only when, besides, the run's last
+  review approved it and the `check-run` record shows each check passed on it.)
 - **Restart** (INV-4), as amended by T164: a check is never run again to replace what it came to.
   The source stores each check that ran (`agent_check_runs`), keyed by the run, the worktree, the
   subject, the check, its argv, and the setup's hash: `started` before its command starts, `done`
@@ -161,9 +166,34 @@ What constrains a fix:
   and a flaky check's failure stands for that subject. A check interrupted by a crash or killed by
   a stop stays an `error` for that subject; the operator decides, or the next attempt's new subject
   runs it.
+- From T283 and T311 (T293, 2026-10-27): a board task with no write subject whose writing step
+  changed the run's worktree has its result on that tree whatever its last step is, and its checks
+  run there; a step whose answer names no worktree (a review member's) no longer hides the tree
+  from them. The checks bind before every acceptance of such a writing result, the lead's and the
+  operator's too: the board takes the command checks the run recorded on the exact tree, never the
+  accepting decision's own, and refuses an acceptance over a recorded failure or while a required
+  check is pending. The run's owner runs a held result's pending checks on its exact tree itself,
+  once per subject, from the landing's watch, and applies its acceptance again with them (a failure
+  sends the work back). Only the operator accepts past a check that did not run, naming it with a
+  note, on a decision of its own ([board](../../design/board.md#required-checks-bind-at-acceptance)).
+  A hold after a lapse or a re-opening counts the checks the run recorded. "Changed" is against the
+  commit the worktree forked from, so a writing step that committed its change binds the tree too.
 
 ## Rejected alternatives
 
 The options above; also: running the checks inside the engine (it would need a confinement of its
 own and the repository's setup, a parallel path to the source's), and a new `exec` seam (not
 planned in the seam catalog: the source's confinement is the one proven).
+
+## Amendment (2026-10-26): the command's report is a file, and says what did not run
+
+Found on T247. The descriptor `SYSTEM_CHECK_REPORT_FD` never reached a suite started through a
+runner that passes only fds 0 to 2 (pnpm's lifecycle runner, which every `corepack pnpm …` check
+goes through), and a pipe's `/proc/<pid>/fd` name cannot be reopened. The report the decision
+names is now written to a file: a fresh, empty, owner-only file in the check's private directory,
+bound writable at its own path (inside, a mount point: written, never replaced), named in
+`SYSTEM_CHECK_REPORT_PATH`, and read once the command ended; one that cannot be read then makes
+the check an `error`. The same file also takes `browser-tests-not-run: <detail>`: the check keeps
+its outcome, and its reason and the acceptance's reasons say that those tests did not run. Neither
+line can make a check pass. The decision is unchanged
+([a run's checks](../../design/agent-runtimes.md#a-runs-checks)).

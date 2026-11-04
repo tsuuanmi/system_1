@@ -45,15 +45,14 @@ import {
   type ToolGate,
   TOOL_GATE_MS, askToolGate, childEnvironment, confinedCommand, proveConfinement, withMetering,
 } from '@tsuuanmi/system-agent-runtime-core'
-import { dshHome } from '@tsuuanmi/system-libs'
+import { dshHome, isRecord } from '@tsuuanmi/system-libs'
 import { ProviderError, type ProviderErrorKind } from '@tsuuanmi/system-provider-core'
 import { type ConfinedExec, type HookAnswer, type HookEvent, HOOK_ENV, SELF_TEST_REASON, TOKEN_ENV, execConfined, openChannel, prepareHome, selfTest } from './bridge.ts'
 import { USAGE_ARGS, VERIFIED_LIMIT_VERSIONS, limitsFromUsage } from './limits.ts'
 import { TOOLS, refusal, workspaceCustomizations } from './policy.ts'
 
-export { HOOKS_JSON, HOOK_COMMAND, prepareHome } from './bridge.ts'
 export { USAGE_ARGS, VERIFIED_LIMIT_VERSIONS, limitsFromUsage } from './limits.ts'
-export { READ_TOOLS, TOOLS, WRITE_TOOLS, refusal, workspaceCustomizations } from './policy.ts'
+export { refusal, workspaceCustomizations } from './policy.ts'
 
 const KIND = 'antigravity-cli'
 
@@ -63,7 +62,7 @@ const KIND = 'antigravity-cli'
  * probe can prove the bridge's half on the host, never agy's (that takes a model turn), so without
  * the installed version here the hook layer is not proven, no sandbox is offered, no tool call is
  * reported gated, and no run starts (docs/operations/runbooks.md#antigravity-cli-workers).
- * - 1.4.6 (2026-10-23, `gemini-3.8-flash-low`, a scratch workspace): the hook ran before each of
+ * - 1.4.6 (2026-10-23, its economy model, a scratch workspace): the hook ran before each of
  *   the session's tool steps with agy's environment, in the config directory; its deny held (the
  *   file was not written); a hook that exits non-zero, prints what agy cannot read, or times out
  *   blocked the step, and one that exits 0 printing nothing let it run, which `HOOK_COMMAND`
@@ -193,6 +192,8 @@ export class AntigravityRuntime implements AgentRuntimeProvider {
     if (!isAbsolute(spec.workspace)) throw new ProviderError('config_error', `${KIND}: the workspace must be an absolute path`)
     // One account's own home (ADR-0051) is not supported yet: refused, never run in the configured home instead.
     if (spec.home !== undefined) throw new ProviderError('config_error', `${KIND}: it runs in its configured home only; refusing a run that names another (RunSpec.home)`)
+    // It reports no web tools (RuntimeEvidence.webTools, T262): a research run is refused, never run without them.
+    if (spec.web) throw new ProviderError('config_error', `${KIND}: it offers no web tools to a research run (RunSpec.web); nothing was run`)
     const offered = TOOLS[spec.sandbox]
     if (!offered) throw new ProviderError('config_error', `${KIND}: unknown sandbox ${String(spec.sandbox)}`)
     // Absent or empty means the sandbox's set.
@@ -489,7 +490,6 @@ const deny = (reason: string): HookAnswer => ({ decision: 'deny', reason: reason
 const deferredError = (d: Deferral): ProviderError => new ProviderError('config_error',
   `${KIND}: the run stopped at tool call ${d.tool}${d.callId ? ` (${d.callId})` : ''} without running it: ${d.reason.slice(0, 300)} (approval request ${d.requestId})`)
 
-const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 const count = (value: unknown): number | undefined => (typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined)
 
 /**
@@ -540,9 +540,9 @@ class StreamReader {
     } catch {
       return
     }
-    if (!isObject(message)) return
+    if (!isRecord(message)) return
     const name = typeof message.event === 'string' ? message.event : undefined
-    const payload = name && isObject(message[name]) ? message[name] as Record<string, unknown> : message
+    const payload = name && isRecord(message[name]) ? message[name] as Record<string, unknown> : message
     const id = [payload.conversation_id, message.conversation_id].find((v): v is string => typeof v === 'string' && v.length > 0)
     if (id && !this.handle) {
       this.handle = id
@@ -580,7 +580,7 @@ class StreamReader {
  * place, or no reading that fits: no usage (a missing number stays missing).
  */
 export function usageFrom(raw: unknown): TokenUsage | undefined {
-  if (!isObject(raw)) return undefined
+  if (!isRecord(raw)) return undefined
   const input = count(raw.input_tokens)
   const output = count(raw.output_tokens)
   if (input === undefined || output === undefined) return undefined
