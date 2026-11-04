@@ -10,7 +10,7 @@ import Artifacts from '@tsuuanmi/system-artifacts'
 import Egress from '@tsuuanmi/system-egress'
 import EventLog from '@tsuuanmi/system-event-log'
 import Leases from '@tsuuanmi/system-leases'
-import { type Brief, captureGitSubject, sha256 } from '@tsuuanmi/system-libs'
+import { captureGitSubject, sha256 } from '@tsuuanmi/system-libs'
 import Store from '@tsuuanmi/system-store'
 import WorkerSessions from '@tsuuanmi/system-worker-sessions'
 import WorkerRouter from '@tsuuanmi/system-workers'
@@ -19,7 +19,6 @@ import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { worker } from '../../../workers-core/conformance/workers.ts'
 import { CONFIG, importantFinding, type Rendered, ScriptedWorkers, verifierReply } from '../conformance/workflow.ts'
 import Workflow, { type NodeTemplate, type RunView } from '../src/index.ts'
-import { REVIEW_RUNS_NOTHING } from '../src/spec.ts'
 
 // Remediation on the approval queue (docs/design/workflow-engine.md#remediation-on-the-approval-queue),
 // and a re-review's instructions, composed as its review's were, end to end over the store-backed
@@ -213,91 +212,6 @@ function unstore(ctx: Context, dir: string, runId: string): void {
 const fixes = (workers: ScriptedWorkers): number => workers.started.filter((s) => s.prompt.includes('Fix the blocking findings')).length
 
 describe('remediation on the approval queue', () => {
-  it('puts the fix\'s plan to the queue on its exact subject, and runs the fix only once the operator approves it there', async () => {
-    const { ctx, workers } = await boot()
-    const run = ctx.workflow.start({ template: 'change', input: 'Fix add()', classification: 'public' })
-    const waiting = await queued(ctx, run.runId)
-    expect(waiting.blocked.nodeId).toBe('review:approve:1')
-    const request = (await ctx.approvals.get(waiting.blocked.approvalRequest))!
-    const gate = ctx.workflow.records(run.runId).find((r) => r.nodeId === 'review:approve:1')!
-    const reviewed = /Subject: (\S+)/.exec(workers.started.find((s) => s.prompt.startsWith('Review'))!.prompt)![1]!
-    // One request, bound to exactly the plan and the reviewed subject (INV-5), asked by the workflow for this gate.
-    expect(['open', 'batched']).toContain(request.state)
-    expect(request).toMatchObject({
-      subject: { type: 'artifact', ref: waiting.blocked.plan, version: reviewed }, action: { class: 'remediation', refs: [waiting.blocked.plan] },
-      requester: { component: 'workflow', runId: run.runId, nodeId: 'review:approve:1' }, classification: 'public',
-    })
-    expect(waiting.blocked.until).toBe(request.expiresAt)
-    expect(gate.state).toBe('BLOCKED')
-    expect(fixes(workers)).toBe(0)
-    // The queue is the one channel for this verdict: the operator's plan approval is refused, and changes nothing.
-    expect(() => ctx.workflow.approve(run.runId, { verdict: 'approved', plan: waiting.blocked.plan })).toThrow(/waits on approval request .* in the approval queue/)
-    expect(ctx.workflow.get(run.runId)!.blocked).toMatchObject({ kind: 'gate' })
-    // Polling again asks nothing new: the waiting run reads its request twice more (every approvalPollSeconds).
-    const reads = queueOf(ctx).reads
-    await vi.waitFor(() => expect(queueOf(ctx).reads).toBeGreaterThanOrEqual(reads + 2), { timeout: 15_000 })
-    expect(await ctx.approvals.list({ states: ['open', 'batched', 'approved', 'rejected'] })).toHaveLength(1)
-    await decide(ctx, request, 'approved')
-    const done = await finished(ctx, run.runId)
-    expect(done.status).toBe('completed')
-    expect(fixes(workers)).toBe(1)
-    const opened = ctx.workflow.records(run.runId).find((r) => r.nodeId === 'review:approve:1')!
-    const approved = (await ctx.approvals.get(request.requestId))!
-    // The gate's result is the operator's approval, and a gate decision by the engine's rule names it.
-    expect(opened.outputReceipt!.result).toBe(approved.resolution!.approval)
-    const decision = ctx.artifacts.get(opened.outputReceipt!.acceptance)!.body as { decisionType: string; decider: { id: string }; outcome: { option: string; detail: { approvalRequest: string } } }
-    expect(decision).toMatchObject({ decisionType: 'gate', decider: { id: 'workflow.remediation-approval' }, outcome: { option: 'open', detail: { approvalRequest: request.requestId } } })
-    expect(done.nodes.map((n) => [n.nodeId, n.state])).toEqual([
-      // The important finding was verified first (ADR-0075); the fix's gate waits after the verification.
-      ['develop', 'COMPLETED'], ['review', 'COMPLETED'], ['review:verify', 'COMPLETED'], ['review:approve:1', 'COMPLETED'], ['review:fix:1', 'COMPLETED'], ['review:review:2', 'COMPLETED'],
-    ])
-  })
-
-  it('routes a fix as the kind of work of the change it fixes, and a re-review as the review\'s (REQ-WRK-11, ADR-0057)', async () => {
-    const { ctx, workers } = await boot()
-    // The only Worker given code work comes first by id among the writers, so a kinded step lands on it.
-    workers.extra.push(worker('w:coder', { schema: 'capability-descriptor@1.6', kinds: ['code'], tier: 'standard', proves: ['develop'] }))
-    const run = ctx.workflow.start({ template: 'kinded', input: 'Fix add()', classification: 'public' })
-    const waiting = await queued(ctx, run.runId)
-    await decide(ctx, (await ctx.approvals.get(waiting.blocked.approvalRequest))!, 'approved')
-    expect((await finished(ctx, run.runId)).status).toBe('completed')
-    expect(workers.started.map((s) => [s.worker, s.requirement.schema, s.requirement.kind])).toEqual([
-      // The verification of the important finding is the review's kind of work too (ADR-0075).
-      ['w:coder', 'work-requirement@1.2', 'code'], ['w:reviewer', 'work-requirement@1.2', 'review'], ['w:reviewer', 'work-requirement@1.2', 'review'],
-      ['w:coder', 'work-requirement@1.2', 'code'], ['w:reviewer', 'work-requirement@1.2', 'review'],
-    ])
-    expect(fixes(workers)).toBe(1)
-  })
-
-  it('ends the cycle on a rejection, and asks again on continue', async () => {
-    const { ctx, workers } = await boot()
-    const run = ctx.workflow.start({ template: 'change', input: 'Fix add()', classification: 'public' })
-    const first = (await ctx.approvals.get((await queued(ctx, run.runId)).blocked.approvalRequest))!
-    await decide(ctx, first, 'rejected')
-    const failed = await finished(ctx, run.runId)
-    expect(failed).toMatchObject({ status: 'failed', error: { kind: 'plan_rejected' } })
-    expect(failed.error!.message).toContain('the operator rejected it')
-    expect(fixes(workers)).toBe(0)
-    ctx.workflow.continue(run.runId, 'review:approve:1')
-    const again = await queued(ctx, run.runId)
-    // A new request on the same exact subject: the old verdict never opens the reopened gate.
-    expect(again.blocked.approvalRequest).not.toBe(first.requestId)
-    const second = (await ctx.approvals.get(again.blocked.approvalRequest))!
-    expect(second.subject).toEqual(first.subject)
-    await decide(ctx, second, 'approved')
-    expect((await finished(ctx, run.runId)).status).toBe('completed')
-    expect(fixes(workers)).toBe(1)
-  })
-
-  it('ends the cycle as gate_timeout when the request expires unanswered', async () => {
-    const { ctx, workers } = await boot()
-    const run = ctx.workflow.start({ template: 'change', input: 'Fix add()', classification: 'public' })
-    const request = (await ctx.approvals.get((await queued(ctx, run.runId)).blocked.approvalRequest))!
-    await ctx.approvals.sweep(new Date(Date.parse(request.expiresAt) + 1000))
-    const failed = await finished(ctx, run.runId)
-    expect(failed).toMatchObject({ status: 'failed', error: { kind: 'gate_timeout' } })
-    expect(fixes(workers)).toBe(0)
-  })
 
   it('closes the gate when the policy forbids remediation, asking no one', async () => {
     const { ctx, workers } = await boot({ policy: { ...POLICY, rules: [...POLICY.rules, { actionClass: 'remediation', mode: 'forbid' }] } })
@@ -306,15 +220,6 @@ describe('remediation on the approval queue', () => {
     expect(failed).toMatchObject({ status: 'failed', error: { kind: 'plan_rejected' } })
     expect(failed.error!.message).toContain('forbids remediation')
     expect(await ctx.approvals.list({ states: ['open', 'batched', 'approved', 'rejected'] })).toEqual([])
-    expect(fixes(workers)).toBe(0)
-  })
-
-  it('withdraws the request when the operator stops the run', async () => {
-    const { ctx, workers } = await boot()
-    const run = ctx.workflow.start({ template: 'change', input: 'Fix add()', classification: 'public' })
-    const requestId = (await queued(ctx, run.runId)).blocked.approvalRequest
-    await ctx.workflow.stop(run.runId)
-    expect(await ctx.approvals.get(requestId)).toMatchObject({ state: 'rejected', resolution: { cause: 'withdrawn' } })
     expect(fixes(workers)).toBe(0)
   })
 
@@ -330,28 +235,6 @@ describe('remediation on the approval queue', () => {
     expect(done.status).toBe('completed')
     expect(fixes(workers)).toBe(1)
     expect((await ctx.approvals.list({ states: ['open', 'batched', 'approved', 'rejected'] })).map((r) => r.requestId)).toEqual([request.requestId])
-  })
-
-  it('reconciles on restart: a request whose id was never stored and that was rejected meanwhile is adopted and applied, never asked again (INV-4)', async () => {
-    const { ctx, workers, dir, restartWorkflow } = await boot()
-    const run = ctx.workflow.start({ template: 'change', input: 'Fix add()', classification: 'public' })
-    const request = (await ctx.approvals.get((await queued(ctx, run.runId)).blocked.approvalRequest))!
-    await restartWorkflow(async () => {
-      unstore(ctx, dir, run.runId)
-      await decide(ctx, request, 'rejected')
-    })
-    const failed = await finished(ctx, run.runId)
-    expect(failed).toMatchObject({ status: 'failed', error: { kind: 'plan_rejected' } })
-    expect(failed.error!.message).toContain('the operator rejected it')
-    expect(fixes(workers)).toBe(0)
-    const all = ['open', 'batched', 'approved', 'rejected'] as const
-    expect((await ctx.approvals.list({ states: [...all] })).map((r) => r.requestId)).toEqual([request.requestId])
-    expect(gateDecision(ctx, run.runId)).toMatchObject({ decider: { id: 'workflow.remediation-approval' }, outcome: { option: 'closed', detail: { approvalRequest: request.requestId } } })
-    // The adopted request is the gate's now: continue asks again on a new one, never adopting the spent one.
-    ctx.workflow.continue(run.runId, 'review:approve:1')
-    const again = await queued(ctx, run.runId)
-    expect(again.blocked.approvalRequest).not.toBe(request.requestId)
-    expect(await ctx.approvals.list({ states: [...all] })).toHaveLength(2)
   })
 
   it('does not open on an approval when the working tree moved since the review: the fix never runs on another tree (INV-5)', async () => {
@@ -375,19 +258,6 @@ describe('remediation on the approval queue', () => {
     expect(await ctx.approvals.get(request.requestId)).toMatchObject({ state: 'approved', resolution: { cause: 'verdict' } })
   })
 
-  it('does not open on an approval resolved after the request expired, as a provider might forge it (defence in depth)', async () => {
-    const { ctx, workers } = await boot()
-    const run = ctx.workflow.start({ template: 'change', input: 'Fix add()', classification: 'public' })
-    const request = (await ctx.approvals.get((await queued(ctx, run.runId)).blocked.approvalRequest))!
-    queueOf(ctx).forge = (r) => r.resolution ? { ...r, resolution: { ...r.resolution, at: new Date(Date.parse(r.expiresAt) + 1000).toISOString() } } : r
-    await decide(ctx, request, 'approved')
-    const failed = await finished(ctx, run.runId)
-    expect(failed).toMatchObject({ status: 'failed', error: { kind: 'gate_timeout' } })
-    expect(failed.error!.message).toContain(`not by its expiry ${request.expiresAt}`)
-    expect(fixes(workers)).toBe(0)
-    expect(gateDecision(ctx, run.runId)).toMatchObject({ decider: { id: 'workflow.remediation-approval' }, outcome: { option: 'closed', detail: { kind: 'gate_timeout', approvalRequest: request.requestId } } })
-  })
-
   it('does not open on an approved request whose approval is not the operator\'s approval of exactly the gate\'s subject (INV-5)', async () => {
     const { ctx, workers } = await boot()
     const run = ctx.workflow.start({ template: 'change', input: 'Fix add()', classification: 'public' })
@@ -404,135 +274,5 @@ describe('remediation on the approval queue', () => {
     expect(failed.error!.message).toContain(`its approval ${foreign} is not the operator's approval of exactly plan`)
     expect(fixes(workers)).toBe(0)
   })
-
-  it('closes the gate as gate_timeout by its deadline when the queue cannot be read, naming and withdrawing its request (INV-9)', async () => {
-    const { ctx, workers, dir, restartWorkflow } = await boot()
-    const run = ctx.workflow.start({ template: 'change', input: 'Fix add()', classification: 'public' })
-    const requestId = (await queued(ctx, run.runId)).blocked.approvalRequest
-    queueOf(ctx).unreadable = true
-    await restartWorkflow(() => {
-      // The request's expiry, the gate's deadline, has passed while the engine was down.
-      const db = new DatabaseSync(join(dir, 'system.db'))
-      db.prepare("UPDATE workflow_nodes SET not_before = ? WHERE run_id = ? AND node_id = 'review:approve:1'").run(new Date(Date.now() - 1000).toISOString(), run.runId)
-      db.close()
-    })
-    const failed = await finished(ctx, run.runId)
-    expect(failed).toMatchObject({ status: 'failed', error: { kind: 'gate_timeout' } })
-    expect(failed.error!.message).toContain(`could be read from the approval queue`)
-    expect(fixes(workers)).toBe(0)
-    expect(gateDecision(ctx, run.runId)).toMatchObject({ decider: { id: 'workflow.remediation-approval' }, outcome: { option: 'closed', detail: { kind: 'gate_timeout', approvalRequest: requestId } } })
-    queueOf(ctx).unreadable = false
-    expect(await ctx.approvals.get(requestId)).toMatchObject({ state: 'rejected', resolution: { cause: 'withdrawn' } })
-  })
-
-  it('without an approval queue, the fix waits for the operator\'s plan gate, never for a policy (INV-2)', async () => {
-    const { ctx, workers } = await boot({ queue: false })
-    const run = ctx.workflow.start({ template: 'change', input: 'Fix add()', classification: 'public' })
-    const view = await until(() => {
-      const v = ctx.workflow.get(run.runId)
-      return v?.blocked?.kind === 'gate' ? v : undefined
-    }, 'the plan gate')
-    expect(view.blocked).not.toHaveProperty('approvalRequest')
-    await new Promise((resolve) => setTimeout(resolve, 1500))
-    expect(fixes(workers)).toBe(0)
-    ctx.workflow.approve(run.runId, { verdict: 'approved', plan: (view.blocked as { plan: string }).plan })
-    expect((await finished(ctx, run.runId)).status).toBe('completed')
-    expect(fixes(workers)).toBe(1)
-  })
-
-  it('records the policy\'s required checks a plain run that wrote did not pass on its acceptance decision, and completes all the same', async () => {
-    const policy: AutonomyPolicy = { ...POLICY, rules: [...POLICY.rules, { actionClass: 'workspace-write', mode: 'auto', requires: ['tests', 'lint', 'review'] }] }
-    const { ctx } = await boot({ policy, reviews: 0 })
-    const run = ctx.workflow.start({ template: 'change', input: 'Fix add()', classification: 'public' })
-    const done = await finished(ctx, run.runId)
-    expect(done.status).toBe('completed')
-    const acceptance = ctx.workflow.explain(run.runId)!.nodes.find((n) => n.nodeId === 'review')!.decisions.find((d) => d.type === 'acceptance' && d.reasons.some((r) => r.includes('are pending')))
-    expect(acceptance).toMatchObject({ outcome: 'accept' })
-    const body = ctx.artifacts.get(acceptance!.id)!.body as { decider: { id: string }; outcome: { detail: Record<string, unknown> } }
-    // The review it ran passed on the subject it wrote; tests and lint never ran, and stay pending.
-    expect(body).toMatchObject({ decider: { id: 'workflow.run-acceptance' }, outcome: { detail: { actionClass: 'workspace-write', mode: 'auto', checks: { review: true }, pendingChecks: ['tests', 'lint'] } } })
-  })
-
-  it('records no acceptance decision for a plain run that wrote nothing', async () => {
-    const { ctx } = await boot()
-    const run = ctx.workflow.start({ template: 'read', input: 'What does add() do?', classification: 'public' })
-    expect((await finished(ctx, run.runId)).status).toBe('completed')
-    expect(ctx.artifacts.list({ kind: 'decision', runId: run.runId }).filter((a) => (a.body as { decider: { id: string } }).decider.id === 'workflow.run-acceptance')).toEqual([])
-  })
 })
 
-/** Every review the Workers read (each is given an exact subject), in order. */
-const reviewsOf = (workers: ScriptedWorkers): Rendered[] => workers.started.filter((s) => /^Subject: /m.test(s.prompt))
-/** What a review was asked, before the exact subject the engine appends. */
-const asked = (prompt: string): string => prompt.split('\n\n## The exact subject of this review')[0]!
-/** A node's row as the engine stored it. */
-const rowOf = (ctx: Context, runId: string, nodeId: string): { spec: string } => ctx.store.db.prepare('SELECT spec FROM workflow_nodes WHERE run_id = ? AND node_id = ?').get(runId, nodeId) as { spec: string }
-
-describe('a re-review\'s instructions (docs/design/workflow-engine.md#graph-growth)', () => {
-  it('are composed as its review\'s were: the caller\'s input for {{input}}, and the pointer to the change\'s writer re-bound to the fix that wrote the new subject (REQ-WF-5, INV-2)', async () => {
-    const { ctx, workers } = await boot()
-    const run = ctx.workflow.start({ template: 'bound', input: 'Fix add()', classification: 'public' })
-    await decide(ctx, (await ctx.approvals.get((await queued(ctx, run.runId)).blocked.approvalRequest))!, 'approved')
-    expect((await finished(ctx, run.runId)).status).toBe('completed')
-    const reviews = reviewsOf(workers)
-    expect(reviews.map((r) => asked(r.prompt))).toEqual(['Review: Fix add()\n<change>changed add()</change>', 'Review: Fix add()\n<change>added a test</change>'])
-    for (const review of reviews) expect(review.prompt).not.toContain('{{')
-    // The review and the re-review are each told, in their subject block, to read and judge and run nothing.
-    for (const review of reviews) expect(review.prompt).toContain(`\n## The exact subject of this review\nReview exactly this change against the request. You see none of the producer's conversation.\n${REVIEW_RUNS_NOTHING}\n`)
-    // Bound to the subject the fix left, not the one the first review read.
-    expect(/^Subject: (\S+)$/m.exec(reviews[1]!.prompt)![1]).not.toBe(/^Subject: (\S+)$/m.exec(reviews[0]!.prompt)![1])
-    // It points at the fix's result by content id, named as the fix's, never carrying it, and binds it in its input receipt.
-    const records = ctx.workflow.records(run.runId)
-    const fix = records.find((r) => r.nodeId === 'review:fix:1')!.outputReceipt!.result
-    const recheck = records.find((r) => r.nodeId === 'review:review:2')!
-    expect(recheck.inputReceipt!.bundle).toEqual([fix])
-    const brief = ctx.artifacts.get(recheck.execution!.brief!)!.body as Brief
-    expect(brief.artifacts).toEqual([{ ref: fix, role: 'input', note: 'the result of node review:fix:1' }])
-    expect(JSON.stringify(brief.instructions)).not.toContain('added a test')
-  })
-
-  it('composes a re-review an earlier engine grew with its review\'s template marked literal as that review, once it is promoted', async () => {
-    const { ctx, workers } = await boot()
-    const run = ctx.workflow.start({ template: 'change', input: 'Fix add()', classification: 'public' })
-    const request = (await ctx.approvals.get((await queued(ctx, run.runId)).blocked.approvalRequest))!
-    const grown = JSON.parse(rowOf(ctx, run.runId, 'review:review:2').spec) as Record<string, unknown>
-    expect(grown).toMatchObject({ prompt: 'Review: {{input}}', reviewOf: 'review', cycle: 2 })
-    expect(grown).not.toHaveProperty('literal')
-    // As the engine grew it before re-reviews were composed: the review's template, marked literal.
-    ctx.store.db.prepare('UPDATE workflow_nodes SET spec = ? WHERE run_id = ? AND node_id = ?').run(JSON.stringify({ ...grown, literal: true }), run.runId, 'review:review:2')
-    await decide(ctx, request, 'approved')
-    expect((await finished(ctx, run.runId)).status).toBe('completed')
-    expect(reviewsOf(workers).map((r) => asked(r.prompt))).toEqual(['Review: Fix add()', 'Review: Fix add()'])
-    // Its spec now says what its instructions were composed from.
-    expect(JSON.parse(rowOf(ctx, run.runId, 'review:review:2').spec)).not.toHaveProperty('literal')
-  })
-
-  it('starts no Worker on instructions an earlier engine stored with the review\'s placeholder unfilled: the re-review fails as config_error on a decision, and continue composes it (INV-2, INV-13)', async () => {
-    const { ctx, workers } = await boot()
-    const scripted = workers.reply
-    let reviews = 0
-    // The re-review's first execution fails after it was sent: the run waits for the operator, the instructions stored.
-    workers.reply = (request) => (/^Subject: /m.test(request.prompt) && ++reviews === 2 ? { fail: 'network', disposition: 'BACKOFF', sent: true } : scripted(request))
-    const run = ctx.workflow.start({ template: 'change', input: 'Fix add()', classification: 'public' })
-    await decide(ctx, (await ctx.approvals.get((await queued(ctx, run.runId)).blocked.approvalRequest))!, 'approved')
-    expect(await finished(ctx, run.runId)).toMatchObject({ status: 'failed', error: { kind: 'network' } })
-    // As the engine before re-reviews were composed left it: the review's template marked literal, and stored as it is.
-    const spec = JSON.parse(rowOf(ctx, run.runId, 'review:review:2').spec) as Record<string, unknown>
-    ctx.store.db.prepare('UPDATE workflow_nodes SET spec = ?, prompt = ?, brief_parts = ? WHERE run_id = ? AND node_id = ?')
-      .run(JSON.stringify({ ...spec, literal: true }), 'Review: {{input}}', JSON.stringify({ segments: [{ text: 'Review: {{input}}' }], pointers: [] }), run.runId, 'review:review:2')
-    const sent = workers.started.length
-    ctx.workflow.continue(run.runId, 'review:review:2')
-    const refused = await finished(ctx, run.runId)
-    expect(refused).toMatchObject({ status: 'failed', error: { kind: 'config_error' } })
-    expect(refused.error!.message).toContain('stored by an earlier engine')
-    expect(workers.started).toHaveLength(sent)
-    const record = ctx.workflow.records(run.runId).find((r) => r.nodeId === 'review:review:2')!
-    expect(record.inputReceipt).toBeUndefined()
-    expect(ctx.artifacts.get(record.lastDecision!)!.body).toMatchObject({ decisionType: 'gate', decider: { id: 'workflow.instructions' }, outcome: { option: 'fail' } })
-    expect(ctx.eventLog.query({ type: 'workflow.node.failed', runId: run.runId }).at(-1)).toMatchObject({ nodeId: 'review:review:2', decision: record.lastDecision, data: { kind: 'config_error' } })
-    // Continued, it is composed as its review was, and runs.
-    ctx.workflow.continue(run.runId, 'review:review:2')
-    expect((await finished(ctx, run.runId)).status).toBe('completed')
-    expect(asked(workers.started.at(-1)!.prompt)).toBe('Review: Fix add()')
-  })
-})

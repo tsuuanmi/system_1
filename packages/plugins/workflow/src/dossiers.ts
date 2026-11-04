@@ -192,7 +192,7 @@ export interface CommandRecord {
  * the evidence of a check: the commands that run a check (`checks`) apart from every other (`others`).
  * `seq` keeps the order they ran in; `dropped` counts what each bound let go.
  */
-export interface StepCommands {
+interface StepCommands {
   checks: Array<CommandRecord & { seq: number }>
   others: Array<CommandRecord & { seq: number }>
   dropped: { checks: number; others: number }
@@ -205,7 +205,7 @@ export interface StepCommands {
  * step (the oldest goes first); steps kept; characters of a check's output tail, of a check's command,
  * and of an other command, in the dossier (a command alone: its exit code always follows it whole).
  */
-export const RECORDED = { checks: 15, others: 50, steps: 500, tail: 300, command: 200, otherLine: 120 } as const
+const RECORDED = { checks: 15, others: 50, steps: 500, tail: 300, command: 200, otherLine: 120 } as const
 
 /** The command a check is, by its words: `corepack pnpm lint`, `pnpm test:affected`, `tsc --noEmit`. */
 const CHECK_COMMAND: Partial<Record<BriefCheck, RegExp>> = {
@@ -225,7 +225,7 @@ const shows = (r: CommandRecord, check: BriefCheck): boolean => !r.unfinished &&
  * among the others. Over the checks' bound, the oldest record goes whose every check another kept
  * record still shows (an unfinished one shows none, so it goes first); the others drop their oldest.
  */
-export function keepCommand(step: StepCommands, record: CommandRecord): void {
+function keepCommand(step: StepCommands, record: CommandRecord): void {
   const kept = { ...record, seq: step.next++ }
   if (!checksRun(record.command).length) {
     step.others.push(kept)
@@ -244,7 +244,7 @@ export function keepCommand(step: StepCommands, record: CommandRecord): void {
 }
 
 /** A step's records in the order they ran. */
-export const commandsIn = (step: StepCommands | undefined): CommandRecord[] =>
+const commandsIn = (step: StepCommands | undefined): CommandRecord[] =>
   step ? [...step.checks, ...step.others].sort((a, b) => a.seq - b.seq).map(({ seq: _seq, ...r }) => r) : []
 
 /** What a record's end was, as reported: its exit code, or why it has none. */
@@ -259,7 +259,7 @@ function endOf(c: CommandRecord): string {
  * that runs a check, first, with its end (exit code) and the tail of its output; then every other kept
  * command with its end; and what the bounds let go, counted. Split into parts at record boundaries.
  */
-export function commandsText(step: StepCommands): string[] {
+function commandsText(step: StepCommands): string[] {
   const checks = [...step.checks].sort((a, b) => a.seq - b.seq)
   const others = [...step.others].sort((a, b) => a.seq - b.seq)
   const one = (s: string): string => s.replace(/\s+/g, ' ').trim()
@@ -298,7 +298,7 @@ export function commandsText(step: StepCommands): string[] {
  * end of (a background launch, an interrupted command) shows nothing. A check no recorded command
  * shows falls back to the Worker's own entries (`texts`, optional prose), read as {@link proseProblem} reads them.
  */
-export function evidenceProblem(texts: readonly string[], checks: readonly BriefCheck[], commands: readonly CommandRecord[] = []): string | undefined {
+function evidenceProblem(texts: readonly string[], checks: readonly BriefCheck[], commands: readonly CommandRecord[] = []): string | undefined {
   if (!commands.length) return proseProblem(texts, checks)
   const required = COMMAND_CHECKS.filter((c) => checks.includes(c))
   const missing = required.filter((c) => !commands.some((r) => shows(r, c)))

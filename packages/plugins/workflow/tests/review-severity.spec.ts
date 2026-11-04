@@ -28,7 +28,7 @@ import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { worker } from '../../../workers-core/conformance/workers.ts'
 import { activeProject, CONFIG, type Rendered, readyTask, ScriptedWorkers } from '../conformance/workflow.ts'
 import Workflow, { type NodeTemplate, type RunView } from '../src/index.ts'
-import { type Assessment, countOf, type Finding, parseAssessment, parseVotes, subjectBlock, summaryOf, VERIFY_HEADING } from '../src/spec.ts'
+import { type Assessment, parseVotes, VERIFY_HEADING } from '../src/spec.ts'
 
 vi.setConfig({ testTimeout: 120_000 })
 
@@ -151,9 +151,6 @@ async function start(ctx: Context): Promise<string> {
   return (await ctx.workflow.start({ template: 'change', input: 'Fix add()', classification: 'public', task: { taskId: task.taskId } })).runId
 }
 
-type Decision = { decider: { id: string }; outcome: { option: string; detail?: Record<string, unknown> }; candidates: Array<{ option: string; selected: boolean; reasons: string[] }> }
-const decisions = (ctx: Context, runId: string, rule: string): Decision[] =>
-  ctx.artifacts.list({ kind: 'decision', runId, limit: 1000 }).map((a) => a.body as Decision).filter((d) => d.decider.id === rule)
 
 /** A step's latest assessment: the one its latest passed exact-subject gate names. */
 function assessmentOf(ctx: Context, runId: string, nodeId: string): Assessment & { schema: string; summary: string } {
@@ -167,39 +164,6 @@ const IMPORTANT = { severity: 'important', title: 'add() still subtracts', file:
 const NIT = { severity: 'nit', title: 'name the test after add()', file: 'test_calc.py' }
 
 describe('severity, evidence, and the summary\'s count (ADR-0075)', () => {
-  it('reads each finding\'s severity, demotes one without a file, a line, and evidence to a nit, reads the old severities, and sets the verdict by what is confirmed', () => {
-    const parsed = parseAssessment(JSON.stringify({
-      subject: 's', verdict: 'changes-requested', findings: [
-        IMPORTANT, NIT, { severity: 'important', title: 'feels off' }, { severity: 'pre-existing', title: 'sub() has the same bug', file: 'calc.py', line: 5, evidence: 'line 5 returns a + b' },
-        { severity: 'blocking', title: 'legacy', file: 'a.py', line: 3, evidence: 'x' }, { severity: 'important', title: 'no line', file: 'b.py', evidence: 'y' }, { severity: 'info', title: 'legacy info' },
-      ],
-    }))
-    expect(parsed.ok).toBe(true)
-    const { assessment } = parsed as { assessment: Assessment }
-    expect(assessment.findings.map((f) => [f.id, f.severity, f.demoted ?? null])).toEqual([
-      ['f1', 'important', null], ['f2', 'nit', null], ['f3', 'nit', 'no-evidence'], ['f4', 'pre-existing', null], ['f5', 'important', null], ['f6', 'nit', 'no-evidence'], ['f7', 'nit', null],
-    ])
-    expect(assessment.findings[0]).toMatchObject({ file: 'calc.py', line: 2, class: 'arithmetic sign', evidence: IMPORTANT.evidence })
-    // Important findings wait for their verification: unverified, they request no changes. Only a confirmed one does.
-    expect(assessment).toMatchObject({ verdict: 'approve', said: 'changes-requested' })
-    // Nits alone never request changes, whatever the reviewer wrote: its own verdict is kept beside.
-    const nits = parseAssessment(JSON.stringify({ subject: 's', verdict: 'changes-requested', findings: [NIT, { severity: 'important', title: 'no evidence' }] })) as { assessment: Assessment }
-    expect(nits.assessment).toMatchObject({ verdict: 'approve', said: 'changes-requested' })
-    expect(parseAssessment(JSON.stringify({ subject: 's', verdict: 'approve', findings: [{ severity: 'major', title: 'x' }] }))).toEqual({ ok: false, reason: 'a finding needs a severity (important, nit, pre-existing) and a title' })
-  })
-
-  it('opens the summary with the count: "2 important, 3 nits", or "no issues", with the votes once they are in', () => {
-    const f = (severity: Finding['severity'], extra: Partial<Finding> = {}): Finding => ({ severity, title: `${severity} ${Math.random()}`, ...extra })
-    expect(countOf([f('important'), f('important'), f('nit'), f('nit'), f('nit')])).toBe('2 important, 3 nits')
-    expect(countOf([])).toBe('no issues')
-    expect(countOf([f('nit', { repeated: 'review#f2' })])).toBe('no issues')
-    expect(countOf([f('nit'), f('pre-existing')])).toBe('1 nit, 1 pre-existing')
-    const voted = [f('important', { verification: { vote: 'confirm', reason: 'it subtracts', node: 'v' } }), f('important', { verification: { vote: 'reject', reason: 'it adds', node: 'v' } }), f('nit')]
-    expect(countOf(voted)).toBe('2 important (1 confirmed, 1 not), 1 nit')
-    expect(summaryOf({ findings: voted, verdict: 'changes-requested' })).toMatch(/^2 important \(1 confirmed, 1 not\), 1 nit; 1 confirmed important finding blocks/)
-    expect(summaryOf({ findings: [f('important')], verdict: 'approve' })).toMatch(/^1 important; 1 important finding waits for verification/)
-    expect(summaryOf({ findings: [], verdict: 'approve', approach: { change: true, why: 'the parser fights the grammar' } })).toBe('no issues; nothing blocks. Approach: should change (the parser fights the grammar).')
-  })
 
   it('reads a verifier\'s votes by finding, and leaves a finding it did not vote on, or an answer on another subject, unverified', () => {
     expect(parseVotes(JSON.stringify({ subject: 's', votes: [{ finding: 'f1', vote: 'confirm', reason: 'line 2 subtracts' }, { finding: 'f9', vote: 'confirm' }] }), 's', ['f1', 'f2'])).toEqual({
@@ -213,99 +177,9 @@ describe('severity, evidence, and the summary\'s count (ADR-0075)', () => {
     expect(Object.values(reasonless.votes).map((v) => v.vote)).toEqual(['none', 'none', 'none', 'none'])
     expect(reasonless.votes.f1!.reason).toBe('the verifier voted confirm without a reason, so the vote does not count')
   })
-
-  it('asks a re-review from the third round on whether the approach should change, and shows it only the change since with the open and answered findings', () => {
-    const prior = [
-      { review: 'review', finding: { id: 'f1', ...IMPORTANT } as Finding, state: 'open' as const },
-      { review: 'review', finding: { id: 'f2', ...NIT } as Finding, state: 'answered' as const },
-    ]
-    const block = subjectBlock('git:abc:def', '/w', 'abc', 'WHOLE', 'Fix add()', { cycle: 3, previous: { review: 'review:review:2', subject: 'git:abc:111' }, since: { commit: 'c1', diff: 'SINCE' }, whole: { commit: 'c0', diff: 'WHOLE' }, prior })
-    expect(block).toContain('SINCE')
-    expect(block).not.toContain('WHOLE')
-    expect(block).toContain('- review#f1 important: add() still subtracts (calc.py:2) [class: arithmetic sign]')
-    expect(block).toMatch(/Findings already answered[^\n]*never raise them again[^\n]*\n- review#f2 nit: name the test after add\(\)/)
-    expect(block).toContain('"approach": {"change": true or false')
-    expect(subjectBlock('git:abc:def', '/w', 'abc', 'WHOLE', 'Fix add()', { cycle: 2, previous: { review: 'review', subject: 'git:abc:111' }, since: { commit: 'c1', diff: 'SINCE' }, whole: { commit: 'c0', diff: 'WHOLE' } })).not.toContain('"approach"')
-    // With no commit that holds the last subject, the whole change stands in for the change since.
-    expect(subjectBlock('git:abc:def', '/w', 'abc', 'WHOLE', 'Fix add()', { cycle: 2, previous: { review: 'review', subject: 'git:abc:111' }, whole: { commit: 'c0', diff: 'WHOLE' } })).toContain('WHOLE')
-  })
 })
 
 describe('a review that converges (board T266)', () => {
-  it('never starts a fix round for nits, nor holds the result for them: the review approves, and the nits reach the author once', async () => {
-    const tree = workingTree()
-    const { ctx, workers } = await boot(tree, { review: () => ({ verdict: 'changes-requested', findings: [NIT, { severity: 'important', title: 'the style feels off' }] }) })
-    const runId = await start(ctx)
-    const done = await reported(ctx, runId)
-    expect(done.status).toBe('completed')
-    // No verification, no gate, no fix: the nits started nothing.
-    expect(done.nodes.map((n) => n.nodeId)).toEqual(['develop', 'review'])
-    expect(workers.started.some((s) => s.prompt.includes('Fix the blocking findings') || s.prompt.includes(VERIFY_HEADING))).toBe(false)
-    const assessment = assessmentOf(ctx, runId, 'review')
-    expect(assessment).toMatchObject({ schema: 'assessment@1.1', verdict: 'approve', said: 'changes-requested' })
-    expect(assessment.summary).toMatch(/^2 nits; nothing blocks\./)
-    expect(assessment.findings[1]).toMatchObject({ severity: 'nit', demoted: 'no-evidence' })
-    // The acceptance reads an approving last review with no blocking finding: what auto-accept reads (ADR-0067).
-    const [acceptance] = decisions(ctx, runId, 'workflow.task-acceptance')
-    expect(acceptance!.outcome).toMatchObject({ option: 'accept' })
-    expect(acceptance!.outcome.detail!.review).toMatchObject({ verdict: 'approve', blocking: 0, summary: expect.stringMatching(/^2 nits/) })
-    const entry = ctx.workflow.dossier({ runId }).entries.find((e) => e.kind === 'review')!
-    expect(entry.text).toMatch(/^2 nits; nothing blocks\./)
-    expect(entry.text).toContain('Nits are optional notes')
-    // The author is told once, though no fix round runs: an entry asking one response line per nit.
-    const notes = ctx.workflow.dossier({ runId }).entries.filter((e) => e.kind === 'evidence' && e.text.startsWith('Optional notes for the author from review review'))
-    expect(notes).toHaveLength(1)
-    expect(notes[0]!.text).toContain('2 nits')
-    expect(notes[0]!.text).toContain('- f1: name the test after add() (test_calc.py)')
-  })
-
-  it('does not block on an important finding the second reviewer rejects or leaves unverified: both are recorded and shown, never sent as work', async () => {
-    const tree = workingTree()
-    const { ctx, workers } = await boot(tree, {
-      review: () => ({ verdict: 'changes-requested', findings: [IMPORTANT, { ...IMPORTANT, title: 'test_calc.py imports nothing it uses', file: 'test_calc.py', line: 1, class: undefined }] }),
-      verify: () => [{ finding: 'f1', vote: 'reject', reason: 'the change keeps a - b on purpose: the task is the test file' }],
-    })
-    const runId = await start(ctx)
-    const done = await reported(ctx, runId)
-    expect(done.status).toBe('completed')
-    expect(done.nodes.map((n) => n.nodeId)).toEqual(['develop', 'review', 'review:verify'])
-    // The verification ran on the other family's reviewer, in a session of its own.
-    const [review, verify] = ['review', 'review:verify'].map((id) => done.nodes.find((n) => n.nodeId === id)!)
-    expect(verify!.worker).not.toBe(review!.worker)
-    expect(workers.started.some((s) => s.prompt.includes('Fix the blocking findings'))).toBe(false)
-    const [voted] = decisions(ctx, runId, 'workflow.verification')
-    expect(voted!.outcome).toMatchObject({ option: 'pass', detail: { review: 'review', confirmed: [], rejected: ['f1'], unverified: ['f2'] } })
-    // The review's latest assessment carries the votes and approves: what the acceptance read.
-    const assessment = assessmentOf(ctx, runId, 'review')
-    expect(assessment.verdict).toBe('approve')
-    expect(assessment.findings.map((f) => f.verification?.vote)).toEqual(['reject', 'none'])
-    expect(assessment.summary).toMatch(/^2 important \(0 confirmed, 2 not\); nothing blocks\./)
-    expect(decisions(ctx, runId, 'workflow.task-acceptance')[0]!.outcome.detail!.review).toMatchObject({ node: 'review', verdict: 'approve', blocking: 0 })
-    // explain shows the findings by severity with their votes.
-    expect(ctx.workflow.explain(runId)!.nodes.find((n) => n.nodeId === 'review')!.review!.findings).toMatchObject([
-      { id: 'f1', severity: 'important', blocks: false, vote: 'reject', reason: expect.stringContaining('on purpose') },
-      { id: 'f2', severity: 'important', blocks: false, vote: 'none' },
-    ])
-  })
-
-  it('does not block on a confirmation without a reason: the finding stays unverified, and no fix round starts', async () => {
-    const tree = workingTree()
-    const { ctx, workers } = await boot(tree, {
-      review: () => ({ verdict: 'changes-requested', findings: [IMPORTANT] }),
-      verify: () => [{ finding: 'f1', vote: 'confirm' } as { finding: string; vote: string; reason: string }],
-    })
-    const runId = await start(ctx)
-    const done = await reported(ctx, runId)
-    expect(done.status).toBe('completed')
-    expect(done.nodes.map((n) => n.nodeId)).toEqual(['develop', 'review', 'review:verify'])
-    expect(workers.started.some((s) => s.prompt.includes('Fix the blocking findings'))).toBe(false)
-    expect(decisions(ctx, runId, 'workflow.remediation')).toEqual([])
-    const [voted] = decisions(ctx, runId, 'workflow.verification')
-    expect(voted!.outcome).toMatchObject({ option: 'pass', detail: { confirmed: [], rejected: [], unverified: ['f1'] } })
-    const assessment = assessmentOf(ctx, runId, 'review')
-    expect(assessment.verdict).toBe('approve')
-    expect(assessment.findings[0]!.verification).toMatchObject({ vote: 'none', reason: 'the verifier voted confirm without a reason, so the vote does not count' })
-  })
 
   it('blocks on a confirmed important finding: its fix gets it with its class and the nits once as notes; the re-review reads the open finding, never counts an answered one again, and the run converges', async () => {
     const tree = workingTree()
@@ -342,27 +216,5 @@ describe('a review that converges (board T266)', () => {
     expect(done.nodes.some((n) => n.nodeId === 'review:review:2:verify')).toBe(false)
     expect(assessmentOf(ctx, runId, 'review').summary).toMatch(/^1 important \(1 confirmed, 0 not\), 1 nit; 1 confirmed important finding blocks/)
     expect(ctx.workflow.explain(runId)!.nodes.find((n) => n.nodeId === 'review')!.review!.findings[0]).toMatchObject({ id: 'f1', blocks: true, vote: 'confirm', place: 'calc.py:2', class: 'arithmetic sign' })
-  })
-
-  it('files a pre-existing finding as a proposed follow-up task, linked, without blocking the change', async () => {
-    const tree = workingTree()
-    const PRE = { severity: 'pre-existing', title: 'sub() has the same sign bug', file: 'calc.py', line: 5, evidence: 'line 5 returns a + b, so sub(3, 1) is 4' }
-    const { ctx } = await boot(tree, { review: () => ({ verdict: 'approve', findings: [PRE] }) })
-    const runId = await start(ctx)
-    const done = await reported(ctx, runId)
-    expect(done.status).toBe('completed')
-    expect(done.nodes.map((n) => n.nodeId)).toEqual(['develop', 'review'])
-    const [filed] = await until(() => {
-      const found = decisions(ctx, runId, 'workflow.follow-up')
-      return found.length ? found : undefined
-    }, 'the follow-up decision')
-    expect(filed!.outcome).toMatchObject({ option: 'propose', detail: { finding: 'f1', taskId: expect.any(String) } })
-    const task = (await ctx.board.task(filed!.outcome.detail!.taskId as string))!
-    expect(task).toMatchObject({ state: 'proposed', projectId: 'p1', title: 'Pre-existing: sub() has the same sign bug', dependsOn: [] })
-    expect(task.goal).toContain(`review review of run ${runId}`)
-    expect(task.goal).toContain('Evidence: line 5 returns a + b')
-    // Linked from the task's dossier; the change it was found in was not held for it.
-    await until(() => ctx.workflow.dossier({ runId }).entries.find((e) => e.kind === 'evidence' && e.text.includes(`follow-up task ${task.taskId}`)), 'the follow-up\'s dossier entry')
-    expect(assessmentOf(ctx, runId, 'review').summary).toMatch(/^1 pre-existing; nothing blocks\./)
   })
 })

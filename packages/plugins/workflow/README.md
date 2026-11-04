@@ -611,7 +611,7 @@ second execution path (INV-1).
     `setDispatchAdvisor(advisor)`, the thin path (contract 1.11), swaps one in place of both; one
     method picks the advisor in force at each choice. Every provider passes the seam's suite
     (`decision-core/conformance/dispatch-advisor.ts`, contract 1.0; run in `tests/dispatch.spec.ts`
-    by a fake, `local`, and `model`, through `setDispatchAdvisor` and through `ctx.dispatchAdvisor`,
+    by a fake, through `setDispatchAdvisor` and through `ctx.dispatchAdvisor`,
     over this engine's dispatch harness, [`conformance/advisor.ts`](conformance/advisor.ts)). An
     advisor is stopped through an `AdvisorSignal`, not an `AbortSignal`: its listeners run inside a
     guard (`advisorStop`), so one that throws is recorded with the timeout and can never become an
@@ -1016,64 +1016,13 @@ second execution path (INV-1).
   continuations, a run's required checks, a plain run's acceptance, and the dispatch pass's verdicts and
   requests (missing `approvals`, a ledger with `quota()`, or a router with `candidates`, dispatch starts
   nothing).
-- **Tests** beyond the suite: [`tests/board.spec.ts`](tests/board.spec.ts) runs the engine over
-  the store-backed board and approval queue end to end: a task claimed and done, a lead's claim
-  adopted, stale claims refused, the lease renewed past its length, a failed and a stopped run
-  reported, a restart with the holder lost (reconciled, nothing new started) and one whose work
-  finished meanwhile (accepted through `reconcileRun`), a review left to the operator for want
-  of a required check (held by the board, past the run's lease), a result off the written
-  subject, a task's budget reserved and released, a spent one blocking the task, a spent one
-  funded over the store-backed ledger (the ask from the ledger's count, approved in the queue, the
-  lines raised, the next attempt reserving and running; a denial and an ask past the board's bound
-  raising nothing; a crash between the approval and the board's move applying it once), the refusals
-  of a budget no ledger can hold, a step's questions blocking its task and the answers briefing
-  the next attempt, the board's TASKS.md in every brief (bounded), and the refusals with no board. [`tests/remediation.spec.ts`](tests/remediation.spec.ts)
-  runs remediation over the store-backed queue and a git working tree: one request on the exact
-  subject and the fix only once it is approved (`approve` refused), a rejection and `continue`, an
-  expiry, `forbid`, `stop` withdrawing, a restart that applies a verdict given meanwhile and adopts
-  a request whose id was lost, the plan gate with no queue, and a plain run's acceptance with its
-  pending checks; and a re-review's instructions: composed as its review's, its pointer re-bound
-  to the fix, one an earlier version grew marked literal composed when promoted, and one stored
-  uncomposed refused before it starts, then composed on `continue`.
-  [`tests/instructions.spec.ts`](tests/instructions.spec.ts) covers the placeholder guard: a
-  template with a placeholder the engine does not fill refused at load and on the profiles seam,
-  a stored one refused at promotion and before a Worker starts, each on a decision with nothing
-  sent, and a `{{…}}` in the caller's input or a result sent as written.
-  The continuation of a deferred call runs end to end with a gating agent runtime
-  in [`agent-workers`' gate tests](../agent-workers/tests/gate.spec.ts), for a plain run and for a
-  board task's run over the store-backed board: the step waiting with its task running, approved
-  and continued once, rejected and expired (`USER_ACTION`, an attempt counted), stopped (its
-  request withdrawn), and across an engine restart.
-  [`tests/replies.spec.ts`](tests/replies.spec.ts) holds the `result` and `usage` replies of
-  completed fixture runs to their ceilings, checks that each says its answer once, and that
-  `usage` leaves out what `result` gives
-  ([token budget](../mcp-server/README.md#token-budget)).
-  [`tests/digests.spec.ts`](tests/digests.spec.ts) covers
-  the digests of task results: asked after the report and set on the task, the next task's brief
-  pointing at it, the hourly bound, no provider, a digest not written, a review held for the
-  operator, a restart while a request is pending, the wait's bound, and a board that no longer
-  takes it. [`tests/member-routing.spec.ts`](tests/member-routing.spec.ts) covers a review
-  member kept off a website by its input bound (the live review of 2026-10-23): a text review's
-  material shown once, so the member fits the site; a member over a site's bound routed at its own
-  tier; a rejected answer its session cannot escalate failed with the rejection and why, never a
-  family shortage that is not there, and one it can escalated within its session.
-  [`tests/checks.spec.ts`](tests/checks.spec.ts) covers a run's required checks over the
-  store-backed board and queue with a scripted source: passed (the task done without the
-  operator, the evidence among the acceptance's inputs), a failed one (another attempt), one that
-  did not run, a refusal, and no source (held for the operator with them pending), none asked for
-  a class that requires none, and a plain run's acceptance reporting them; on the real stack with
-  confined commands in
-  [`profile-software-development`'s checks tests](../profile-software-development/tests/checks.spec.ts).
-  [`tests/dispatch.spec.ts`](tests/dispatch.spec.ts) runs the dispatch pass over the store-backed
-  board, queue, and ledger: the settings and their ranges (a row refused on one), the operator's
-  case (oldest first, `maxPerPass`, each start on a free Worker chosen by quota, a reason on every
-  task and Worker), an ask interrupted between the request and its record adopted, an approval
-  starting exactly its attempt and Worker, an approval past its hold used for nothing and asked
-  again, a lead's start winning the race (the ask withdrawn), a denied attempt never asked again,
-  every bound, the repository bound (D64), unknown, stale, and reserved windows never free, the
-  board's gate counting as approval (D62), `forbid`, `auto` in D1, off, and a pause across a
-  restart, and the counts across a restart. The crash suite kills it after its request and after
-  its run's record ([`dispatch.crash.ts`](../../system-bundle/tests/crash/dispatch.crash.ts)).
+- **Tests** beyond the suite: one or a few scenarios per behavior that guards an invariant or a
+  gate (fail closed, restart reconciliation, exact subject, bounds, recorded decisions, one
+  writer), end to end over the store-backed board and approval queue where it matters. The
+  required checks of a run are also tested in
+  [`profile-software-development`'s checks tests](../profile-software-development/tests/checks.spec.ts),
+  and the crash suite kills the dispatch pass after its request and after its run's record
+  ([`dispatch.crash.ts`](../../system-bundle/tests/crash/dispatch.crash.ts)).
 
 ## Source layout
 

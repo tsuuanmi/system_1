@@ -152,7 +152,7 @@ export function featuresOf(input: { kind?: string; template: string; step: strin
 // --- the local adapter: a regularized logistic regression ---
 
 /** One labelled dispatched attempt: the chosen candidate's features then, and what came of it. */
-export interface Labelled {
+interface Labelled {
   candidate: AdvisorCandidate
   reservePercent: number
   labels: Record<Question, 0 | 1>

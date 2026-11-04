@@ -217,8 +217,6 @@ other payload (QA-12, INV-9).
   token (the lead's), every tool's entry, and the replies of `status` in both scopes, of
   `result` for a failed `ask`, and of `usage` with that run. A Worker holds at most the `model`
   token, which `/mcp` refuses, so it pays for no list.
-  [`workflow/tests/replies.spec.ts`](../workflow/tests/replies.spec.ts) measures `result` and
-  `usage` on fixture runs that completed.
 - **Replies:** a tool answers once. The answer is the result's `structuredContent`; its text
   block is a short summary (`reply` and `outline` in
   [`gateway-core`](../../gateway-core/README.md#replies)), never the same JSON again. A completed

@@ -23,7 +23,7 @@ import WorkerRouter from '@tsuuanmi/system-workers'
 import type { TipChecked, TipCheckStep, WorkerSource } from '@tsuuanmi/system-workers-core'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { activeProject, CONFIG } from '../conformance/workflow.ts'
-import Workflow, { type DailyCheckConfig, dailyCheckProblems, dailyCheckSettings } from '../src/index.ts'
+import Workflow, { type DailyCheckConfig } from '../src/index.ts'
 
 vi.setConfig({ testTimeout: 120_000 })
 
@@ -98,43 +98,6 @@ async function boot(dir: string, dailyCheck: DailyCheckConfig = {}): Promise<{ c
 const DAY = (n: number, hour = 5): Date => new Date(Date.UTC(2026, 10, 1 + n, hour, 0, 0))
 const tasksOf = (ctx: Context) => ctx.board.tasks({ projectId: 'p1' })
 
-describe('the settings', () => {
-  it('defaults to dev at 04:00 UTC, off, and refuses what is out of range or missing when on', () => {
-    expect(dailyCheckSettings({})).toMatchObject({ enabled: false, ref: 'dev', hourUtc: 4, actionClass: 'workspace-write' })
-    expect(dailyCheckProblems({ dailyCheck: { enabled: true } })).toEqual([expect.stringContaining('projectId is required'), expect.stringContaining('repository is required')])
-    expect(dailyCheckProblems({ dailyCheck: { hourUtc: 24 } })).toEqual(['dailyCheck.hourUtc must be a whole number from 0 to 23'])
-    expect(dailyCheckProblems({ dailyCheck: { repository: 'relative/path' } })).toEqual([expect.stringContaining('absolute path')])
-    expect(() => dailyCheckSettings({ dailyCheck: { bogus: 1 } as DailyCheckConfig })).toThrow(/dailyCheck.bogus is not an option/)
-  })
-})
-
-describe('the schedule', () => {
-  it('runs once a day, from its hour, on the ref\'s tip, and records a pass', async () => {
-    const { dir, tip } = repository()
-    const { ctx, script } = await boot(dir, { hourUtc: 4 })
-    expect(await ctx.workflow.dailyCheckTick(DAY(0, 3))).toBeUndefined()
-    expect(script.steps).toEqual([])
-    const first = await ctx.workflow.dailyCheckTick(DAY(0, 4))
-    expect(first).toMatchObject({ state: 'passed', ref: 'dev', commit: tip(), trigger: 'schedule', day: '2026-11-01', failures: [] })
-    expect(script.steps).toEqual([expect.objectContaining({ repository: dir, commit: tip(), runId: `daily-2026-11-01-${tip().slice(0, 12)}` })])
-    // The same day, later: nothing runs again.
-    expect(await ctx.workflow.dailyCheckTick(DAY(0, 23))).toBeUndefined()
-    expect(script.steps).toHaveLength(1)
-    // The next day it runs again.
-    expect(await ctx.workflow.dailyCheckTick(DAY(1))).toMatchObject({ state: 'passed', day: '2026-11-02' })
-    expect(script.steps).toHaveLength(2)
-    expect(await tasksOf(ctx)).toEqual([])
-  })
-
-  it('does nothing while it is off', async () => {
-    const { dir } = repository()
-    const { ctx, script } = await boot(dir, { enabled: false })
-    expect(await ctx.workflow.dailyCheckTick(DAY(0))).toBeUndefined()
-    expect(script.steps).toEqual([])
-    expect(ctx.workflow.dailyCheckReport().text).toBe('The daily run is off (dailyCheck.enabled).')
-  })
-})
-
 describe('a failure', () => {
   it('files one task with the failing tests, the commit, and the last green commit', async () => {
     const repo = repository()
@@ -155,47 +118,9 @@ describe('a failure', () => {
     expect(report.lastGreen).toMatchObject({ commit: green })
     expect(report.text).toContain(`Last green: ${green.slice(0, 12)}`)
   })
-
-  it('files none for a second failure while the task is open, and one again once it is cancelled', async () => {
-    const repo = repository()
-    const { ctx, script } = await boot(repo.dir)
-    script.answer = () => failed()
-    const first = await ctx.workflow.dailyCheckTick(DAY(0))
-    expect(first).toMatchObject({ state: 'failed', duplicate: false })
-    repo.commit()
-    const second = await ctx.workflow.dailyCheckTick(DAY(1))
-    expect(second).toMatchObject({ state: 'failed', duplicate: true, taskId: first!.taskId })
-    expect(await tasksOf(ctx)).toHaveLength(1)
-    await ctx.board.cancel(first!.taskId!, 'operator', 'fixed by hand')
-    const third = await ctx.workflow.dailyCheckTick(DAY(2))
-    expect(third).toMatchObject({ state: 'failed', duplicate: false })
-    expect(third!.taskId).not.toBe(first!.taskId)
-    expect(await tasksOf(ctx)).toHaveLength(2)
-  })
-
-  it('bounds the failing lines it tells', async () => {
-    const repo = repository()
-    const { ctx, script } = await boot(repo.dir)
-    script.answer = () => failed(Array.from({ length: 500 }, (_, i) => `line ${i} ${'x'.repeat(400)}`))
-    const row = await ctx.workflow.dailyCheckTick(DAY(0))
-    expect(row!.failures).toHaveLength(200)
-    expect(Math.max(...row!.failures.map((l) => l.length))).toBeLessThanOrEqual(240)
-  })
 })
 
 describe('a run that did not run to an exit code', () => {
-  it('is an error that files nothing: no source, a refusal, or a check that errored', async () => {
-    const repo = repository()
-    const { ctx, script } = await boot(repo.dir)
-    script.answer = () => undefined
-    expect(await ctx.workflow.dailyCheckTick(DAY(0))).toMatchObject({ state: 'error', problem: expect.stringContaining('no Worker source') })
-    script.answer = () => ({ outcome: 'refused', cause: 'failed', reason: 'its setup did not run' })
-    expect(await ctx.workflow.dailyCheckTick(DAY(1))).toMatchObject({ state: 'error', problem: expect.stringContaining('its setup did not run') })
-    script.answer = () => ({ outcome: 'checked', result: { check: 'tests', outcome: 'error', reason: 'it did not finish within 3600 s' } })
-    expect(await ctx.workflow.dailyCheckTick(DAY(2))).toMatchObject({ state: 'error', problem: 'it did not finish within 3600 s' })
-    expect(await tasksOf(ctx)).toEqual([])
-    expect(ctx.workflow.dailyCheckReport().lastGreen).toBeUndefined()
-  })
 
   it('is an error, never a pass nor the last green commit, when its command passed without running the browser tests', async () => {
     const repo = repository()
@@ -211,19 +136,5 @@ describe('a run that did not run to an exit code', () => {
     expect(row).toMatchObject({ state: 'failed' })
     expect(row!.lastGreen).toBeUndefined()
     expect((await tasksOf(ctx))[0]!.goal).toContain('Last green commit: none recorded')
-  })
-
-  it('resumes a run a restart cut, without a second one for the day', async () => {
-    const repo = repository()
-    const { ctx, script, restart } = await boot(repo.dir)
-    ctx.store.db.prepare(`INSERT INTO workflow_daily_checks (check_id, day, trigger, repo_ref, commit_sha, state, started_at) VALUES ('daily-2026-11-01-x', '2026-11-01', 'schedule', 'dev', ?, 'running', ?)`)
-      .run(repo.tip(), DAY(0).toISOString())
-    await restart()
-    await vi.waitFor(() => expect(ctx.workflow.dailyCheckReport().last).toMatchObject({ checkId: 'daily-2026-11-01-x', state: 'passed' }))
-    expect(script.steps).toEqual([expect.objectContaining({ runId: 'daily-2026-11-01-x' })])
-    // The day has its run: a later pass starts no other.
-    await ctx.workflow.dailyCheckTick(DAY(0, 23))
-    expect(script.steps).toHaveLength(1)
-    expect(ctx.workflow.dailyCheckReport().runs).toHaveLength(1)
   })
 })

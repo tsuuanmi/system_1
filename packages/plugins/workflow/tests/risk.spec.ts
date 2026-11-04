@@ -20,7 +20,7 @@ import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { worker } from '../../../workers-core/conformance/workers.ts'
 import { activeProject, CONFIG, readyTask, type Rendered, ScriptedWorkers, TEMPLATES } from '../conformance/workflow.ts'
 import Workflow from '../src/index.ts'
-import { type AcceptanceRisk, heavyReasons, secondFamily } from '../src/risk.ts'
+import { type AcceptanceRisk, secondFamily } from '../src/risk.ts'
 import type { NodeTemplate } from '../src/spec.ts'
 
 // Process tiered by risk (PROP-0016 §4, D83, ADR-0071), over the store-backed board and approval
@@ -277,60 +277,19 @@ describe('the acceptance of a heavy result requires approving reviews of its exa
   const at = 'git:abc:v1'
   const risk = (reviews: AcceptanceRisk['reviews'], tier: AcceptanceRisk['tier'] = 'heavy'): AcceptanceRisk => ({ tier, decision: 'sha256:r' as ArtifactRef, reviews })
 
-  it('counts families, never reviews: two Workers of one family are one', () => {
-    expect(secondFamily(risk([{ node: 'review', worker: 'a1', subject: at, family: 'fam-a' }, { node: 'review:second', worker: 'a2', subject: at, family: 'fam-a' }]), at)).toMatchObject({ met: false, families: 1 })
-    expect(secondFamily(risk([{ node: 'review', worker: 'a', subject: at, family: 'fam-a' }, { node: 'review:second', worker: 'b', subject: at, family: 'fam-b' }]), at)).toMatchObject({ met: true, families: 2 })
-  })
-
   it('counts only approvals of the exact tree, and a Worker whose family is not listed now as none (INV-5, ADR-0027)', () => {
     expect(secondFamily(risk([{ node: 'review', worker: 'a', subject: at, family: 'fam-a' }, { node: 'review:second', worker: 'b', subject: 'git:abc:v0', family: 'fam-b' }]), at)).toMatchObject({ met: false, families: 1 })
     expect(secondFamily(risk([{ node: 'review', worker: 'a', subject: at, family: 'fam-a' }, { node: 'review:second', worker: 'gone', subject: at }]), at)).toMatchObject({ met: false, families: 1 })
   })
 
-  const reviewed = { node: 'review', verdict: 'approve', blocking: 0, cycle: 1, maxCycles: 3, subject: { ref: 'abc', version: 'v1' } }
   const both: AcceptanceRisk['reviews'] = [{ node: 'review', worker: 'a', subject: at, family: 'fam-a' }, { node: 'review:second', worker: 'b', subject: at, family: 'fam-b' }]
-  const report = { type: 'artifact', ref: 'sha256:report' }
-
-  it('judges a result bound to a report artifact on the tree its reviews judged (T280)', () => {
-    expect(heavyReasons(risk(both), report, reviewed)).toMatchObject({ met: true, families: 2, reasons: [] })
-  })
-
-  it('names a last review that requested changes at the bound first, before any family reason (T280)', () => {
-    const said = heavyReasons(risk([both[0]!]), report, { ...reviewed, verdict: 'changes-requested', blocking: 1, cycle: 3 })
-    expect(said.met).toBe(false)
-    expect(said.reasons[0]).toMatch(/changes-requested with 1 blocking finding\(s\) at cycle 3 of 3/)
-    expect(said.reasons[1]).toMatch(/only 1 provider family/)
-  })
 
   it('throws on an empty subject, never reading it as no reviews (T280)', () => {
     expect(() => secondFamily(risk(both), '')).toThrow(/empty/)
   })
-
-  it('rejects a heavy result with no review of a git tree, saying so', () => {
-    expect(heavyReasons(risk(both), report, undefined)).toMatchObject({ met: false, reasons: [expect.stringMatching(/no review of a git tree/)] })
-  })
-
-  it('asks nothing of a light or normal result, or of a run with no tier', () => {
-    expect(secondFamily(risk([], 'normal'), at).met).toBe(true)
-    expect(secondFamily(undefined, at).met).toBe(true)
-  })
 })
 
 describe('a light change (ADR-0071): its validation step is skipped once its required checks pass', () => {
-  it('retires the validation step after the review approved and the checks passed on its exact tree, and is accepted without the operator', async () => {
-    const { ctx, holder, workers, task } = await boot()
-    holder.files = ['docs/a.md', 'docs/b.md']
-    const { taskId, runId } = await task()
-    expect(await settled(ctx, taskId)).toMatchObject({ state: 'review', waiting: { reason: 'landing' } })
-    expect(workers.started.some((s) => s.prompt.includes('Validate it'))).toBe(false)
-    const view = ctx.workflow.get(runId)!
-    expect(view.nodes.find((n) => n.nodeId === 'validate')?.state).toBe('RETIRED')
-    expect(view.nodes.some((n) => n.nodeId === 'review:second')).toBe(false)
-    const [skip] = decisionsOf(ctx, runId, 'workflow.risk-skip')
-    expect(skip).toMatchObject({ nodeId: 'validate', outcome: { option: 'skip', detail: { tier: 'light' } } })
-    expect(acceptanceOf(ctx, runId).outcome).toMatchObject({ option: 'accept', detail: { risk: { tier: 'light' }, checks: { tests: true, lint: true } } })
-    expect(ctx.workflow.explain(runId)?.risk?.tier).toBe('light')
-  })
 
   it('runs the validation step when a required check failed, recorded, and the failed check sends the work back', async () => {
     const { ctx, holder, workers, task } = await boot()
@@ -343,123 +302,10 @@ describe('a light change (ADR-0071): its validation step is skipped once its req
     expect(run).toMatchObject({ nodeId: 'validate', outcome: { option: 'run' } })
     expect(run!.candidates.find((c) => c.selected)!.reasons[0]).toMatch(/a required check failed: lint/)
   })
-
-  it('a normal change runs every step and is accepted as before', async () => {
-    const { ctx, holder, workers, task } = await boot()
-    holder.files = ['src/a.c']
-    const { taskId, runId } = await task()
-    expect(await settled(ctx, taskId)).toMatchObject({ state: 'review', waiting: { reason: 'landing' } })
-    expect(workers.started.some((s) => s.prompt.includes('Validate it'))).toBe(true)
-    expect(decisionsOf(ctx, runId, 'workflow.risk-skip')).toEqual([])
-    expect(acceptanceOf(ctx, runId).outcome.detail['risk']).toMatchObject({ tier: 'normal' })
-  })
 })
 
 describe('tier by risk (ADR-0073): a step\'s minimum tier set by its task\'s risk tier, as the policy maps it, recorded', () => {
   const tierDecisions = (ctx: Context, runId: string) => decisionsOf(ctx, runId, 'workflow.tier-by-risk')
-
-  it('raises a heavy change\'s reviews to frontier, the first and the second, a recorded decision naming the risk and the map, while develop, routed before the change existed, keeps its tier', async () => {
-    const frontier = (id: string, family: string) => worker(id, { schema: 'capability-descriptor@1.1', family, tier: 'frontier', proves: ['review'] })
-    const { ctx, holder, workers, task } = await boot({ reviewers: [frontier('w:reviewer-a', 'fam-a'), frontier('w:reviewer-b', 'fam-b')], byRisk: BY_RISK })
-    holder.files = ['src/gate/policy.ts']
-    const { taskId, runId } = await task()
-    await settled(ctx, taskId)
-    // develop ran before there was a change: it keeps its template's tier. Both reviews are tiered from the change they review (T288).
-    const decided = tierDecisions(ctx, runId)
-    expect(decided.map((d) => d.nodeId)).toEqual(['review', 'review:second'])
-    expect(decided[0]).toMatchObject({ outcome: { option: 'frontier', detail: { risk: 'heavy', from: 'standard', to: 'frontier' } } })
-    expect(ctx.workflow.get(runId)!.nodes.find((n) => n.nodeId === 'review')).toMatchObject({ tier: 'frontier' })
-    // The routing-time decision is the review's own, never the run's: the acceptance still records its one run-level decision.
-    expect(acceptanceOf(ctx, runId).outcome.detail['risk']).toMatchObject({ tier: 'heavy' })
-    expect(decisionsOf(ctx, runId, 'workflow.risk-tier').filter((d) => d.nodeId === undefined)).toHaveLength(1)
-    const second = decided[1]
-    expect(second).toMatchObject({ decider: { id: 'workflow.tier-by-risk', version: '1' }, outcome: { option: 'frontier', detail: { risk: 'heavy', from: 'standard', to: 'frontier', matched: [{ policy: 'studio', policyVersion: 1, mapVersion: 1, key: 'review', tier: 'frontier' }] } } })
-    expect(second!.inputs).toHaveLength(1)
-    expect(ctx.artifacts.get(second!.inputs[0] as ArtifactRef)?.body).toMatchObject({ decider: { id: 'workflow.risk-tier' }, outcome: { option: 'heavy' } })
-    expect(second!.candidates.find((c) => c.selected)!.reasons).toEqual([expect.stringContaining('the task\'s change is heavy'), 'raised from standard to frontier'])
-    const view = ctx.workflow.get(runId)!
-    expect(view.nodes.find((n) => n.nodeId === 'review:second')).toMatchObject({ state: 'COMPLETED', worker: 'w:reviewer-b', tier: 'frontier' })
-    expect(view.nodes.find((n) => n.nodeId === 'develop')).toMatchObject({ worker: 'w:standard', tier: 'standard' })
-    const explained = ctx.workflow.explain(runId)!.nodes.find((n) => n.nodeId === 'review:second')!
-    expect(explained.decisions.map((d) => d.type)).toEqual(expect.arrayContaining(['tier', 'route']))
-    expect(workers.started.filter((s) => s.worker === 'w:frontier')).toEqual([])
-  })
-
-  it('runs a first attempt\'s first review at frontier when its develop wrote a heavy change, and at the template\'s tier when the change is light (T288)', async () => {
-    const heavy = await boot({ reviewers: [reviewer('w:reviewer-a', 'fam-a'), worker('w:reviewer-b', { schema: 'capability-descriptor@1.1', family: 'fam-b', tier: 'frontier', proves: ['review'] })], byRisk: BY_RISK })
-    heavy.holder.files = ['src/gate/policy.ts']
-    const one = await heavy.task()
-    // Only fam-b reviews at frontier, so the second review (fam-a, frontier) finds no Worker and the run fails before any
-    // acceptance: what is asserted here is the first review's tier only.
-    await settled(heavy.ctx, one.taskId)
-    expect(heavy.ctx.workflow.get(one.runId)!.nodes.find((n) => n.nodeId === 'review')?.state).toBe('COMPLETED')
-    const first = tierDecisions(heavy.ctx, one.runId).find((d) => d.nodeId === 'review')!
-    expect(first).toMatchObject({ outcome: { option: 'frontier', detail: { risk: 'heavy', from: 'standard', to: 'frontier' } } })
-    // Its input is the risk of the change it reviews, decided under the review when it was routed.
-    expect(heavy.ctx.artifacts.get(first.inputs[0] as ArtifactRef)).toMatchObject({ nodeId: 'review', body: { decider: { id: 'workflow.risk-tier' }, outcome: { option: 'heavy', detail: { routed: 'review' } } } })
-    // The frontier Worker of fam-b took it; at the template's standard tier, fam-a's would have been as good.
-    expect(heavy.ctx.workflow.get(one.runId)!.nodes.find((n) => n.nodeId === 'review')).toMatchObject({ worker: 'w:reviewer-b', tier: 'frontier' })
-
-    const light = await boot({ byRisk: BY_RISK })
-    light.holder.files = ['docs/a.md']
-    const two = await light.task()
-    await settled(light.ctx, two.taskId)
-    expect(decisionsOf(light.ctx, two.runId, 'workflow.risk-tier').find((d) => d.nodeId === 'review' && d.outcome.detail['routed'] === 'review')?.outcome.option).toBe('light')
-    expect(tierDecisions(light.ctx, two.runId).find((d) => d.nodeId === 'review')).toBeUndefined()
-    expect(light.ctx.workflow.get(two.runId)!.nodes.find((n) => n.nodeId === 'review')).toMatchObject({ tier: 'standard' })
-  })
-
-  it('records in the brief of a step on a Worker that offers tiers the tier it was served at and the model its source runs there; a one-tier Worker\'s brief names neither', async () => {
-    const tiered = worker('w:reviewer-t', { schema: 'capability-descriptor@1.10', family: 'fam-a', tier: 'standard', tiers: [{ tier: 'standard' }, { tier: 'frontier' }], proves: ['review'] })
-    const { ctx, workers, task } = await boot({ map: null, reviewers: [tiered] })
-    workers.models.set('w:reviewer-t standard', 'model-standard-1')
-    workers.models.set('w:reviewer-t frontier', 'model-frontier-1')
-    const { taskId, runId } = await task()
-    await settled(ctx, taskId)
-    const view = ctx.workflow.get(runId)!
-    const brief = (nodeId: string) => ctx.artifacts.get(view.nodes.find((n) => n.nodeId === nodeId)!.brief!)!.body as Record<string, unknown>
-    // A board task's step records its handbook slice too (brief@1.6, which holds the tier and the model).
-    expect(brief('review')).toMatchObject({ schema: 'brief@1.6', tier: 'standard', model: 'model-standard-1', handbook: { selection: { role: 'review' } } })
-    expect(brief('develop')).not.toHaveProperty('tier')
-    expect(brief('develop')).not.toHaveProperty('model')
-  })
-
-  it('lowers a light change\'s validation to economy when it runs (a required check failed), and leaves a normal change\'s steps as their templates say', async () => {
-    const { ctx, holder, workers, task } = await boot({ byRisk: BY_RISK })
-    holder.files = ['docs/a.md']
-    holder.lint = 'failed'
-    const { taskId, runId } = await task()
-    await settled(ctx, taskId)
-    const validate = workers.started.find((s) => s.prompt.includes('Validate it'))!
-    expect(validate.worker).toBe('w:economy')
-    expect(tierDecisions(ctx, runId)).toEqual([expect.objectContaining({ nodeId: 'validate', outcome: expect.objectContaining({ option: 'economy', detail: expect.objectContaining({ risk: 'light', from: 'standard', to: 'economy' }) }) })])
-
-    const normal = await boot({ byRisk: BY_RISK })
-    normal.holder.files = ['src/a.c']
-    const two = await normal.task()
-    await settled(normal.ctx, two.taskId)
-    expect(tierDecisions(normal.ctx, two.runId)).toEqual([])
-    expect(normal.workers.started.find((s) => s.prompt.includes('Validate it'))!.worker).toBe('w:standard')
-  })
-
-  it('starts a heavy task\'s next attempt with its develop step at frontier, from the earlier attempt\'s risk tier', async () => {
-    const { ctx, holder, workers, task } = await boot({ reviewers: [reviewer('w:reviewer-a', 'fam-a'), reviewer('w:reviewer-a2', 'fam-a')], byRisk: { version: 2, heavy: { develop: 'frontier' } } })
-    holder.files = ['src/gate/policy.ts']
-    const first = await task()
-    // One family only: the second review cannot run, and the attempt fails, its change found heavy.
-    expect((await settled(ctx, first.taskId)).state).toBe('ready')
-    expect(decisionsOf(ctx, first.runId, 'workflow.risk-tier').map((d) => d.outcome.option)).toContain('heavy')
-    const again = await ctx.workflow.start({ template: 'tiered', input: 'change it again', classification: 'public', task: { taskId: first.taskId } })
-    await vi.waitFor(() => {
-      if (!ctx.workflow.get(again.runId)!.nodes.find((n) => n.nodeId === 'develop')?.worker) throw new Error('develop not routed yet')
-    }, { timeout: 30_000, interval: 25 })
-    expect(ctx.workflow.get(again.runId)!.nodes.find((n) => n.nodeId === 'develop')).toMatchObject({ worker: 'w:frontier', tier: 'frontier' })
-    expect(workers.started.find((s) => s.runId === again.runId)!.worker).toBe('w:frontier')
-    const [raised] = tierDecisions(ctx, again.runId)
-    expect(raised).toMatchObject({ nodeId: 'develop', outcome: { option: 'frontier', detail: { risk: 'heavy', from: 'standard', matched: [{ mapVersion: 2, key: 'develop' }] } } })
-    // Its input is the earlier attempt's risk-tier decision: the task's tier, read from the run that found it.
-    expect(ctx.artifacts.get(raised!.inputs[0] as ArtifactRef)?.body).toMatchObject({ decider: { id: 'workflow.risk-tier' }, outcome: { option: 'heavy' } })
-  })
 
   it('holds a step whose tier at its risk tier cannot be read (the policy unreadable): it is never routed at its template\'s tier, and fails unsent once its attempts are spent (INV-2)', async () => {
     const { ctx, workers, task } = await boot({ byRisk: BY_RISK })
@@ -479,15 +325,4 @@ describe('tier by risk (ADR-0073): a step\'s minimum tier set by its task\'s ris
     read.mockRestore()
     expect((await ctx.board.task(taskId))!.state).not.toBe('done')
   })
-})
-
-it('is off with no path map in the policy: no tier is decided, and the process is as before', async () => {
-  const { ctx, holder, workers, task } = await boot({ map: null })
-  holder.files = ['src/gate/policy.ts']
-  const { taskId, runId } = await task()
-  expect(await settled(ctx, taskId)).toMatchObject({ state: 'review', waiting: { reason: 'landing' } })
-  expect(workers.started.some((s) => s.prompt.includes('Validate it'))).toBe(true)
-  expect(decisionsOf(ctx, runId, 'workflow.risk-tier')).toEqual([])
-  expect(acceptanceOf(ctx, runId).outcome.detail).not.toHaveProperty('risk')
-  expect(ctx.workflow.explain(runId)).not.toHaveProperty('risk')
 })

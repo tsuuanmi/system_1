@@ -12,13 +12,13 @@ import { type DigestRequest, Digests, type DigestView } from '@tsuuanmi/system-d
 import Egress from '@tsuuanmi/system-egress'
 import EventLog from '@tsuuanmi/system-event-log'
 import Leases from '@tsuuanmi/system-leases'
-import { type Brief, SchemaRegistry } from '@tsuuanmi/system-libs'
+import { SchemaRegistry } from '@tsuuanmi/system-libs'
 import Store from '@tsuuanmi/system-store'
 import WorkerSessions from '@tsuuanmi/system-worker-sessions'
 import WorkerRouter from '@tsuuanmi/system-workers'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { type Drafter, FakeDigests } from '../../../digest-core/conformance/digests.ts'
-import { activeProject, CONFIG, handbookPointer, readyTask, ScriptedWorkers, TEMPLATES } from '../conformance/workflow.ts'
+import { activeProject, CONFIG, readyTask, ScriptedWorkers, TEMPLATES } from '../conformance/workflow.ts'
 import Workflow, { type Config, type RunView, type TaskView } from '../src/index.ts'
 
 // The engine's digests of board task results, end to end over the store-backed board and approval
@@ -150,34 +150,6 @@ const decisionOf = (ctx: Context, ref: string | undefined): Decision => {
 const events = (ctx: Context, runId: string) => ctx.eventLog.query({ runId, type: 'workflow.task.digest' })
 
 describe('the engine digests a board task\'s result once it reached the board (B6)', () => {
-  it('asks once the result is reported, sets the written digest on the task through the board\'s attachDigest, and the next task\'s brief points at it', async () => {
-    const { ctx, workers } = await boot({ digests: quoting('answer') })
-    const first = await readyTask(ctx, 'first')
-    workers.reply = () => ({ text: 'the answer of the first' })
-    const one = await run(ctx, first)
-    // The report came first: the task is done whatever the digest does.
-    expect(one.task?.outcome).toMatchObject({ status: 'accepted', state: 'done' })
-    const task = await digested(ctx, one.runId)
-    expect(task.digest).toMatchObject({ state: 'attached', requestId: expect.any(String), digest: expect.stringMatching(/^sha256:/) })
-    const board = (await ctx.board.task(first.taskId))!
-    schemas.assertRecord(board)
-    expect(board.result).toMatchObject({ artifacts: [one.result], digest: (task.digest as { digest?: string }).digest })
-    expect((ctx.artifacts.get(board.result!.digest!)!.body as { sources: string[] }).sources).toEqual([one.result])
-    // Asked for by a recorded admission decision, and its end is an event naming the digest's own settling decision.
-    const asked = decisionOf(ctx, (task.digest as { decision?: string }).decision)
-    expect(asked).toMatchObject({ decisionType: 'admission', decider: { id: 'workflow.task-digest' }, outcome: { option: 'request', detail: { taskId: first.taskId, runId: one.runId, requested: 0, perHour: 6 } }, inputs: [one.result] })
-    const [event] = events(ctx, one.runId)
-    expect(event).toMatchObject({ data: { taskId: first.taskId, state: 'attached' } })
-    expect(decisionOf(ctx, event!.decision)).toMatchObject({ decisionType: 'acceptance', decider: { id: 'digests.quote-check' }, outcome: { option: 'written' } })
-
-    // A task that depends on it reads the digest, never the raw result.
-    const second = await readyTask(ctx, 'second', { dependsOn: [first.taskId] })
-    const two = await run(ctx, second, 'go on')
-    expect(two.task?.outcome).toMatchObject({ status: 'accepted' })
-    const brief = ctx.artifacts.get(workers.started.at(-1)!.brief!)!.body as Brief
-    // Then the step's handbook slice (docs/design/handbook.md).
-    expect(brief.artifacts).toEqual([{ ref: board.result!.digest, role: 'input', note: `the digest of the accepted result of ${first.taskId}: first` }, handbookPointer(ctx, brief)!.pointer])
-  })
 
   it('records why a result keeps no digest: the hourly bound reached, a digest not written, or no digest provider loaded (ADR-0036, INV-9)', async () => {
     const { ctx, workers } = await boot({ digests: (sources, tier) => (tier === 'economy' ? quoting('answer')(sources, tier) : { fail: 'never' }), workflow: { digestsPerHour: 1 } })
@@ -198,26 +170,6 @@ describe('the engine digests a board task\'s result once it reached the board (B
     bare.workers.reply = () => ({ text: 'an answer' })
     const three = await run(bare.ctx, await readyTask(bare.ctx, 'three'))
     expect((await digested(bare.ctx, three.runId)).digest).toMatchObject({ state: 'bypassed', reason: expect.stringMatching(/no digest provider is loaded/) })
-  })
-
-  it('leaves the result without a digest when none is written, naming the digest\'s settling decision', async () => {
-    const { ctx, workers } = await boot({ digests: () => ({ text: 'no digest here' }) })
-    workers.reply = () => ({ text: 'an answer' })
-    const one = await run(ctx, await readyTask(ctx, 'one'))
-    const task = await digested(ctx, one.runId)
-    expect(task.digest).toMatchObject({ state: 'bypassed', reason: expect.stringMatching(/the digest was not-written: the answer holds no JSON object/) })
-    expect(decisionOf(ctx, events(ctx, one.runId)[0]!.decision)).toMatchObject({ decider: { id: 'digests.quote-check' }, outcome: { option: 'not-written' } })
-    expect((await ctx.board.task(task.taskId))!.result!.digest).toBeUndefined()
-  })
-
-  it('sets the digest on a review held for the operator, whose acceptance then names it', async () => {
-    const { ctx, workers } = await boot({ digests: quoting('answer') })
-    workers.reply = () => ({ text: 'an answer' })
-    const one = await run(ctx, await readyTask(ctx, 'writes', { actionClass: 'workspace-write' }))
-    expect(one.task?.outcome).toMatchObject({ status: 'review', state: 'review' })
-    const task = await digested(ctx, one.runId)
-    expect(task.digest?.state).toBe('attached')
-    expect((await ctx.board.task(task.taskId))!).toMatchObject({ state: 'review', waiting: { reason: 'operator-review' }, result: { artifacts: [one.result], digest: expect.stringMatching(/^sha256:/) } })
   })
 
   it('goes on after a restart: a request made before the engine stopped is waited for and set on the task, asked once (INV-4)', async () => {

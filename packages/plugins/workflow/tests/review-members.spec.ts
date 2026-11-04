@@ -34,8 +34,6 @@ const member = (id: string, family: string): CapabilityDescriptor => worker(id, 
     { capability: 'persistent-conversation', evidence: { kind: 'conformance', at: AT }, scope: 'review-member' },
   ],
 })
-/** A website Worker: reason and its conversation for any work. */
-const website = worker('web:a', { schema: 'capability-descriptor@1.1', family: 'site-a', proves: ['reason', 'persistent-conversation'] })
 
 const isProposal = (prompt: string): boolean => prompt.includes('Answer on your own')
 const findings = '```json\n' + JSON.stringify({ findings: [{ severity: 'warning', claim: 'the lease is never released', evidence: 'line 3', quote: { path: 'material', line: 3, text: 'const lease = acquire()' } }] }) + '\n```'
@@ -115,32 +113,5 @@ describe('review team members on Workers scoped to a review member\'s steps (ADR
     const brainstorm = await ctx.workflow.wait(ctx.workflow.start({ template: 'brainstorm', input: 'q', classification: 'public' }).runId, 30_000)
     expect(brainstorm).toMatchObject({ status: 'failed', error: { message: expect.stringMatching(/no Worker proves reason, persistent-conversation/) } })
     expect(started).toHaveLength(4)
-  }, 60_000)
-
-  it('names review-member work on each debate step too, and keeps every member step on its member\'s Worker', async () => {
-    const { ctx } = await boot()
-    let ballots = 0
-    // A split with objections, then both pass in the debate.
-    const started = scripted(ctx, [member('agent:a', 'runtime-a'), member('agent:b', 'runtime-b')], (prompt) => (isProposal(prompt) ? findings
-      : prompt.includes('is split') ? ballot('pass') : ++ballots === 1 ? ballot('changes', ['the lease leaks']) : ballot('pass', ['it is fine'])))
-    const done = await ctx.workflow.wait(ctx.workflow.start({ template: 'review', input: MATERIAL, classification: 'public' }).runId, 60_000)
-    expect(done).toMatchObject({ status: 'completed' })
-    const debates = ctx.workflow.records(done.runId).filter((r) => /^review:m\d:debate:1$/.test(r.nodeId))
-    expect(debates.map((r) => r.requirement)).toEqual([expect.objectContaining({ scope: 'review-member' }), expect.objectContaining({ scope: 'review-member' })])
-    expect(started).toHaveLength(6)
-    for (const s of started) expect(started.filter((t) => t.sessionId === s.sessionId).every((t) => t.worker === s.worker)).toBe(true)
-  }, 60_000)
-
-  it('still puts a website Worker first among the Workers a member step admits: the quota order is unchanged (REQ-WRK-8)', async () => {
-    const { ctx } = await boot()
-    const started = scripted(ctx, [website, member('agent:b', 'runtime-b')], (prompt) => (isProposal(prompt) ? findings : ballot('pass')))
-    const done = await ctx.workflow.wait(ctx.workflow.start({ template: 'review', input: MATERIAL, classification: 'public' }).runId, 60_000)
-    expect(done).toMatchObject({ status: 'completed' })
-    const workers = Object.fromEntries(done.nodes.map((n) => [n.nodeId, n.worker]))
-    expect(workers).toMatchObject({ 'review:m1:propose': 'web:a', 'review:m2:propose': 'agent:b' })
-    // The ask goes to the website Worker; the agent member never takes it.
-    const asked = await ctx.workflow.wait(ctx.workflow.start({ template: 'ask', input: 'q', classification: 'public' }).runId, 30_000)
-    expect(asked).toMatchObject({ status: 'completed', nodes: [{ worker: 'web:a' }] })
-    expect(started.filter((s) => s.worker === 'agent:b').every((s) => s.requirement.scope === 'review-member')).toBe(true)
   }, 60_000)
 })

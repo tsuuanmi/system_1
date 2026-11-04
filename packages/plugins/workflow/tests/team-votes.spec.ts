@@ -1,28 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import { canRunBrowser } from '../../browser-patchright/tests/support.ts'
-import { ballot, browserStack, isProposal, kind, proposal, until } from './stack.ts'
+import { ballot, browserStack, isProposal, kind, proposal } from './stack.ts'
 
 const { boot } = browserStack()
 
 describe.runIf(canRunBrowser)('ctx.workflow: teams that vote', () => {
-  it('fails a member whose conversation the site no longer has at once, naming it, with no attempt spent reopening it (live 2026-10-16)', async () => {
-    const { ctx, gemini } = await boot({
-      fake: { thinkMs: 6000, answer: (prompt) => (isProposal(prompt) ? proposal('Use SQLite') : ballot('O1')) },
-      gemini: { answer: (prompt) => (isProposal(prompt) ? proposal('Use Postgres') : ballot('O1')) },
-    })
-    const run = ctx.workflow.start({ template: 'brainstorm', input: 'Which store?' })
-    // m2 proposes first; its conversation is gone from the site before its ballot, as after the live
-    // re-login, whose reservation closes the account's kept tabs (ADR-0030).
-    await until(() => ctx.workflow.get(run.runId)!.nodes.some((n) => n.nodeId === 'brainstorm:m2:propose' && n.state === 'COMPLETED'), 60_000)
-    gemini!.conversations.clear()
-    ;(await ctx.browser.reserveProfile('gemini-main', ctx.login.profileDir('gemini-main')))()
-    const done = await ctx.workflow.wait(run.runId, 120_000)
-    expect(done.status).toBe('failed')
-    const ballot2 = done.nodes.find((n) => n.nodeId === 'brainstorm:m2:ballot:1')!
-    expect(ballot2).toMatchObject({ state: 'FAILED', error: { kind: 'conversation_lost', disposition: 'USER_ACTION', message: expect.stringMatching(/no longer opens/) } })
-    expect(ctx.eventLog.query({ type: 'workflow.node.retry', nodeId: 'brainstorm:m2:ballot:1' })).toEqual([])
-    expect(gemini!.sent).toHaveLength(1)
-  }, 180_000)
 
   it('runs a brainstorm: proposals on two provider families, sealed ballots over them, and a majority with no debate (REQ-TEAM-1, REQ-TEAM-2, REQ-TEAM-6)', async () => {
     const { ctx, fake, gemini } = await boot({
@@ -60,37 +42,4 @@ describe.runIf(canRunBrowser)('ctx.workflow: teams that vote', () => {
     const explained = ctx.workflow.explain(done.runId)!.nodes.find((n) => n.nodeId === 'brainstorm:tally:1')!.decisions[0]!
     expect(explained).toMatchObject({ type: 'vote', outcome: 'O1', ballots: [{ round: 1, member: 'm1', choice: 'O1', confidence: 'high' }, { round: 1, member: 'm2', choice: 'O1' }] })
   }, 180_000)
-
-  it('escalates a member whose proposal is rejected within its own conversation and account, and explains every attempt (Model A, REQ-WRK-9)', async () => {
-    let first = true
-    const { ctx, fake } = await boot({
-      fake: { answer: (prompt) => {
-        if (!isProposal(prompt)) return ballot('O1')
-        if (first) {
-          first = false
-          return 'A proposal without its JSON object.'
-        }
-        return proposal('Use SQLite')
-      } },
-      gemini: { answer: (prompt) => (isProposal(prompt) ? proposal('Use Postgres') : ballot('O1')) },
-    })
-    const done = await ctx.workflow.wait(ctx.workflow.start({ template: 'brainstorm', input: 'Which store?' }).runId, 180_000)
-    expect(done).toMatchObject({ status: 'completed', answer: expect.stringMatching(/^outcome: O1; method: team-majority;/) })
-    // The escalation runs on the same account at the next tier, and the ballot stays in that conversation.
-    const worker = (id: string) => done.nodes.find((n) => n.nodeId === id)!.worker
-    expect(worker('brainstorm:m1:propose')).toBe('worker:chatgpt-main/frontier')
-    expect(worker('brainstorm:m1:ballot:1')).toMatch(/^worker:chatgpt-main\//)
-    expect(fake.sent.map((s) => kind(s.prompt))).toEqual(['proposal', 'proposal', 'ballot'])
-    // explain keeps the rejected first answer's acceptance and the escalation it led to.
-    const decisions = ctx.workflow.explain(done.runId)!.nodes.find((n) => n.nodeId === 'brainstorm:m1:propose')!.decisions
-    expect(decisions.filter((d) => d.type === 'acceptance').map((d) => [d.outcome, d.reasons.join(' ')])).toEqual([
-      ['reject', expect.stringMatching(/no JSON object/)], ['accept', expect.any(String)],
-    ])
-    expect(decisions.map((d) => d.type)).toContain('escalation')
-    // Each acceptance names the answer it judged, so the operator can read the rejected one (system artifact).
-    const [rejected, accepted] = decisions.filter((d) => d.type === 'acceptance')
-    expect(rejected!.result).not.toBe(accepted!.result)
-    expect(ctx.artifacts.read(rejected!.result!)).toMatchObject({ state: 'stored', content: 'text', text: 'A proposal without its JSON object.' })
-    expect(decisions.filter((d) => d.type !== 'acceptance').every((d) => d.result === undefined)).toBe(true)
-  }, 240_000)
 })

@@ -141,13 +141,13 @@ const DAY_MS = 86_400_000
 export const dayOf = (at: Date): string => at.toISOString().slice(0, 10)
 
 /** A guide's area name: its file name without the suffix. */
-export const areaOf = (guide: Pick<ReviewGuide, 'file'>): string => guide.file.slice(guide.file.lastIndexOf('/') + 1, -GUIDE_SUFFIX.length)
+const areaOf = (guide: Pick<ReviewGuide, 'file'>): string => guide.file.slice(guide.file.lastIndexOf('/') + 1, -GUIDE_SUFFIX.length)
 
 /**
  * The area reviewed on a day: the guides in name order, one per day, round robin (the UTC day number
  * modulo their count). `cycle` counts the rounds completed, which moves where a truncated area is read from.
  */
-export function pickArea(guides: readonly ReviewGuide[], at: Date): { guide: ReviewGuide; cycle: number } | undefined {
+function pickArea(guides: readonly ReviewGuide[], at: Date): { guide: ReviewGuide; cycle: number } | undefined {
   if (!guides.length) return undefined
   const sorted = [...guides].sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0))
   const day = Math.floor(at.getTime() / DAY_MS)
@@ -188,7 +188,7 @@ export function guidesAt(repository: string, sha: string): { guides: ReviewGuide
 /** Files nobody reviews as code: dependencies, build output, binaries, locks, maps. */
 const SKIPPED = /(^|\/)(node_modules|dist|lib|coverage)\/|\.(png|jpe?g|gif|ico|webp|woff2?|ttf|pdf|zip|gz|snap|map|lock|tsbuildinfo)$|(^|\/)pnpm-lock\.yaml$|\.min\.[a-z]+$/
 
-export interface AreaFile { path: string; size: number }
+interface AreaFile { path: string; size: number }
 export interface AreaSelection { shown: AreaFile[]; left: AreaFile[] }
 
 /**
@@ -199,7 +199,7 @@ export interface AreaSelection { shown: AreaFile[]; left: AreaFile[] }
  * round `cycle` is found by walking the windows of the rounds before it (`cycle` modulo the files, each
  * window at least one file). The files left are named to the reviewer and counted.
  */
-export function selectFiles(files: readonly AreaFile[], settings: Pick<ScheduledReviewSettings, 'maxFiles' | 'maxBytes' | 'maxFileBytes'>, cycle: number): AreaSelection {
+function selectFiles(files: readonly AreaFile[], settings: Pick<ScheduledReviewSettings, 'maxFiles' | 'maxBytes' | 'maxFileBytes'>, cycle: number): AreaSelection {
   const byPath = (a: AreaFile, b: AreaFile): number => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
   const sorted = [...files].sort(byPath)
   const largest = Math.min(settings.maxFileBytes, settings.maxBytes)
@@ -273,7 +273,7 @@ export function readArea(repository: string, sha: string, guide: ReviewGuide, se
 }
 
 /** Whether a finding cites a file and a line the reviewers were shown. */
-export const citesShown = (f: Pick<Finding, 'file' | 'line'>, lines: ReadonlyMap<string, number>): boolean =>
+const citesShown = (f: Pick<Finding, 'file' | 'line'>, lines: ReadonlyMap<string, number>): boolean =>
   !!f.file && !!f.line && f.line <= (lines.get(f.file) ?? 0)
 
 /** The states of a board task that count as open for the duplicate rule: a task not yet done or cancelled. */

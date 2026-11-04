@@ -164,7 +164,7 @@ export function parseFindings(text: string): Finding[] | string {
 }
 
 /** A ballot over exactly `options`: one choice, a ranking of all of them, and the strongest point of each one not chosen. */
-export function parseBallot(text: string, options: readonly string[]): Ballot | string {
+function parseBallot(text: string, options: readonly string[]): Ballot | string {
   const value = extractJson(text)
   if (!value) return 'the answer ends with no JSON ballot'
   const choice = value.choice
@@ -355,7 +355,7 @@ function quoted(label: string, text: string): string {
 }
 
 /** The ballot a prompt asks for, as a shape that holds whichever option the member chooses. */
-export function ballotShape(team: TeamRole, options: readonly string[], debate: boolean): string {
+function ballotShape(team: TeamRole, options: readonly string[], debate: boolean): string {
   // Every option is shown, so the shape holds whichever one the member chooses; the chosen one's entry is ignored.
   const others = `{${options.map((o) => `"${o}": "its strongest point"`).join(', ')}}`
   return [
@@ -688,7 +688,7 @@ function conclude(e: Engine, run: RunRow, node: NodeRow, spec: ResolvedNode, nod
  * The repository a review's vote names (`decision@1.2`: url, ref, commit). How the commit was
  * pinned stays on the source snapshot it came from, which the vote's inputs reach.
  */
-export function voteRepository(repository: NonNullable<SourceSnapshot['repository']>): { url: string; ref?: string; commit: string } {
+function voteRepository(repository: NonNullable<SourceSnapshot['repository']>): { url: string; ref?: string; commit: string } {
   return { url: repository.url, ...(repository.ref ? { ref: repository.ref } : {}), commit: repository.commit }
 }
 

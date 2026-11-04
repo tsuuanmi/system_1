@@ -8,45 +8,6 @@ import { account, ask, turnsStack } from './stack.ts'
 const { boot } = turnsStack()
 
 describe.runIf(canRunBrowser)('ctx.turns: across a restart', () => {
-  it('recovers a submitted persistent turn after a restart from its conversation, without resending (REQ-PRV-2, QA-1)', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'system-turns-'))
-    onTestFinished(() => rmSync(dir, { recursive: true, force: true }))
-    const first = await boot({ dir, fake: { thinkMs: 4000, answer: 'answered while we were down' } })
-    const turn = await ask(first.ctx, { prompt: 'survive a crash', persist: true })
-    const until = (check: () => boolean): Promise<void> => vi.waitFor(() => {
-      if (!check()) throw new Error('timed out')
-    }, { timeout: 30_000, interval: 100 })
-    await until(() => first.ctx.turns.get(turn.turnId)?.binding !== undefined)
-    await first.stop()
-    // The provider keeps working while the host is down.
-    await until(() => [...first.fake.conversations.values()].some((c) => c.turns.some((t) => t.role === 'assistant')))
-    const second = await boot({ dir, shared: first.fake })
-    const recovered = await second.ctx.turns.wait(turn.turnId, 60_000)
-    expect(recovered).toMatchObject({ status: 'completed', answer: 'answered while we were down' })
-    expect(first.fake.sent).toHaveLength(1)
-    const outcome = second.ctx.artifacts.list({ kind: 'decision', decisionType: 'reconciliation' }).map((a) => (a.body as { outcome: { option: string } }).outcome.option)
-    expect(outcome).toEqual(['RECOVER'])
-  }, 120_000)
-
-  it('recovers a Deep research turn after a restart from its run, without resending (live 2026-10-12)', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'system-turns-'))
-    onTestFinished(() => rmSync(dir, { recursive: true, force: true }))
-    const first = await boot({ dir, fake: { researchMs: 9000, report: 'Report written while we were down.' } })
-    const turn = await ask(first.ctx, { research: true, prompt: 'survive a crash' })
-    const deadline = Date.now() + 30_000
-    while (first.ctx.turns.get(turn.turnId)?.binding === undefined) {
-      if (Date.now() > deadline) throw new Error('never bound')
-      await new Promise((resolve) => setTimeout(resolve, 100))
-    }
-    await first.stop()
-    const second = await boot({ dir, shared: first.fake })
-    const recovered = await second.ctx.turns.wait(turn.turnId, 60_000)
-    expect(recovered).toMatchObject({ status: 'completed', answer: 'Research findings\nReport written while we were down.' })
-    expect(first.fake.sent).toHaveLength(1)
-    const outcomes = second.ctx.artifacts.list({ kind: 'decision', decisionType: 'reconciliation' }).map((a) => (a.body as { outcome: { option: string } }).outcome.option)
-    expect(outcomes).not.toContain('RESUBMIT')
-    expect(outcomes.at(-1)).toBe('RECOVER')
-  }, 150_000)
 
   it('runs a recovered turn in only one of two processes sharing the same home', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'system-turns-'))

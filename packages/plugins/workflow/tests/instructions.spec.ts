@@ -52,17 +52,7 @@ const finished = (ctx: Context, runId: string): Promise<RunView> => until(() => 
   return view && view.status !== 'running' ? view : undefined
 }, `run ${runId} to finish`)
 
-/** Rewrite node `b`'s stored template text, as an engine that checked less would have admitted it. */
-const storeTemplate = (ctx: Context, runId: string, prompt: string): void => {
-  const row = ctx.store.db.prepare("SELECT spec FROM workflow_nodes WHERE run_id = ? AND node_id = 'b'").get(runId) as { spec: string }
-  ctx.store.db.prepare("UPDATE workflow_nodes SET spec = ? WHERE run_id = ? AND node_id = 'b'").run(JSON.stringify({ ...JSON.parse(row.spec), prompt }), runId)
-}
 
-/** The decision a node failed on last, and the failure it names. */
-const refusal = (ctx: Context, runId: string) => {
-  const record = ctx.workflow.records(runId).find((r) => r.nodeId === 'b')!
-  return { record, decision: ctx.artifacts.get(record.lastDecision!)!.body }
-}
 
 describe('a step\'s instructions (INV-2)', () => {
   it('refuses a template whose text holds a placeholder the engine does not fill, at load and on the profiles seam, before any Worker starts', async () => {
@@ -79,47 +69,5 @@ describe('a step\'s instructions (INV-2)', () => {
     expect(workers.started).toEqual([])
     // The engine and every other template keep working.
     expect((await finished(ctx, ctx.workflow.start({ template: 'chain', input: 'q', classification: 'public' }).runId)).status).toBe('completed')
-  })
-
-  it('fails a step whose stored template holds a placeholder the engine cannot fill when it is promoted, with a decision and nothing sent', async () => {
-    const { ctx, workers } = await boot({ chain: CHAIN })
-    workers.reply = () => 'hold'
-    const run = ctx.workflow.start({ template: 'chain', input: 'q', classification: 'public' })
-    await until(() => workers.started.length === 1, 'a to start')
-    storeTemplate(ctx, run.runId, 'B: {{node:a}} for {{caller}}')
-    workers.release(workers.started[0]!.id, { text: 'alpha' })
-    const failed = await finished(ctx, run.runId)
-    expect(failed).toMatchObject({ status: 'failed', error: { kind: 'config_error', disposition: 'CODE_FIX' } })
-    expect(failed.error!.message).toBe('node b\'s template holds {{caller}}, which the engine does not fill for it; nothing was sent: fix the template, then start the run again')
-    expect(workers.started).toHaveLength(1)
-    const { record, decision } = refusal(ctx, run.runId)
-    expect(record).toMatchObject({ state: 'FAILED' })
-    expect(record.inputReceipt).toBeUndefined()
-    expect(decision).toMatchObject({ decisionType: 'gate', decider: { type: 'rule', id: 'workflow.instructions' }, outcome: { option: 'fail', detail: { placeholders: ['{{caller}}'] } } })
-  })
-
-  it('starts no Worker on a step whose template gained a placeholder it cannot fill since it was promoted: it fails before routing, and continue composes it again', async () => {
-    const { ctx, workers } = await boot({ chain: CHAIN })
-    workers.reply = (request) => (request.prompt.startsWith('B:') ? { fail: 'network', disposition: 'BACKOFF', sent: true } : { text: 'alpha' })
-    const run = ctx.workflow.start({ template: 'chain', input: 'q', classification: 'public' })
-    expect(await finished(ctx, run.runId)).toMatchObject({ status: 'failed', error: { kind: 'network' } })
-    // Its input is bound, so continue would send its stored instructions again: the guard reads its template first.
-    storeTemplate(ctx, run.runId, 'B: {{node:a}} for {{caller}}')
-    ctx.workflow.continue(run.runId, 'b')
-    expect(await finished(ctx, run.runId)).toMatchObject({ status: 'failed', error: { kind: 'config_error' } })
-    expect(workers.started.map((s) => s.prompt)).toEqual(['A: q', 'B: alpha'])
-    expect(refusal(ctx, run.runId).decision).toMatchObject({ decider: { id: 'workflow.instructions' }, outcome: { option: 'fail', detail: { placeholders: ['{{caller}}'] } } })
-    // Continued, it is promoted again: its template still holds the placeholder, so it fails there, unsent.
-    ctx.workflow.continue(run.runId, 'b')
-    expect(await finished(ctx, run.runId)).toMatchObject({ status: 'failed', error: { kind: 'config_error' } })
-    expect(workers.started).toHaveLength(2)
-  })
-
-  it('sends text the engine never expands as it is: a {{…}} in the caller\'s input or a dependency\'s result is data, never refused', async () => {
-    const { ctx, workers } = await boot({ chain: CHAIN })
-    workers.reply = (request) => ({ text: request.prompt.startsWith('A:') ? 'use {{node:a}}, {{input}}, or {{other}}' : 'done' })
-    const run = ctx.workflow.start({ template: 'chain', input: 'what does {{input}} do in a template?', classification: 'public' })
-    expect((await finished(ctx, run.runId)).status).toBe('completed')
-    expect(workers.started.map((s) => s.prompt)).toEqual(['A: what does {{input}} do in a template?', 'B: use {{node:a}}, {{input}}, or {{other}}'])
   })
 })

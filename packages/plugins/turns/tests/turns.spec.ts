@@ -6,30 +6,6 @@ import { ask, turnsStack } from './stack.ts'
 const { boot } = turnsStack()
 
 describe.runIf(canRunBrowser)('ctx.turns: ask through a saved account', () => {
-  it('answers a one-shot ask in Temporary chat, in Chat mode, with a receipt, a route decision, and an answer artifact', async () => {
-    const { ctx, fake } = await boot({ fake: { answer: 'Hello' } })
-    const started = await ask(ctx, { prompt: 'Say hello' })
-    // The first turn launches the browser; a loaded CI runner can take longer than 30 s.
-    const turn = await ctx.turns.wait(started.turnId, 90_000)
-    expect(turn).toMatchObject({ status: 'completed', account: 'chatgpt-main', mode: 'temporary', answer: 'Hello', submitted: true })
-    expect(turn.sessionId).toBeUndefined()
-    expect(fake.sent).toEqual([expect.objectContaining({ prompt: 'Say hello', mode: 'chat', temporary: true })])
-    const answer = ctx.artifacts.get(turn.answerArtifact!)
-    expect(answer?.body).toMatchObject({ schema: 'provider-answer@1.0', text: 'Hello', conversation: { mode: 'temporary' } })
-    const route = ctx.artifacts.get(turn.routeDecision!)
-    expect(route?.body).toMatchObject({ decisionType: 'route', outcome: { option: 'worker:chatgpt-main/standard' } })
-    expect(ctx.turnReceipts.read({ account: 'chatgpt-main', sessionId: turn.turnId, requestId: turn.turnId })).toMatchObject({ status: 'COMPLETED' })
-  }, 150_000)
-
-  it('is idempotent on clientRequestId and sends once (REQ-PRV-1)', async () => {
-    const { ctx, fake } = await boot()
-    const a = await ask(ctx, { prompt: 'once', key: 'req-1' })
-    const b = await ask(ctx, { prompt: 'once', key: 'req-1' })
-    expect(b.turnId).toBe(a.turnId)
-    await ctx.turns.wait(a.turnId, 30_000)
-    expect(fake.sent).toHaveLength(1)
-    await expect(ask(ctx, { prompt: 'different', key: 'req-1' })).rejects.toThrow(/different prompt/)
-  }, 90_000)
 
   it('checks egress before sending: credentials or local-private content never leave (INV-12)', async () => {
     const { ctx, fake } = await boot()

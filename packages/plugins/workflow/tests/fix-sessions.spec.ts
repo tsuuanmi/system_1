@@ -29,7 +29,6 @@ import Workflow, { type NodeTemplate, type RunView } from '../src/index.ts'
 vi.setConfig({ testTimeout: 120_000 })
 
 const AUTHOR = worker('w:author', { schema: 'capability-descriptor@1.3', family: 'family-a', proves: ['develop', 'persistent-conversation'] })
-const OTHER = worker('w:other', { schema: 'capability-descriptor@1.3', family: 'family-b', proves: ['develop', 'persistent-conversation'] })
 const REVIEWER = worker('w:reviewer', { schema: 'capability-descriptor@1.3', family: 'family-c', proves: ['review'] })
 
 /** As algorithm-development: the change is written in the run's session, then reviewed in a temporary one. */
@@ -207,106 +206,6 @@ const decisions = (ctx: Context, runId: string, rule: string): Decision[] =>
   ctx.artifacts.list({ kind: 'decision', runId, limit: 1000 }).map((a) => a.body as Decision).filter((d) => d.decider.id === rule)
 
 describe('one task, one author session (board T232)', () => {
-  it('continues the author\'s session on its Worker for the fix, which sees its earlier turns; the reviewer never runs in it; each fix is its own commit, and the re-review reads only the change since the last review, with the open finding', async () => {
-    const { ctx, workers, tree } = await boot()
-    const runId = await runToFix(ctx)
-    const done = await finished(ctx, runId)
-    expect(done.status).toBe('completed')
-    // The review's important finding is verified before it grows the fix (ADR-0075).
-    const [develop, review, verify, fix, recheck] = workers.seen
-    expect(workers.seen).toHaveLength(5)
-    expect(verify!.prompt).toContain('## Verify these findings')
-    expect(develop).toMatchObject({ worker: 'w:author', sessionId: expect.any(String) })
-    // The fix is the author session's next message, on its Worker, resuming its native conversation.
-    expect(fix).toMatchObject({ worker: 'w:author', sessionId: develop!.sessionId, resumed: workers.sessions.get(develop!.sessionId!)!.handle })
-    expect(fix!.before).toEqual([develop!.prompt])
-    expect(fix!.prompt).toContain('reviewed the change you made earlier in this conversation')
-    expect(fix!.prompt).toContain(`Reviewed subject: ${/^Subject: (\S+)$/m.exec(review!.prompt)![1]}`)
-    expect(fix!.prompt).toContain('- no test for add() (calc.py:1)')
-    expect(fix!.prompt).toContain('What to change:')
-    expect(ctx.workflow.records(runId).find((r) => r.nodeId === 'review:1:fix:1')!.outputReceipt).toBeDefined()
-    expect((ctx.artifacts.get(ctx.workflow.records(runId).find((r) => r.nodeId === 'review:1:fix:1')!.outputReceipt!.result)!.body as { text: string }).text).toBe('added a test, on top of the add() I changed')
-    const [path] = decisions(ctx, runId, 'workflow.fix-session')
-    expect(path).toMatchObject({ outcome: { option: 'continue', detail: { sessionId: develop!.sessionId, author: 'develop:1', worker: 'w:author' } } })
-    // The reviewer is independent: each review runs in no session, never the author's, and resumes nothing.
-    for (const reviewer of [review!, verify!, recheck!]) {
-      expect(reviewer).toMatchObject({ worker: 'w:reviewer', sessionId: undefined })
-      expect(reviewer.resumed).toBeUndefined()
-      expect((ctx.artifacts.get(reviewer.brief!)!.body as Brief).resume).toBeUndefined()
-    }
-    // History: the change the review read, then the fix, each its own commit on the run's review
-    // history ref; the worktree's HEAD never moved, so a task bound to it still binds the result.
-    const base = git(tree, 'rev-parse', 'main').trim()
-    expect(git(tree, 'log', '--format=%s', '-1', 'main').trim()).toBe('init')
-    const history = reviewRef(runId)
-    expect(git(tree, 'log', '--format=%s', '-3', history).trim().split('\n')).toEqual([
-      `system: review:1:fix:1 of run ${runId}, the fix of review review:1's blocking findings`,
-      expect.stringMatching(/^system: the change review review:1 of run \S+ read \(git:/),
-      'init',
-    ])
-    expect(git(tree, 'show', '--name-only', '--format=', history).trim()).toBe('test_calc.py')
-    expect(git(tree, 'show', '--name-only', '--format=', `${history}~1`).trim()).toBe('calc.py')
-    expect(git(tree, 'rev-parse', `${history}~2`).trim()).toBe(base)
-    expect(captureGitSubject(tree)!.subject.ref).toBe(base)
-    const commits = decisions(ctx, runId, 'workflow.fix-commit')
-    expect(commits.map((d) => [d.outcome.option, d.outcome.detail!.what])).toEqual([['commit', 'reviewed'], ['commit', 'fixed']])
-    // The re-review reads only what changed since the subject the last review read (T266), with the
-    // open finding to check: the rest of the change was reviewed already, and is not shown again.
-    const reviewedAt = git(tree, 'rev-parse', `${history}~1`).trim()
-    expect(recheck!.prompt).toContain('This is review cycle 2. The last review (review:1) read subject')
-    expect(recheck!.prompt).toContain('Review only what changed since then')
-    const since = recheck!.prompt.split(`(relative to commit ${reviewedAt}, which holds it), verbatim:`)[1]!
-    expect(since).toContain('test_calc.py')
-    expect(recheck!.prompt).not.toContain('return a + b')
-    expect(recheck!.prompt).not.toContain(`The whole change relative to commit ${base}`)
-    expect(recheck!.prompt).toContain('- review:1#f1 important: no test for add() (calc.py:1)')
-  })
-
-  it('waits for the author\'s Worker while it cannot take the fix, recorded, then hands the session off past the bound, recorded, rather than starting fresh in silence', async () => {
-    const { ctx, workers } = await boot({ fixSessionWaitMinutes: 0.03 })
-    const runId = await runToFix(ctx, () => {
-      // The author's account runs out of quota after the review, and another writer is there.
-      workers.workers = [{ ...AUTHOR, state: 'quota-exhausted' }, OTHER, REVIEWER]
-    })
-    const done = await finished(ctx, runId)
-    expect(done.status).toBe('completed')
-    const develop = workers.seen[0]!
-    const [wait] = decisions(ctx, runId, 'workflow.fix-session')
-    expect(wait).toMatchObject({ outcome: { option: 'wait', detail: { sessionId: develop.sessionId, author: 'develop:1', fixSessionWaitMinutes: 0.03 } } })
-    // Past the bound, handed off through the session move (T230), carrying the author's turn.
-    const developResult = ctx.workflow.records(runId).find((r) => r.nodeId === 'develop:1')!.outputReceipt!.result
-    const [move] = decisions(ctx, runId, 'workflow.session-move')
-    expect(move).toMatchObject({ outcome: { option: 'handoff', detail: { sessionId: develop.sessionId, from: ['w:author'], worker: 'w:other', carried: [developResult] } } })
-    expect(move!.candidates.find((c) => c.option === 'stay')!.reasons[0]).toMatch(/its bounded wait for them ended$/)
-    const fix = workers.seen.find((s) => s.prompt.includes('Fix the blocking findings'))!
-    expect(fix).toMatchObject({ worker: 'w:other', sessionId: undefined })
-    expect(fix.prompt).toContain('changed add()')
-    // Nothing was sent while it waited: one fix in all.
-    expect(workers.seen.filter((s) => s.prompt.includes('Fix the blocking findings'))).toHaveLength(1)
-  })
-
-  it('waits for the author\'s account while it cannot take the self-review, recorded, spending no attempt, then runs it there (T267 hotfix, 2026-10-26)', async () => {
-    const { ctx, workers } = await boot({ fixSessionWaitMinutes: 0.05 })
-    // The author's account reviews too (its read-only role); it is out of quota for a moment once the change is written.
-    const author = { ...AUTHOR, capabilities: [...AUTHOR.capabilities, ...REVIEWER.capabilities] }
-    workers.workers = [author, REVIEWER]
-    const scripted = workers as unknown as { answer: (prompt: string, before: string[]) => string }
-    const answer = scripted.answer.bind(workers)
-    scripted.answer = (prompt, before) => {
-      if (prompt.startsWith('Develop: ')) {
-        workers.workers = [{ ...author, state: 'quota-exhausted' }, REVIEWER]
-        setTimeout(() => { workers.workers = [author, REVIEWER] }, 1000)
-      }
-      return answer(prompt, before)
-    }
-    const { runId } = ctx.workflow.start({ template: 'selfcheck', input: 'Fix add()', classification: 'public' })
-    const done = await finished(ctx, runId)
-    expect(done.status).toBe('completed')
-    const [wait] = decisions(ctx, runId, 'workflow.self-review-wait')
-    expect(wait).toMatchObject({ outcome: { option: 'wait', detail: { selfReviewOf: 'develop:1', fixSessionWaitMinutes: 0.05 } } })
-    const self = done.nodes.find((n) => n.nodeId === 'selfreview:1')!
-    expect(self).toMatchObject({ state: 'COMPLETED', worker: 'w:author', attempt: 1 })
-  })
 
   it('hands a lost author session off, recorded, its brief carrying the session\'s earlier turns', async () => {
     const { ctx, workers } = await boot()

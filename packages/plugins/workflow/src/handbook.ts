@@ -69,7 +69,7 @@ export interface LayerDeclaration {
  * The five layers (docs/design/handbook.md#the-five-layers), each source declared here and nowhere
  * else. A higher layer wins over a lower one; a lower layer may only be stricter.
  */
-export const HANDBOOK_LAYERS: readonly LayerDeclaration[] = [
+const HANDBOOK_LAYERS: readonly LayerDeclaration[] = [
   {
     layer: 1, name: 'Constitution', owner: 'operator', share: 600, renderedBy: ['engine'],
     homes: ['docs/architecture/invariants.md', 'docs/decisions/adr/README.md', 'docs/decisions/README.md#decision-rules', 'docs/governance/documentation.md'],
@@ -144,7 +144,7 @@ export const PLAYBOOK_RULES: ReadonlyArray<{ id: string; applies: Applies }> = [
 ]
 
 /** One part of a layer: a rule or a group of rules, with its id and where it applies. */
-export interface HandbookPart {
+interface HandbookPart {
   id: string
   layer: HandbookLayer
   /** What it counts: the text the Worker reads. */
@@ -177,7 +177,7 @@ export interface Selection {
 }
 
 /** The tokens a text is estimated at: its UTF-8 bytes over four, rounded up. */
-export const tokensOf = (text: string): number => Math.ceil(Buffer.byteLength(text, 'utf8') / 4)
+const tokensOf = (text: string): number => Math.ceil(Buffer.byteLength(text, 'utf8') / 4)
 
 /** Whether a part applies to a selection. */
 export function appliesTo(part: HandbookPart, s: Selection): boolean {
@@ -291,7 +291,7 @@ export interface Homes {
 }
 
 /** The git blob id of a file's bytes, as `git hash-object` gives it: the version of a home as checked out. */
-export function blobOf(content: Buffer): string {
+function blobOf(content: Buffer): string {
   return createHash('sha1').update(`blob ${content.length}\0`).update(content).digest('hex')
 }
 

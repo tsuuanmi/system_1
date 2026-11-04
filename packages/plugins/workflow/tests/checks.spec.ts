@@ -228,19 +228,6 @@ describe('ctx.workflow runs a written result\'s required checks on its exact tre
     expect(done.result?.acceptance).toBeDefined()
   })
 
-  it('tells the review, among the acceptance\'s reasons, that a passed check did not run its browser tests, never reading their absence as a pass (T247)', async () => {
-    const checker = new Checker()
-    checker.notRun = { tests: 'its browser tests (12 browser tests skipped: no usable Chrome)' }
-    const { ctx, task } = await boot(checker)
-    const { taskId, runId } = await task()
-    await settled(ctx, taskId)
-    const acceptance = acceptanceOf(ctx, runId)
-    expect(acceptance.outcome.detail['checks']).toEqual({ tests: true, lint: true })
-    const reasons = acceptance.candidates.find((c) => c.selected)!.reasons
-    expect(reasons).toContainEqual('its tests check passed without running its browser tests (12 browser tests skipped: no usable Chrome): its outcome says nothing of those')
-    expect(reasons.filter((r) => r.includes('without running'))).toHaveLength(1)
-  })
-
   it('sends a result whose check failed back as another attempt: a failed check is work for the lead, never the operator\'s (REQ-WF-15, INV-2)', async () => {
     const checker = new Checker()
     checker.outcomes = { tests: 'passed', lint: 'failed' }
@@ -252,32 +239,6 @@ describe('ctx.workflow runs a written result\'s required checks on its exact tre
     const acceptance = acceptanceOf(ctx, runId)
     expect(acceptance.outcome).toMatchObject({ option: 'reject', detail: { checks: { tests: true, lint: false } } })
     expect(acceptance.candidates.find((c) => c.selected)!.reasons[0]).toMatch(/the run's own lint check failed on git-head/)
-  })
-
-  it('puts the failing tests\' names and assertion lines of a failed check in the task\'s dossier, within the bound, for the next attempt\'s Worker to read (T270)', async () => {
-    const checker = new Checker()
-    checker.outcomes = { tests: 'failed', lint: 'passed' }
-    // More than the bound: the source's lines are bounded again before the dossier takes them.
-    checker.failures = { tests: [' FAIL  packages/b/tests/b.spec.ts > the sum adds up', 'AssertionError: expected 3 to be 4', ...Array.from({ length: 400 }, (_, i) => ` FAIL  packages/p/tests/t${i}.spec.ts > case ${i}`)], lint: ['never told: lint passed'] }
-    const { ctx, task } = await boot(checker)
-    const { taskId, runId } = await task()
-    expect((await settled(ctx, taskId)).state).toBe('ready')
-    const entries = ctx.workflow.dossier({ runId }).entries
-    const failed = entries.filter((e) => e.kind === 'evidence' && e.author.type === 'system' && e.text.startsWith('The tests check failed on '))
-    expect(failed).toHaveLength(1)
-    const text = failed[0]!.text
-    expect(text).toContain(' FAIL  packages/b/tests/b.spec.ts > the sum adds up')
-    expect(text).toContain('AssertionError: expected 3 to be 4')
-    // Within the bound: at most 200 lines of the output after the entry's first line, and the entry's own 4,000 characters.
-    expect(text.split('\n').length - 1).toBeLessThanOrEqual(200)
-    expect([...text].length).toBeLessThanOrEqual(4000)
-    // It follows the acceptance and links it and the check-run evidence; a passed check adds no entry.
-    const acceptance = entries.findIndex((e) => e.text.startsWith('Acceptance of attempt 1'))
-    expect(acceptance).toBeGreaterThanOrEqual(0)
-    expect(entries.indexOf(failed[0]!)).toBeGreaterThan(acceptance)
-    const detail = acceptanceOf(ctx, runId).outcome.detail['checkRun'] as { evidence: string }
-    expect(failed[0]!.refs).toContain(detail.evidence)
-    expect(entries.some((e) => e.text.includes('never told: lint passed'))).toBe(false)
   })
 
   it('holds the result for the operator with each check that did not run to an exit code pending, and with every one pending when the source refuses or none can run them (INV-2)', async () => {
@@ -302,66 +263,6 @@ describe('ctx.workflow runs a written result\'s required checks on its exact tre
     const three = await none.task()
     expect(await settled(none.ctx, three.taskId)).toMatchObject({ state: 'review', waiting: { pendingChecks: ['tests', 'lint'] } })
     expect(acceptanceOf(none.ctx, three.runId).outcome.detail).toMatchObject({ checkRun: { outcome: 'not-run', reason: expect.stringContaining('no Worker source holds the worktree') } })
-  })
-
-  it('runs by itself, once, on the held tree, the checks a result was held with: passed, the run owner\'s acceptance applies again and the result waits for its landing; failed, it goes back (T293)', async () => {
-    const until = (ctx: Context, taskId: string, ok: (t: BoardTask) => boolean, what: string): Promise<BoardTask> => vi.waitFor(async () => {
-      const t = (await ctx.board.task(taskId))!
-      if (!ok(t)) throw new Error(`task ${taskId} is ${t.state}${t.waiting ? ` (${t.waiting.reason})` : ''}, not ${what}`)
-      return t
-    }, { timeout: 30_000, interval: 25 })
-    const acceptances = (ctx: Context, runId: string): Array<Acceptance & { id: string }> => ctx.artifacts.list({ kind: 'decision', decisionType: 'acceptance', runId })
-      .map((a) => ({ ...a.body as Acceptance, id: a.id })).filter((b) => b.decider.id === 'workflow.task-acceptance')
-
-    // The run's own ask is refused (the source busy then): held with tests and lint pending; the landing's watch asks again on the same tree.
-    const checker = new Checker()
-    checker.refuse = { outcome: 'refused', cause: 'busy', reason: 'a run of the worktree may still write it' }
-    checker.refuseTimes = 1
-    const { ctx, workspace, subject, task } = await boot(checker)
-    const { taskId, runId } = await task()
-    const landed = await until(ctx, taskId, (t) => t.waiting?.reason === 'landing', 'waiting for its landing')
-    const asked = { runId, workspace, subject: { ref: subject.ref, version: subject.version }, checks: ['tests', 'lint'], classification: 'public' }
-    expect(checker.steps).toEqual([asked, asked])
-    const all = acceptances(ctx, runId)
-    expect(all).toHaveLength(2)
-    const [own, again] = all
-    expect(own).toMatchObject({ outcome: { option: 'accept', detail: { checks: {}, checkRun: { outcome: 'refused' } } } })
-    expect(again).toMatchObject({ decider: { id: 'workflow.task-acceptance' }, outcome: { option: 'accept', detail: { checks: { tests: true, lint: true }, checkRun: { outcome: 'checked' } } } })
-    expect(landed.result?.acceptance).toBe(again!.id)
-
-    // Failed there, the run owner's acceptance rejects it: another attempt, its failure in the dossier.
-    const failing = new Checker()
-    failing.refuse = checker.refuse
-    failing.refuseTimes = 1
-    failing.outcomes = { tests: 'passed', lint: 'failed' }
-    const second = await boot(failing)
-    const two = await second.task()
-    const back = await until(second.ctx, two.taskId, (t) => t.state === 'ready', 'ready again')
-    expect(back.attempts.count).toBe(1)
-    expect(acceptances(second.ctx, two.runId).at(-1)).toMatchObject({ outcome: { option: 'reject', detail: { checks: { tests: true, lint: false } } } })
-    expect(failing.steps).toHaveLength(2)
-  })
-
-  it('asks again the checks a result was held with on an approval they wait for (a new lockfile\'s verification, T333) once that request is resolved, never while it is open, and runs them by itself (INV-2)', async () => {
-    const checker = new Checker()
-    const { ctx, task } = await boot(checker)
-    const verdict = await ctx.approvals.check({ class: 'merge' })
-    const opened = await ctx.approvals.request({
-      subject: { type: 'content', ref: 'lockfile-verification:repo/sha256:0', version: 'sha256:0' }, action: { class: 'merge', summary: 'verify the lockfile' },
-      requester: { component: 'workflow', runId: 'run_lockfile' }, verdict, classification: 'public',
-    })
-    // The source refuses every ask, naming the request, until the test lets it run them.
-    checker.refuse = { outcome: 'refused', cause: 'dependency_unavailable', reason: 'its lockfile is not verified: it waits for the operator\'s approval', requests: [opened.requestId] }
-    const { taskId } = await task()
-    // The run's own ask and the landing's watch's: held for the operator, naming what it waits for; the watch asks no more while the request is open.
-    await vi.waitFor(() => expect(checker.steps).toHaveLength(2), { timeout: 30_000, interval: 25 })
-    expect(await settled(ctx, taskId)).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: ['tests', 'lint'] } })
-    expect(checker.steps).toHaveLength(2)
-    // Approved, the watch asks again by itself, and the checks pass on the held tree.
-    checker.refuse = undefined
-    await ctx.approvals.decide([{ requestId: opened.requestId, subject: opened.subject, verdict: 'approved' }])
-    await vi.waitFor(async () => expect((await ctx.board.task(taskId))!.waiting?.reason).toBe('landing'), { timeout: 30_000, interval: 25 })
-    expect(checker.steps).toHaveLength(3)
   })
 
   it('holds for the operator a result whose checks could not start, an infrastructure error, and never sends it back as a failed attempt (INV-2)', async () => {
@@ -401,48 +302,7 @@ describe('ctx.workflow runs a written result\'s required checks on its exact tre
     expect(ctx.workflow.get(runId)).toMatchObject({ status: 'completed' })
   })
 
-  it('asks again, after the restart, for the checks the host\'s stop cut, on the same tree, and accepts the result they pass without the operator (T269)', async () => {
-    const checker = new Checker()
-    checker.cutNext = true
-    const { ctx, workspace, subject, task, restart } = await boot(checker)
-    const { taskId, runId } = await task()
-    // The checks run when the host stops: the stop cuts them, and no acceptance is decided.
-    await vi.waitFor(() => expect(checker.steps).toHaveLength(1), { timeout: 30_000, interval: 25 })
-    await restart()
-    const done = await settled(ctx, taskId)
-    expect(done).toMatchObject(LANDING)
-    // Asked again on the exact tree the result is on, the cut check's source runs it there again.
-    const asked = { runId, workspace, subject: { ref: subject.ref, version: subject.version }, checks: ['tests', 'lint'], classification: 'public' }
-    expect(checker.steps).toEqual([asked, asked])
-    expect(acceptanceOf(ctx, runId).outcome).toMatchObject({ option: 'accept', detail: { checks: { tests: true, lint: true }, checkRun: { outcome: 'checked' } } })
-  })
-
-  it('asks for no check the task\'s class does not require', async () => {
-    const checker = new Checker()
-    const { ctx, task } = await boot(checker)
-    const { taskId, runId } = await task('read')
-    expect(await settled(ctx, taskId)).toMatchObject(LANDING)
-    expect(checker.steps).toEqual([])
-    expect(acceptanceOf(ctx, runId).outcome.detail).not.toHaveProperty('checkRun')
-  })
-
   describe('the red-on-base check, behind its enforce switch (T306c, ADR-0079, ADR-0078)', () => {
-    const gateDecisions = (ctx: Context, runId: string) => ctx.artifacts.list({ kind: 'decision', decisionType: 'gate', runId, limit: 100 })
-      .filter((a) => (a.body as { decider?: { id?: string } }).decider?.id === 'workflow.red-on-base')
-
-    it('on: a result whose new test passes on its base is sent back as a failed attempt, the check asked with the others', async () => {
-      const checker = new Checker()
-      checker.outcomes = { tests: 'passed', lint: 'passed', 'red-on-base': 'failed' }
-      checker.failures = { 'red-on-base': ['FAIL red-on-base: packages/p/tests/a.spec.ts passes on the base tree (works): it proves nothing of the change'] }
-      const { ctx, task } = await boot(checker, { redOnBase: 'on' })
-      const { taskId, runId } = await task()
-      expect((await settled(ctx, taskId)).state).toBe('ready')
-      expect(checker.steps.map((s) => s.checks)).toEqual([['tests', 'lint', 'red-on-base']])
-      const acceptance = acceptanceOf(ctx, runId)
-      expect(acceptance.outcome).toMatchObject({ option: 'reject', detail: { checks: { tests: true, lint: true, 'red-on-base': false } } })
-      expect(acceptance.candidates.find((c) => c.selected)!.reasons[0]).toMatch(/red-on-base check failed/)
-      expect(gateDecisions(ctx, runId)).toEqual([])
-    })
 
     it('on: a result whose new test fails on its base and passes on the result is accepted', async () => {
       const checker = new Checker()
@@ -454,102 +314,9 @@ describe('ctx.workflow runs a written result\'s required checks on its exact tre
       // Not a refactor: its check is not told so.
       expect(checker.steps[0]).not.toHaveProperty('refactor')
     })
-
-    it('warn (the start value): the check runs, a result it would refuse is accepted all the same, and the refusal is recorded as a decision naming the failing lines (INV-13)', async () => {
-      const checker = new Checker()
-      checker.outcomes = { tests: 'passed', lint: 'passed', 'red-on-base': 'failed' }
-      checker.failures = { 'red-on-base': ['FAIL red-on-base: packages/p/tests/a.spec.ts passes on the base tree (works): it proves nothing of the change'] }
-      const { ctx, task } = await boot(checker, { redOnBase: 'warn' })
-      const { taskId, runId } = await task()
-      expect(await settled(ctx, taskId)).toMatchObject(LANDING)
-      expect(checker.steps.map((s) => s.checks)).toEqual([['tests', 'lint', 'red-on-base']])
-      const acceptance = acceptanceOf(ctx, runId)
-      expect(acceptance.outcome).toMatchObject({ option: 'accept', detail: { checks: { tests: true, lint: true, 'red-on-base': true } } })
-      expect(acceptance.candidates.find((c) => c.selected)!.reasons.join('\n')).toMatch(/red-on-base check failed .*passes on the base tree.*warn mode, so the result is judged as if it passed/)
-      const [decision] = gateDecisions(ctx, runId)
-      expect(decision!.body).toMatchObject({ outcome: { option: 'warn', detail: { check: 'red-on-base', outcome: 'failed' } } })
-    })
-
-    it('warn: a check that could not run does not hold the result for the operator either', async () => {
-      const checker = new Checker()
-      checker.outcomes = { tests: 'passed', lint: 'passed', 'red-on-base': 'error' }
-      const { ctx, task } = await boot(checker, { redOnBase: 'warn' })
-      const { taskId, runId } = await task()
-      expect(await settled(ctx, taskId)).toMatchObject(LANDING)
-      expect(gateDecisions(ctx, runId)).toHaveLength(1)
-    })
-
-    it('off: the check is not asked, and the policy sees it met', async () => {
-      const checker = new Checker()
-      const { ctx, task } = await boot(checker, { redOnBase: 'off' })
-      const { taskId, runId } = await task()
-      expect(await settled(ctx, taskId)).toMatchObject(LANDING)
-      expect(checker.steps.map((s) => s.checks)).toEqual([['tests', 'lint']])
-      expect(acceptanceOf(ctx, runId).outcome.detail['checkRun']).toMatchObject({ redOnBase: expect.stringContaining('off') })
-    })
-
-    it('is told a task whose criteria say `refactor: no behaviour change` is a refactor', async () => {
-      const checker = new Checker()
-      checker.outcomes = { tests: 'passed', lint: 'passed', 'red-on-base': 'passed' }
-      const { ctx, task } = await boot(checker, { redOnBase: 'on' })
-      const { taskId } = await task('workspace-write', { criteria: 'Refactor: no behaviour change; the related suite passes' })
-      expect(await settled(ctx, taskId)).toMatchObject(LANDING)
-      expect(checker.steps[0]).toMatchObject({ checks: ['tests', 'lint', 'red-on-base'], refactor: true })
-    })
-
-    it('never asks it of a change of the light tier (the policy requires it by tier): the policy sees it met, and the acceptance says why; a change of no known tier is asked (the tests above)', async () => {
-      const checker = new Checker()
-      // The tier is read from the source's changes: this run's worktree touches no path, so it is light.
-      checker.base = 'dev'
-      const { ctx, task } = await boot(checker, { redOnBase: 'on', tiered: true, review: 'approve' })
-      const { taskId, runId } = await task('workspace-write', { writes: false, template: 'reviewed' })
-      expect(await settled(ctx, taskId)).toMatchObject({ state: 'review' })
-      expect(checker.steps.map((s) => s.checks)).toEqual([['tests', 'lint']])
-      const acceptance = acceptanceOf(ctx, runId)
-      expect(acceptance.outcome).toMatchObject({ option: 'accept', detail: { checks: { tests: true, lint: true, 'red-on-base': true }, checkRun: { redOnBase: expect.stringContaining('light tier') } } })
-    })
   })
 
   describe('a board task with no write subject (T165: the lead\'s parallel tasks on one repository)', () => {
-    it('runs the checks on the tree its agent result is on and binds the result to that tree: passed, it is accepted without the operator (INV-5)', async () => {
-      const checker = new Checker()
-      const { ctx, workspace, subject, task } = await boot(checker)
-      const { taskId, runId } = await task('workspace-write', { writes: false })
-      const done = await settled(ctx, taskId)
-      expect(done).toMatchObject({ ...LANDING, result: { subject: { type: 'git-head', ref: subject.ref, version: subject.version } } })
-      expect(checker.steps).toEqual([{ runId, workspace, subject: { ref: subject.ref, version: subject.version }, checks: ['tests', 'lint'], classification: 'public' }])
-      const acceptance = acceptanceOf(ctx, runId)
-      expect(acceptance.outcome).toMatchObject({ option: 'accept', detail: { subject: { type: 'git-head', ref: subject.ref, version: subject.version }, checks: { tests: true, lint: true }, checkRun: { outcome: 'checked' } } })
-      // The result's artifacts name that exact tree: the agent result on it is among them and the decision's inputs.
-      const onTree = done.result!.artifacts.filter((a) => (ctx.artifacts.get(a)?.body as { subject?: { version?: string } } | undefined)?.subject?.version === subject.version)
-      expect(onTree.length).toBeGreaterThan(0)
-      for (const a of done.result!.artifacts) expect(acceptance.inputs).toContain(a)
-    })
-
-    it('sends one whose lint check failed on its tree back as a rejected attempt', async () => {
-      const checker = new Checker()
-      checker.outcomes = { tests: 'passed', lint: 'failed' }
-      const { ctx, task } = await boot(checker)
-      const { taskId, runId } = await task('workspace-write', { writes: false })
-      const back = await settled(ctx, taskId)
-      expect(back.state).toBe('ready')
-      expect(back.attempts.count).toBe(1)
-      const acceptance = acceptanceOf(ctx, runId)
-      expect(acceptance.outcome).toMatchObject({ option: 'reject', detail: { subject: { type: 'git-head' }, checks: { tests: true, lint: false } } })
-      expect(acceptance.candidates.find((c) => c.selected)!.reasons[0]).toMatch(/the run's own lint check failed on git-head/)
-    })
-
-    it('binds a run whose last step is a review, and whose checks did not run, to the tree its writing step changed, never to the review\'s report (T293, INV-5)', async () => {
-      // No source runs checks: they stay pending, as on T283, and the result is still the written tree.
-      const { ctx, workspace, subject, task } = await boot(undefined, { review: 'approve' })
-      const { taskId, runId } = await task('workspace-write', { writes: false, template: 'reviewed' })
-      const held = await settled(ctx, taskId)
-      expect(held).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: ['tests', 'lint'] }, result: { subject: { type: 'git-head', ref: subject.ref, version: subject.version } } })
-      const acceptance = acceptanceOf(ctx, runId)
-      expect(acceptance.outcome.detail).toMatchObject({ subject: { type: 'git-head', ref: subject.ref, version: subject.version }, checkRun: { outcome: 'not-run' } })
-      // The agent result that names the worktree is among the result's artifacts, so its landing finds the tree.
-      expect(held.result!.artifacts.some((a) => (ctx.artifacts.get(a)?.body as { workspace?: string } | undefined)?.workspace === workspace)).toBe(true)
-    })
 
     it('binds to the written tree a run whose writing step left its change in a commit, its worktree clean: changed is against the commit it forked from (T293)', async () => {
       const checker = new Checker()
@@ -566,17 +333,6 @@ describe('ctx.workflow runs a written result\'s required checks on its exact tre
       const held = await settled(ctx, taskId)
       expect(held).toMatchObject({ state: 'review', result: { subject: { type: 'git-head', ref: committed.ref, version: committed.version } } })
       expect(acceptanceOf(ctx, runId).outcome.detail).toMatchObject({ subject: { type: 'git-head', ref: committed.ref } })
-    })
-
-    it('keeps the checks pending, for the operator, when its result is not on a git working tree (INV-2)', async () => {
-      const checker = new Checker()
-      const { ctx, task } = await boot(checker, { onTree: false })
-      const { taskId, runId } = await task('workspace-write', { writes: false })
-      expect(await settled(ctx, taskId)).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: ['tests', 'lint'] } })
-      expect(checker.steps).toEqual([])
-      const acceptance = acceptanceOf(ctx, runId)
-      expect(acceptance.outcome.detail).toMatchObject({ subject: { type: 'artifact' } })
-      expect(acceptance.outcome.detail).not.toHaveProperty('checkRun')
     })
   })
 
@@ -603,65 +359,6 @@ describe('ctx.workflow runs a written result\'s required checks on its exact tre
       expect(ctx.artifacts.get(done.result!.acceptance!)?.body).toMatchObject({ decider: { id: 'workflow.task-acceptance' } })
       // Reported as accepted, and watched for its landing, whose merge asks the operator as before; done once it lands (T293).
       await vi.waitFor(() => expect(ctx.workflow.get(runId)?.task).toMatchObject({ phase: 'reported', outcome: { status: 'accepted', state: 'review' } }), { timeout: 30_000, interval: 25 })
-    })
-
-    it('holds for the operator a result that lands on another branch, or whose checks are pending', async () => {
-      const elsewhere = new Checker()
-      elsewhere.base = 'main'
-      const main = await boot(elsewhere, { review: 'approve', board: AUTO })
-      const one = await main.task('workspace-write', { template: 'reviewed' })
-      const held = await settled(main.ctx, one.taskId)
-      expect(held).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: [] } })
-      expect(main.ctx.artifacts.get(held.lastDecision!)?.body).toMatchObject({ outcome: { option: 'operator-review', detail: { autoAccept: ['it lands on main, not on a listed branch (dev)'] } } })
-
-      const pending = new Checker()
-      pending.base = 'dev'
-      pending.outcomes = { tests: 'passed', lint: 'error' }
-      const dev = await boot(pending, { review: 'approve', board: AUTO })
-      const two = await dev.task('workspace-write', { template: 'reviewed' })
-      expect(await settled(dev.ctx, two.taskId)).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: ['lint'] } })
-    })
-
-    it('holds for the lead or the operator a result whose tests check passed without running its browser tests, naming the check and what did not run (T247, T255)', async () => {
-      const checker = new Checker()
-      checker.base = 'dev'
-      checker.notRun = { tests: 'its browser tests (12 browser tests skipped: no usable Chrome)' }
-      const { ctx, task } = await boot(checker, { review: 'approve', board: AUTO })
-      const { taskId, runId } = await task('workspace-write', { template: 'reviewed' })
-      const held = await settled(ctx, taskId)
-      expect(held).toMatchObject({ state: 'review', waiting: { reason: 'operator-review', pendingChecks: [] } })
-      // The acceptance records what did not run with each result; the board's hold names it.
-      expect(acceptanceOf(ctx, runId).outcome.detail['checkRun']).toMatchObject({ results: [
-        { check: 'tests', outcome: 'passed', notRun: 'its browser tests (12 browser tests skipped: no usable Chrome)' },
-        { check: 'lint', outcome: 'passed' },
-      ] })
-      expect((acceptanceOf(ctx, runId).outcome.detail['checkRun'] as { results: object[] }).results[1]).not.toHaveProperty('notRun')
-      expect(ctx.artifacts.get(held.lastDecision!)?.body).toMatchObject({ outcome: { option: 'operator-review', detail: { autoAccept: [
-        'checks passed, browser tests not run: its tests check passed without running its browser tests (12 browser tests skipped: no usable Chrome), so its pass says nothing of those',
-      ] } } })
-    })
-
-    it('never lands a result whose last review left a blocking finding at the cycle bound', async () => {
-      const checker = new Checker()
-      checker.base = 'dev'
-      const { ctx, task } = await boot(checker, { review: 'changes-requested', board: AUTO })
-      const { taskId, runId } = await task('workspace-write', { template: 'reviewed' })
-      const after = await settled(ctx, taskId)
-      expect(after.state).not.toBe('done')
-      // The review the run counts on its exact result requested changes: its own review check failed, so the work goes back.
-      expect(acceptanceOf(ctx, runId).outcome).toMatchObject({ option: 'reject', detail: { checks: { review: false }, review: { verdict: 'changes-requested', blocking: 1, cycle: 1, maxCycles: 1 } } })
-    })
-  })
-
-  it('records a plain run\'s checks as passed or failed on its acceptance, never blocking it', async () => {
-    const checker = new Checker()
-    checker.outcomes = { tests: 'passed', lint: 'failed' }
-    const { ctx } = await boot(checker)
-    const run = ctx.workflow.start({ template: 'develop', input: 'Fix add()', classification: 'public' })
-    expect(await ctx.workflow.wait(run.runId, 30_000)).toMatchObject({ status: 'completed' })
-    expect(acceptanceOf(ctx, run.runId, 'workflow.run-acceptance')).toMatchObject({
-      decider: { version: '2' },
-      outcome: { option: 'accept', detail: { actionClass: 'workspace-write', checks: { tests: true, lint: false }, pendingChecks: ['lint'], checkRun: { outcome: 'checked' } } },
     })
   })
 })

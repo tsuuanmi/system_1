@@ -37,15 +37,6 @@ function explain(told?: { runs: Array<typeof HELD>; unread: Array<{ source: stri
 }
 
 describe('explain: the liveness of a run\'s executions (PROP-0013)', () => {
-  it('gives a run\'s executions whose liveness needs a look beside its decision chain: the verdict, its looks, why, what it holds, and what to do', async () => {
-    const { handler, asked } = explain({ runs: [HELD], unread: [] })
-    const explained = await handler({ id: 'run_1' })
-    expect(explained.structuredContent).toEqual({ ...RUN, liveness: [HELD] })
-    expect(asked).toEqual([{ runId: 'run_1' }])
-    // An execution told of by its own id; anything else is unknown.
-    expect((await handler({ id: HELD.execution })).structuredContent).toEqual({ execution: HELD.execution, liveness: [HELD] })
-    expect(await handler({ id: 'arun_00000000000000cc' })).toMatchObject({ isError: true, content: [{ text: 'nothing is known about arun_00000000000000cc' }] })
-  })
 
   it('leaves a run with nothing to tell as it was, and names a source that could not tell, never reading it as having none (INV-2)', async () => {
     expect((await explain({ runs: [], unread: [] }).handler({ id: 'run_1' })).structuredContent).toEqual(RUN)

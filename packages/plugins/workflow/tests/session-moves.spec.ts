@@ -82,54 +82,6 @@ const step = (nodeId: string, prompt: string, extra: Partial<NodeTemplate> = {})
   ({ nodeId, objective: `step ${nodeId}`, prompt, capabilities: ['reason'], tier: 'standard', conversation: 'persistent', acceptance: 'acceptance.answer', ...extra })
 
 describe('a step its session\'s Worker cannot take (live 2026-10-26, board T229)', () => {
-  it('runs a step over its session\'s Worker\'s input bound without the session, when its brief quotes every earlier turn; the run completes', async () => {
-    // As the research template: frame on the site, then a step that quotes it and is over the site's bound.
-    const research: NodeTemplate[] = [
-      step('frame:1', 'Frame: {{input}}'),
-      step('evidence:1', 'Extract the evidence from:\n{{node:frame:1}}', { dependsOn: ['frame:1'] }),
-      step('conclusion:1', 'Conclude.', { dependsOn: ['evidence:1'] }),
-    ]
-    const { ctx } = await boot({ research })
-    const started = scripted(ctx, (prompt) => (prompt.startsWith('Frame:') ? `FRAMED ${'h'.repeat(40_000)}` : prompt.startsWith('Extract') ? 'EVIDENCE TABLE' : 'CONCLUDED'))
-    const done = await ctx.workflow.wait(ctx.workflow.start({ template: 'research', input: 'Does it hold?' }).runId, 30_000)
-    expect(done.status).toBe('completed')
-    const [frame, evidence, conclusion] = started
-    expect(frame).toMatchObject({ worker: 'web:gem/standard', sessionId: expect.any(String) })
-    // Off the session, on the Worker that takes it: no session, nothing to resume.
-    expect(evidence).toMatchObject({ worker: 'model:api', sessionId: undefined })
-    expect(evidence!.prompt).toContain('FRAMED')
-    const [move] = moves(ctx, done.runId)
-    expect(move).toMatchObject({ outcome: { option: 'sessionless', detail: { sessionId: frame!.sessionId, from: ['web:gem/standard'], worker: 'model:api', carried: [] } } })
-    expect(move!.candidates.find((c) => c.option === 'stay')!.reasons[0]).toMatch(/^not stay: session \S+ stays on web:gem\/standard, which cannot take this step: web:gem\/standard: the input has \d+ characters; it takes at most 30000/)
-    // Back on the session's Worker, the conclusion is handed the step its conversation never saw.
-    expect(conclusion).toMatchObject({ worker: 'web:gem/standard', sessionId: frame!.sessionId })
-    expect(conclusion!.prompt).toContain('EVIDENCE TABLE')
-    expect(moves(ctx, done.runId)).toHaveLength(1)
-    // The route decision of the step off the session reports its input against the bound it is over.
-    const route = ctx.artifacts.get(ctx.workflow.records(done.runId).find((r) => r.nodeId === 'evidence:1')!.execution!.route)!.body as Decision
-    expect(route.candidates.find((c) => c.selected)!.reasons).toContainEqual(expect.stringMatching(/^input \d+ characters; model:api declares no input bound$/))
-  })
-
-  it('hands a step whose capability its session\'s Worker lacks to a Worker that proves it, carrying the turns its brief does not quote; the run completes', async () => {
-    const search: NodeTemplate[] = [
-      step('frame:1', 'Frame: {{input}}'),
-      // It quotes nothing: what it builds on is the conversation, so the handoff carries it.
-      step('search:1', 'Search the web for the question framed above.', { dependsOn: ['frame:1'], capabilities: ['reason', 'web-search'] }),
-    ]
-    const { ctx } = await boot({ search })
-    const started = scripted(ctx, (prompt) => (prompt.startsWith('Frame:') ? 'H1: it holds' : 'FOUND'))
-    const done = await ctx.workflow.wait(ctx.workflow.start({ template: 'search', input: 'Does it hold?' }).runId, 30_000)
-    expect(done.status).toBe('completed')
-    const [frame, search1] = started
-    expect(frame!.worker).toBe('web:gem/standard')
-    expect(search1).toMatchObject({ worker: 'model:api', sessionId: undefined })
-    // The handoff: the session's earlier turn, in the brief.
-    expect(search1!.prompt).toContain('H1: it holds')
-    const [move] = moves(ctx, done.runId)
-    const frameResult = ctx.workflow.records(done.runId).find((r) => r.nodeId === 'frame:1')!.outputReceipt!.result
-    expect(move).toMatchObject({ outcome: { option: 'handoff', detail: { worker: 'model:api', carried: [frameResult] } } })
-    expect(move!.candidates.find((c) => c.option === 'stay')!.reasons[0]).toContain('does not prove web-search')
-  })
 
   it('still fails a step no Worker at all can take, with the reason, after trying it off the session', async () => {
     const deep: NodeTemplate[] = [

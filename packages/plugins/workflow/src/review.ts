@@ -128,11 +128,11 @@ export function reviewSubject(e: Engine, results: ArtifactRef[], request: string
 }
 
 /** What a review is told of tests the run that wrote its change did not run (T265). */
-export const notRunNote = (notRun: string): string =>
+const notRunNote = (notRun: string): string =>
   `Note: the run that wrote this change ran its tests without running ${notRun.slice(0, 300)}; whatever it says of its tests says nothing of those. Judge what they cover from the change itself, and say so in a finding when it matters.`
 
 /** What a review is told when what the run that wrote its change reported of its tests is not known (T265). */
-export const reportUnreadNote = (why: string): string =>
+const reportUnreadNote = (why: string): string =>
   `Note: what the run that wrote this change reported of its own test runs is not known (${why.slice(0, 300)}): whether its browser tests ran is not known, so whatever it says of its tests may not cover them. Judge what they cover from the change itself, and say so in a finding when it matters.`
 
 /**

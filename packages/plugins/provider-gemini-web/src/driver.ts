@@ -814,7 +814,7 @@ function termsNotice(shown: boolean): void {
 }
 
 /** What the operator does about a terms notice ("Account re-auth" in the runbook). */
-export const TERMS_NOTICE_MESSAGE = 'gemini-web: a notice of updated terms ("Keep in mind") covers the input; system never acknowledges it: press the notice\'s own button in the login profile (system account login), then Save'
+const TERMS_NOTICE_MESSAGE = 'gemini-web: a notice of updated terms ("Keep in mind") covers the input; system never acknowledges it: press the notice\'s own button in the login profile (system account login), then Save'
 
 /** Rethrow anything but UI drift, which the caller then refuses with its own reason. */
 function driftOnly(error: unknown): void {

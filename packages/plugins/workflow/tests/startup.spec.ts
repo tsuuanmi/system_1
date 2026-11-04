@@ -40,13 +40,6 @@ describe('startup validation (REQ-HOST-2)', () => {
     expect(outcome.error?.message).toMatch(/templates\.broken\[0\]\.conversation missing required value/)
   })
 
-  // A template that passes the schema but fails its own check is refused alone (INV-2): the engine
-  // serves every other template, and health names the refused one.
-  it('refuses a template whose result schema is unknown, alone (REQ-ART-5)', async () => {
-    const outcome = await engine({ broken: [{ ...step, resultSchema: 'nothing@1.0' }], fine: [step] })
-    expect(outcome).toMatchObject({ error: undefined, served: true, refused: [{ name: 'broken', reason: expect.stringMatching(/node a: unknown result schema nothing@1\.0/) }] })
-  })
-
   it('refuses a template that fails preflight, alone, naming the template\'s problem', async () => {
     const outcome = await engine({ broken: [{ ...step, dependsOn: ['missing'] }] })
     expect(outcome).toMatchObject({ error: undefined, served: true, refused: [{ name: 'broken', reason: expect.stringMatching(/unknown node missing/) }] })

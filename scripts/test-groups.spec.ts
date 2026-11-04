@@ -138,10 +138,10 @@ describe('related tests (T299)', () => {
     // It reads every spec file of the suite several times: the default 5 s fails on a loaded host (T331's landing).
     const browser = browserSpecs()
     expect(browser).toContain('packages/plugins/workflow/tests/team-votes.spec.ts')
-    expect(browser).toContain('packages/plugins/turns/tests/profiles.spec.ts')
+    expect(browser).toContain('packages/plugins/turns/tests/restart.spec.ts')
     expect(browser).not.toContain('packages/plugins/workflow/tests/review-guides.spec.ts')
     // A file with plain in-process tests beside its browser ones is no browser spec: those tests still run when reached.
-    for (const mixed of ['packages/plugins/web-ui/tests/policy.spec.ts', 'packages/plugins/web-ui/tests/dispatch.spec.ts', 'packages/plugins/provider-chatgpt-web/tests/driver.spec.ts', 'packages/ui-ops/tests/engine.spec.ts']) expect(browser, mixed).not.toContain(mixed)
+    for (const mixed of ['packages/plugins/web-ui/tests/policy.spec.ts', 'packages/plugins/web-ui/tests/dispatch.spec.ts', 'packages/ui-ops/tests/engine.spec.ts']) expect(browser, mixed).not.toContain(mixed)
     expect(isBrowserSpec("describe.runIf(canRunBrowser)('a', () => {})\ndescribe.runIf(canRunBrowser && vnc)('b', () => {})\n")).toBe(true)
     expect(isBrowserSpec("describe('a', () => {})\ndescribe.runIf(canRunBrowser)('b', () => {})\n")).toBe(false)
     expect(isBrowserSpec("describe('a', () => { headlessIt('b', async () => {}) })\n")).toBe(false)

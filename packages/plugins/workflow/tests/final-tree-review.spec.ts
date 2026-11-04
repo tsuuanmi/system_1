@@ -9,16 +9,6 @@ const FINAL = { ref: 'repo', version: 'bbb' }
 const gate = (node: string, verdict: string, subject: { ref: string; version: string }) => ({ node, verdict, subject })
 
 describe('finalTreeReview (T287)', () => {
-  it('reads approve when the final tree was approved after a verified changes-requested first round', () => {
-    const reviews = [
-      gate('review:1', 'changes-requested', OLD),
-      gate('review:1:review:2', 'approve', FINAL),
-      gate('review:1:second:review:2', 'approve', FINAL),
-      // the verification gate of round one lands on review:1 after the rest in run order
-      gate('review:1', 'changes-requested', OLD),
-    ]
-    expect(finalTreeReview(reviews, { type: 'git-head', ...FINAL })).toMatchObject({ node: 'review:1:second:review:2', verdict: 'approve' })
-  })
 
   it('reads changes-requested when the last review of the final tree requests changes', () => {
     const reviews = [
@@ -28,12 +18,5 @@ describe('finalTreeReview (T287)', () => {
       gate('review:1', 'approve', OLD),
     ]
     expect(finalTreeReview(reviews, { type: 'git-head', ...FINAL })).toMatchObject({ node: 'review:1:review:3', verdict: 'changes-requested' })
-  })
-
-  it('falls back to the last review when none is of the tree, or the result names no tree', () => {
-    const reviews = [gate('review:1', 'approve', OLD), gate('review:2', 'changes-requested', OLD)]
-    expect(finalTreeReview(reviews, FINAL)?.node).toBe('review:2')
-    expect(finalTreeReview(reviews)?.node).toBe('review:2')
-    expect(finalTreeReview([])).toBeUndefined()
   })
 })

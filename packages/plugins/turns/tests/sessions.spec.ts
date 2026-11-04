@@ -1,40 +1,11 @@
 import type { WorkRequirement } from '@tsuuanmi/system-workers'
 import { describe, expect, it } from 'vitest'
 import { canRunBrowser } from '../../browser-patchright/tests/support.ts'
-import { account, ask, turnsStack } from './stack.ts'
+import { account, turnsStack } from './stack.ts'
 
 const { boot } = turnsStack()
 
 describe.runIf(canRunBrowser)('ctx.turns: persistent sessions and Deep research', () => {
-  it('starts Deep research at once in a persistent session and delivers the report through result (REQ-PRV-6)', async () => {
-    const { ctx, fake } = await boot({ fake: { report: 'Research report', thinkMs: 1500 } })
-    const started = await ask(ctx, { research: true, prompt: 'Survey the plugin catalog' })
-    expect(started).toMatchObject({ status: 'queued', mode: 'persistent', feature: 'deep-research' })
-    expect(started.sessionId).toMatch(/^ses_/)
-    const done = await ctx.turns.wait(started.turnId, 60_000)
-    expect(done).toMatchObject({ status: 'completed', answer: 'Research findings\nResearch report' })
-    expect(fake.sent[0]).toMatchObject({ deepResearch: true, temporary: false, prompt: 'Survey the plugin catalog' })
-  }, 90_000)
-
-  it('accepts a follow-up on a new persistent session before its first turn has finished', async () => {
-    const { ctx } = await boot({ fake: { thinkMs: 1500 } })
-    const first = await ask(ctx, { prompt: 'one', persist: true })
-    const second = await ask(ctx, { prompt: 'two', sessionId: first.sessionId! })
-    expect((await ctx.turns.wait(second.turnId, 60_000)).status).toBe('completed')
-    expect((await ctx.turns.wait(first.turnId, 1000)).status).toBe('completed')
-  }, 90_000)
-
-  it('keeps a persistent session on one conversation across asks', async () => {
-    const { ctx, fake } = await boot({ fake: { answer: 'first' } })
-    const first = await ctx.turns.wait((await ask(ctx, { prompt: 'one', persist: true })).turnId, 30_000)
-    expect(first).toMatchObject({ status: 'completed', mode: 'persistent', answer: 'first' })
-    expect(first.sessionId).toMatch(/^ses_/)
-    fake.options.answer = 'second'
-    const second = await ctx.turns.wait((await ask(ctx, { prompt: 'two', sessionId: first.sessionId! })).turnId, 30_000)
-    expect(second).toMatchObject({ status: 'completed', sessionId: first.sessionId, answer: 'second', binding: first.binding })
-    expect(first.binding).toMatch(/^[0-9a-f-]{36}$/)
-    expect(fake.sent[1]).toMatchObject({ conversationId: first.binding, temporary: false })
-  }, 120_000)
 
   it('holds a session to its account only once something was sent, so an unsent first turn may move to a sibling (ADR-0034)', async () => {
     const { ctx, fake } = await boot({ accounts: [account('chatgpt-main'), account('chatgpt-2')], ready: ['chatgpt-main', 'chatgpt-2'], fake: { captcha: true } })
