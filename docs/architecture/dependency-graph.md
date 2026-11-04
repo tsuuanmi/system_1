@@ -13,7 +13,7 @@ importing another, `value` when any of its imports is a value import, `type` whe
 
 | Class | Packages | Members |
 |---|---|---|
-| kernel: libraries, the host, and the `*-core` seam definitions | 19 | `agent-runtime-core`, `approvals-core`, `board-core`, `cli`, `decision-core`, `digest-core`, `feedback-core`, `gateway-core`, `gateway-turns`, `landing-core`, `ledger-core`, `libs`, `models-core`, `plugin-host-core`, `provider-core`, `resources-core`, `system-bundle`, `ui-ops`, `workers-core` |
+| kernel: libraries, the host, and the `*-core` seam definitions | 18 | `agent-runtime-core`, `approvals-core`, `board-core`, `cli`, `decision-core`, `digest-core`, `gateway-core`, `gateway-turns`, `landing-core`, `ledger-core`, `libs`, `models-core`, `plugin-host-core`, `provider-core`, `resources-core`, `system-bundle`, `ui-ops`, `workers-core` |
 | guarantee: guarantee providers: the required rows | 15 | `approvals`, `artifacts`, `board`, `credentials-vault`, `egress`, `event-log`, `landing-local`, `leases`, `plugin-host`, `resources`, `store`, `turn-receipts`, `worker-sessions`, `workers`, `workflow` |
 | capability: capability plugins | 18 | `accounts`, `agent-runtimes`, `agent-workers`, `browser-patchright`, `digest`, `digest-extractive`, `display-virtual`, `login`, `models`, `provider-chatgpt-web`, `provider-gemini-web`, `providers`, `runtime-acp`, `runtime-antigravity-cli`, `runtime-claude-agent-sdk`, `runtime-codex-sdk`, `turns`, `workers-fake` |
 | surface: surfaces | 8 | `decisions`, `gateway-anthropic`, `gateway-responses`, `lead-inbox`, `mcp-server`, `notify`, `report`, `web-ui` |
@@ -25,7 +25,7 @@ Packages importing packages, importer by row, imported by column; each cell is v
 
 | importer \ imported | kernel | guarantee | capability | surface | profile |
 |---|---|---|---|---|---|
-| kernel | 15 / 6 | 0 / 1 | 1 / 0 | · | · |
+| kernel | 14 / 6 | 0 / 1 | 1 / 0 | · | · |
 | guarantee | 40 / 11 | 1 / 0 | · | · | · |
 | capability | 51 / 16 | 0 / 1 | 1 / 3 | · | · |
 | surface | 21 / 12 | 0 / 1 | · | · | · |
@@ -33,8 +33,8 @@ Packages importing packages, importer by row, imported by column; each cell is v
 
 ## Counts
 
-- 62 packages: 19 kernel, 15 guarantee, 18 capability, 8 surface, 2 profile.
-- 187 package-to-package edges (133 value, 54 type); 12 of them end in a plugin (4 value, 8 type).
+- 61 packages: 18 kernel, 15 guarantee, 18 capability, 8 surface, 2 profile.
+- 186 package-to-package edges (132 value, 54 type); 12 of them end in a plugin (4 value, 8 type).
 - 11 violations (3 value, 8 type) in 7 of 43 plugins: 7 import a guarantee provider (`guarantee-provider`), 4 import another plugin outside its family (`plugin-to-plugin`).
 
 ## Edges that end in a plugin

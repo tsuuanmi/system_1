@@ -35,7 +35,6 @@ A plugin may also consume a service of the dsh launcher itself, which no row pro
 | [digest](../../packages/plugins/digest/README.md) | orchestration | `digests` | `digest` | `store`, `artifacts`, `leases`, `workers`, `mcp` (optional) | `board-core`, `digest-core`, `gateway-core`, `ledger-core`, `libs`, `workers-core` |
 | [digest-core](../../packages/digest-core/README.md) | orchestration | defines `digests` | — | `eventLog` (optional) | `board-core`, `gateway-core`, `ledger-core`, `libs`, `workers-core` |
 | [digest-extractive](../../packages/plugins/digest-extractive/README.md) | orchestration | `digests` | `digest-extractive` | `store`, `artifacts`, `leases`, `workers`, `mcp` (optional) | `board-core`, `digest-core`, `gateway-core`, `ledger-core`, `libs`, `workers-core` |
-| [feedback-core](../../packages/feedback-core/README.md) | orchestration | defines `evaluations`, defines `experiments` | — | — | `libs` |
 | [landing-core](../../packages/landing-core/README.md) | orchestration | defines `landing` | — | — | — |
 | [landing-local](../../packages/plugins/landing-local/README.md) | orchestration | `landing` | `landing-local` | `workers` | `landing-core`, `workers-core` |
 | [profile-scientific-research](../../packages/plugins/profile-scientific-research/README.md) | orchestration | — | `profile-scientific-research` | `workflow`, `workers`, `artifacts`, `eventLog` | `ledger-core`, `libs` |
@@ -44,7 +43,7 @@ A plugin may also consume a service of the dsh launcher itself, which no row pro
 | [workflow](../../packages/plugins/workflow/README.md) | orchestration | `workflow` | `workflow` | `store`, `artifacts`, `eventLog`, `leases`, `egress`, `workers`, `workerSessions`, `agentWorkers` (optional), `approvals` (optional), `board` (optional), `digests` (optional), `dispatchAdvisor` (optional), `landing` (optional), `mcp` (optional), `pluginHost` (optional), `resources` (optional) | `approvals-core`, `board-core`, `decision-core`, `digest-core`, `gateway-core`, `landing-core`, `ledger-core`, `libs`, `provider-core`, `resources-core`, `worker-sessions`, `workers-core` |
 | [approvals](../../packages/plugins/approvals/README.md) | routing | `approvals` | `approvals` | `store`, `artifacts`, `board` (optional), `eventLog` (optional), `mcp` (optional), `workflow` (optional) | `approvals-core`, `gateway-core`, `ledger-core`, `libs` |
 | [approvals-core](../../packages/approvals-core/README.md) | routing | defines `approvals` | — | — | `libs` |
-| [egress](../../packages/plugins/egress/README.md) | routing | `egress` | `egress` | `artifacts` | `ledger-core`, `libs`, `provider-core`, `workers-core` |
+| [egress](../../packages/plugins/egress/README.md) | routing | `egress` | `egress` | `artifacts` | `ledger-core`, `libs`, `workers-core` |
 | [resources](../../packages/plugins/resources/README.md) | routing | `resources` | `resources` | `store`, `artifacts`, `board` (optional), `eventLog` (optional), `mcp` (optional), `workflow` (optional) | `gateway-core`, `ledger-core`, `libs`, `resources-core` |
 | [resources-core](../../packages/resources-core/README.md) | routing | defines `resources` | — | — | — |
 | [workers](../../packages/plugins/workers/README.md) | routing | `workers` | `workers` | `artifacts`, `resources` (optional) | `ledger-core`, `libs`, `workers-core` |
@@ -495,7 +494,6 @@ flowchart TB
   digest_extractive --> workers_core
   display_virtual --> provider_core
   egress --> ledger_core
-  egress --> provider_core
   egress --> workers_core
   event_log --> ledger_core
   gateway_anthropic --> gateway_core

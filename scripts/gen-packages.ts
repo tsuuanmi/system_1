@@ -76,7 +76,6 @@ export const LAYER_OF: Record<string, Layer> = {
   'landing-local': 'orchestration',
   'digest': 'orchestration',
   'digest-extractive': 'orchestration',
-  'feedback-core': 'orchestration',
   'worker-sessions': 'orchestration',
   'profile-software-development': 'orchestration',
   'profile-scientific-research': 'orchestration',

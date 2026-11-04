@@ -1553,36 +1553,6 @@ Enable them: `systemctl --user enable --now system.service system-health.timer s
 Prune old daily backup directories yourself; each one is a full snapshot. The live update prunes
 its own `<date>-before-base*` backups (see [update the live install](#update-the-live-install-from-e218ae7-to-the-base-release)).
 
-**Automatic update of the live install.** A timer runs one pass of the [automatic
-update](#update-the-live-install-automatically) every 15 minutes, from the check checkout:
-
-```ini
-# ~/.config/systemd/user/system-auto-update.service
-[Unit]
-Description=system: one pass of the live install's automatic update
-# A pass that stops and pauses itself exits 1, once; a paused pass exits 0.
-OnFailure=<your notifier>.service
-
-[Service]
-Type=oneshot
-# gh and git; the script puts Node 24 and pnpm on PATH itself.
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-# Options after the script: --branch <name> (default main), --settle <minutes>, --hours <HH-HH>
-# (its section). To follow dev:
-#   ExecStart=%h/workspaces/system-live-check/scripts/live-auto-update.sh --branch dev
-ExecStart=%h/workspaces/system-live-check/scripts/live-auto-update.sh
-# A pass with a drain and two builds takes its time. The daemon it stops and starts is
-# system.service's (systemctl), so nothing of it is in this unit: no KillMode= is needed.
-TimeoutStartSec=infinity
-
-# ~/.config/systemd/user/system-auto-update.timer
-[Timer]
-OnCalendar=*:0/15
-
-[Install]
-WantedBy=timers.target
-```
-
 ## Upgrade with drain
 
 1. `system backup <dir>`.
@@ -1628,9 +1598,8 @@ back when one fails. It is a dry run unless `--apply`.
 `--apply`: `--stage` implies `--apply`, and before `system` is captured, paused, or stopped, it
 updates and checks the `system-test` profile with the same code and patch (`scripts/live-stage.sh`),
 and updates `system` only when that passes. If the stage fails, `system` and its unit are untouched,
-the output says which step failed, and the test daemon's log is `~/.dsh/system-test.log`. The
-[automatic update](#update-the-live-install-automatically) stages too. `--apply` alone is only the
-live steps: use it to retry an update the stage already passed.
+the output says which step failed, and the test daemon's log is `~/.dsh/system-test.log`. `--apply`
+alone is only the live steps: use it to retry an update the stage already passed.
 
 - **The test profile** is made by `system init --profile system-test` (the stage runs it) beside
   `system`. It has its own data directory, `~/.dsh/system-test` (store, vault and its key, tokens,
@@ -1798,78 +1767,6 @@ under the Workers' tools directory ([Codex Workers](#codex-workers)), agy at the
    <dir>/store`, then again with `--yes`.
 4. `systemctl --user reset-failed system.service; systemctl --user start system.service`, then
    `system health`.
-
-## Update the live install automatically
-
-[`scripts/live-auto-update.sh`](../../scripts/live-auto-update.sh) keeps the live install on a branch
-of origin, `--branch <name>`, `main` by default (`--branch dev` follows dev: **Follow dev** below).
-Each pass decides whether to start an update; the update itself is
-[`live-update.sh`'s](#update-the-live-install-from-e218ae7-to-the-base-release), with its backup,
-upgrade checks, and rollback. A systemd user timer runs a pass every 15 minutes
-([units](#run-as-a-service)). The branch name must be a plain one (letters, digits, `.`, `_`, `-` in
-components joined by `/`, such as `dev` or `release/1`); any other is refused before any git
-command, exit 2 and the usage. Below, `<branch>` is the branch it follows. One pass:
-
-1. Does nothing while `~/.dsh/system/auto-update.paused` exists, while another pass or a live update
-   runs (their locks under `~/system-backups`), or while an update that stopped the daemon is
-   unfinished (it pauses itself then: take that update up by hand, with the command its notes name).
-2. `git fetch origin refs/heads/<branch>` in the check checkout; no other branch is read. Nothing to
-   do when it is the live checkout's HEAD.
-3. Refuses, and pauses itself, unless `<branch>` descends from the live commit (a fast-forward).
-4. Waits `--settle` minutes (default 30) after the pass first saw the commit, so a quick revert can
-   land first; and, with `--hours 02-06`, for 02:00 to 05:59 local time (`22-04` wraps midnight;
-   default any time).
-5. Asks GitHub (`gh api`, signed in as `gh auth status` shows) for the commit's check runs and
-   statuses. Every one must have completed with success. One still running, none yet, or no usable
-   `gh` is a wait; a failed one is a refusal until `<branch>` moves on. Neither pauses.
-6. Builds the target in the check checkout (`~/workspaces/system-live-check`, a worktree of the
-   live repository, never `system-live`): `git checkout --detach`, `pnpm install
-   --frozen-lockfile`, `pnpm build`.
-7. Runs that checkout's `scripts/live-update.sh <branch's head> --from <live HEAD> --check-with
-   ~/workspaces/system-live-check`: the dry run, then `--apply`. The [build
-   stamp](../../packages/cli/README.md) tells the builds apart. A dry run that refuses (the live
-   patch fails the target's `system check`, say), an update that stops or rolls back, or a target
-   that does not build, pauses the timer.
-
-Each pass appends one line to `~/system-backups/auto-update/log`, `<time> origin/<branch> <kind>:
-<detail>`, the kind one of `current`, `wait`, `refused`, `busy`, `paused`, `stopped` (it paused
-itself), or `updated`. The pause file's notes name the branch too. A pass that built and ran the
-update writes its output next to it (`<time>-<sha>.out`); the update's own notes are in its
-`~/system-backups/<date>-before-base*/` directory.
-
-**What it never does.** It never changes the profile's patch (`--patch` is never passed: a target
-that needs a new patch stops at the dry run, and you update to it [by
-hand](#update-the-live-install-from-e218ae7-to-the-base-release)). It never updates to a commit that
-is not a fast-forward of the live one, to a branch other than `--branch`'s, on a red or pending CI,
-or while paused. It never stops the daemon but by `systemctl --user stop system.service`, whose
-`ExecStop` drains, and never kills it.
-
-**Enable it** once the daemon runs under `system.service`
-([once](#run-the-live-daemon-under-systemservice); until then every dry run refuses, and the first
-pass pauses itself): add the check worktree (`git -C ~/workspaces/system-live fetch origin main && git
--C ~/workspaces/system-live worktree add --detach ~/workspaces/system-live-check origin/main`),
-confirm `gh auth status`, write the two units ([Run as a service](#run-as-a-service)), then
-`systemctl --user daemon-reload && systemctl --user enable --now system-auto-update.timer` (and
-`loginctl enable-linger`). Run a pass now and read its line: `systemctl --user start
-system-auto-update.service; tail -n 1 ~/system-backups/auto-update/log`.
-
-**Follow dev.** Put `--branch dev` on the service's `ExecStart`, fetch it
-(`git -C ~/workspaces/system-live fetch origin dev`), and run a pass: its line names `origin/dev`. The
-live commit must be an ancestor of the branch, or the first pass refuses and pauses itself: update to
-it [by hand](#update-the-live-install-from-e218ae7-to-the-base-release) first. Return to `main` the
-same way, without `--branch`.
-
-The daemon an update restarts is `system.service`'s, with the unit's environment file. The dry run
-checks that file against the target's profile (`system check --env-file`): a name the target no longer
-reads stops it there, and a name a row of the target forwards that the file does not set is a note in
-the pass's output.
-
-**Pause, and resume.** Pause by hand with `echo 'paused by hand' > ~/.dsh/system/auto-update.paused`;
-stop the timer altogether with `systemctl --user disable --now system-auto-update.timer`. A pass
-that pauses itself writes the reason on the file's first line, with the live and target commits and
-its output. Read them, act (fix the live patch and update by hand, take up the unfinished update,
-recover from `LOOK FIRST` as that section says), then `rm ~/.dsh/system/auto-update.paused`: the
-next pass starts again from step 1.
 
 ## Run the live daemon under system.service
 
@@ -2366,7 +2263,7 @@ request for you or a file: nothing applies until you approve it, and the reposit
    `dna-develop` and the repository's `worktreeSetup`, with the account assignment, the generated
    files, and auto-accept as comments. A patch that targets a row replaces its whole config: merge
    each part into the `agent-workers` row your patch has, add the assignment, then `system check`
-   and a live update ([update the live install automatically](#update-the-live-install-automatically)).
+   and a live update ([update the live install](#update-the-live-install-from-e218ae7-to-the-base-release)).
    The command never applies it.
 5. **Hand over to the project's lead.** Its own lead session starts from `LEAD.md` in the
    coordination directory: the lead's playbook, the onboarding checklist, and what the template
@@ -3423,63 +3320,6 @@ regenerated: <why>; the repository is as it was", or naming the files that are n
 | `the autonomy policy asks the operator about the generated files' command n` | list the command (step 3), then merge by hand or run the task again |
 | `was not set up under …'s setup as loaded now` | the setup changed after the run's worktree was made: merge by hand |
 | `the worktree … was removed` | the retention removed the run's worktree, where the commands run: merge by hand |
-
-## Replay the golden set (workflow eval)
-
-Before a change to how System works on a task is kept (a fix in the author's session, a run without
-`validate:1`, …), replay golden past board tasks under it and under the current process, and compare
-([workflow eval](../validation/experiments/workflow-eval.md)). Everything runs beside live work: an
-eval clone of the repository, an eval board project, a budget cap. The helper is `node --import tsx
-scripts/experiments/workflow-eval.ts` (`wfe` below), run from a checkout of the `system`
-repository; it writes under the eval's directory only.
-
-1. **Once: the eval clone and its Workers.** Clone the repository where nothing else works
-   (`git clone /home/me/src/system ~/experiments/workflow-eval/repo`), outside `~/.dsh`. In a patch
-   kept for the eval, add writing and reviewing Workers on it as for any repository
-   ([agent Workers](#agent-workers): `worktreePerRun: true`), and its `worktreeSetup` with the
-   setup and checks ([set up a run's worktree](#set-up-a-runs-worktree),
-   [let a run pass the required checks](#let-a-run-pass-the-required-checks)). Never point them at
-   your checkout: a trial checks the clone out at old commits.
-2. **Once: the eval project.** Found a project for the eval with `board_charter`
-   (`projectId: eval-<evalId>`), which you approve, so its tasks, approvals, and usage are the
-   trials' alone. Its results are never merged: reject each `merge` request it asks.
-3. **Calibrate** each task you will replay: `wfe calibrate <caseId> --repo ~/experiments/workflow-eval/repo
-   --good <a commit with its accepted change> --scratch ~/experiments/workflow-eval/scratch` must
-   say `calibrated` (the grader fails on the base and passes on the accepted change).
-4. **Plan:** `wfe plan ~/experiments/workflow-eval/<evalId> --variants current,<variant> --tasks
-   T184,T187,T188 --repetitions 2 --seed <any text> --cap <tokens>:<quota points>:<minutes>
-   --reserve <tokens>:<quota points>:<minutes>`. The cap bounds every trial together; the reserve is
-   what one trial may take. The plan prints the trials' order: each round runs one variant's block,
-   then the other's.
-5. **Each block: a maintenance window.** Routing does not bind a step to a repository yet, so for
-   a block pause dispatch (`system dispatch pause`) and let running work finish; put the block's
-   variant configuration in force (its `configuration` patch, or none for `current`) with the eval's
-   Workers, `system check`, restart. After the block, take the eval Workers' rows out, restart, and
-   `system dispatch resume`.
-6. **Each trial**, one at a time:
-   1. `wfe next <eval> --repo ~/experiments/workflow-eval/repo`: it checks the clone out at the
-      task's base and prints the board task. Propose it (MCP `board_propose` with what it printed),
-      then start it once ready: `system run algorithm-development --task <taskId> -` with the goal on
-      stdin (`--variant docs` when it says so). Answer what it asks as you would for live work: each
-      approval is a counted touch.
-   2. When the run ends: `wfe export <eval> <trialId> <runId>`; beside the export put `usage.json`
-      (MCP `resources_usage` with the `runId`) and `draws.json` (the run's `quota-draw` records),
-      and the trial's `approvals.json` (MCP `approvals_list` with every state and the eval project).
-      A task given more attempts (`--attempts`) exports each attempt's run.
-   3. `wfe grade <eval> <trialId> --repo ~/experiments/workflow-eval/repo --worktree <the run's
-      worktree>` (`system worktrees` names it). It reads the worktree and changes nothing in it.
-   `next` refuses while a trial is not graded, and once the cap would be passed: the eval stops
-   there, and the report says which trials did not run.
-7. **Report:** `wfe report <eval>` writes `report.md` and `report.json`: per task and in total,
-   passed, passed first time, review cycles, touches, tokens, quota points, minutes, and the tasks
-   that flipped. Copy `report.md` into the experiment's records when the eval closes.
-
-| It says | Do |
-|---|---|
-| `the golden set changed since the plan` or `variant … changed since the plan` | the records moved under a running eval: finish it from the checkout it was planned on, or plan a new eval |
-| `the eval clone … holds uncommitted changes` | something wrote in the clone: it is the eval's alone. Look, then `git -C <clone> stash` or reset it |
-| a trial not counted: `the eval clone was pinned at …` or `does not descend from the base` | the run's worktree was not cut from the task's base (the clone moved before the run's first step): run the trial again in a new eval |
-| a trial not counted: `the grader's setup failed` | the offline install could not run in the grading worktree: the store lacks a package of that commit's lockfile; install once online in your checkout, then grade again |
 
 ## Run the reviewer eval
 

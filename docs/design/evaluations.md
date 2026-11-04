@@ -1,6 +1,6 @@
 # Evaluations
 
-The evaluation engine judges a pre-registered experiment offline. It runs paired trials in a seeded order, measures each trial with the collectors the contract names and the resource ledger, analyses once at the horizon, and records a deterministic `verdict` decision. It promotes nothing: a supported verdict is evidence that a promotion request cites, and the operator decides. The code is in [feedback-core](../../packages/feedback-core/README.md).
+The evaluation engine judges a pre-registered experiment offline. It runs paired trials in a seeded order, measures each trial with the collectors the contract names and the resource ledger, analyses once at the horizon, and records a deterministic `verdict` decision. It promotes nothing: a supported verdict is evidence that a promotion request cites, and the operator decides.
 
 Parked (row off, package frozen) by PROP-0022 change 6; see [docs/proposals/0022-lean-core.md](../proposals/0022-lean-core.md).
 

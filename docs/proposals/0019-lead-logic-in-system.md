@@ -308,7 +308,7 @@ Notes on the order:
 
 - Every mechanism is optional and starts `off` or `warn` (2.0). Turning one off returns the duty to the lead's script, which therefore stays until N days clean; the records a mechanism made stay.
 - The scripts are removed last, one duty at a time (rank 12), and not before the replacement has been `on` for N days. A removed script stays in the coordination directory's git history, so a duty can return to a script in minutes.
-- A mechanism goes to `on` on the test profile first, with the canary, then on live ([update the live install](../operations/runbooks.md#update-the-live-install-automatically)).
+- A mechanism goes to `on` on the test profile first, with the canary, then on live ([update the live install](../operations/runbooks.md#update-the-live-install-from-e218ae7-to-the-base-release)).
 
 ## Observability and operations
 

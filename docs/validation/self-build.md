@@ -14,8 +14,7 @@ The measured version of this evidence is the [pilot](../operations/pilot.md) and
 `system`'s own `review` template (one member per provider family, quotes checked against the files
 read, sealed ballots) reviews security-relevant code of `system` at a pinned commit of this public
 repository. The lead checks each finding against the code before any change. Only the findings that
-hold are fixed, each with a test that fails on the code before the fix. The reviews' subjects and
-findings are the cases of the [worker-agnosticism experiment](experiments/worker-agnosticism.md)'s suite.
+hold are fixed, each with a test that fails on the code before the fix.
 
 ## Not yet through system
 

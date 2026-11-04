@@ -1,6 +1,6 @@
 # Statistics
 
-The statistics library turns one metric's paired values per case into the interval that the [verdict rule](evaluations.md#the-verdict-rule) reads. It is pure inference: it holds no threshold and decides nothing. Its one method is the exact paired sign-flip test and the confidence interval that inverts it. The code is in [feedback-core](../../packages/feedback-core/README.md#statistics).
+The statistics library turns one metric's paired values per case into the interval that the [verdict rule](evaluations.md#the-verdict-rule) reads. It is pure inference: it holds no threshold and decides nothing. Its one method is the exact paired sign-flip test and the confidence interval that inverts it.
 
 Parked (row off, package frozen) by PROP-0022 change 6; see [docs/proposals/0022-lean-core.md](../proposals/0022-lean-core.md).
 

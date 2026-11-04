@@ -337,7 +337,7 @@ section deletes nothing.
 
 | Part | Why (research, section 5) | Turned back on by |
 |---|---|---|
-| `feedback-core`'s experiments, evaluations, statistics (about 3,200 source lines; frozen, no row, no importers) | no runtime use | the first change that needs them |
+| `feedback-core`'s experiments, evaluations, statistics: deleted on 2026-11-04 by the operator's decision, before the 30 days | no runtime use, no importers | a change that rebuilds them from git history |
 | `gateway-anthropic`, `gateway-responses` | 16 conversations ever | their rows: `disabled: false` |
 | `runtime-antigravity-cli`, `runtime-acp` | rows off; no run | their rows: `disabled: false` |
 | `digest-extractive` | the second provider of one seam, row off | the row on and `digest` off, in one patch |

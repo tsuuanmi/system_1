@@ -108,9 +108,8 @@ Work flows through two long-lived branches, `dev` and then `main`:
 - **`dev` integrates.** Workers' branches and the lead's batches merge into
   `dev`. CI runs the full gate on every push to `dev`, as on `main`
   ([CI gates](testing.md#ci-gates)).
-- **The live install follows `dev`.** The automatic live update runs with
-  `--branch dev` ([runbook](../operations/runbooks.md#update-the-live-install-automatically)),
-  and only a commit whose CI passed reaches it, as a fast-forward.
+- **The live install follows `dev`.** The operator updates it to a `dev` commit
+  whose CI passed ([runbook](../operations/runbooks.md#update-the-live-install-from-e218ae7-to-the-base-release)).
 - **`main` takes `dev` only by the operator.** `dev` reaches `main` only when the
   operator merges a `dev` → `main` pull request: for a release, or for a point
   that needs the operator's permission. A release tag is cut from `main` only

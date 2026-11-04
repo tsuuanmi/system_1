@@ -35,7 +35,6 @@
     "@deepseek-ai/schemastery": "3.18.5-alpha.1",
     "@tsuuanmi/system-artifacts": "workspace:*",
     "@tsuuanmi/system-browser-patchright": "workspace:*",
-    "@tsuuanmi/system-display-virtual": "workspace:*",
     "@tsuuanmi/system-event-log": "workspace:*",
     "@tsuuanmi/system-providers": "workspace:*",
     "@tsuuanmi/system-store": "workspace:*",

@@ -331,25 +331,6 @@ importers:
         specifier: ^4.6.6
         version: 4.6.7
 
-  packages/feedback-core:
-    dependencies:
-      '@tsuuanmi/system-libs':
-        specifier: workspace:*
-        version: link:../libs
-    devDependencies:
-      '@deepseek-ai/cordis':
-        specifier: 4.0.5-alpha.1
-        version: 4.0.5-alpha.1(@deepseek-ai/cordis-plugin-include@1.0.10-alpha.1)(@deepseek-ai/cordis-plugin-loader@1.0.6-alpha.1)
-      '@tsuuanmi/system-artifacts':
-        specifier: workspace:*
-        version: link:../plugins/artifacts
-      '@tsuuanmi/system-ledger-core':
-        specifier: workspace:*
-        version: link:../ledger-core
-      '@tsuuanmi/system-store':
-        specifier: workspace:*
-        version: link:../plugins/store
-
   packages/gateway-core:
     dependencies:
       '@tsuuanmi/system-libs':
@@ -779,18 +760,12 @@ importers:
       '@tsuuanmi/system-artifacts':
         specifier: workspace:*
         version: link:../artifacts
-      '@tsuuanmi/system-egress':
-        specifier: workspace:*
-        version: link:../egress
       '@tsuuanmi/system-event-log':
         specifier: workspace:*
         version: link:../event-log
       '@tsuuanmi/system-leases':
         specifier: workspace:*
         version: link:../leases
-      '@tsuuanmi/system-mcp-server':
-        specifier: workspace:*
-        version: link:../mcp-server
       '@tsuuanmi/system-store':
         specifier: workspace:*
         version: link:../store
@@ -871,9 +846,6 @@ importers:
       '@tsuuanmi/system-libs':
         specifier: workspace:*
         version: link:../../libs
-      '@tsuuanmi/system-provider-core':
-        specifier: workspace:*
-        version: link:../../provider-core
       '@tsuuanmi/system-workers-core':
         specifier: workspace:*
         version: link:../../workers-core
@@ -1360,9 +1332,6 @@ importers:
       '@tsuuanmi/system-browser-patchright':
         specifier: workspace:*
         version: link:../browser-patchright
-      '@tsuuanmi/system-display-virtual':
-        specifier: workspace:*
-        version: link:../display-virtual
       '@tsuuanmi/system-event-log':
         specifier: workspace:*
         version: link:../event-log
@@ -1403,9 +1372,6 @@ importers:
       '@tsuuanmi/system-browser-patchright':
         specifier: workspace:*
         version: link:../browser-patchright
-      '@tsuuanmi/system-display-virtual':
-        specifier: workspace:*
-        version: link:../display-virtual
       '@tsuuanmi/system-event-log':
         specifier: workspace:*
         version: link:../event-log
@@ -1559,9 +1525,6 @@ importers:
       '@deepseek-ai/schemastery':
         specifier: 3.18.5-alpha.1
         version: 3.18.5-alpha.1
-      '@tsuuanmi/system-agent-runtimes':
-        specifier: workspace:*
-        version: link:../agent-runtimes
 
   packages/plugins/runtime-codex-sdk:
     dependencies:
@@ -1674,9 +1637,6 @@ importers:
       '@tsuuanmi/system-credentials-vault':
         specifier: workspace:*
         version: link:../credentials-vault
-      '@tsuuanmi/system-display-virtual':
-        specifier: workspace:*
-        version: link:../display-virtual
       '@tsuuanmi/system-egress':
         specifier: workspace:*
         version: link:../egress
@@ -1922,9 +1882,6 @@ importers:
       '@tsuuanmi/system-credentials-vault':
         specifier: workspace:*
         version: link:../credentials-vault
-      '@tsuuanmi/system-display-virtual':
-        specifier: workspace:*
-        version: link:../display-virtual
       '@tsuuanmi/system-egress':
         specifier: workspace:*
         version: link:../egress
@@ -1964,9 +1921,6 @@ importers:
       '@tsuuanmi/system-workers':
         specifier: workspace:*
         version: link:../workers
-      patchright-core:
-        specifier: 1.63.0
-        version: 1.63.0(patch_hash=a0adfdf949fb2d56a2b047ace2b0ac22c9655a74549995ae80266814e2666284)
       zod:
         specifier: ^4.6.6
         version: 4.6.7
@@ -2165,9 +2119,6 @@ importers:
       '@tsuuanmi/system-browser-patchright':
         specifier: workspace:*
         version: link:../plugins/browser-patchright
-      '@tsuuanmi/system-display-virtual':
-        specifier: workspace:*
-        version: link:../plugins/display-virtual
       patchright-core:
         specifier: 1.63.0
         version: 1.63.0(patch_hash=a0adfdf949fb2d56a2b047ace2b0ac22c9655a74549995ae80266814e2666284)

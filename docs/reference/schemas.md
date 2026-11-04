@@ -1556,8 +1556,7 @@ Tools: `board_projects`, `board_charter`, `board_brief`, `board_tasks`, `board_t
   stricter ([experiments](../design/experiments.md#a-registration)). Each method is the pinned
   statistics library's ([statistics](../design/statistics.md)).
 - The registry also refuses a contract whose primary or a guardrail has no method or no metric, whose
-  ratio reads an undefined metric or a ratio, or that guards the primary or one metric twice
-  (`contractProblems` in [`feedback-core`](../../packages/feedback-core/README.md)). Example:
+  ratio reads an undefined metric or a ratio, or that guards the primary or one metric twice. Example:
   [`objective-contract.review.json`](../../schemas/examples/objective-contract.review.json).
 
 ### `hypothesis`

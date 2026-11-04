@@ -40,7 +40,6 @@ package's `package.json`. **Status** is **in use**, **planned**, or **dropped**.
 | Versions and changelogs | Changesets (`@changesets/cli`), one `fixed` group | dev tool | repository root | in use | release-please and semantic-release derive versions from commit messages; Changesets records the bump with the change ([releasing](releasing.md)) |
 | SBOM | `pnpm sbom` (CycloneDX), built into the package manager | dev tool | `scripts/release-artifacts.ts` | in use | `@cyclonedx/cdxgen` and `@cyclonedx/cyclonedx-npm` add a dependency; the package manager already resolves the exact production tree |
 | Build provenance | `actions/attest-build-provenance`, pinned by SHA | CI action | `release` workflow | in use | SLSA provenance stored by GitHub, verified with `gh attestation verify`; no signing key to keep |
-| Statistics reference | SciPy 1.18.1 `scipy.stats.permutation_test` (BSD-3-Clause), with NumPy 2.5.4 on Python 3.14.2, fetched by `uv run --with` into uv's cache | dev tool (reference, run once) | `scripts/statistics/sign-flip-goldens.py`, the fixture of `statistics` | in use | it generates the golden results the [statistics](../design/statistics.md#golden-tests) tests read; never installed in the workspace, never run by a test or at runtime |
 
 ### Claude Agent SDK terms
 
@@ -159,7 +158,6 @@ Each of these is built because nothing fits; the comparison is the reason.
 | Operator web UI | the small `/ui` page | `web-ui` | in use | DSH `dsh-web-app` needs `dsh-base` (ADR-0019); operator decision |
 | Notifications | the `notify` surface plugin: a cursor over the event log, deduplication in the store, a bounded queue, the desktop sink, and a webhook sink on Node's `fetch` behind `ctx.egress` | `notify` | in use (its row off) | DSH's webhook rows are avoided (experimental, [reuse map](../architecture/plugin-model.md#dsh-core-reuse-map)); Apprise (Python) and ntfy's client are one sink each, which the webhook reaches as plain HTTP. The rules follow superorchestrator's notifications, read for the pattern only (MIT, nothing ported) |
 | CLI | the `system` binary with a stdio MCP shim | `cli` | in use | commander, citty; mcp-remote and supergateway would put the token in client config |
-| Statistics of the evaluation engine | the exact paired sign-flip test and its interval, 2 to 20 cases, golden-tested against SciPy, no dependency, pinned by version in each experiment ([statistics](../design/statistics.md)) | `statistics` | in use | SciPy and statsmodels (BSD-3-Clause) are Python, so SciPy is the reference only; GrowthBook `gbstats` (MIT) tests independent samples, with no paired resampling; Optuna and Ax/BoTorch (MIT) optimize rather than infer; PyMC and ArviZ (Apache-2.0) only for a later Bayesian method; MLflow (Apache-2.0) at most a downstream projection of the record; simple-statistics (ISC) awaits a licence-policy decision and is not used |
 
 ## Dropped
 

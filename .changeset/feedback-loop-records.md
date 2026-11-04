@@ -4,7 +4,6 @@
 "@tsuuanmi/system-approvals": minor
 "@tsuuanmi/system-board": minor
 "@tsuuanmi/system-artifacts": patch
-"@tsuuanmi/system-feedback-core": minor
 ---
 
 The feedback loop's records and seam definitions (PROP-0011 F1). Nothing runs them yet: no provider, bundle row, or MCP tool.

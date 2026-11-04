@@ -311,7 +311,6 @@
         "paths": [
           "packages/cli/",
           "packages/digest-core/",
-          "packages/feedback-core/",
           "packages/gateway-core/",
           "packages/gateway-turns/",
           "packages/libs/",

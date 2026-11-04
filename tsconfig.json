@@ -188,9 +188,6 @@
       ],
       "@tsuuanmi/system-plugin-host": [
         "packages/plugins/plugin-host/src/index.ts"
-      ],
-      "@tsuuanmi/system-feedback-core": [
-        "packages/feedback-core/src/index.ts"
       ]
     }
   },

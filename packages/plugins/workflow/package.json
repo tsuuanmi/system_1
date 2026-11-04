@@ -49,7 +49,6 @@
     "@tsuuanmi/system-board": "workspace:*",
     "@tsuuanmi/system-browser-patchright": "workspace:*",
     "@tsuuanmi/system-credentials-vault": "workspace:*",
-    "@tsuuanmi/system-display-virtual": "workspace:*",
     "@tsuuanmi/system-egress": "workspace:*",
     "@tsuuanmi/system-event-log": "workspace:*",
     "@tsuuanmi/system-landing-local": "workspace:*",
@@ -63,7 +62,6 @@
     "@tsuuanmi/system-turn-receipts": "workspace:*",
     "@tsuuanmi/system-turns": "workspace:*",
     "@tsuuanmi/system-workers": "workspace:*",
-    "patchright-core": "1.63.0",
     "zod": "^4.1.0"
   }
 }

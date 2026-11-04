@@ -22,10 +22,8 @@
     "@deepseek-ai/cordis": "4.0.5-alpha.1",
     "@deepseek-ai/schemastery": "3.18.5-alpha.1",
     "@tsuuanmi/system-artifacts": "workspace:*",
-    "@tsuuanmi/system-egress": "workspace:*",
     "@tsuuanmi/system-event-log": "workspace:*",
     "@tsuuanmi/system-leases": "workspace:*",
-    "@tsuuanmi/system-mcp-server": "workspace:*",
     "@tsuuanmi/system-store": "workspace:*",
     "@tsuuanmi/system-workers": "workspace:*"
   }

@@ -131,11 +131,6 @@ scenario of the suite, on the same provider, does not stay.
   plugin and asserts cleanup (plugin rule 3).
 - **Mock only the expensive boundary.** Keep the real registry, store, and
   engine downstream of a scripted provider.
-- **Golden fixtures.** The statistics library is checked against SciPy's results
-  on fixed datasets, generated once by hand
-  ([`scripts/statistics/`](../../scripts/statistics/sign-flip-goldens.py)) and
-  committed with the versions they ran with. No test runs Python
-  ([golden tests](../design/statistics.md#golden-tests)).
 - **Clean up with the test.** What a test or its helper starts (a store, a fake
   site, a browser) is released by `onTestFinished`, newest first, so a helper that
   boots something registers its own cleanup and a test file keeps no list of its

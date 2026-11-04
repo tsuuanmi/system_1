@@ -12,7 +12,6 @@
 "@tsuuanmi/system-digest": patch
 "@tsuuanmi/system-digest-extractive": patch
 "@tsuuanmi/system-workflow": patch
-"@tsuuanmi/system-feedback-core": patch
 "@tsuuanmi/system-models": patch
 "@tsuuanmi/system-provider-core": patch
 "@tsuuanmi/system-ui-ops": patch

@@ -243,10 +243,9 @@ and LD4 (D4).
 | LD14 | how to salvage | in part: CI on `dev` |
 | LD15 | each salvage files its root-cause task | **none** |
 | LD16 | sync the landing checkout after every lead push | in part: the landing refuses a moved or dirty checkout |
-| LD17 | never push on a failed check | in part: CI, the auto-update |
+| LD17 | never push on a failed check | in part: CI |
 | LD18 | never build or test in the live checkout | in part: `live-update.sh` |
 | LD19 | a live update: pause, wait, build, check, roll back, verify Workers | in part: `live-update.sh`; the lead's own starts **none** |
-| LD20 | a paused automatic update is read the same day | **none** |
 | LD21 | a task: one concern; what to read, deliver, test, document, and leave alone | **none** |
 | LD22 | give work as a board task; propose just before running | in part: the board validates the shape |
 | LD23 | a release is the operator's | the release workflow's `verify` job |
