@@ -18,7 +18,7 @@ the directories under `packages/` and `packages/plugins/`.
 |---|---|---|
 | **MVP** (v0.1) | prove the four [purposes](purpose.md) end to end with the thinnest durable slice | Claude Code and Codex call `system` **tools over MCP**; operator CLI |
 | **Beta** (v0.5) | durable multi-Worker workflows and teams; Claude Code and Codex also as Workers | MCP + CLI + Web UI |
-| **Base** (v0.8) | the closed core ([ADR-0036](../decisions/adr/0036-guarantee-core-and-capability-plugins.md)), Claude Code as the first Worker, every record and seam specified ([ADR-0037](../decisions/adr/0037-schema-and-protocol-first.md)), proven on one multi-day project | MCP (board, approvals, resources) + CLI + Web UI |
+| **Base** (v0.8, folded into v1.0) | the closed core ([ADR-0036](../decisions/adr/0036-guarantee-core-and-capability-plugins.md)), Claude Code as the first Worker, every record and seam specified ([ADR-0037](../decisions/adr/0037-schema-and-protocol-first.md)), proven on one multi-day project | MCP (board, approvals, resources) + CLI + Web UI |
 | **Production-ready** (v1.0) | the lean core, hardened, operated, and judged by measured reliability targets | MCP + CLI + Web UI |
 | **1.x** | the rest of the target architecture, one decided item at a time | adds the Responses and Anthropic Messages gateways and the DSH bundle |
 
@@ -179,7 +179,9 @@ Beta exit criteria:
 ## Base (v0.8)
 
 Design: [PROP-0010](../proposals/0010-base-version.md). Base is the version after which `system`
-evolves by plugins only.
+evolves by plugins only. It is not released on its own: its exit criteria are part of v1.0's, and
+its pilot runs inside v1.0's measuring window
+([ADR-0086](../decisions/adr/0086-production-is-the-lean-core-judged-by-reliability-targets.md)).
 
 ### Goal
 
@@ -286,7 +288,7 @@ that directly moves a target below may be granted by the operator as an exceptio
 
 ### Production-ready exit criteria
 
-Each target is measured on the live install over 14 consecutive days of the operator's real work,
+Each target is measured by `system metrics` on the live install over 14 consecutive days of the operator's real work,
 from the store's own records. The baseline is the week of 2026-10-25 that PROP-0022 measured.
 
 | Target | Measure | Baseline | v1.0 |
@@ -295,6 +297,7 @@ from the store's own records. The baseline is the week of 2026-10-25 that PROP-0
 | R2 Unattended work | share of accepted tasks with no operator touch between the charter and the merge batch | 6.5 % | at least 50 % |
 | R3 Right figures | the ledger's usage per account against the provider's own record | about 3.9 times too high | within 10 % |
 | R4 Few decisions | operator decisions a day on the `system` project | about 116 | at most 10 |
+| R5 Any workflow | the [`research`](../reference/workflow-templates.md#research) template, a workflow outside code, run end to end on live Workers with no engine change | not recorded | at least 3 accepted runs |
 
 Beside the targets, v1.0 also needs:
 
@@ -303,7 +306,8 @@ Beside the targets, v1.0 also needs:
 2. The manual release checklist passes on live accounts, and a skipped item blocks the release.
    Deep Research checks are future work and do not gate v1.0
    ([PROP-0010](../proposals/0010-base-version.md#non-goals)).
-3. The Base exit criteria still hold.
+3. The [Base exit criteria](#base-exit-criteria) hold; the pilot's five working days and its
+   restart fall inside the 14-day window.
 
 Task time and cost per accepted result are reported beside the targets and do not gate.
 
@@ -316,9 +320,6 @@ Each item needs the operator's go-ahead after v1.0; none gates it:
   conversation threads, and the guard (REQ-GW-1, REQ-GW-2, REQ-GW-5), with journaled client
   configuration edits (REQ-HOST-3). They are built and off by default; their smoke tests against
   real Codex and Claude Code binaries move here.
-- `profile-scientific-research` with typed artifacts and invalidation, running with zero engine
-  changes: the test of [P6](purpose.md#p6-any-workflow-not-one-built-in) on a workflow outside
-  code (REQ-WF-9).
 - Publication of the `system` bundle (`dsh-plugin` topic), so DSH users can mount `system`
   plugins in their own profiles.
 - A2A, when the first peer appears that `system` does not drive

@@ -21,14 +21,16 @@ Set by the operator on 2026-10-22 ([PROP-0010](0010-base-version.md)):
 Set by the operator on 2026-11-05
 ([ADR-0086](../decisions/adr/0086-production-is-the-lean-core-judged-by-reliability-targets.md)):
 
-5. **Production (v1.0) is the lean core, hardened**, judged by the reliability targets R1 to R4
-   ([exit criteria](../requirements/release-scope.md#production-ready-exit-criteria)).
+5. **Production (v1.0) is the lean core, hardened**, judged by the targets R1 to R5 over 14 days
+   ([exit criteria](../requirements/release-scope.md#production-ready-exit-criteria)). Base is
+   not released on its own; its milestones and pilot are part of v1.0.
+7. **Measures first.** R1 to R5 in `system metrics` before any other change.
 6. **No new features until v1.0.** An accepted increment that moves no target waits; the operator
    may grant an exception for a change that directly moves one.
 
 ## Next: Base (v0.8)
 
-Base exit criteria are in [release scope](../requirements/release-scope.md#base-v08).
+Base is part of v1.0, not a release of its own. Base exit criteria are in [release scope](../requirements/release-scope.md#base-v08).
 B2 to B9 are in order; B6 needs B5, B7 needs B6, B8 needs B7, and B9 needs B6 and B7.
 
 | Milestone | State | What remains |
@@ -160,7 +162,7 @@ Proposals with open work that no table above holds.
 | **PROP-0007** Account pools | live checks open | After Base: two concurrent `ask`s on two accounts, a two-member team on two accounts, a failover. A failover needs a provider the operator records as `pooled`; under the default `assigned`, work waits for the limit's reset ([ADR-0052](../decisions/adr/0052-accounts-are-assigned-unless-pooling-is-recorded.md)). Limit rules once a site's limit text is seen. Design: [agent runtimes](../design/agent-runtimes.md), [routing](../design/routing.md). |
 | **PROP-0012** Agent accounts | phases B to F built | Phase A: the identity check on the operator's real Codex and Claude Code accounts (equal across restart, token refresh, re-login). Phase G: live checks with the operator's go-ahead (accounts assigned by default, D24; pooling on the operator's recorded acceptance, D33, [ADR-0055](../decisions/adr/0055-personal-accounts-may-be-pooled-on-the-operators-recorded-acceptance.md)). The operator's `system account migrate --apply` on the live host ([runbook](../operations/runbooks.md#migrate-agent-workers-to-accounts--roles)); acceptance of ADR-0051 and ADR-0052. Antigravity CLI accounts wait for a verified way to read their identity. |
 | **Work kinds** (D35, D36) | built, live split open | The live split and a writing Claude Code Worker on the system repository, as an example patch ([route work by kind](../operations/runbooks.md#route-work-by-kind)), applied on the live host after Claude Code's confined commands and Codex's sign-in. Validating the system repository in a run's worktree. Brainstorms on the Codex or Antigravity CLI need their own decision (ADR-0049). |
-| **v1.0** Production-ready release | after Base | The reliability targets R1 to R4 met over 14 days, the operational readiness items, and the open live items of the release checklist, except Deep Research ([exit criteria](../requirements/release-scope.md#production-ready-exit-criteria)). The gateways move to 1.x ([after v1.0](../requirements/release-scope.md#after-v10-1x)). |
+| **v1.0** Production-ready release | after Base | The targets R1 to R5 met over 14 days, the Base milestones above and the pilot within that window, the operational readiness items, and the open live items of the release checklist, except Deep Research ([exit criteria](../requirements/release-scope.md#production-ready-exit-criteria)). The gateways move to 1.x ([after v1.0](../requirements/release-scope.md#after-v10-1x)). |
 
 The operator web page stays the small `/ui` page in
 [`web-ui`](../../packages/plugins/web-ui/README.md); `system` does not build a UI

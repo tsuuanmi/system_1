@@ -45,10 +45,11 @@ Full statement: [docs/requirements/purpose.md](docs/requirements/purpose.md).
 
 ## Status
 
-The next release is Base (v0.8, [PROP-0010](docs/proposals/0010-base-version.md)): the
+The next milestone is Base (v0.8, [PROP-0010](docs/proposals/0010-base-version.md)): the
 closed core, with Claude Code as the first Worker
-([scope](docs/requirements/release-scope.md#base-v08)). Production (v1.0) is that lean core,
-hardened and judged by measured reliability targets; new features wait until then
+([scope](docs/requirements/release-scope.md#base-v08)). Base is not released on its own:
+production (v1.0) is that lean core, hardened, with the Base pilot inside its 14-day measuring
+window, and judged by measured reliability targets; new features wait until then
 ([ADR-0086](docs/decisions/adr/0086-production-is-the-lean-core-judged-by-reliability-targets.md)).
 Each kind of status has one home
 ([status ownership](docs/README.md#status-ownership)):

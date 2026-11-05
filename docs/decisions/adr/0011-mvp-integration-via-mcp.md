@@ -1,6 +1,6 @@
 # ADR-0011: The MVP integrates with Claude Code and Codex through MCP first
 
-- **Status:** Accepted; amended 2026-10-16 (any MCP client)
+- **Status:** Accepted; amended 2026-10-16 (any MCP client); superseded in part by [ADR-0086](0086-production-is-the-lean-core-judged-by-reliability-targets.md) (the gateways come after v1.0)
 - **Date:** 2026-10-11
 - **Related:** ADR-0008, ADR-0009, [release scope](../../requirements/release-scope.md)
 
