@@ -2,14 +2,15 @@
 
 This is the canonical answer to the question **"what is `system` for?"** Every
 requirement, decision, and design choice should trace back to one of the seven
-purposes below. A feature that serves none of them does not belong in `system`.
+purposes below; the identifiers P1 to P7 are stable, and the order shows what leads. A feature
+that serves none of them does not belong in `system`.
 
-> **Right Worker, right job. Spend intelligence where intelligence matters.**
+> **Any Worker continues the work. The person decides only what matters.**
 
 ## The problem
 
 People who work with AI coding agents such as Claude Code and Codex hit the same
-the same walls:
+walls:
 
 1. **Token and quota cost.** Coding agents and APIs bill or limit by token. Long
    research, broad reading, and repeated reasoning burn that budget fast, even
@@ -33,7 +34,45 @@ the same walls:
 7. **The person becomes the bottleneck.** Agents ask about every step, so the
    person approves routine actions instead of deciding what matters.
 
-## The seven purposes
+## The core: any Worker continues, any workflow, few decisions
+
+System's centre is P5 to P7: work state lives in artifacts, so replaceable Workers hand work to
+each other; every workflow runs on the same engine; and the person decides only what matters.
+Production (v1.0) is judged by them
+([ADR-0086](../decisions/adr/0086-production-is-the-lean-core-judged-by-reliability-targets.md),
+[exit criteria](release-scope.md#production-ready-exit-criteria)).
+
+### P5: Any Worker can continue unfinished work
+
+Workers are replaceable. Work state lives in artifacts, not in a Worker's
+session: every input, result, decision, and handoff is an immutable artifact with
+its own id, and Workers communicate by artifact id. A Worker that stops, runs out
+of quota, or is replaced leaves nothing behind that the next Worker needs, so any
+Worker that proves the capabilities can pick the work up from its artifacts
+([INV-13](../architecture/invariants.md#inv-13-every-decision-is-an-artifact),
+[artifacts](../design/artifacts.md)).
+
+### P6: Any workflow, not one built in
+
+`system` is workflow-agnostic. A workflow, whether software development,
+scientific research, or work outside code, is a definition: its steps, the
+capability and minimum tier each step needs, its acceptance, and its review.
+The engine runs every workflow the same way, and no core path is special to one
+of them ([workflow engine](../design/workflow-engine.md),
+[templates](../reference/workflow-templates.md)).
+
+### P7: The person decides only what matters
+
+The person sets intent, approves what only a person should approve (a charter, a
+merge, a policy change, spending), and resolves real disagreements. Routine
+actions inside an approved boundary run without asking. A mechanism that adds
+routine decisions for the person works against this purpose
+([approvals](../design/approvals.md)).
+
+## What the mix of Workers buys
+
+P1 to P4 are what routing across many kinds of Workers gains. Website Workers are a first-class
+kind of Worker among them, not the reason System exists.
 
 ### P1: Save tokens by spending the separate ChatGPT chat quota
 
@@ -119,34 +158,7 @@ website quota absorbs the expensive reasoning.
 
 *Requirements:* REQ-WRK-9, REQ-WRK-10. *Design:* [routing](../design/routing.md#intelligence-tiers).
 
-### P5: Any Worker can continue unfinished work
-
-Workers are replaceable. Work state lives in artifacts, not in a Worker's
-session: every input, result, decision, and handoff is an immutable artifact with
-its own id, and Workers communicate by artifact id. A Worker that stops, runs out
-of quota, or is replaced leaves nothing behind that the next Worker needs, so any
-Worker that proves the capabilities can pick the work up from its artifacts
-([INV-13](../architecture/invariants.md#inv-13-every-decision-is-an-artifact),
-[artifacts](../design/artifacts.md)).
-
-### P6: Any workflow, not one built in
-
-`system` is workflow-agnostic. A workflow, whether software development,
-scientific research, or work outside code, is a definition: its steps, the
-capability and minimum tier each step needs, its acceptance, and its review.
-The engine runs every workflow the same way, and no core path is special to one
-of them ([workflow engine](../design/workflow-engine.md),
-[templates](../reference/workflow-templates.md)).
-
-### P7: The person decides only what matters
-
-The person sets intent, approves what only a person should approve (a charter, a
-merge, a policy change, spending), and resolves real disagreements. Routine
-actions inside an approved boundary run without asking. A mechanism that adds
-routine decisions for the person works against this purpose
-([approvals](../design/approvals.md)).
-
-### Purposes per preset
+## Purposes per preset
 
 The default composition serves all seven purposes. The `api-first` preset
 ([ADR-0025](../decisions/adr/0025-api-first-composition.md)), for organizations that cannot
@@ -188,13 +200,13 @@ agents, and wants them to work together as one system (CON-6).
 
 | Purpose | Measure |
 |---|---|
+| P5 | share of tasks finished by a Worker other than the one that started them, with no rework |
+| P6 | workflows run in production per domain (software, research, other) |
+| P7 | person decisions per day; share of tasks finished unattended |
 | P1 | share of research and reasoning tokens served from website quota instead of metered or agent quota, per workflow |
 | P2 | number of website-native capabilities (Deep Research, search, connectors) reachable as admitted capabilities |
 | P3 | zero local-data egress outside policy; local jobs run only on local Workers; acceptance rate per Worker kind and job type |
 | P4 | share of jobs completed at `economy` tier; escalation rate per job type (low means tiers are declared well) |
-| P5 | share of tasks finished by a Worker other than the one that started them, with no rework |
-| P6 | workflows run in production per domain (software, research, other) |
-| P7 | person decisions per day; share of tasks finished unattended |
 
 What each release must deliver toward these purposes is defined in
 [release scope](release-scope.md).

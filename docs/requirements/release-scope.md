@@ -2,8 +2,9 @@
 
 This document is the canonical definition of **what each release stage must
 deliver** and how its exit is judged. The order of the work lives in the
-[roadmap](../proposals/roadmap.md). The full target architecture, which is what
-production-ready means, lives in [architecture](../architecture/README.md).
+[roadmap](../proposals/roadmap.md). The full target architecture lives in
+[architecture](../architecture/README.md); production-ready (v1.0) is its lean core, hardened
+([ADR-0086](../decisions/adr/0086-production-is-the-lean-core-judged-by-reliability-targets.md)).
 
 Because everything is a plugin, each stage is a set of plugins (rows of the
 `system` bundle) on the seams in the
@@ -18,7 +19,8 @@ the directories under `packages/` and `packages/plugins/`.
 | **MVP** (v0.1) | prove the four [purposes](purpose.md) end to end with the thinnest durable slice | Claude Code and Codex call `system` **tools over MCP**; operator CLI |
 | **Beta** (v0.5) | durable multi-Worker workflows and teams; Claude Code and Codex also as Workers | MCP + CLI + Web UI |
 | **Base** (v0.8) | the closed core ([ADR-0036](../decisions/adr/0036-guarantee-core-and-capability-plugins.md)), Claude Code as the first Worker, every record and seam specified ([ADR-0037](../decisions/adr/0037-schema-and-protocol-first.md)), proven on one multi-day project | MCP (board, approvals, resources) + CLI + Web UI |
-| **Production-ready** (v1.0) | the full target architecture, operated, hardened, and validated | Responses and Anthropic Messages gateways + MCP + CLI + Web UI + DSH bundle |
+| **Production-ready** (v1.0) | the lean core, hardened, operated, and judged by measured reliability targets | MCP + CLI + Web UI |
+| **1.x** | the rest of the target architecture, one decided item at a time | adds the Responses and Anthropic Messages gateways and the DSH bundle |
 
 ## MVP (v0.1)
 
@@ -248,29 +250,26 @@ knowledge family; RTK, Serena, context-mode; automated shadow and canary runs.
    reported: cost per accepted result and operator interventions
    ([PROP-0008](../proposals/0008-studio-operating-model.md#validation-plan)).
 
+
 ## Production-ready (v1.0)
 
-Production-ready means **the complete target architecture**
-([layer map](../architecture/README.md#layer-map)) with every requirement in the
-[SRS](SRS.md) and every [quality attribute](quality-attributes.md) met, plus
-operational readiness.
+Production-ready means **the lean core, hardened**: what
+[PROP-0022](../proposals/0022-lean-core.md) keeps, operated on the live install and judged by
+measured reliability targets, not by a list of features
+([ADR-0086](../decisions/adr/0086-production-is-the-lean-core-judged-by-reliability-targets.md)).
+It is a per-user deployment on Linux (CON-6). New features wait until v1.0 is reached; a change
+that directly moves a target below may be granted by the operator as an exception.
 
-### Functional additions
+### What v1.0 holds
 
-- `gateway-responses` and `gateway-anthropic`, which share the `gateway-turns`
-  library: the text tool protocol
-  ([ADR-0022](../decisions/adr/0022-text-protocol-tool-calls-for-website-models.md)),
-  conversation threads, and the guard (REQ-GW-1, REQ-GW-2, REQ-GW-5). Codex and
-  Claude Code can select `system` Workers *as models*. Client configuration
-  edits are journaled (REQ-HOST-3).
-- `profile-scientific-research` with typed artifacts and invalidation, running
-  with zero engine changes. This is the architecture test (REQ-WF-9).
-- Publication of the `system` bundle (`dsh-plugin` topic), so DSH users can
-  mount `system` plugins in their own profiles.
-- A2A, when the first peer appears that `system` does not drive: `gateway-a2a`
-  exposes sessions as A2A agents, and `runtime-a2a` uses remote A2A agents
-  ([ADR-0006](../decisions/adr/0006-protocol-introduction-gates.md)). It ships in
-  v1.0 if that requirement exists by then, otherwise later.
+| Part | What it must do |
+|---|---|
+| Routing | each step reaches the right Worker by capability, tier, egress, and quota; website, agent, and model Workers are routed alike |
+| Handoff | every input, result, decision, and handoff is an artifact, so another Worker continues an unfinished task from them ([P5](purpose.md#p5-any-worker-can-continue-unfinished-work)) |
+| Durable runs | a run survives a restart by reconciliation, never by blind replay ([INV-4](../architecture/invariants.md#inv-4-restart-is-reconciliation-not-replay)) |
+| Review and checks | one independent review and the required checks on the exact tree before landing |
+| Accounting | usage and quota figures match the providers' own records |
+| Board and approvals | routine actions inside an approved boundary run unasked; the operator decides in batches ([P7](purpose.md#p7-the-person-decides-only-what-matters)) |
 
 ### Operational readiness
 
@@ -280,18 +279,48 @@ operational readiness.
 | Operations docs | `docs/operations/` with runbooks (login, account re-auth, backup and restore, upgrade with drain, retention cleanup) and playbooks (stuck turn, AMBIGUOUS reconciliation, quota exhaustion, provider UI change) |
 | Data safety | store backup and restore tested; versioned, tested migrations; upgrade path from every v0.x release |
 | Security | every control in the [threat model](../security/threat-model.md) implemented and tested; secrets audit; `pnpm audit` clean; egress policy covered by tests |
-| Validation | `docs/validation/` with acceptance criteria per requirement, traceability from requirement to test, and the recorded manual release checklist |
-| Reference | `docs/reference/` with the MCP tool contracts, gateway compatibility notes, configuration catalog generated from plugin `Config` schemas, and the seam definitions |
+| Validation | `docs/validation/` with acceptance criteria per requirement of the parts above, traceability from requirement to test, and the recorded manual release checklist |
+| Reference | `docs/reference/` with the MCP tool contracts, configuration catalog generated from plugin `Config` schemas, and the seam definitions |
 | Reliability | crash-injection suite across every reconcile point passes repeatedly with zero duplicate effects; every bound in INV-9 configured and tested |
 | Platforms | Linux supported, with the `virtual` display and noVNC remote login; macOS and Windows are out of scope (PROP-0004); packaged distribution with checksum-verified artifacts |
 
 ### Production-ready exit criteria
 
-1. Every REQ, QA, and INV has linked test or validation evidence.
-2. Both gateways pass smoke tests against real Codex and Claude Code binaries:
-   streaming, tool round trip, cancel, interrupt, and drain.
-3. The scientific-research profile ships without any change to engine packages.
-4. The manual release checklist passes on live accounts, and a skipped item
-   blocks the release. Deep Research checks are future work and do not gate
-   v1.0 ([PROP-0010](../proposals/0010-base-version.md#non-goals)).
-5. The Base exit criteria still hold.
+Each target is measured on the live install over 14 consecutive days of the operator's real work,
+from the store's own records. The baseline is the week of 2026-10-25 that PROP-0022 measured.
+
+| Target | Measure | Baseline | v1.0 |
+|---|---|---|---|
+| R1 Restart survival | share of runs in flight at a host restart that reach a terminal state with no operator repair, and duplicate effects | not recorded | at least 99 %; zero duplicate effects |
+| R2 Unattended work | share of accepted tasks with no operator touch between the charter and the merge batch | 6.5 % | at least 50 % |
+| R3 Right figures | the ledger's usage per account against the provider's own record | about 3.9 times too high | within 10 % |
+| R4 Few decisions | operator decisions a day on the `system` project | about 116 | at most 10 |
+
+Beside the targets, v1.0 also needs:
+
+1. Quality held: escaped defects, reverts, and failed required checks after landing at or below
+   the baseline week ([PROP-0022 goal 5](../proposals/0022-lean-core.md#goals)).
+2. The manual release checklist passes on live accounts, and a skipped item blocks the release.
+   Deep Research checks are future work and do not gate v1.0
+   ([PROP-0010](../proposals/0010-base-version.md#non-goals)).
+3. The Base exit criteria still hold.
+
+Task time and cost per accepted result are reported beside the targets and do not gate.
+
+## After v1.0 (1.x)
+
+Each item needs the operator's go-ahead after v1.0; none gates it:
+
+- `gateway-responses` and `gateway-anthropic`, which share the `gateway-turns` library: the text
+  tool protocol ([ADR-0022](../decisions/adr/0022-text-protocol-tool-calls-for-website-models.md)),
+  conversation threads, and the guard (REQ-GW-1, REQ-GW-2, REQ-GW-5), with journaled client
+  configuration edits (REQ-HOST-3). They are built and off by default; their smoke tests against
+  real Codex and Claude Code binaries move here.
+- `profile-scientific-research` with typed artifacts and invalidation, running with zero engine
+  changes: the test of [P6](purpose.md#p6-any-workflow-not-one-built-in) on a workflow outside
+  code (REQ-WF-9).
+- Publication of the `system` bundle (`dsh-plugin` topic), so DSH users can mount `system`
+  plugins in their own profiles.
+- A2A, when the first peer appears that `system` does not drive
+  ([ADR-0006](../decisions/adr/0006-protocol-introduction-gates.md)).
+- The feedback loop's F3 to F7 ([PROP-0011](../proposals/0011-feedback-loop.md)).

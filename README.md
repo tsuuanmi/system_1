@@ -21,22 +21,25 @@ it is a plugin.
 
 ## Why
 
-1. **Save tokens.** Website chat quota (ChatGPT, Gemini) is counted separately
+1. **Replaceable Workers.** Work state lives in artifacts, and Workers communicate by
+   artifact id, so any Worker can continue unfinished work.
+2. **Any workflow.** Software development, scientific research, or work outside code:
+   a workflow defines its steps, tiers, and acceptance; the engine runs them all alike.
+3. **The person decides only what matters.** Routine actions inside an approved
+   boundary run without asking.
+
+What the mix of Workers buys:
+
+4. **Save tokens.** Website chat quota (ChatGPT, Gemini) is counted separately
    from API and coding-agent quota. Research and reasoning go there.
-2. **Use what the websites already have.** That includes Deep Research, web
+5. **Use what the websites already have.** That includes Deep Research, web
    search, and the connectors, apps, and plugins enabled on the account.
-3. **Right Worker, right job.** Website Workers search and synthesize. Local
+6. **Right Worker, right job.** Website Workers search and synthesize. Local
    Workers (Claude Code, Codex, local tools) work on local code and data, which
    stays local.
-4. **Right model, right job.** Cheap models handle low-level work such as triage,
+7. **Right model, right job.** Cheap models handle low-level work such as triage,
    extraction, summaries, and formatting. Strong models are kept for hard
    reasoning and final synthesis.
-5. **Replaceable Workers.** Work state lives in artifacts, and Workers communicate by
-   artifact id, so any Worker can continue unfinished work.
-6. **Any workflow.** Software development, scientific research, or work outside code:
-   a workflow defines its steps, tiers, and acceptance; the engine runs them all alike.
-7. **The person decides only what matters.** Routine actions inside an approved
-   boundary run without asking.
 
 Full statement: [docs/requirements/purpose.md](docs/requirements/purpose.md).
 
@@ -44,7 +47,10 @@ Full statement: [docs/requirements/purpose.md](docs/requirements/purpose.md).
 
 The next release is Base (v0.8, [PROP-0010](docs/proposals/0010-base-version.md)): the
 closed core, with Claude Code as the first Worker
-([scope](docs/requirements/release-scope.md#base-v08)). Each kind of status has one home
+([scope](docs/requirements/release-scope.md#base-v08)). Production (v1.0) is that lean core,
+hardened and judged by measured reliability targets; new features wait until then
+([ADR-0086](docs/decisions/adr/0086-production-is-the-lean-core-judged-by-reliability-targets.md)).
+Each kind of status has one home
 ([status ownership](docs/README.md#status-ownership)):
 
 - which milestones are done, and what remains: the [roadmap](docs/proposals/roadmap.md);
